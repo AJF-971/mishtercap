@@ -7727,7 +7727,7 @@ function DispatchJobCard({ row, ticketNo, isDone, isStarted, assignedName, onCli
 
 function DispatchDetailModal({ row, ticketNo, isDone, isStarted, assignedId, assignedName, staffOptions, onClose, onToggleDone, onToggleStarted, onAssign, saving }) {
   const { job, categoryLabel } = row;
-  return (
+  return createPortal(
     <div onClick={onClose} style={{ position: "fixed", inset: 0, background: "rgba(0,0,0,0.6)", zIndex: 200, display: "flex", alignItems: "center", justifyContent: "center", padding: 18 }}>
       <div onClick={(e) => e.stopPropagation()} style={{ background: COLORS.panel, border: `1px solid ${COLORS.line}`, borderRadius: 16, padding: 22, maxWidth: 420, width: "100%", maxHeight: "86vh", overflowY: "auto" }}>
         <div style={{ display: "flex", justifyContent: "space-between", alignItems: "flex-start" }}>
@@ -7817,7 +7817,8 @@ function DispatchDetailModal({ row, ticketNo, isDone, isStarted, assignedId, ass
           </button>
         </div>
       </div>
-    </div>
+    </div>,
+    document.body
   );
 }
 
