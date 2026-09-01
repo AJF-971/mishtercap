@@ -7646,6 +7646,8 @@ async function loadDispatchJobs() {
 }
 
 function playDispatchBeep() {
+  // New job arrived — a single flat ping, deliberately plain so it's
+  // never confused with the "finished" chime below.
   try {
     const Ctx = window.AudioContext || window.webkitAudioContext;
     if (!Ctx) return;
@@ -7661,6 +7663,36 @@ function playDispatchBeep() {
     gain.gain.exponentialRampToValueAtTime(0.001, ctx.currentTime + 0.55);
     osc.start(ctx.currentTime);
     osc.stop(ctx.currentTime + 0.55);
+  } catch { /* best-effort only — a silent tablet shouldn't block the board */ }
+}
+
+function playDispatchDoneChime() {
+  // Job marked finished — a rising two-note chime (like a doorbell "ding
+  // dong" in reverse), intentionally shaped differently from the flat
+  // arrival ping above so the two are easy to tell apart by ear alone
+  // without looking at the screen.
+  try {
+    const Ctx = window.AudioContext || window.webkitAudioContext;
+    if (!Ctx) return;
+    const ctx = new Ctx();
+    const notes = [
+      { freq: 660, start: 0, dur: 0.16 },
+      { freq: 990, start: 0.14, dur: 0.32 },
+    ];
+    notes.forEach(({ freq, start, dur }) => {
+      const osc = ctx.createOscillator();
+      const gain = ctx.createGain();
+      osc.connect(gain);
+      gain.connect(ctx.destination);
+      osc.frequency.value = freq;
+      osc.type = "sine";
+      const t0 = ctx.currentTime + start;
+      gain.gain.setValueAtTime(0.001, t0);
+      gain.gain.exponentialRampToValueAtTime(0.3, t0 + 0.02);
+      gain.gain.exponentialRampToValueAtTime(0.001, t0 + dur);
+      osc.start(t0);
+      osc.stop(t0 + dur);
+    });
   } catch { /* best-effort only — a silent tablet shouldn't block the board */ }
 }
 
@@ -7885,6 +7917,7 @@ function DispatchBoard({ team, session }) {
     });
     setJobs((prev) => prev.map((j) => (j.id === job.id ? { ...j, serviceDone: nextServiceDone } : j)));
     setSaving(false);
+    if (nowDone) playDispatchDoneChime();
   };
 
   // Same shape and same history trail as toggleDone, kept as a fully
