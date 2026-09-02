@@ -7663,7 +7663,7 @@ function TeamScreen({ team, setTeam, session, onBack, onImport, onServices, canS
 
 async function loadDispatchJobs() {
   const { ok, data } = await sbFetch(
-    "jobs?select=id,plate,make_model,customer_name,description,damage_notes,photos,priority,location,stage_index,service_types,assigned_to,service_done,service_started,treatments,parts,created_at,updated_at&order=created_at.asc&limit=900"
+    "jobs?select=id,plate,make_model,customer_name,description,damage_notes,photos,priority,location,stage_index,service_types,assigned_to,assigned_team,service_done,service_started,treatments,parts,created_at,updated_at&order=created_at.asc&limit=900"
   );
   if (!ok || !data) return [];
   return data
@@ -7671,7 +7671,7 @@ async function loadDispatchJobs() {
     .map((r) => ({
       id: r.id, plate: r.plate, makeModel: r.make_model, customerName: r.customer_name,
       description: r.description, damageNotes: r.damage_notes, photos: r.photos || {}, priority: r.priority, location: r.location,
-      stageIndex: r.stage_index, serviceTypes: r.service_types || [], assignedTo: r.assigned_to || {},
+      stageIndex: r.stage_index, serviceTypes: r.service_types || [], assignedTo: r.assigned_to || {}, assignedTeam: r.assigned_team || {},
       serviceDone: r.service_done || {}, serviceStarted: r.service_started || {}, treatments: r.treatments || {},
       parts: r.parts || [],
       createdAt: new Date(r.created_at).getTime(), updatedAt: new Date(r.updated_at).getTime(),
@@ -7827,10 +7827,10 @@ function staffForRole(team, role) {
   return team.filter((m) => m.role !== "detailing" && m.role !== "admin" && m.role !== "intake");
 }
 
-function DispatchJobCard({ row, ticketNo, isDone, isStarted, startedAt, now, assignedName, onClick }) {
+function DispatchJobCard({ row, ticketNo, isDone, isStarted, startedAt, now, assignedNames, onClick }) {
   const { job, categoryLabel } = row;
   const isPartsRemoval = STAGES[job.stageIndex]?.key === "parts_removal";
-  const isStaleUnassigned = !assignedName && !isStarted && !isDone && (now - job.createdAt) > STALE_UNASSIGNED_MS;
+  const isStaleUnassigned = (!assignedNames || assignedNames.length === 0) && !isStarted && !isDone && (now - job.createdAt) > STALE_UNASSIGNED_MS;
   const isStaleInProgress = isStarted && !isDone && startedAt && (now - new Date(startedAt).getTime()) > STALE_IN_PROGRESS_MS;
   const isStale = isStaleUnassigned || isStaleInProgress;
   return (
@@ -7874,8 +7874,8 @@ function DispatchJobCard({ row, ticketNo, isDone, isStarted, startedAt, now, ass
           }}>{STAGES[job.stageIndex]?.label || "—"}</span>
           <span style={{ fontSize: 10.5, fontWeight: 600, padding: "3px 8px", borderRadius: 999, background: COLORS.panel2, color: COLORS.ink }}>{categoryLabel}</span>
         </div>
-        <div style={{ fontSize: 11.5, marginTop: 7, color: isDone ? COLORS.green : isStarted ? COLORS.gold : (assignedName ? COLORS.goldBright : COLORS.muted) }}>
-          {isDone ? "Finished" : isStarted ? `In progress${formatDispatchElapsed(startedAt, now) ? ` · ${formatDispatchElapsed(startedAt, now)}` : ""}` : assignedName ? `Assigned: ${assignedName}` : "Unassigned — tap to assign"}
+        <div style={{ fontSize: 11.5, marginTop: 7, color: isDone ? COLORS.green : isStarted ? COLORS.gold : (assignedNames?.length ? COLORS.goldBright : COLORS.muted) }}>
+          {isDone ? "Finished" : isStarted ? `In progress${formatDispatchElapsed(startedAt, now) ? ` · ${formatDispatchElapsed(startedAt, now)}` : ""}` : assignedNames?.length ? `Assigned: ${assignedNames.join(", ")}` : "Unassigned — tap to assign"}
         </div>
         {isStale && (
           <div style={{ fontSize: 10.5, fontWeight: 700, color: COLORS.red, marginTop: 4 }}>
@@ -7887,7 +7887,7 @@ function DispatchJobCard({ row, ticketNo, isDone, isStarted, startedAt, now, ass
   );
 }
 
-function DispatchDetailModal({ row, ticketNo, isDone, isStarted, startedAt, now, assignedId, assignedName, staffOptions, moveOptions, canWriteUpdate, onClose, onToggleDone, onToggleStarted, onAssign, onMove, onAddUpdate, saving }) {
+function DispatchDetailModal({ row, ticketNo, isDone, isStarted, startedAt, now, assignedIds, assignedNames, staffOptions, moveOptions, canWriteUpdate, onClose, onToggleDone, onToggleStarted, onAssign, onMove, onAddUpdate, saving }) {
   const { job, categoryLabel, categoryKey } = row;
   const isUnclassified = categoryKey === "_none";
   const [updateText, setUpdateText] = useState("");
@@ -7967,28 +7967,34 @@ function DispatchDetailModal({ row, ticketNo, isDone, isStarted, startedAt, now,
         {!isUnclassified && (
           <div style={{ marginTop: 14 }}>
             <div style={{ fontSize: 11.5, fontWeight: 700, color: COLORS.muted, textTransform: "uppercase", letterSpacing: 0.5, marginBottom: 7 }}>
-              {assignedName ? `Assigned to ${assignedName} — tap a name to reassign` : "Tap a name to assign"}
+              {assignedNames?.length ? `Assigned to ${assignedNames.join(", ")} — tap to add/remove (max 3)` : "Tap up to 3 names to assign"}
             </div>
             <div style={{ display: "flex", flexWrap: "wrap", gap: 7 }}>
               {staffOptions.length === 0 ? (
                 <div style={{ fontSize: 12, color: COLORS.muted }}>No staff with this role yet — add them under Team.</div>
               ) : (
-                staffOptions.map((m) => (
-                  <button
-                    key={m.id}
-                    onClick={() => onAssign(row, assignedId === m.id ? null : m.id)}
-                    className="mrcap-press"
-                    style={{
-                      padding: "8px 12px", borderRadius: 999,
-                      border: `1.5px solid ${assignedId === m.id ? COLORS.gold : COLORS.line}`,
-                      background: assignedId === m.id ? COLORS.gold : COLORS.panel2,
-                      color: assignedId === m.id ? COLORS.darkText : COLORS.ink,
-                      fontSize: 12.5, fontWeight: 600, cursor: "pointer",
-                    }}
-                  >
-                    {m.name}{m.specialty ? <span style={{ opacity: 0.75, fontWeight: 500 }}> — {m.specialty}</span> : null}
-                  </button>
-                ))
+                staffOptions.map((m) => {
+                  const isSelected = (assignedIds || []).includes(m.id);
+                  const atCap = !isSelected && (assignedIds || []).length >= 3;
+                  return (
+                    <button
+                      key={m.id}
+                      onClick={() => { if (!atCap) onAssign(row, m.id); }}
+                      disabled={atCap}
+                      className="mrcap-press"
+                      style={{
+                        padding: "8px 12px", borderRadius: 999,
+                        border: `1.5px solid ${isSelected ? COLORS.gold : COLORS.line}`,
+                        background: isSelected ? COLORS.gold : COLORS.panel2,
+                        color: isSelected ? COLORS.darkText : COLORS.ink,
+                        fontSize: 12.5, fontWeight: 600, cursor: atCap ? "default" : "pointer",
+                        opacity: atCap ? 0.4 : 1,
+                      }}
+                    >
+                      {m.name}{m.specialty ? <span style={{ opacity: 0.75, fontWeight: 500 }}> — {m.specialty}</span> : null}
+                    </button>
+                  );
+                })
               )}
             </div>
           </div>
@@ -8144,20 +8150,27 @@ function DispatchBoard({ team, session }) {
     return () => clearInterval(interval);
   }, [refresh]);
 
-  const assign = async (row, memberId) => {
+  // Multi-select, capped at 3 per (job, category) — separate field from
+  // the single-assignee `assigned_to` JobDetail still uses, so that
+  // screen's own assignment picker is completely unaffected by this.
+  const DISPATCH_MAX_ASSIGNEES = 3;
+  const toggleTeamAssign = async (row, memberId) => {
     const { job, categoryKey } = row;
-    const nextAssignedTo = { ...job.assignedTo, [categoryKey]: memberId || undefined };
-    if (!memberId) delete nextAssignedTo[categoryKey];
-    setJobs((prev) => prev.map((j) => (j.id === job.id ? { ...j, assignedTo: nextAssignedTo } : j)));
-    const staffName = memberId ? (team.find((m) => m.id === memberId)?.name || memberId) : null;
-    withActivitySummary(memberId
-      ? `Dispatch board: assigned ${categoryKey} on ${job.plate} to ${staffName}`
-      : `Dispatch board: unassigned ${categoryKey} on ${job.plate}`);
-    if (staffName) announceDispatchAssignment(staffName, job.makeModel || job.plate);
+    const current = job.assignedTeam[categoryKey] || [];
+    const isRemoving = current.includes(memberId);
+    if (!isRemoving && current.length >= DISPATCH_MAX_ASSIGNEES) return; // cap reached — no-op
+    const nextList = isRemoving ? current.filter((id) => id !== memberId) : [...current, memberId];
+    const nextAssignedTeam = { ...job.assignedTeam, [categoryKey]: nextList };
+    setJobs((prev) => prev.map((j) => (j.id === job.id ? { ...j, assignedTeam: nextAssignedTeam } : j)));
+    const staffName = team.find((m) => m.id === memberId)?.name || memberId;
+    withActivitySummary(isRemoving
+      ? `Dispatch board: removed ${staffName} from ${categoryKey} on ${job.plate}`
+      : `Dispatch board: added ${staffName} to ${categoryKey} on ${job.plate}`);
+    if (!isRemoving) announceDispatchAssignment(staffName, job.makeModel || job.plate);
     await sbFetch(`jobs?id=eq.${job.id}`, {
       method: "PATCH",
       headers: { Prefer: "return=minimal" },
-      body: JSON.stringify({ assigned_to: nextAssignedTo }),
+      body: JSON.stringify({ assigned_team: nextAssignedTeam }),
     });
   };
 
@@ -8225,13 +8238,14 @@ function DispatchBoard({ team, session }) {
     setSaving(true);
     const { job, categoryKey, categoryLabel } = row;
     const newLabel = SERVICES.find((s) => s.key === newCategoryKey)?.label || newCategoryKey;
-    const { ok, data } = await sbFetch(`jobs?id=eq.${job.id}&select=service_types,assigned_to,service_done,service_started,history`);
+    const { ok, data } = await sbFetch(`jobs?id=eq.${job.id}&select=service_types,assigned_to,assigned_team,service_done,service_started,history`);
     const current = ok && data && data[0]
       ? data[0]
-      : { service_types: job.serviceTypes, assigned_to: job.assignedTo, service_done: job.serviceDone, service_started: job.serviceStarted, history: [] };
+      : { service_types: job.serviceTypes, assigned_to: job.assignedTo, assigned_team: job.assignedTeam, service_done: job.serviceDone, service_started: job.serviceStarted, history: [] };
     const nextServiceTypes = (current.service_types || []).filter((k) => k !== categoryKey);
     if (!nextServiceTypes.includes(newCategoryKey)) nextServiceTypes.push(newCategoryKey);
     const nextAssignedTo = { ...(current.assigned_to || {}) }; delete nextAssignedTo[categoryKey];
+    const nextAssignedTeam = { ...(current.assigned_team || {}) }; delete nextAssignedTeam[categoryKey];
     const nextServiceDone = { ...(current.service_done || {}) }; delete nextServiceDone[categoryKey];
     const nextServiceStarted = { ...(current.service_started || {}) }; delete nextServiceStarted[categoryKey];
     const nextHistory = [
@@ -8243,12 +8257,12 @@ function DispatchBoard({ team, session }) {
       method: "PATCH",
       headers: { Prefer: "return=minimal" },
       body: JSON.stringify({
-        service_types: nextServiceTypes, assigned_to: nextAssignedTo, service_done: nextServiceDone,
+        service_types: nextServiceTypes, assigned_to: nextAssignedTo, assigned_team: nextAssignedTeam, service_done: nextServiceDone,
         service_started: nextServiceStarted, history: nextHistory, updated_at: new Date().toISOString(),
       }),
     });
     setJobs((prev) => prev.map((j) => (j.id === job.id
-      ? { ...j, serviceTypes: nextServiceTypes, assignedTo: nextAssignedTo, serviceDone: nextServiceDone, serviceStarted: nextServiceStarted }
+      ? { ...j, serviceTypes: nextServiceTypes, assignedTo: nextAssignedTo, assignedTeam: nextAssignedTeam, serviceDone: nextServiceDone, serviceStarted: nextServiceStarted }
       : j)));
     setSaving(false);
     setSelectedRowKey(null); // the old (job, category) row this modal was showing no longer exists
@@ -8334,7 +8348,7 @@ function DispatchBoard({ team, session }) {
                 isStarted={!!r.job.serviceStarted[r.categoryKey]}
                 startedAt={r.job.serviceStarted[r.categoryKey] || null}
                 now={nowTick}
-                assignedName={r.job.assignedTo[r.categoryKey] ? (team.find((m) => m.id === r.job.assignedTo[r.categoryKey])?.name || r.job.assignedTo[r.categoryKey]) : null}
+                assignedNames={(r.job.assignedTeam[r.categoryKey] || []).map((id) => team.find((m) => m.id === id)?.name || id)}
                 onClick={() => setSelectedRowKey(key)}
               />
             );
@@ -8410,15 +8424,15 @@ function DispatchBoard({ team, session }) {
           isStarted={!!selectedRow.job.serviceStarted[selectedRow.categoryKey]}
           startedAt={selectedRow.job.serviceStarted[selectedRow.categoryKey] || null}
           now={nowTick}
-          assignedId={selectedRow.job.assignedTo[selectedRow.categoryKey] || null}
-          assignedName={selectedRow.job.assignedTo[selectedRow.categoryKey] ? (team.find((m) => m.id === selectedRow.job.assignedTo[selectedRow.categoryKey])?.name || selectedRow.job.assignedTo[selectedRow.categoryKey]) : null}
+          assignedIds={selectedRow.job.assignedTeam[selectedRow.categoryKey] || []}
+          assignedNames={(selectedRow.job.assignedTeam[selectedRow.categoryKey] || []).map((id) => team.find((m) => m.id === id)?.name || id)}
           staffOptions={staffForRole(team, selectedRow.role)}
           moveOptions={SERVICES.filter((s) => s.key !== selectedRow.categoryKey)}
           canWriteUpdate={canWriteUpdate}
           onClose={() => setSelectedRowKey(null)}
           onToggleDone={toggleDone}
           onToggleStarted={toggleStarted}
-          onAssign={assign}
+          onAssign={toggleTeamAssign}
           onMove={moveCategory}
           onAddUpdate={addProgressUpdate}
           saving={saving}
