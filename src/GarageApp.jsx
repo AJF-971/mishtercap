@@ -7760,8 +7760,7 @@ const rowKey = (jobId, categoryKey) => `${jobId}::${categoryKey}`;
 // this is a shop-floor glance-at-it label, not a stopwatch.
 function formatDispatchElapsed(startedAt, now) {
   if (!startedAt) return null;
-  const ms = now - new Date(startedAt).getTime();
-  if (ms < 0) return null;
+  const ms = Math.max(0, now - new Date(startedAt).getTime()); // clamp: the 30s tick can be a moment behind the exact click time
   const totalMin = Math.floor(ms / 60000);
   if (totalMin < 60) return `${totalMin}m`;
   const h = Math.floor(totalMin / 60);
