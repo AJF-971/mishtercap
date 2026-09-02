@@ -1664,6 +1664,7 @@ function DesktopShell({ session, team, view, setView, onLogout, canArchive, chil
           {navItem("import", "Import Data", Upload, () => setView("import"), hasPermission(session, team, "import"))}
           {navItem("dispatch", "Dispatch Board", ListChecks, () => setView("dispatch"))}
           {navItem("admindash", "Admin Dashboard", TrendingUp, () => setView("admindash"), isSuperAdmin(session))}
+          {navItem("liveupdates", "Live Updates", MessageSquare, () => setView("liveupdates"), session.role === "admin")}
           {navItem("msgtemplates", "WhatsApp Messages", MessageSquare, () => setView("msgtemplates"), isSuperAdmin(session))}
           {navItem("issues", "Issue Reports", AlertCircle, () => setView("issues"), isSuperAdmin(session))}
         </div>
@@ -2404,7 +2405,7 @@ export default function GarageApp() {
     <ActiveShell session={session} team={team} view={view} setView={setView} onLogout={onLogout} canArchive={canArchive}>
       {isSuperAdmin(session) && <DraggablePorscheEgg badgeCount={eggAttentionCount} onTap={() => setView("admindash")} />}
       <ReportIssueButton session={session} view={view} />
-      <TopBar session={session} team={team} onLogout={onLogout} onNew={() => setView("new")} view={view} onBack={() => window.history.back()} onTeam={() => setView("team")} onArchive={() => setView("archive")} onCustomers={() => setView("customers")} onReports={() => setView("reports")} onQuotes={() => setView("quotes")} canArchive={canArchive} onAdminDash={() => setView("admindash")} onMsgTemplates={() => setView("msgtemplates")} onIssues={() => setView("issues")} onDispatch={() => setView("dispatch")} />
+      <TopBar session={session} team={team} onLogout={onLogout} onNew={() => setView("new")} view={view} onBack={() => window.history.back()} onTeam={() => setView("team")} onArchive={() => setView("archive")} onCustomers={() => setView("customers")} onReports={() => setView("reports")} onQuotes={() => setView("quotes")} canArchive={canArchive} onAdminDash={() => setView("admindash")} onMsgTemplates={() => setView("msgtemplates")} onIssues={() => setView("issues")} onDispatch={() => setView("dispatch")} onLiveUpdates={() => setView("liveupdates")} />
       {view === "list" && (
         ROLE_DEFS[session.role]?.simplified
           ? <SimplifiedDashboard index={index} session={session} onOpen={openJob} onRefresh={refreshIndex} syncState={syncState} lastSyncedAt={lastSyncedAt} />
@@ -2466,6 +2467,8 @@ export default function GarageApp() {
       )}
       {view === "reports" && !hasPermission(session, team, "reports") && <AccessDenied onBack={() => window.history.back()} />}
       {view === "dispatch" && <DispatchBoard team={team} session={session} />}
+      {view === "liveupdates" && session.role === "admin" && <LiveUpdatesBoard team={team} />}
+      {view === "liveupdates" && session.role !== "admin" && <AccessDenied onBack={() => window.history.back()} />}
       {view === "admindash" && isSuperAdmin(session) && (
         <AdminStatsScreen team={team} onBack={() => window.history.back()} />
       )}
@@ -2644,7 +2647,7 @@ const keyBtnStyle = { height: 54, borderRadius: 12, border: `1px solid ${COLORS.
 
 /* ---------------- Top bar ---------------- */
 
-function TopBar({ session, team, onLogout, onNew, view, onBack, onTeam, onArchive, onCustomers, onReports, onQuotes, canArchive, onAdminDash, onMsgTemplates, onIssues, onDispatch }) {
+function TopBar({ session, team, onLogout, onNew, view, onBack, onTeam, onArchive, onCustomers, onReports, onQuotes, canArchive, onAdminDash, onMsgTemplates, onIssues, onDispatch, onLiveUpdates }) {
   const isSimplified = !!ROLE_DEFS[session.role]?.simplified;
   return (
     <div className="mrcap-view">
@@ -2686,6 +2689,9 @@ function TopBar({ session, team, onLogout, onNew, view, onBack, onTeam, onArchiv
           )}
           {view === "list" && isSuperAdmin(session) && (
             <button onClick={onAdminDash} style={iconBtnStyle} className="mrcap-press" title="Admin Dashboard"><LayoutDashboard size={16} color={COLORS.ink} /></button>
+          )}
+          {view === "list" && session.role === "admin" && (
+            <button onClick={onLiveUpdates} style={iconBtnStyle} className="mrcap-press" title="Live Updates"><MessageSquare size={16} color={COLORS.ink} /></button>
           )}
           {view === "list" && isSuperAdmin(session) && (
             <button onClick={onMsgTemplates} style={iconBtnStyle} className="mrcap-press" title="WhatsApp Messages"><MessageSquare size={16} color={COLORS.ink} /></button>
@@ -7853,9 +7859,10 @@ function DispatchJobCard({ row, ticketNo, isDone, isStarted, startedAt, now, ass
   );
 }
 
-function DispatchDetailModal({ row, ticketNo, isDone, isStarted, startedAt, now, assignedId, assignedName, staffOptions, moveOptions, onClose, onToggleDone, onToggleStarted, onAssign, onMove, saving }) {
+function DispatchDetailModal({ row, ticketNo, isDone, isStarted, startedAt, now, assignedId, assignedName, staffOptions, moveOptions, canWriteUpdate, onClose, onToggleDone, onToggleStarted, onAssign, onMove, onAddUpdate, saving }) {
   const { job, categoryLabel, categoryKey } = row;
   const isUnclassified = categoryKey === "_none";
+  const [updateText, setUpdateText] = useState("");
   return createPortal(
     <div onClick={onClose} style={{ position: "fixed", inset: 0, background: "rgba(0,0,0,0.6)", zIndex: 200, display: "flex", alignItems: "center", justifyContent: "center", padding: 18 }}>
       <div onClick={(e) => e.stopPropagation()} style={{ background: COLORS.panel, border: `1px solid ${COLORS.line}`, borderRadius: 16, padding: 22, maxWidth: 420, width: "100%", maxHeight: "86vh", overflowY: "auto" }}>
@@ -7971,6 +7978,36 @@ function DispatchDetailModal({ row, ticketNo, isDone, isStarted, startedAt, now,
             >
               <CheckCircle2 size={16} />
               {isDone ? "Finished — tap to undo" : "Mark Finished"}
+            </button>
+          </div>
+        )}
+
+        {!isUnclassified && isStarted && !isDone && canWriteUpdate && (
+          <div style={{ marginTop: 16 }}>
+            <div style={{ fontSize: 11.5, fontWeight: 700, color: COLORS.muted, textTransform: "uppercase", letterSpacing: 0.5, marginBottom: 7 }}>
+              Post a progress update — shows on the admin Live Updates board
+            </div>
+            <textarea
+              value={updateText}
+              onChange={(e) => setUpdateText(e.target.value)}
+              placeholder="e.g. Half done with polish, moving to interior next"
+              rows={2}
+              style={{
+                width: "100%", background: COLORS.panel2, border: `1px solid ${COLORS.line}`, borderRadius: 10,
+                padding: 10, fontSize: 13.5, color: COLORS.ink, fontFamily: "inherit", resize: "vertical", boxSizing: "border-box",
+              }}
+            />
+            <button
+              onClick={() => { if (!updateText.trim()) return; onAddUpdate(row, updateText.trim()); setUpdateText(""); }}
+              disabled={saving || !updateText.trim()}
+              className="mrcap-press"
+              style={{
+                marginTop: 8, width: "100%", padding: "11px 12px", borderRadius: 10, border: "none",
+                background: COLORS.gold, color: COLORS.darkText, fontSize: 13, fontWeight: 700,
+                cursor: saving || !updateText.trim() ? "default" : "pointer", opacity: saving || !updateText.trim() ? 0.5 : 1,
+              }}
+            >
+              Post Update
             </button>
           </div>
         )}
@@ -8132,6 +8169,30 @@ function DispatchBoard({ team, session }) {
     setSelectedRowKey(null); // the old (job, category) row this modal was showing no longer exists
   };
 
+  // Restricted to Ahmed and Noel by request — not a general permission,
+  // just these two names. Written as its own history entry type
+  // ("progress_update") so the Live Updates admin board can pull just
+  // these out of the mix without picking up every Started/Finished/
+  // Moved/Assigned entry too.
+  const canWriteUpdate = ["ahmed", "noel"].includes((session.name || "").toLowerCase());
+  const addProgressUpdate = async (row, text) => {
+    setSaving(true);
+    const { job, categoryLabel } = row;
+    const { ok, data } = await sbFetch(`jobs?id=eq.${job.id}&select=history`);
+    const current = ok && data && data[0] ? data[0] : { history: [] };
+    const nextHistory = [
+      ...(current.history || []),
+      { stage: "progress_update", label: categoryLabel, by: session.name, role: session.role, note: text, at: Date.now() },
+    ];
+    withActivitySummary(`Dispatch board: ${session.name} posted an update on ${job.plate}`);
+    await sbFetch(`jobs?id=eq.${job.id}`, {
+      method: "PATCH",
+      headers: { Prefer: "return=minimal" },
+      body: JSON.stringify({ history: nextHistory, updated_at: new Date().toISOString() }),
+    });
+    setSaving(false);
+  };
+
   // One row per (job, category-it-needs). A job needing both detailing
   // and dentrepair shows once in each relevant column with its own
   // ticket number in that column. Finished rows are dropped entirely —
@@ -8268,14 +8329,92 @@ function DispatchBoard({ team, session }) {
           assignedName={selectedRow.job.assignedTo[selectedRow.categoryKey] ? (team.find((m) => m.id === selectedRow.job.assignedTo[selectedRow.categoryKey])?.name || selectedRow.job.assignedTo[selectedRow.categoryKey]) : null}
           staffOptions={staffForRole(team, selectedRow.role)}
           moveOptions={SERVICES.filter((s) => s.key !== selectedRow.categoryKey)}
+          canWriteUpdate={canWriteUpdate}
           onClose={() => setSelectedRowKey(null)}
           onToggleDone={toggleDone}
           onToggleStarted={toggleStarted}
           onAssign={assign}
           onMove={moveCategory}
+          onAddUpdate={addProgressUpdate}
           saving={saving}
         />
       )}
+    </div>
+  );
+}
+
+/* ---------------- Live Updates (admin) ----------------
+   A read-only feed for any admin login (Suhail or AJF) showing every
+   progress update Ahmed or Noel have posted from the Dispatch Board,
+   newest first. Pulls straight from each job's existing history array
+   rather than a separate table — updates are just history entries
+   tagged stage: "progress_update", so nothing new needed on the
+   database side. Polls every 15s; this doesn't need Dispatch Board's
+   6s urgency since it's a monitoring view, not something staff act on
+   in real time. */
+
+async function loadLiveUpdates() {
+  const { ok, data } = await sbFetch(
+    "jobs?select=id,plate,make_model,customer_name,stage_index,history&order=updated_at.desc&limit=300"
+  );
+  if (!ok || !data) return [];
+  const updates = [];
+  for (const r of data) {
+    for (const entry of r.history || []) {
+      if (entry.stage === "progress_update") {
+        updates.push({
+          jobId: r.id, plate: r.plate, makeModel: r.make_model, customerName: r.customer_name,
+          categoryLabel: entry.label, by: entry.by, note: entry.note, at: entry.at,
+        });
+      }
+    }
+  }
+  updates.sort((a, b) => b.at - a.at);
+  return updates;
+}
+
+function LiveUpdatesBoard({ team }) {
+  const [updates, setUpdates] = useState([]);
+  const [loading, setLoading] = useState(true);
+
+  const refresh = useCallback(async () => {
+    setUpdates(await loadLiveUpdates());
+    setLoading(false);
+  }, []);
+
+  useEffect(() => {
+    refresh();
+    const interval = setInterval(refresh, 15000);
+    return () => clearInterval(interval);
+  }, [refresh]);
+
+  return (
+    <div className="mrcap-view" style={{ padding: 16, display: "flex", flexDirection: "column", gap: 14, minHeight: "calc(100vh - 80px)" }}>
+      <div>
+        <div style={{ fontFamily: DISPLAY_FONT, fontWeight: 700, fontSize: 20, color: COLORS.ink }}>Live Updates</div>
+        <div style={{ fontSize: 12, color: COLORS.muted, marginTop: 2 }}>
+          {loading ? "Loading…" : "Progress notes from Ahmed and Noel · updates automatically"}
+        </div>
+      </div>
+      <div style={{ display: "flex", flexDirection: "column", gap: 10, maxWidth: 640 }}>
+        {updates.length === 0 ? (
+          <div style={{ textAlign: "center", color: COLORS.muted, fontSize: 13, marginTop: 40 }}>No updates posted yet</div>
+        ) : (
+          updates.map((u, i) => (
+            <div key={`${u.jobId}-${u.at}-${i}`} style={{ background: COLORS.panel, border: `1px solid ${COLORS.line}`, borderRadius: 12, padding: 14 }}>
+              <div style={{ display: "flex", justifyContent: "space-between", alignItems: "flex-start", gap: 10 }}>
+                <div>
+                  <span style={{ fontFamily: MONO_FONT, fontWeight: 700, fontSize: 14, color: COLORS.ink }}>{u.plate}</span>
+                  <span style={{ fontSize: 12.5, color: COLORS.muted, marginLeft: 8 }}>{u.makeModel}</span>
+                </div>
+                <div style={{ fontSize: 11, color: COLORS.muted, flexShrink: 0 }}>{new Date(u.at).toLocaleString([], { month: "short", day: "numeric", hour: "2-digit", minute: "2-digit" })}</div>
+              </div>
+              <div style={{ fontSize: 14, color: COLORS.ink, marginTop: 8, lineHeight: 1.4 }}>{u.note}</div>
+              <div style={{ fontSize: 11.5, color: COLORS.goldBright, marginTop: 8, fontWeight: 600 }}>{u.by} · {u.categoryLabel}</div>
+            </div>
+          ))
+        )}
+      </div>
     </div>
   );
 }
