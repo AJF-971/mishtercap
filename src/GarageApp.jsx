@@ -7756,6 +7756,13 @@ function playDispatchDoneChime() {
 
 const rowKey = (jobId, categoryKey) => `${jobId}::${categoryKey}`;
 
+// Thresholds for the "this is going stale" warnings — tune these two
+// numbers if an hour/three hours turns out too eager or too lax.
+const STALE_UNASSIGNED_MS = 60 * 60 * 1000; // 1 hour sitting unassigned
+const STALE_IN_PROGRESS_MS = 3 * 60 * 60 * 1000; // 3 hours "in progress" with no update
+
+const PRIORITY_RANK = { urgent: 3, high: 2, medium: 1, low: 0 };
+
 // The free-text "description" field is usually empty in practice — the
 // actual "what to do" for a specific category is the treatments picked
 // for it (e.g. "Tune Up"), stored separately per category. Prefer that;
@@ -7790,12 +7797,15 @@ function staffForRole(team, role) {
 function DispatchJobCard({ row, ticketNo, isDone, isStarted, startedAt, now, assignedName, onClick }) {
   const { job, categoryLabel } = row;
   const isPartsRemoval = STAGES[job.stageIndex]?.key === "parts_removal";
+  const isStaleUnassigned = !assignedName && !isStarted && !isDone && (now - job.createdAt) > STALE_UNASSIGNED_MS;
+  const isStaleInProgress = isStarted && !isDone && startedAt && (now - new Date(startedAt).getTime()) > STALE_IN_PROGRESS_MS;
+  const isStale = isStaleUnassigned || isStaleInProgress;
   return (
     <div
       onClick={onClick}
       className="mrcap-press"
       style={{
-        background: COLORS.panel, border: `1.5px solid ${COLORS.line}`, borderRadius: 11,
+        background: COLORS.panel, border: `1.5px solid ${isStale ? COLORS.red : COLORS.line}`, borderRadius: 11,
         padding: 12, marginBottom: 9, cursor: "pointer", opacity: isDone ? 0.6 : 1,
         display: "flex", gap: 12, alignItems: "flex-start",
       }}
@@ -7833,6 +7843,11 @@ function DispatchJobCard({ row, ticketNo, isDone, isStarted, startedAt, now, ass
         <div style={{ fontSize: 11.5, marginTop: 7, color: isDone ? COLORS.green : isStarted ? COLORS.gold : (assignedName ? COLORS.goldBright : COLORS.muted) }}>
           {isDone ? "Finished" : isStarted ? `In progress${formatDispatchElapsed(startedAt, now) ? ` · ${formatDispatchElapsed(startedAt, now)}` : ""}` : assignedName ? `Assigned: ${assignedName}` : "Unassigned — tap to assign"}
         </div>
+        {isStale && (
+          <div style={{ fontSize: 10.5, fontWeight: 700, color: COLORS.red, marginTop: 4 }}>
+            ⚠ {isStaleInProgress ? "In progress a while — check on this" : "Sitting unassigned a while"}
+          </div>
+        )}
       </div>
     </div>
   );
@@ -7840,6 +7855,7 @@ function DispatchJobCard({ row, ticketNo, isDone, isStarted, startedAt, now, ass
 
 function DispatchDetailModal({ row, ticketNo, isDone, isStarted, startedAt, now, assignedId, assignedName, staffOptions, moveOptions, onClose, onToggleDone, onToggleStarted, onAssign, onMove, saving }) {
   const { job, categoryLabel, categoryKey } = row;
+  const isUnclassified = categoryKey === "_none";
   return createPortal(
     <div onClick={onClose} style={{ position: "fixed", inset: 0, background: "rgba(0,0,0,0.6)", zIndex: 200, display: "flex", alignItems: "center", justifyContent: "center", padding: 18 }}>
       <div onClick={(e) => e.stopPropagation()} style={{ background: COLORS.panel, border: `1px solid ${COLORS.line}`, borderRadius: 16, padding: 22, maxWidth: 420, width: "100%", maxHeight: "86vh", overflowY: "auto" }}>
@@ -7854,7 +7870,9 @@ function DispatchDetailModal({ row, ticketNo, isDone, isStarted, startedAt, now,
 
         <div style={{ display: "flex", gap: 6, flexWrap: "wrap", marginTop: 14 }}>
           <span style={{ fontSize: 11, fontWeight: 600, padding: "4px 10px", borderRadius: 999, background: COLORS.panel2, color: COLORS.ink }}>{STAGES[job.stageIndex]?.label || "—"}</span>
-          <span style={{ fontSize: 11, fontWeight: 600, padding: "4px 10px", borderRadius: 999, background: COLORS.panel2, color: COLORS.ink }}>{categoryLabel}</span>
+          {!isUnclassified && (
+            <span style={{ fontSize: 11, fontWeight: 600, padding: "4px 10px", borderRadius: 999, background: COLORS.panel2, color: COLORS.ink }}>{categoryLabel}</span>
+          )}
           {job.priority ? (
             <span style={{ fontSize: 11, fontWeight: 700, padding: "4px 10px", borderRadius: 999, color: COLORS.red, border: `1px solid ${COLORS.red}`, textTransform: "uppercase" }}>{job.priority}</span>
           ) : null}
@@ -7867,41 +7885,43 @@ function DispatchDetailModal({ row, ticketNo, isDone, isStarted, startedAt, now,
         <div style={{ marginTop: 14 }}>
           <div style={{ fontSize: 11.5, fontWeight: 700, color: COLORS.muted, textTransform: "uppercase", letterSpacing: 0.5, marginBottom: 5 }}>What to do</div>
           <div style={{ fontSize: 14, color: COLORS.ink, lineHeight: 1.5, background: COLORS.panel2, borderRadius: 10, padding: 12 }}>
-            {dispatchWhatToDo(job, categoryKey) || "No treatments or description entered for this job."}
+            {isUnclassified ? "This job hasn't been assigned a service type yet — pick one below." : (dispatchWhatToDo(job, categoryKey) || "No treatments or description entered for this job.")}
           </div>
         </div>
 
-        <div style={{ marginTop: 14 }}>
-          <div style={{ fontSize: 11.5, fontWeight: 700, color: COLORS.muted, textTransform: "uppercase", letterSpacing: 0.5, marginBottom: 7 }}>
-            {assignedName ? `Assigned to ${assignedName} — tap a name to reassign` : "Tap a name to assign"}
+        {!isUnclassified && (
+          <div style={{ marginTop: 14 }}>
+            <div style={{ fontSize: 11.5, fontWeight: 700, color: COLORS.muted, textTransform: "uppercase", letterSpacing: 0.5, marginBottom: 7 }}>
+              {assignedName ? `Assigned to ${assignedName} — tap a name to reassign` : "Tap a name to assign"}
+            </div>
+            <div style={{ display: "flex", flexWrap: "wrap", gap: 7 }}>
+              {staffOptions.length === 0 ? (
+                <div style={{ fontSize: 12, color: COLORS.muted }}>No staff with this role yet — add them under Team.</div>
+              ) : (
+                staffOptions.map((m) => (
+                  <button
+                    key={m.id}
+                    onClick={() => onAssign(row, assignedId === m.id ? null : m.id)}
+                    className="mrcap-press"
+                    style={{
+                      padding: "8px 12px", borderRadius: 999,
+                      border: `1.5px solid ${assignedId === m.id ? COLORS.gold : COLORS.line}`,
+                      background: assignedId === m.id ? COLORS.gold : COLORS.panel2,
+                      color: assignedId === m.id ? COLORS.darkText : COLORS.ink,
+                      fontSize: 12.5, fontWeight: 600, cursor: "pointer",
+                    }}
+                  >
+                    {m.name}
+                  </button>
+                ))
+              )}
+            </div>
           </div>
-          <div style={{ display: "flex", flexWrap: "wrap", gap: 7 }}>
-            {staffOptions.length === 0 ? (
-              <div style={{ fontSize: 12, color: COLORS.muted }}>No staff with this role yet — add them under Team.</div>
-            ) : (
-              staffOptions.map((m) => (
-                <button
-                  key={m.id}
-                  onClick={() => onAssign(row, assignedId === m.id ? null : m.id)}
-                  className="mrcap-press"
-                  style={{
-                    padding: "8px 12px", borderRadius: 999,
-                    border: `1.5px solid ${assignedId === m.id ? COLORS.gold : COLORS.line}`,
-                    background: assignedId === m.id ? COLORS.gold : COLORS.panel2,
-                    color: assignedId === m.id ? COLORS.darkText : COLORS.ink,
-                    fontSize: 12.5, fontWeight: 600, cursor: "pointer",
-                  }}
-                >
-                  {m.name}
-                </button>
-              ))
-            )}
-          </div>
-        </div>
+        )}
 
         <div style={{ marginTop: 14 }}>
           <div style={{ fontSize: 11.5, fontWeight: 700, color: COLORS.muted, textTransform: "uppercase", letterSpacing: 0.5, marginBottom: 7 }}>
-            Move to a different section — tap where it should go
+            {isUnclassified ? "Set the service type — tap one" : "Move to a different section — tap where it should go"}
           </div>
           <div style={{ display: "flex", flexWrap: "wrap", gap: 7 }}>
             {moveOptions.map((s) => (
@@ -7922,36 +7942,38 @@ function DispatchDetailModal({ row, ticketNo, isDone, isStarted, startedAt, now,
           </div>
         </div>
 
-        <div style={{ display: "flex", gap: 8, marginTop: 18 }}>
-          <button
-            onClick={() => onToggleStarted(row, !isStarted)}
-            disabled={saving || isDone}
-            className="mrcap-press"
-            style={{
-              flex: 1, padding: "13px 12px", borderRadius: 11, border: `1.5px solid ${isStarted ? COLORS.gold : COLORS.line}`,
-              background: isStarted ? `${COLORS.gold}22` : COLORS.panel2, color: isStarted ? COLORS.goldBright : COLORS.ink,
-              fontSize: 13.5, fontWeight: 700, cursor: saving || isDone ? "default" : "pointer", opacity: saving || isDone ? 0.5 : 1,
-              display: "flex", alignItems: "center", justifyContent: "center", gap: 7,
-            }}
-          >
-            <Clock size={16} />
-            {isStarted ? `In Progress${formatDispatchElapsed(startedAt, now) ? ` · ${formatDispatchElapsed(startedAt, now)} — tap to undo` : " — tap to undo"}` : "Start"}
-          </button>
-          <button
-            onClick={() => onToggleDone(row, !isDone)}
-            disabled={saving}
-            className="mrcap-press"
-            style={{
-              flex: 1, padding: "13px 12px", borderRadius: 11, border: "none",
-              background: isDone ? COLORS.panel2 : COLORS.gold, color: isDone ? COLORS.ink : COLORS.darkText,
-              fontSize: 13.5, fontWeight: 700, cursor: saving ? "default" : "pointer", opacity: saving ? 0.6 : 1,
-              display: "flex", alignItems: "center", justifyContent: "center", gap: 7,
-            }}
-          >
-            <CheckCircle2 size={16} />
-            {isDone ? "Finished — tap to undo" : "Mark Finished"}
-          </button>
-        </div>
+        {!isUnclassified && (
+          <div style={{ display: "flex", gap: 8, marginTop: 18 }}>
+            <button
+              onClick={() => onToggleStarted(row, !isStarted)}
+              disabled={saving || isDone}
+              className="mrcap-press"
+              style={{
+                flex: 1, padding: "13px 12px", borderRadius: 11, border: `1.5px solid ${isStarted ? COLORS.gold : COLORS.line}`,
+                background: isStarted ? `${COLORS.gold}22` : COLORS.panel2, color: isStarted ? COLORS.goldBright : COLORS.ink,
+                fontSize: 13.5, fontWeight: 700, cursor: saving || isDone ? "default" : "pointer", opacity: saving || isDone ? 0.5 : 1,
+                display: "flex", alignItems: "center", justifyContent: "center", gap: 7,
+              }}
+            >
+              <Clock size={16} />
+              {isStarted ? `In Progress${formatDispatchElapsed(startedAt, now) ? ` · ${formatDispatchElapsed(startedAt, now)} — tap to undo` : " — tap to undo"}` : "Start"}
+            </button>
+            <button
+              onClick={() => onToggleDone(row, !isDone)}
+              disabled={saving}
+              className="mrcap-press"
+              style={{
+                flex: 1, padding: "13px 12px", borderRadius: 11, border: "none",
+                background: isDone ? COLORS.panel2 : COLORS.gold, color: isDone ? COLORS.ink : COLORS.darkText,
+                fontSize: 13.5, fontWeight: 700, cursor: saving ? "default" : "pointer", opacity: saving ? 0.6 : 1,
+                display: "flex", alignItems: "center", justifyContent: "center", gap: 7,
+              }}
+            >
+              <CheckCircle2 size={16} />
+              {isDone ? "Finished — tap to undo" : "Mark Finished"}
+            </button>
+          </div>
+        )}
       </div>
     </div>,
     document.body
@@ -7964,7 +7986,7 @@ function DispatchBoard({ team, session }) {
   const [selectedRowKey, setSelectedRowKey] = useState(null);
   const [saving, setSaving] = useState(false);
   const [nowTick, setNowTick] = useState(() => Date.now());
-  const [sortOrder, setSortOrder] = useState("oldest"); // "oldest" | "newest"
+  const [sortOrder, setSortOrder] = useState("oldest"); // "oldest" | "newest" | "priority"
   const prevCountRef = useRef(null);
   const firstLoadRef = useRef(true);
 
@@ -8114,8 +8136,9 @@ function DispatchBoard({ team, session }) {
   // and dentrepair shows once in each relevant column with its own
   // ticket number in that column. Finished rows are dropped entirely —
   // once cleared, it comes off the board rather than sitting there
-  // dimmed. jobs is already sorted oldest-first from the fetch; flip
-  // it here for the newest-first toggle without re-querying.
+  // dimmed. Jobs with no service type yet ("_none") go into their own
+  // "needs classification" bucket rather than being dumped into a
+  // colored column with a meaningless badge.
   const allRows = [];
   for (const job of jobs) {
     const types = job.serviceTypes.length ? job.serviceTypes : ["_none"];
@@ -8125,12 +8148,22 @@ function DispatchBoard({ team, session }) {
       allRows.push({ job, categoryKey: key, categoryLabel: svc?.label || key, role: svc?.role || null });
     }
   }
-  if (sortOrder === "newest") allRows.reverse();
+
+  if (sortOrder === "newest") {
+    allRows.reverse();
+  } else if (sortOrder === "priority") {
+    // Stable sort: highest priority first, oldest-within-same-priority
+    // first (allRows already arrives oldest-first from the fetch, and
+    // Array.prototype.sort is stable in every browser this runs on).
+    allRows.sort((a, b) => (PRIORITY_RANK[b.job.priority] ?? -1) - (PRIORITY_RANK[a.job.priority] ?? -1));
+  }
+
   const rowsByKey = {};
   allRows.forEach((r) => { rowsByKey[rowKey(r.job.id, r.categoryKey)] = r; });
 
+  const unclassifiedRows = allRows.filter((r) => r.categoryKey === "_none");
   const detailingRows = allRows.filter((r) => r.role === "detailing");
-  const otherRows = allRows.filter((r) => r.role !== "detailing");
+  const otherRows = allRows.filter((r) => r.role !== "detailing" && r.categoryKey !== "_none");
 
   const selectedRow = selectedRowKey ? rowsByKey[selectedRowKey] : null;
 
@@ -8166,7 +8199,7 @@ function DispatchBoard({ team, session }) {
   );
 
   const selectedTicketNo = selectedRow
-    ? (selectedRow.role === "detailing" ? detailingRows : otherRows).findIndex((r) => rowKey(r.job.id, r.categoryKey) === selectedRowKey) + 1
+    ? (selectedRow.categoryKey === "_none" ? unclassifiedRows : selectedRow.role === "detailing" ? detailingRows : otherRows).findIndex((r) => rowKey(r.job.id, r.categoryKey) === selectedRowKey) + 1
     : null;
 
   return (
@@ -8175,11 +8208,11 @@ function DispatchBoard({ team, session }) {
         <div>
           <div style={{ fontFamily: DISPLAY_FONT, fontWeight: 700, fontSize: 20, color: COLORS.ink }}>Dispatch Board</div>
           <div style={{ fontSize: 12, color: COLORS.muted, marginTop: 2 }}>
-            {loading ? "Loading…" : `${sortOrder === "oldest" ? "Oldest" : "Newest"} first · updates automatically · last checked ${new Date().toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" })}`}
+            {loading ? "Loading…" : `${sortOrder === "priority" ? "Priority" : sortOrder === "oldest" ? "Oldest" : "Newest"} first · updates automatically · last checked ${new Date().toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" })}`}
           </div>
         </div>
         <div style={{ display: "flex", gap: 6, background: COLORS.panel2, borderRadius: 10, padding: 3 }}>
-          {["oldest", "newest"].map((opt) => (
+          {["oldest", "newest", "priority"].map((opt) => (
             <button
               key={opt}
               onClick={() => setSortOrder(opt)}
@@ -8191,11 +8224,34 @@ function DispatchBoard({ team, session }) {
                 fontSize: 12.5, fontWeight: 700, textTransform: "capitalize",
               }}
             >
-              {opt} first
+              {opt === "priority" ? "Priority first" : `${opt} first`}
             </button>
           ))}
         </div>
       </div>
+      {unclassifiedRows.length > 0 && (
+        <div style={{ background: "#1a1408", border: `1px solid ${COLORS.gold}55`, borderRadius: 12, padding: 14 }}>
+          <div style={{ fontSize: 12.5, fontWeight: 700, color: COLORS.goldBright, marginBottom: 10 }}>
+            ⚠ {unclassifiedRows.length} job{unclassifiedRows.length === 1 ? "" : "s"} need{unclassifiedRows.length === 1 ? "s" : ""} a service type — tap to classify
+          </div>
+          <div style={{ display: "flex", gap: 9, overflowX: "auto", paddingBottom: 2 }}>
+            {unclassifiedRows.map((r) => (
+              <div
+                key={rowKey(r.job.id, r.categoryKey)}
+                onClick={() => setSelectedRowKey(rowKey(r.job.id, r.categoryKey))}
+                className="mrcap-press"
+                style={{
+                  flexShrink: 0, minWidth: 160, background: COLORS.panel, border: `1px solid ${COLORS.line}`,
+                  borderRadius: 10, padding: 10, cursor: "pointer",
+                }}
+              >
+                <div style={{ fontFamily: MONO_FONT, fontWeight: 700, fontSize: 13, color: COLORS.ink }}>{r.job.plate}</div>
+                <div style={{ fontSize: 11.5, color: COLORS.muted }}>{r.job.makeModel}</div>
+              </div>
+            ))}
+          </div>
+        </div>
+      )}
       <div style={{ display: "flex", gap: 14, flex: 1, minHeight: 0, flexWrap: "wrap" }}>
         <Column title="Detailing" accent={COLORS.red} rowsForColumn={detailingRows} />
         <Column title="Denting / Bodyshop / PPF" accent={COLORS.blue} rowsForColumn={otherRows} />
