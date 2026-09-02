@@ -4263,13 +4263,20 @@ function JobDetail({ id, initialJob, session, team, onChanged, onBack, canArchiv
     onChanged(updated, saved);
   };
 
-  // What shows on the customer's public tracking page, beyond the
-  // coarse 6-stage strip — e.g. "In polish" or "Waiting on parts".
-  // Picking a preset (or typing a custom line) saves immediately, same
-  // pattern as everything else on this screen.
-  const saveCustomerStatusNote = async (text) => {
+  // Used to be the customer-facing status line. Repurposed per request:
+  // this now posts an internal operational update (same hot-button
+  // pattern, same permission gate) into the job's history, tagged so
+  // it also shows up on the admin Live Updates board. Customers no
+  // longer receive anything from this section — their tracking page
+  // falls back to the plain stage label instead.
+  const postAdminUpdate = async (text) => {
+    if (!text.trim()) return;
     setSavingStatusNote(true);
-    const updated = { ...job, customerStatusNote: text.trim() || null, customerStatusUpdatedAt: Date.now(), updatedAt: Date.now() };
+    const updated = {
+      ...job,
+      history: [...(job.history || []), { stage: "progress_update", label: stage.label, by: session.name, role: session.role, note: text.trim(), at: Date.now() }],
+      updatedAt: Date.now(),
+    };
     const saved = await saveJob(updated);
     setJob(updated);
     setSavingStatusNote(false);
@@ -4708,40 +4715,34 @@ function JobDetail({ id, initialJob, session, team, onChanged, onBack, canArchiv
         <div style={{ background: COLORS.panel, border: `1px solid ${COLORS.line}`, borderRadius: 12, padding: 16, marginBottom: 16 }}>
           <div style={{ display: "flex", alignItems: "center", gap: 7, marginBottom: 3 }}>
             <MessageSquare size={14} color={COLORS.gold} />
-            <div style={{ fontFamily: DISPLAY_FONT, fontWeight: 600, fontSize: 14.5, color: COLORS.ink }}>Customer Update</div>
+            <div style={{ fontFamily: DISPLAY_FONT, fontWeight: 600, fontSize: 14.5, color: COLORS.ink }}>Admin Update</div>
           </div>
           <div style={{ fontSize: 11.5, color: COLORS.muted, marginBottom: 12 }}>
-            Shown on the customer's tracking page. Pick one or type your own.
+            Internal only — posts to the Live Updates admin board, not shown to the customer. Pick one or type your own.
           </div>
 
-          {job.customerStatusNote && (
-            <div style={{ background: "rgba(201,162,39,0.08)", border: `1px solid ${COLORS.gold}`, borderRadius: 8, padding: "9px 11px", marginBottom: 12, display: "flex", justifyContent: "space-between", alignItems: "center", gap: 10 }}>
-              <div style={{ minWidth: 0 }}>
-                <div style={{ fontSize: 12.5, color: COLORS.ink, fontWeight: 600 }}>{job.customerStatusNote}</div>
-                {job.customerStatusUpdatedAt && (
-                  <div style={{ fontSize: 10.5, color: COLORS.muted, marginTop: 2 }}>Showing since {new Date(job.customerStatusUpdatedAt).toLocaleString()}</div>
-                )}
-              </div>
-              <button onClick={() => saveCustomerStatusNote("")} className="mrcap-press" style={{ background: "none", border: "none", color: COLORS.muted, cursor: "pointer", padding: 4, flexShrink: 0 }} title="Clear">
-                <X size={14} />
-              </button>
+          {(job.history || []).filter((h) => h.stage === "progress_update").slice(-3).reverse().length > 0 && (
+            <div style={{ display: "flex", flexDirection: "column", gap: 6, marginBottom: 12 }}>
+              {(job.history || []).filter((h) => h.stage === "progress_update").slice(-3).reverse().map((h, i) => (
+                <div key={i} style={{ background: "rgba(201,162,39,0.08)", border: `1px solid ${COLORS.gold}`, borderRadius: 8, padding: "9px 11px" }}>
+                  <div style={{ fontSize: 12.5, color: COLORS.ink, fontWeight: 600 }}>{h.note}</div>
+                  <div style={{ fontSize: 10.5, color: COLORS.muted, marginTop: 2 }}>{h.by} · {new Date(h.at).toLocaleString()}</div>
+                </div>
+              ))}
             </div>
           )}
 
           <div style={{ display: "flex", flexWrap: "wrap", gap: 6, marginBottom: 10 }}>
-            {CUSTOMER_STATUS_PRESETS.map((preset) => (
+            {DISPATCH_UPDATE_PRESETS.map((preset) => (
               <button
                 key={preset}
-                onClick={() => saveCustomerStatusNote(preset)}
+                onClick={() => postAdminUpdate(preset)}
                 disabled={savingStatusNote}
                 className="mrcap-press"
                 style={{
                   padding: "7px 11px", borderRadius: 999, fontSize: 11.5, cursor: "pointer",
-                  border: `1.5px solid ${job.customerStatusNote === preset ? COLORS.gold : COLORS.line}`,
-                  background: job.customerStatusNote === preset ? COLORS.gold : COLORS.panel2,
-                  color: job.customerStatusNote === preset ? COLORS.darkText : COLORS.ink,
-                  fontWeight: job.customerStatusNote === preset ? 700 : 500,
-                  opacity: savingStatusNote ? 0.6 : 1,
+                  border: `1.5px solid ${COLORS.line}`, background: COLORS.panel2, color: COLORS.ink,
+                  fontWeight: 500, opacity: savingStatusNote ? 0.6 : 1,
                 }}
               >
                 {preset}
@@ -4755,15 +4756,15 @@ function JobDetail({ id, initialJob, session, team, onChanged, onBack, canArchiv
               onChange={(e) => setCustomStatusNote(e.target.value)}
               placeholder="Or type a custom update…"
               style={{ ...inputStyle, marginTop: 0, flex: 1 }}
-              onKeyDown={(e) => { if (e.key === "Enter" && customStatusNote.trim()) saveCustomerStatusNote(customStatusNote); }}
+              onKeyDown={(e) => { if (e.key === "Enter" && customStatusNote.trim()) postAdminUpdate(customStatusNote); }}
             />
             <button
-              onClick={() => saveCustomerStatusNote(customStatusNote)}
+              onClick={() => postAdminUpdate(customStatusNote)}
               disabled={savingStatusNote || !customStatusNote.trim()}
               className="mrcap-press"
               style={{ ...secondaryBtnStyle, padding: "0 16px", opacity: savingStatusNote || !customStatusNote.trim() ? 0.5 : 1 }}
             >
-              Set
+              Post
             </button>
           </div>
         </div>
