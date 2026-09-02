@@ -108,6 +108,13 @@ function canSeeLiveUpdates(session) {
   return !!session && (session.role === "admin" || (session.name || "").toLowerCase() === "noel");
 }
 
+// Who can hide/show a car on the Dispatch Board entirely (e.g. it's
+// actually sitting at Smartech, not on-site) — a named list by request,
+// not a toggleable permission flag.
+function canManageDispatchVisibility(session) {
+  return !!session && ["ajf", "ahmed", "laani", "mr.cap"].includes((session.name || "").toLowerCase());
+}
+
 const LOCATIONS = ["Mr CAP (Main)", "Beneloom (Upholstery)", "Smartech (Body & Paint)"];
 // Placeholder until the shop's real Terms & Conditions text is provided —
 // swap this single constant, nothing else needs to change.
@@ -7663,7 +7670,7 @@ function TeamScreen({ team, setTeam, session, onBack, onImport, onServices, canS
 
 async function loadDispatchJobs() {
   const { ok, data } = await sbFetch(
-    "jobs?select=id,plate,make_model,customer_name,description,damage_notes,photos,priority,location,stage_index,service_types,assigned_to,assigned_team,service_done,service_started,treatments,parts,created_at,updated_at&order=created_at.asc&limit=900"
+    "jobs?select=id,plate,make_model,customer_name,description,damage_notes,photos,priority,location,stage_index,service_types,assigned_to,assigned_team,service_done,service_started,treatments,parts,dispatch_hidden,created_at,updated_at&order=created_at.asc&limit=900"
   );
   if (!ok || !data) return [];
   return data
@@ -7673,7 +7680,7 @@ async function loadDispatchJobs() {
       description: r.description, damageNotes: r.damage_notes, photos: r.photos || {}, priority: r.priority, location: r.location,
       stageIndex: r.stage_index, serviceTypes: r.service_types || [], assignedTo: r.assigned_to || {}, assignedTeam: r.assigned_team || {},
       serviceDone: r.service_done || {}, serviceStarted: r.service_started || {}, treatments: r.treatments || {},
-      parts: r.parts || [],
+      parts: r.parts || [], dispatchHidden: !!r.dispatch_hidden,
       createdAt: new Date(r.created_at).getTime(), updatedAt: new Date(r.updated_at).getTime(),
     }));
 }
@@ -7887,7 +7894,7 @@ function DispatchJobCard({ row, ticketNo, isDone, isStarted, startedAt, now, ass
   );
 }
 
-function DispatchDetailModal({ row, ticketNo, isDone, isStarted, startedAt, now, assignedIds, assignedNames, staffOptions, moveOptions, canWriteUpdate, onClose, onToggleDone, onToggleStarted, onAssign, onMove, onAddUpdate, saving }) {
+function DispatchDetailModal({ row, ticketNo, isDone, isStarted, startedAt, now, assignedIds, assignedNames, staffOptions, moveOptions, canWriteUpdate, canManageVisibility, onClose, onToggleDone, onToggleStarted, onAssign, onMove, onAddUpdate, onToggleHidden, saving }) {
   const { job, categoryLabel, categoryKey } = row;
   const isUnclassified = categoryKey === "_none";
   const [updateText, setUpdateText] = useState("");
@@ -8102,6 +8109,21 @@ function DispatchDetailModal({ row, ticketNo, isDone, isStarted, startedAt, now,
             </button>
           </div>
         )}
+
+        {canManageVisibility && (
+          <button
+            onClick={() => onToggleHidden(job, true)}
+            disabled={saving}
+            className="mrcap-press"
+            style={{
+              marginTop: 18, width: "100%", padding: "10px 12px", borderRadius: 10,
+              border: `1px solid ${COLORS.line}`, background: "transparent", color: COLORS.muted,
+              fontSize: 12, fontWeight: 600, cursor: saving ? "default" : "pointer",
+            }}
+          >
+            Hide this car from the Dispatch Board
+          </button>
+        )}
       </div>
     </div>,
     document.body
@@ -8117,6 +8139,13 @@ function DispatchBoard({ team, session }) {
   const [sortOrder, setSortOrder] = useState("oldest"); // "oldest" | "newest" | "priority"
   const prevCountRef = useRef(null);
   const firstLoadRef = useRef(true);
+  // Set to a future timestamp right after any local write (assign,
+  // toggle, move, etc.) — refresh() skips applying its result until
+  // that time passes, so a poll landing between "tap" and "server
+  // finished saving" can't silently revert the tap. This was the real
+  // cause of taps sometimes seeming to not register.
+  const suppressRefreshUntilRef = useRef(0);
+  const markLocalWrite = () => { suppressRefreshUntilRef.current = Date.now() + 4000; };
 
   // Forces a re-render every 30s purely so elapsed-time labels ("23m")
   // stay roughly current without needing a full data refetch.
@@ -8127,6 +8156,7 @@ function DispatchBoard({ team, session }) {
 
   const refresh = useCallback(async () => {
     const data = await loadDispatchJobs();
+    if (Date.now() < suppressRefreshUntilRef.current) return; // a local write is still settling — don't clobber it
     setJobs(data);
     setLoading(false);
     if (!firstLoadRef.current && prevCountRef.current !== null && data.length > prevCountRef.current) {
@@ -8155,6 +8185,7 @@ function DispatchBoard({ team, session }) {
   // screen's own assignment picker is completely unaffected by this.
   const DISPATCH_MAX_ASSIGNEES = 3;
   const toggleTeamAssign = async (row, memberId) => {
+    markLocalWrite();
     const { job, categoryKey } = row;
     const current = job.assignedTeam[categoryKey] || [];
     const isRemoving = current.includes(memberId);
@@ -8180,6 +8211,7 @@ function DispatchBoard({ team, session }) {
   // rather than trusting the board's lightweight copy, so two people
   // acting around the same time don't clobber each other's history.
   const toggleDone = async (row, nowDone) => {
+    markLocalWrite();
     setSaving(true);
     const { job, categoryKey, categoryLabel } = row;
     const { ok, data } = await sbFetch(`jobs?id=eq.${job.id}&select=service_done,history`);
@@ -8209,6 +8241,7 @@ function DispatchBoard({ team, session }) {
   // "started" everywhere else that checks it — this is a superset of
   // the old boolean shape, nothing else needs to change.
   const toggleStarted = async (row, nowStarted) => {
+    markLocalWrite();
     setSaving(true);
     const { job, categoryKey, categoryLabel } = row;
     const { ok, data } = await sbFetch(`jobs?id=eq.${job.id}&select=service_started,history`);
@@ -8235,6 +8268,7 @@ function DispatchBoard({ team, session }) {
   // different kind of work needs a fresh assignment, not a carried-over
   // one from whoever was doing the old job).
   const moveCategory = async (row, newCategoryKey) => {
+    markLocalWrite();
     setSaving(true);
     const { job, categoryKey, categoryLabel } = row;
     const newLabel = SERVICES.find((s) => s.key === newCategoryKey)?.label || newCategoryKey;
@@ -8275,6 +8309,7 @@ function DispatchBoard({ team, session }) {
   // Moved/Assigned entry too.
   const canWriteUpdate = ["ahmed", "noel"].includes((session.name || "").toLowerCase());
   const addProgressUpdate = async (row, text) => {
+    markLocalWrite();
     setSaving(true);
     const { job, categoryLabel } = row;
     const { ok, data } = await sbFetch(`jobs?id=eq.${job.id}&select=history`);
@@ -8292,15 +8327,39 @@ function DispatchBoard({ team, session }) {
     setSaving(false);
   };
 
-  // One row per (job, category-it-needs). A job needing both detailing
-  // and dentrepair shows once in each relevant column with its own
+  // Fully manual by request — no automatic location-based hiding.
+  // Named-list gated (canManageDispatchVisibility), not a permission
+  // flag. Hides the *whole job* from the board, not just one category.
+  const canManageVisibility = canManageDispatchVisibility(session);
+  const toggleDispatchHidden = async (job, hide) => {
+    markLocalWrite();
+    setSaving(true);
+    const { ok, data } = await sbFetch(`jobs?id=eq.${job.id}&select=history`);
+    const current = ok && data && data[0] ? data[0] : { history: [] };
+    const nextHistory = [
+      ...(current.history || []),
+      { stage: "dispatch_visibility", label: job.plate, by: session.name, role: session.role, note: hide ? "Hidden from Dispatch Board" : "Shown on Dispatch Board again", at: Date.now() },
+    ];
+    withActivitySummary(`Dispatch board: ${session.name} ${hide ? "hid" : "unhid"} ${job.plate}`);
+    setJobs((prev) => prev.map((j) => (j.id === job.id ? { ...j, dispatchHidden: hide } : j)));
+    await sbFetch(`jobs?id=eq.${job.id}`, {
+      method: "PATCH",
+      headers: { Prefer: "return=minimal" },
+      body: JSON.stringify({ dispatch_hidden: hide, history: nextHistory, updated_at: new Date().toISOString() }),
+    });
+    setSaving(false);
+    if (hide) setSelectedRowKey(null); // it's about to disappear from the visible columns
+  };
+
   // ticket number in that column. Finished rows are dropped entirely —
   // once cleared, it comes off the board rather than sitting there
   // dimmed. Jobs with no service type yet ("_none") go into their own
   // "needs classification" bucket rather than being dumped into a
   // colored column with a meaningless badge.
   const allRows = [];
+  const hiddenJobs = []; // manually hidden jobs — shown in their own management panel, not the columns
   for (const job of jobs) {
+    if (job.dispatchHidden) { hiddenJobs.push(job); continue; }
     const types = job.serviceTypes.length ? job.serviceTypes : ["_none"];
     for (const key of types) {
       if (job.serviceDone[key]) continue; // cleared — remove it from the board
@@ -8429,14 +8488,36 @@ function DispatchBoard({ team, session }) {
           staffOptions={staffForRole(team, selectedRow.role)}
           moveOptions={SERVICES.filter((s) => s.key !== selectedRow.categoryKey)}
           canWriteUpdate={canWriteUpdate}
+          canManageVisibility={canManageVisibility}
           onClose={() => setSelectedRowKey(null)}
           onToggleDone={toggleDone}
           onToggleStarted={toggleStarted}
           onAssign={toggleTeamAssign}
           onMove={moveCategory}
           onAddUpdate={addProgressUpdate}
+          onToggleHidden={toggleDispatchHidden}
           saving={saving}
         />
+      )}
+      {canManageVisibility && hiddenJobs.length > 0 && (
+        <div style={{ background: "#141414", border: `1px solid ${COLORS.line}`, borderRadius: 12, padding: 14, marginTop: 4 }}>
+          <div style={{ fontSize: 12.5, fontWeight: 700, color: COLORS.muted, marginBottom: 10 }}>
+            Hidden from board ({hiddenJobs.length}) — visible only to you
+          </div>
+          <div style={{ display: "flex", flexDirection: "column", gap: 8 }}>
+            {hiddenJobs.map((job) => (
+              <div key={job.id} style={{ display: "flex", justifyContent: "space-between", alignItems: "center", background: COLORS.panel2, borderRadius: 8, padding: "9px 12px" }}>
+                <div>
+                  <span style={{ fontFamily: MONO_FONT, fontWeight: 700, fontSize: 13, color: COLORS.ink }}>{job.plate}</span>
+                  <span style={{ fontSize: 12, color: COLORS.muted, marginLeft: 8 }}>{job.makeModel}{job.location ? ` · ${job.location}` : ""}</span>
+                </div>
+                <button onClick={() => toggleDispatchHidden(job, false)} className="mrcap-press" style={{ padding: "5px 12px", borderRadius: 999, border: `1px solid ${COLORS.gold}`, background: "transparent", color: COLORS.gold, fontSize: 11.5, fontWeight: 700, cursor: "pointer" }}>
+                  Show again
+                </button>
+              </div>
+            ))}
+          </div>
+        </div>
       )}
     </div>
   );
