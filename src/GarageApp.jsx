@@ -7666,6 +7666,44 @@ function playDispatchBeep() {
   } catch { /* best-effort only — a silent tablet shouldn't block the board */ }
 }
 
+// Picks the best-sounding voice the tablet's browser already has for
+// free — modern Chrome ships genuinely decent voices (not the old
+// robotic screen-reader kind), so there's no need for a paid TTS
+// service. Cached after the first successful lookup since browsers
+// load the voice list asynchronously and it doesn't change at runtime.
+let cachedDispatchVoice = null;
+function getBestDispatchVoice() {
+  if (cachedDispatchVoice) return cachedDispatchVoice;
+  if (!window.speechSynthesis) return null;
+  const voices = window.speechSynthesis.getVoices();
+  if (!voices.length) return null;
+  const pick =
+    voices.find((v) => /Google/i.test(v.name) && /^en/i.test(v.lang)) ||
+    voices.find((v) => /Natural|Enhanced|Premium/i.test(v.name) && /^en/i.test(v.lang)) ||
+    voices.find((v) => /^en-US/i.test(v.lang)) ||
+    voices.find((v) => /^en/i.test(v.lang)) ||
+    voices[0];
+  cachedDispatchVoice = pick;
+  return cachedDispatchVoice;
+}
+
+// Assignment announcement only (by design — arrival and finished
+// already have their own distinct beep/chime, and voice on top of
+// those too would be noisy). Plays alongside whichever beep is already
+// wired up elsewhere, not instead of it.
+function announceDispatchAssignment(staffName, vehicleLabel) {
+  try {
+    if (!window.speechSynthesis) return;
+    const utter = new SpeechSynthesisUtterance(`${staffName}, you've been assigned the ${vehicleLabel}.`);
+    const voice = getBestDispatchVoice();
+    if (voice) utter.voice = voice;
+    utter.rate = 1;
+    utter.pitch = 1;
+    utter.volume = 1;
+    window.speechSynthesis.speak(utter);
+  } catch { /* best-effort only — a silent tablet shouldn't block the board */ }
+}
+
 function playDispatchDoneChime() {
   // Job marked finished — a rising two-note chime (like a doorbell "ding
   // dong" in reverse), intentionally shaped differently from the flat
@@ -7876,6 +7914,14 @@ function DispatchBoard({ team, session }) {
   useEffect(() => {
     refresh();
     const interval = setInterval(refresh, 6000);
+    // Voices load asynchronously and are empty on first call in some
+    // browsers — prime the cache now and again once the browser fires
+    // voiceschanged, so the very first assignment doesn't fall back to
+    // a default voice while the good ones are still loading.
+    if (window.speechSynthesis) {
+      getBestDispatchVoice();
+      window.speechSynthesis.onvoiceschanged = () => { cachedDispatchVoice = null; getBestDispatchVoice(); };
+    }
     return () => clearInterval(interval);
   }, [refresh]);
 
@@ -7884,9 +7930,11 @@ function DispatchBoard({ team, session }) {
     const nextAssignedTo = { ...job.assignedTo, [categoryKey]: memberId || undefined };
     if (!memberId) delete nextAssignedTo[categoryKey];
     setJobs((prev) => prev.map((j) => (j.id === job.id ? { ...j, assignedTo: nextAssignedTo } : j)));
+    const staffName = memberId ? (team.find((m) => m.id === memberId)?.name || memberId) : null;
     withActivitySummary(memberId
-      ? `Dispatch board: assigned ${categoryKey} on ${job.plate} to ${team.find((m) => m.id === memberId)?.name || memberId}`
+      ? `Dispatch board: assigned ${categoryKey} on ${job.plate} to ${staffName}`
       : `Dispatch board: unassigned ${categoryKey} on ${job.plate}`);
+    if (staffName) announceDispatchAssignment(staffName, job.makeModel || job.plate);
     await sbFetch(`jobs?id=eq.${job.id}`, {
       method: "PATCH",
       headers: { Prefer: "return=minimal" },
