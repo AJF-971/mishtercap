@@ -7669,7 +7669,9 @@ function playDispatchBeep() {
 // Picks the best-sounding voice the tablet's browser already has for
 // free — modern Chrome ships genuinely decent voices (not the old
 // robotic screen-reader kind), so there's no need for a paid TTS
-// service. Cached after the first successful lookup since browsers
+// service. Prefers British English specifically (requested), since the
+// default en-US voice was reading some car names with Spanish-style
+// phonetics. Cached after the first successful lookup since browsers
 // load the voice list asynchronously and it doesn't change at runtime.
 let cachedDispatchVoice = null;
 function getBestDispatchVoice() {
@@ -7678,13 +7680,29 @@ function getBestDispatchVoice() {
   const voices = window.speechSynthesis.getVoices();
   if (!voices.length) return null;
   const pick =
+    voices.find((v) => /Google/i.test(v.name) && /^en-GB/i.test(v.lang)) ||
+    voices.find((v) => /UK|British/i.test(v.name) && /^en/i.test(v.lang)) ||
+    voices.find((v) => /^en-GB/i.test(v.lang)) ||
     voices.find((v) => /Google/i.test(v.name) && /^en/i.test(v.lang)) ||
     voices.find((v) => /Natural|Enhanced|Premium/i.test(v.name) && /^en/i.test(v.lang)) ||
-    voices.find((v) => /^en-US/i.test(v.lang)) ||
     voices.find((v) => /^en/i.test(v.lang)) ||
     voices[0];
   cachedDispatchVoice = pick;
   return cachedDispatchVoice;
+}
+
+// The Web Speech API has no pronunciation-hint support (no SSML), so
+// the only reliable fix for a model name being misread is to respell
+// it phonetically before it's spoken. Add to this list as more come up
+// — matching is case-insensitive and whole-word only so it doesn't
+// clobber substrings inside other model names.
+const DISPATCH_PRONUNCIATION_FIXES = [
+  [/\bpajero\b/gi, "pa-jair-oh"],
+];
+function fixDispatchPronunciation(text) {
+  let out = text;
+  DISPATCH_PRONUNCIATION_FIXES.forEach(([pattern, replacement]) => { out = out.replace(pattern, replacement); });
+  return out;
 }
 
 // Assignment announcement only (by design — arrival and finished
@@ -7694,9 +7712,11 @@ function getBestDispatchVoice() {
 function announceDispatchAssignment(staffName, vehicleLabel) {
   try {
     if (!window.speechSynthesis) return;
-    const utter = new SpeechSynthesisUtterance(`${staffName}, you've been assigned the ${vehicleLabel}.`);
+    const spokenVehicle = fixDispatchPronunciation(vehicleLabel);
+    const utter = new SpeechSynthesisUtterance(`${staffName}, you've been assigned the ${spokenVehicle}.`);
     const voice = getBestDispatchVoice();
     if (voice) utter.voice = voice;
+    utter.lang = voice?.lang || "en-GB";
     utter.rate = 1;
     utter.pitch = 1;
     utter.volume = 1;
