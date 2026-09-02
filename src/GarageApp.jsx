@@ -7631,7 +7631,7 @@ function TeamScreen({ team, setTeam, session, onBack, onImport, onServices, canS
 
 async function loadDispatchJobs() {
   const { ok, data } = await sbFetch(
-    "jobs?select=id,plate,make_model,customer_name,description,priority,location,stage_index,service_types,assigned_to,service_done,service_started,created_at,updated_at&order=created_at.asc&limit=900"
+    "jobs?select=id,plate,make_model,customer_name,description,priority,location,stage_index,service_types,assigned_to,service_done,service_started,treatments,created_at,updated_at&order=created_at.asc&limit=900"
   );
   if (!ok || !data) return [];
   return data
@@ -7640,7 +7640,7 @@ async function loadDispatchJobs() {
       id: r.id, plate: r.plate, makeModel: r.make_model, customerName: r.customer_name,
       description: r.description, priority: r.priority, location: r.location,
       stageIndex: r.stage_index, serviceTypes: r.service_types || [], assignedTo: r.assigned_to || {},
-      serviceDone: r.service_done || {}, serviceStarted: r.service_started || {},
+      serviceDone: r.service_done || {}, serviceStarted: r.service_started || {}, treatments: r.treatments || {},
       createdAt: new Date(r.created_at).getTime(), updatedAt: new Date(r.updated_at).getTime(),
     }));
 }
@@ -7756,6 +7756,17 @@ function playDispatchDoneChime() {
 
 const rowKey = (jobId, categoryKey) => `${jobId}::${categoryKey}`;
 
+// The free-text "description" field is usually empty in practice — the
+// actual "what to do" for a specific category is the treatments picked
+// for it (e.g. "Tune Up"), stored separately per category. Prefer that;
+// fall back to the general description, then a plain "no details" note.
+function dispatchWhatToDo(job, categoryKey) {
+  const picks = (job.treatments || {})[categoryKey];
+  if (picks && picks.length) return picks.join(", ");
+  if (job.description) return job.description;
+  return null;
+}
+
 // "23m" / "1h 12m" — deliberately coarse (minutes, not seconds), since
 // this is a shop-floor glance-at-it label, not a stopwatch.
 function formatDispatchElapsed(startedAt, now) {
@@ -7808,8 +7819,8 @@ function DispatchJobCard({ row, ticketNo, isDone, isStarted, startedAt, now, ass
           </div>
         </div>
         <div style={{ fontSize: 12.5, color: COLORS.muted, marginTop: 2 }}>{job.makeModel}</div>
-        {job.description ? (
-          <div style={{ fontSize: 12, color: COLORS.ink, marginTop: 6, opacity: 0.85, overflow: "hidden", textOverflow: "ellipsis", display: "-webkit-box", WebkitLineClamp: 2, WebkitBoxOrient: "vertical" }}>{job.description}</div>
+        {dispatchWhatToDo(job, row.categoryKey) ? (
+          <div style={{ fontSize: 12, color: COLORS.ink, marginTop: 6, opacity: 0.85, overflow: "hidden", textOverflow: "ellipsis", display: "-webkit-box", WebkitLineClamp: 2, WebkitBoxOrient: "vertical" }}>{dispatchWhatToDo(job, row.categoryKey)}</div>
         ) : null}
         <div style={{ display: "flex", alignItems: "center", gap: 6, marginTop: 8, flexWrap: "wrap" }}>
           <span style={{
@@ -7828,7 +7839,7 @@ function DispatchJobCard({ row, ticketNo, isDone, isStarted, startedAt, now, ass
 }
 
 function DispatchDetailModal({ row, ticketNo, isDone, isStarted, startedAt, now, assignedId, assignedName, staffOptions, moveOptions, onClose, onToggleDone, onToggleStarted, onAssign, onMove, saving }) {
-  const { job, categoryLabel } = row;
+  const { job, categoryLabel, categoryKey } = row;
   return createPortal(
     <div onClick={onClose} style={{ position: "fixed", inset: 0, background: "rgba(0,0,0,0.6)", zIndex: 200, display: "flex", alignItems: "center", justifyContent: "center", padding: 18 }}>
       <div onClick={(e) => e.stopPropagation()} style={{ background: COLORS.panel, border: `1px solid ${COLORS.line}`, borderRadius: 16, padding: 22, maxWidth: 420, width: "100%", maxHeight: "86vh", overflowY: "auto" }}>
@@ -7856,7 +7867,7 @@ function DispatchDetailModal({ row, ticketNo, isDone, isStarted, startedAt, now,
         <div style={{ marginTop: 14 }}>
           <div style={{ fontSize: 11.5, fontWeight: 700, color: COLORS.muted, textTransform: "uppercase", letterSpacing: 0.5, marginBottom: 5 }}>What to do</div>
           <div style={{ fontSize: 14, color: COLORS.ink, lineHeight: 1.5, background: COLORS.panel2, borderRadius: 10, padding: 12 }}>
-            {job.description || "No description was entered for this job."}
+            {dispatchWhatToDo(job, categoryKey) || "No treatments or description entered for this job."}
           </div>
         </div>
 
@@ -7953,6 +7964,7 @@ function DispatchBoard({ team, session }) {
   const [selectedRowKey, setSelectedRowKey] = useState(null);
   const [saving, setSaving] = useState(false);
   const [nowTick, setNowTick] = useState(() => Date.now());
+  const [sortOrder, setSortOrder] = useState("oldest"); // "oldest" | "newest"
   const prevCountRef = useRef(null);
   const firstLoadRef = useRef(true);
 
@@ -8098,17 +8110,22 @@ function DispatchBoard({ team, session }) {
     setSelectedRowKey(null); // the old (job, category) row this modal was showing no longer exists
   };
 
-  // One row per (job, category-it-needs), oldest job first — that's the
-  // whole queue. A job needing both detailing and dentrepair shows once
-  // in each relevant column with its own ticket number in that column.
+  // One row per (job, category-it-needs). A job needing both detailing
+  // and dentrepair shows once in each relevant column with its own
+  // ticket number in that column. Finished rows are dropped entirely —
+  // once cleared, it comes off the board rather than sitting there
+  // dimmed. jobs is already sorted oldest-first from the fetch; flip
+  // it here for the newest-first toggle without re-querying.
   const allRows = [];
   for (const job of jobs) {
     const types = job.serviceTypes.length ? job.serviceTypes : ["_none"];
     for (const key of types) {
+      if (job.serviceDone[key]) continue; // cleared — remove it from the board
       const svc = SERVICES.find((s) => s.key === key);
       allRows.push({ job, categoryKey: key, categoryLabel: svc?.label || key, role: svc?.role || null });
     }
   }
+  if (sortOrder === "newest") allRows.reverse();
   const rowsByKey = {};
   allRows.forEach((r) => { rowsByKey[rowKey(r.job.id, r.categoryKey)] = r; });
 
@@ -8154,10 +8171,29 @@ function DispatchBoard({ team, session }) {
 
   return (
     <div className="mrcap-view" style={{ padding: 16, display: "flex", flexDirection: "column", gap: 14, minHeight: "calc(100vh - 80px)" }}>
-      <div>
-        <div style={{ fontFamily: DISPLAY_FONT, fontWeight: 700, fontSize: 20, color: COLORS.ink }}>Dispatch Board</div>
-        <div style={{ fontSize: 12, color: COLORS.muted, marginTop: 2 }}>
-          {loading ? "Loading…" : `Oldest first, like a queue · updates automatically · last checked ${new Date().toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" })}`}
+      <div style={{ display: "flex", justifyContent: "space-between", alignItems: "flex-end", flexWrap: "wrap", gap: 10 }}>
+        <div>
+          <div style={{ fontFamily: DISPLAY_FONT, fontWeight: 700, fontSize: 20, color: COLORS.ink }}>Dispatch Board</div>
+          <div style={{ fontSize: 12, color: COLORS.muted, marginTop: 2 }}>
+            {loading ? "Loading…" : `${sortOrder === "oldest" ? "Oldest" : "Newest"} first · updates automatically · last checked ${new Date().toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" })}`}
+          </div>
+        </div>
+        <div style={{ display: "flex", gap: 6, background: COLORS.panel2, borderRadius: 10, padding: 3 }}>
+          {["oldest", "newest"].map((opt) => (
+            <button
+              key={opt}
+              onClick={() => setSortOrder(opt)}
+              className="mrcap-press"
+              style={{
+                padding: "7px 14px", borderRadius: 8, border: "none", cursor: "pointer",
+                background: sortOrder === opt ? COLORS.gold : "transparent",
+                color: sortOrder === opt ? COLORS.darkText : COLORS.muted,
+                fontSize: 12.5, fontWeight: 700, textTransform: "capitalize",
+              }}
+            >
+              {opt} first
+            </button>
+          ))}
         </div>
       </div>
       <div style={{ display: "flex", gap: 14, flex: 1, minHeight: 0, flexWrap: "wrap" }}>
