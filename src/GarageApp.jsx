@@ -259,6 +259,21 @@ const CUSTOMER_STATUS_PRESETS = [
   "Final touches — almost ready",
 ];
 
+// Hot buttons for the Dispatch Board's internal progress updates
+// (Ahmed/Noel → Live Updates admin board) — deliberately shop-floor
+// language, not the customer-facing wording above. Tapping one posts
+// immediately, same instant feel as the customer status buttons.
+const DISPATCH_UPDATE_PRESETS = [
+  "Started work",
+  "Halfway done",
+  "Almost finished",
+  "Waiting on parts",
+  "Waiting on customer approval",
+  "Running behind schedule",
+  "Paused — need help",
+  "Quality check in progress",
+];
+
 const COLORS = {
   ink: "#E9E4D4",        // primary text (on dark backgrounds) — bone white
   darkText: "#0D0C08",   // fixed dark text, used on gold/light surfaces
@@ -7987,10 +8002,27 @@ function DispatchDetailModal({ row, ticketNo, isDone, isStarted, startedAt, now,
             <div style={{ fontSize: 11.5, fontWeight: 700, color: COLORS.muted, textTransform: "uppercase", letterSpacing: 0.5, marginBottom: 7 }}>
               Post a progress update — shows on the admin Live Updates board
             </div>
+            <div style={{ display: "flex", flexWrap: "wrap", gap: 7, marginBottom: 9 }}>
+              {DISPATCH_UPDATE_PRESETS.map((preset) => (
+                <button
+                  key={preset}
+                  onClick={() => { if (saving) return; onAddUpdate(row, preset); }}
+                  disabled={saving}
+                  className="mrcap-press"
+                  style={{
+                    padding: "7px 11px", borderRadius: 999, border: `1.5px solid ${COLORS.line}`,
+                    background: COLORS.panel2, color: COLORS.ink, fontSize: 11.5, fontWeight: 600,
+                    cursor: saving ? "default" : "pointer", opacity: saving ? 0.6 : 1,
+                  }}
+                >
+                  {preset}
+                </button>
+              ))}
+            </div>
             <textarea
               value={updateText}
               onChange={(e) => setUpdateText(e.target.value)}
-              placeholder="e.g. Half done with polish, moving to interior next"
+              placeholder="Or type something not covered above…"
               rows={2}
               style={{
                 width: "100%", background: COLORS.panel2, border: `1px solid ${COLORS.line}`, borderRadius: 10,
