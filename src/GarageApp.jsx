@@ -7794,6 +7794,30 @@ function playDispatchDoneChime() {
   } catch { /* best-effort only — a silent tablet shouldn't block the board */ }
 }
 
+// 6:45pm "update the app before leaving" reminder — deliberately harsh
+// and attention-grabbing (unlike the other two calm sounds above), a
+// rising-falling siren sweep, loud and at full volume. Meant to be
+// impossible to ignore, not pleasant.
+function playDispatchAlarm() {
+  try {
+    const Ctx = window.AudioContext || window.webkitAudioContext;
+    if (!Ctx) return;
+    const ctx = new Ctx();
+    const osc = ctx.createOscillator();
+    const gain = ctx.createGain();
+    osc.connect(gain);
+    gain.connect(ctx.destination);
+    osc.type = "square";
+    const dur = 0.9;
+    osc.frequency.setValueAtTime(600, ctx.currentTime);
+    osc.frequency.linearRampToValueAtTime(1200, ctx.currentTime + dur / 2);
+    osc.frequency.linearRampToValueAtTime(600, ctx.currentTime + dur);
+    gain.gain.setValueAtTime(0.5, ctx.currentTime);
+    osc.start(ctx.currentTime);
+    osc.stop(ctx.currentTime + dur);
+  } catch { /* best-effort only */ }
+}
+
 const rowKey = (jobId, categoryKey) => `${jobId}::${categoryKey}`;
 
 // Thresholds for the "this is going stale" warnings — tune these two
@@ -7891,6 +7915,57 @@ function DispatchJobCard({ row, ticketNo, isDone, isStarted, startedAt, now, ass
         )}
       </div>
     </div>
+  );
+}
+
+// End-of-day "update the app" reminder — full-screen, flashing red,
+// impossible to dismiss accidentally (needs exactly 5 taps). Fires once
+// at 6:45pm local time and stays dismissed for the rest of that day,
+// tracked in localStorage by date string so a page refresh mid-alarm
+// doesn't bring it back, but it's fresh again tomorrow.
+function DispatchEndOfDayReminder({ onDismiss }) {
+  const [taps, setTaps] = useState(0);
+  const [flashOn, setFlashOn] = useState(true);
+
+  useEffect(() => {
+    playDispatchAlarm();
+    const soundLoop = setInterval(playDispatchAlarm, 1100);
+    const flashLoop = setInterval(() => setFlashOn((f) => !f), 400);
+    return () => { clearInterval(soundLoop); clearInterval(flashLoop); };
+  }, []);
+
+  const handleTap = () => {
+    const next = taps + 1;
+    if (next >= 5) { onDismiss(); return; }
+    setTaps(next);
+  };
+
+  return createPortal(
+    <div
+      onClick={handleTap}
+      style={{
+        position: "fixed", inset: 0, zIndex: 999, cursor: "pointer",
+        background: flashOn ? "#c81e1e" : "#3d0808",
+        display: "flex", flexDirection: "column", alignItems: "center", justifyContent: "center",
+        padding: 24, textAlign: "center", transition: "background 0.15s linear",
+      }}
+    >
+      <div style={{ fontSize: 15, fontWeight: 700, color: "#fff", opacity: 0.85, letterSpacing: 1, marginBottom: 14 }}>
+        END OF DAY
+      </div>
+      <div style={{ fontFamily: DISPLAY_FONT, fontWeight: 700, fontSize: 34, color: "#fff", lineHeight: 1.25, maxWidth: 480 }}>
+        Please update the app before leaving...
+      </div>
+      <div style={{ marginTop: 34, fontSize: 16, fontWeight: 700, color: "#fff" }}>
+        Tap {5 - taps} more time{5 - taps === 1 ? "" : "s"} to dismiss
+      </div>
+      <div style={{ display: "flex", gap: 8, marginTop: 16 }}>
+        {[0, 1, 2, 3, 4].map((i) => (
+          <div key={i} style={{ width: 14, height: 14, borderRadius: "50%", background: i < taps ? "#fff" : "rgba(255,255,255,0.3)" }} />
+        ))}
+      </div>
+    </div>,
+    document.body
   );
 }
 
@@ -8137,6 +8212,7 @@ function DispatchBoard({ team, session }) {
   const [saving, setSaving] = useState(false);
   const [nowTick, setNowTick] = useState(() => Date.now());
   const [sortOrder, setSortOrder] = useState("oldest"); // "oldest" | "newest" | "priority"
+  const [showEndOfDayReminder, setShowEndOfDayReminder] = useState(false);
   const prevCountRef = useRef(null);
   const firstLoadRef = useRef(true);
   // Set to a future timestamp right after any local write (assign,
@@ -8146,6 +8222,36 @@ function DispatchBoard({ team, session }) {
   // cause of taps sometimes seeming to not register.
   const suppressRefreshUntilRef = useRef(0);
   const markLocalWrite = () => { suppressRefreshUntilRef.current = Date.now() + 4000; };
+
+  // Fires the end-of-day reminder once at 6:45pm local time, then stays
+  // dismissed for the rest of that calendar day (localStorage-tracked
+  // by date string, not just in-memory, so a refresh mid-alarm doesn't
+  // bring it back) — but resets automatically the next day.
+  useEffect(() => {
+    // ?testEOD=1 in the URL forces it to show immediately, ignoring the
+    // time and the dismissed-today flag — for testing on demand rather
+    // than waiting for the clock. Doesn't affect the real 6:45 trigger.
+    if (new URLSearchParams(window.location.search).get("testEOD") === "1") {
+      setShowEndOfDayReminder(true);
+      return;
+    }
+    const check = () => {
+      const now = new Date();
+      const todayKey = now.toISOString().slice(0, 10);
+      const alreadyDismissed = window.localStorage?.getItem("mrcap_eod_reminder_dismissed") === todayKey;
+      if (!alreadyDismissed && now.getHours() === 18 && now.getMinutes() === 45) {
+        setShowEndOfDayReminder(true);
+      }
+    };
+    check();
+    const t = setInterval(check, 15000);
+    return () => clearInterval(t);
+  }, []);
+  const dismissEndOfDayReminder = () => {
+    const todayKey = new Date().toISOString().slice(0, 10);
+    try { window.localStorage?.setItem("mrcap_eod_reminder_dismissed", todayKey); } catch { /* ignore */ }
+    setShowEndOfDayReminder(false);
+  };
 
   // Forces a re-render every 30s purely so elapsed-time labels ("23m")
   // stay roughly current without needing a full data refetch.
@@ -8519,6 +8625,7 @@ function DispatchBoard({ team, session }) {
           </div>
         </div>
       )}
+      {showEndOfDayReminder && <DispatchEndOfDayReminder onDismiss={dismissEndOfDayReminder} />}
     </div>
   );
 }
@@ -8594,6 +8701,142 @@ function LiveUpdatesBoard({ team }) {
             </div>
           ))
         )}
+      </div>
+    </div>
+  );
+}
+
+/* ---------------- Dispatch Kiosk (standalone entry point) ----------------
+   Reachable directly at /dispatch — bypasses the normal staff-PIN login
+   entirely. Regular staff just tap their name and go straight in, no
+   PIN, fast for a shared tablet passed between people all day. The four
+   people who can also manage what shows on the board (AJF, Ahmed,
+   Laani, Mr Cap — see canManageDispatchVisibility) get an extra PIN
+   step using their real, existing PIN — same credential as the full
+   app, not a new shared code — which unlocks the admin controls
+   (hide/show, etc.) right there on the tablet. Session persists in its
+   own localStorage key, separate from the main app's session, so
+   logging into one doesn't affect the other. */
+export function DispatchKiosk() {
+  const [team, setTeam] = useState(DEFAULT_TEAM);
+  const [ready, setReady] = useState(false);
+  const [session, setSession] = useState(() => {
+    try {
+      const raw = window.localStorage.getItem("mrcap_kiosk_session");
+      return raw ? JSON.parse(raw) : null;
+    } catch { return null; }
+  });
+  const [picked, setPicked] = useState(null);
+  const [pin, setPin] = useState("");
+  const [error, setError] = useState("");
+
+  useEffect(() => {
+    (async () => {
+      setTeam(await loadTeam());
+      setReady(true);
+    })();
+  }, []);
+
+  const loginAs = (member) => {
+    const next = { id: member.id, name: member.name, role: member.role };
+    setSession(next);
+    try { window.localStorage.setItem("mrcap_kiosk_session", JSON.stringify(next)); } catch { /* ignore */ }
+  };
+
+  const pick = (member) => {
+    const needsPin = ["ajf", "ahmed", "laani", "mr.cap"].includes((member.name || "").toLowerCase());
+    if (needsPin && member.pin) {
+      setPicked(member);
+      setPin("");
+      setError("");
+    } else {
+      loginAs(member);
+    }
+  };
+
+  const press = (d) => { if (pin.length < 4) setPin((p) => p + d); };
+  const backspace = () => setPin((p) => p.slice(0, -1));
+
+  useEffect(() => {
+    if (pin.length !== 4 || !picked) return;
+    if (pin === picked.pin) {
+      loginAs(picked);
+    } else {
+      setError("Wrong PIN");
+      setTimeout(() => setPin(""), 260);
+    }
+    // eslint-disable-next-line
+  }, [pin]);
+
+  const switchUser = () => {
+    setSession(null);
+    setPicked(null);
+    try { window.localStorage.removeItem("mrcap_kiosk_session"); } catch { /* ignore */ }
+  };
+
+  if (!ready) {
+    return <div style={{ minHeight: "100vh", background: "#0b0b0c", display: "flex", alignItems: "center", justifyContent: "center", color: COLORS.muted, fontSize: 13 }}>Loading…</div>;
+  }
+
+  if (session) {
+    return (
+      <div style={{ minHeight: "100vh", background: "#0b0b0c" }}>
+        <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", padding: "10px 16px", borderBottom: `1px solid ${COLORS.line}` }}>
+          <div style={{ fontSize: 12, color: COLORS.muted }}>Working the board as <span style={{ color: COLORS.ink, fontWeight: 700 }}>{session.name}</span></div>
+          <button onClick={switchUser} className="mrcap-press" style={{ fontSize: 11.5, color: COLORS.muted, background: "none", border: `1px solid ${COLORS.line}`, borderRadius: 999, padding: "5px 12px", cursor: "pointer" }}>
+            Switch user
+          </button>
+        </div>
+        <DispatchBoard team={team} session={session} />
+      </div>
+    );
+  }
+
+  if (picked) {
+    return (
+      <div className="mrcap-view" style={{ minHeight: "100vh", background: "#0b0b0c", padding: "48px 22px", textAlign: "center" }}>
+        <button onClick={() => setPicked(null)} style={{ ...iconBtnStyle, marginBottom: 24 }} className="mrcap-press"><ChevronLeft size={18} color={COLORS.ink} /></button>
+        <div style={{ fontFamily: DISPLAY_FONT, fontWeight: 600, fontSize: 20, color: COLORS.ink }}>{picked.name}</div>
+        <div style={{ fontSize: 12, color: COLORS.muted, marginTop: 3, marginBottom: 22, letterSpacing: 0.3, textTransform: "uppercase" }}>Admin PIN required</div>
+        {error && <div style={{ color: COLORS.red, fontSize: 12.5, marginBottom: 12, letterSpacing: 0.3, textTransform: "uppercase" }}>{error}</div>}
+        <div style={{ display: "flex", gap: 7, justifyContent: "center", marginBottom: 22 }}>
+          {[0, 1, 2, 3].map((i) => (
+            <div key={i} style={{ width: 10, height: 10, borderRadius: "50%", background: i < pin.length ? COLORS.gold : "transparent", border: `1.5px solid ${i < pin.length ? COLORS.gold : COLORS.muted}` }} />
+          ))}
+        </div>
+        <div style={{ display: "grid", gridTemplateColumns: "repeat(3, 1fr)", gap: 12, maxWidth: 240, margin: "0 auto" }}>
+          {[1, 2, 3, 4, 5, 6, 7, 8, 9].map((n) => (
+            <button key={n} onClick={() => press(String(n))} style={keyBtnStyle} className="mrcap-press">{n}</button>
+          ))}
+          <div />
+          <button onClick={() => press("0")} style={keyBtnStyle} className="mrcap-press">0</button>
+          <button onClick={backspace} style={keyBtnStyle} className="mrcap-press"><Delete size={17} color={COLORS.ink} /></button>
+        </div>
+      </div>
+    );
+  }
+
+  return (
+    <div className="mrcap-view" style={{ minHeight: "100vh", background: "#0b0b0c", padding: "44px 22px" }}>
+      <div style={{ textAlign: "center", marginBottom: 34 }}>
+        <div style={{ width: 88, height: 88, borderRadius: 16, background: "#fff", margin: "0 auto 18px", display: "flex", alignItems: "center", justifyContent: "center", padding: 9, boxSizing: "border-box", border: `1px solid ${COLORS.line}`, boxShadow: `0 0 0 1px rgba(201,162,39,0.15), 0 12px 30px -12px rgba(0,0,0,0.6)` }}>
+          <img src={LOGO_SRC} alt="Mr.CAP" style={{ width: "100%", height: "100%", objectFit: "contain" }} />
+        </div>
+        <div style={{ fontSize: 10.5, color: COLORS.gold, letterSpacing: 3, textTransform: "uppercase", marginBottom: 6 }}>Dispatch Board</div>
+        <div style={{ fontFamily: DISPLAY_FONT, fontWeight: 600, fontSize: 25, color: COLORS.ink }}>Who's working the board?</div>
+        <div style={{ fontSize: 12.5, color: COLORS.muted, marginTop: 6 }}>Tap your name — no PIN needed</div>
+      </div>
+      <div style={{ display: "flex", flexDirection: "column", gap: 8, maxWidth: 420, margin: "0 auto" }}>
+        {team.map((m) => (
+          <button
+            key={m.id}
+            onClick={() => pick(m)}
+            className="mrcap-press mrcap-fade"
+            style={{ padding: "14px 16px", borderRadius: 12, border: `1px solid ${COLORS.line}`, background: COLORS.panel, color: COLORS.ink, textAlign: "left", fontSize: 15, fontWeight: 600, cursor: "pointer" }}
+          >
+            {m.name}
+          </button>
+        ))}
       </div>
     </div>
   );
