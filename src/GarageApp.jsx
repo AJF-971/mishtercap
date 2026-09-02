@@ -101,6 +101,13 @@ function isSuperAdmin(session) {
   return !!session && session.id === "suhail";
 }
 
+// Live Updates access — any admin login, plus Noel specifically (a
+// named exception, same pattern as isSuperAdmin above, not a toggleable
+// permission).
+function canSeeLiveUpdates(session) {
+  return !!session && (session.role === "admin" || (session.name || "").toLowerCase() === "noel");
+}
+
 const LOCATIONS = ["Mr CAP (Main)", "Beneloom (Upholstery)", "Smartech (Body & Paint)"];
 // Placeholder until the shop's real Terms & Conditions text is provided —
 // swap this single constant, nothing else needs to change.
@@ -1679,7 +1686,7 @@ function DesktopShell({ session, team, view, setView, onLogout, canArchive, chil
           {navItem("import", "Import Data", Upload, () => setView("import"), hasPermission(session, team, "import"))}
           {navItem("dispatch", "Dispatch Board", ListChecks, () => setView("dispatch"))}
           {navItem("admindash", "Admin Dashboard", TrendingUp, () => setView("admindash"), isSuperAdmin(session))}
-          {navItem("liveupdates", "Live Updates", MessageSquare, () => setView("liveupdates"), session.role === "admin")}
+          {navItem("liveupdates", "Live Updates", MessageSquare, () => setView("liveupdates"), canSeeLiveUpdates(session))}
           {navItem("msgtemplates", "WhatsApp Messages", MessageSquare, () => setView("msgtemplates"), isSuperAdmin(session))}
           {navItem("issues", "Issue Reports", AlertCircle, () => setView("issues"), isSuperAdmin(session))}
         </div>
@@ -2482,8 +2489,8 @@ export default function GarageApp() {
       )}
       {view === "reports" && !hasPermission(session, team, "reports") && <AccessDenied onBack={() => window.history.back()} />}
       {view === "dispatch" && <DispatchBoard team={team} session={session} />}
-      {view === "liveupdates" && session.role === "admin" && <LiveUpdatesBoard team={team} />}
-      {view === "liveupdates" && session.role !== "admin" && <AccessDenied onBack={() => window.history.back()} />}
+      {view === "liveupdates" && canSeeLiveUpdates(session) && <LiveUpdatesBoard team={team} />}
+      {view === "liveupdates" && !canSeeLiveUpdates(session) && <AccessDenied onBack={() => window.history.back()} />}
       {view === "admindash" && isSuperAdmin(session) && (
         <AdminStatsScreen team={team} onBack={() => window.history.back()} />
       )}
@@ -2705,7 +2712,7 @@ function TopBar({ session, team, onLogout, onNew, view, onBack, onTeam, onArchiv
           {view === "list" && isSuperAdmin(session) && (
             <button onClick={onAdminDash} style={iconBtnStyle} className="mrcap-press" title="Admin Dashboard"><LayoutDashboard size={16} color={COLORS.ink} /></button>
           )}
-          {view === "list" && session.role === "admin" && (
+          {view === "list" && canSeeLiveUpdates(session) && (
             <button onClick={onLiveUpdates} style={iconBtnStyle} className="mrcap-press" title="Live Updates"><MessageSquare size={16} color={COLORS.ink} /></button>
           )}
           {view === "list" && isSuperAdmin(session) && (
@@ -7653,7 +7660,7 @@ function TeamScreen({ team, setTeam, session, onBack, onImport, onServices, canS
 
 async function loadDispatchJobs() {
   const { ok, data } = await sbFetch(
-    "jobs?select=id,plate,make_model,customer_name,description,priority,location,stage_index,service_types,assigned_to,service_done,service_started,treatments,created_at,updated_at&order=created_at.asc&limit=900"
+    "jobs?select=id,plate,make_model,customer_name,description,priority,location,stage_index,service_types,assigned_to,service_done,service_started,treatments,parts,created_at,updated_at&order=created_at.asc&limit=900"
   );
   if (!ok || !data) return [];
   return data
@@ -7663,6 +7670,7 @@ async function loadDispatchJobs() {
       description: r.description, priority: r.priority, location: r.location,
       stageIndex: r.stage_index, serviceTypes: r.service_types || [], assignedTo: r.assigned_to || {},
       serviceDone: r.service_done || {}, serviceStarted: r.service_started || {}, treatments: r.treatments || {},
+      parts: r.parts || [],
       createdAt: new Date(r.created_at).getTime(), updatedAt: new Date(r.updated_at).getTime(),
     }));
 }
@@ -7911,6 +7919,19 @@ function DispatchDetailModal({ row, ticketNo, isDone, isStarted, startedAt, now,
             {isUnclassified ? "This job hasn't been assigned a service type yet — pick one below." : (dispatchWhatToDo(job, categoryKey) || "No treatments or description entered for this job.")}
           </div>
         </div>
+
+        {!isUnclassified && (job.parts || []).length > 0 && (
+          <div style={{ marginTop: 14 }}>
+            <div style={{ fontSize: 11.5, fontWeight: 700, color: COLORS.muted, textTransform: "uppercase", letterSpacing: 0.5, marginBottom: 5 }}>Parts on the invoice</div>
+            <div style={{ display: "flex", flexDirection: "column", gap: 5 }}>
+              {job.parts.map((p) => (
+                <div key={p.id} style={{ fontSize: 13, color: COLORS.ink, background: COLORS.panel2, borderRadius: 8, padding: "8px 11px" }}>
+                  {p.description || "Unnamed part"}{p.qty > 1 ? ` × ${p.qty}` : ""}
+                </div>
+              ))}
+            </div>
+          </div>
+        )}
 
         {!isUnclassified && (
           <div style={{ marginTop: 14 }}>
