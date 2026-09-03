@@ -1635,6 +1635,50 @@ ${FONT_IMPORT}
   background: #1A1815;
   box-shadow: 0 14px 28px -14px rgba(0,0,0,0.55);
 }
+
+/* Keyboard focus — never remove the outline, only restyle it. Mouse/touch
+   clicks stay clean (no ring), Tab navigation gets a clear gold ring so the
+   app is usable without a mouse (shop iPad + a keyboard, admin on desktop). */
+button:focus-visible,
+a:focus-visible,
+input:focus-visible,
+textarea:focus-visible,
+select:focus-visible,
+[tabindex]:focus-visible {
+  outline: 2px solid ${COLORS.gold};
+  outline-offset: 2px;
+  border-radius: 4px;
+}
+input:focus,
+textarea:focus,
+select:focus {
+  border-color: ${COLORS.gold} !important;
+}
+
+/* Respect the OS-level reduced-motion setting instead of ignoring it. */
+@media (prefers-reduced-motion: reduce) {
+  *, *::before, *::after {
+    animation-duration: 0.001ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.001ms !important;
+    scroll-behavior: auto !important;
+  }
+}
+
+/* Scrollbars and text selection in the app's own palette instead of the
+   browser default light-grey scrollbar sitting on a black page. */
+::-webkit-scrollbar { width: 10px; height: 10px; }
+::-webkit-scrollbar-track { background: transparent; }
+::-webkit-scrollbar-thumb { background: ${COLORS.line}; border-radius: 999px; border: 2px solid ${COLORS.paper}; }
+::-webkit-scrollbar-thumb:hover { background: ${COLORS.muted}; }
+* { scrollbar-width: thin; scrollbar-color: ${COLORS.line} transparent; }
+::selection { background: rgba(201,162,39,0.35); color: ${COLORS.ink}; }
+
+/* Disabled controls should read as disabled at a glance, everywhere. */
+button:disabled, [aria-disabled="true"] {
+  cursor: not-allowed !important;
+  opacity: 0.5;
+}
 `;
 
 function Shell({ children }) {
