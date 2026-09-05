@@ -1635,50 +1635,6 @@ ${FONT_IMPORT}
   background: #1A1815;
   box-shadow: 0 14px 28px -14px rgba(0,0,0,0.55);
 }
-
-/* Keyboard focus — never remove the outline, only restyle it. Mouse/touch
-   clicks stay clean (no ring), Tab navigation gets a clear gold ring so the
-   app is usable without a mouse (shop iPad + a keyboard, admin on desktop). */
-button:focus-visible,
-a:focus-visible,
-input:focus-visible,
-textarea:focus-visible,
-select:focus-visible,
-[tabindex]:focus-visible {
-  outline: 2px solid ${COLORS.gold};
-  outline-offset: 2px;
-  border-radius: 4px;
-}
-input:focus,
-textarea:focus,
-select:focus {
-  border-color: ${COLORS.gold} !important;
-}
-
-/* Respect the OS-level reduced-motion setting instead of ignoring it. */
-@media (prefers-reduced-motion: reduce) {
-  *, *::before, *::after {
-    animation-duration: 0.001ms !important;
-    animation-iteration-count: 1 !important;
-    transition-duration: 0.001ms !important;
-    scroll-behavior: auto !important;
-  }
-}
-
-/* Scrollbars and text selection in the app's own palette instead of the
-   browser default light-grey scrollbar sitting on a black page. */
-::-webkit-scrollbar { width: 10px; height: 10px; }
-::-webkit-scrollbar-track { background: transparent; }
-::-webkit-scrollbar-thumb { background: ${COLORS.line}; border-radius: 999px; border: 2px solid ${COLORS.paper}; }
-::-webkit-scrollbar-thumb:hover { background: ${COLORS.muted}; }
-* { scrollbar-width: thin; scrollbar-color: ${COLORS.line} transparent; }
-::selection { background: rgba(201,162,39,0.35); color: ${COLORS.ink}; }
-
-/* Disabled controls should read as disabled at a glance, everywhere. */
-button:disabled, [aria-disabled="true"] {
-  cursor: not-allowed !important;
-  opacity: 0.5;
-}
 `;
 
 function Shell({ children }) {
@@ -7714,14 +7670,15 @@ function TeamScreen({ team, setTeam, session, onBack, onImport, onServices, canS
 
 async function loadDispatchJobs() {
   const { ok, data } = await sbFetch(
-    "jobs?select=id,plate,make_model,customer_name,description,damage_notes,photos,priority,location,stage_index,service_types,assigned_to,assigned_team,service_done,service_started,treatments,parts,dispatch_hidden,created_at,updated_at&order=created_at.asc&limit=900"
+    "jobs?select=id,plate,make_model,customer_name,description,damage_notes,damage_diagram_image,photos,priority,location,stage_index,service_types,assigned_to,assigned_team,service_done,service_started,treatments,parts,dispatch_hidden,created_at,updated_at&order=created_at.asc&limit=900"
   );
   if (!ok || !data) return [];
   return data
     .filter((r) => r.stage_index !== 5) // 5 = Collected — done, doesn't belong on a live queue
     .map((r) => ({
       id: r.id, plate: r.plate, makeModel: r.make_model, customerName: r.customer_name,
-      description: r.description, damageNotes: r.damage_notes, photos: r.photos || {}, priority: r.priority, location: r.location,
+      description: r.description, damageNotes: r.damage_notes, damageDiagramImage: r.damage_diagram_image || null,
+      photos: r.photos || {}, priority: r.priority, location: r.location,
       stageIndex: r.stage_index, serviceTypes: r.service_types || [], assignedTo: r.assigned_to || {}, assignedTeam: r.assigned_team || {},
       serviceDone: r.service_done || {}, serviceStarted: r.service_started || {}, treatments: r.treatments || {},
       parts: r.parts || [], dispatchHidden: !!r.dispatch_hidden,
@@ -7871,6 +7828,18 @@ const STALE_IN_PROGRESS_MS = 3 * 60 * 60 * 1000; // 3 hours "in progress" with n
 
 const PRIORITY_RANK = { urgent: 3, high: 2, medium: 1, low: 0 };
 
+// Age-based color coding, separate from (and lower priority than) the
+// red stale-warning above — this is a general "how long has this been
+// sitting" glance rather than an alert. Fresh jobs get a bright green
+// edge and a NEW badge; the longer it sits, the warmer the color gets.
+function dispatchAgeTier(createdAt, now) {
+  const hours = (now - createdAt) / 3600000;
+  if (hours < 1) return { color: "#3fb950", label: "NEW", isNew: true };
+  if (hours < 4) return { color: COLORS.line, label: null, isNew: false };
+  if (hours < 8) return { color: "#d29922", label: null, isNew: false };
+  return { color: "#c9601f", label: null, isNew: false };
+}
+
 // The free-text "description" field is usually empty in practice — the
 // actual "what to do" for a specific category is the treatments picked
 // for it (e.g. "Tune Up"), stored separately per category. Prefer that;
@@ -7908,12 +7877,14 @@ function DispatchJobCard({ row, ticketNo, isDone, isStarted, startedAt, now, ass
   const isStaleUnassigned = (!assignedNames || assignedNames.length === 0) && !isStarted && !isDone && (now - job.createdAt) > STALE_UNASSIGNED_MS;
   const isStaleInProgress = isStarted && !isDone && startedAt && (now - new Date(startedAt).getTime()) > STALE_IN_PROGRESS_MS;
   const isStale = isStaleUnassigned || isStaleInProgress;
+  const ageTier = dispatchAgeTier(job.createdAt, now);
+  const edgeColor = isStale ? COLORS.red : ageTier.color;
   return (
     <div
       onClick={onClick}
       className="mrcap-press"
       style={{
-        background: COLORS.panel, border: `1.5px solid ${isStale ? COLORS.red : COLORS.line}`, borderRadius: 11,
+        background: COLORS.panel, border: `1.5px solid ${edgeColor}`, borderLeft: `4px solid ${edgeColor}`, borderRadius: 11,
         padding: 12, marginBottom: 9, cursor: "pointer", opacity: isDone ? 0.6 : 1,
         display: "flex", gap: 12, alignItems: "flex-start",
       }}
@@ -7932,6 +7903,10 @@ function DispatchJobCard({ row, ticketNo, isDone, isStarted, startedAt, now, ass
             {isDone && <CheckCircle2 size={15} color={COLORS.green} />}
             {!isDone && isStarted && <Clock size={14} color={COLORS.gold} />}
             {job.damageNotes && <AlertCircle size={14} color={COLORS.red} />}
+            {job.damageDiagramImage && <Car size={14} color={COLORS.gold} />}
+            {ageTier.isNew && !isStale && (
+              <span style={{ fontSize: 9, fontWeight: 700, color: "#3fb950", border: `1px solid #3fb950`, borderRadius: 999, padding: "1px 6px" }}>NEW</span>
+            )}
             {job.priority === "urgent" || job.priority === "high" ? (
               <span style={{ fontSize: 9.5, fontWeight: 700, color: COLORS.red, border: `1px solid ${COLORS.red}`, borderRadius: 999, padding: "1px 7px", textTransform: "uppercase" }}>{job.priority}</span>
             ) : null}
@@ -8074,6 +8049,13 @@ function DispatchDetailModal({ row, ticketNo, isDone, isStarted, startedAt, now,
                 <img key={i} src={src} alt="" style={{ width: 78, height: 78, objectFit: "cover", borderRadius: 8, border: `1px solid ${COLORS.line}`, flexShrink: 0 }} />
               ))}
             </div>
+          </div>
+        )}
+
+        {!isUnclassified && job.damageDiagramImage && (
+          <div style={{ marginTop: 14 }}>
+            <div style={{ fontSize: 11.5, fontWeight: 700, color: COLORS.muted, textTransform: "uppercase", letterSpacing: 0.5, marginBottom: 5 }}>Damage Diagram</div>
+            <img src={job.damageDiagramImage} alt="Damage diagram" style={{ width: "100%", height: "auto", display: "block", borderRadius: 8, border: `1px solid ${COLORS.line}` }} />
           </div>
         )}
 
@@ -8686,11 +8668,16 @@ function DispatchBoard({ team, session }) {
 
 async function loadLiveUpdates() {
   const { ok, data } = await sbFetch(
-    "jobs?select=id,plate,make_model,customer_name,stage_index,history&order=updated_at.desc&limit=300"
+    "jobs?select=id,plate,make_model,customer_name,stage_index,history,service_started&order=updated_at.desc&limit=300"
   );
-  if (!ok || !data) return [];
+  if (!ok || !data) return { updates: [], digest: null };
   const updates = [];
+  const todayKey = new Date().toISOString().slice(0, 10);
+  let finishedToday = 0;
+  const byStaff = {}; // name -> count
+  const durations = []; // minutes, only where a matching start timestamp exists
   for (const r of data) {
+    const started = r.service_started || {};
     for (const entry of r.history || []) {
       if (entry.stage === "progress_update") {
         updates.push({
@@ -8698,18 +8685,41 @@ async function loadLiveUpdates() {
           categoryLabel: entry.label, by: entry.by, note: entry.note, at: entry.at,
         });
       }
+      if (entry.stage === "service" && entry.note === "Marked done" && new Date(entry.at).toISOString().slice(0, 10) === todayKey) {
+        finishedToday += 1;
+        if (entry.by) byStaff[entry.by] = (byStaff[entry.by] || 0) + 1;
+        // Best-effort: service_started only ever holds the *current* start
+        // time for that category, so if it was started/finished/restarted
+        // more than once today the match can be approximate — good enough
+        // for a daily average, not meant to be a precise time-clock.
+        const svc = SERVICES.find((s) => s.label === entry.label);
+        const startedAtRaw = svc ? started[svc.key] : null;
+        if (startedAtRaw) {
+          const mins = (entry.at - new Date(startedAtRaw).getTime()) / 60000;
+          if (mins > 0 && mins < 24 * 60) durations.push(mins);
+        }
+      }
     }
   }
   updates.sort((a, b) => b.at - a.at);
-  return updates;
+  const avgMins = durations.length ? Math.round(durations.reduce((a, b) => a + b, 0) / durations.length) : null;
+  const digest = {
+    finishedToday,
+    byStaff: Object.entries(byStaff).sort((a, b) => b[1] - a[1]),
+    avgLabel: avgMins === null ? null : avgMins < 60 ? `${avgMins}m` : `${Math.floor(avgMins / 60)}h ${avgMins % 60}m`,
+  };
+  return { updates, digest };
 }
 
 function LiveUpdatesBoard({ team }) {
   const [updates, setUpdates] = useState([]);
+  const [digest, setDigest] = useState(null);
   const [loading, setLoading] = useState(true);
 
   const refresh = useCallback(async () => {
-    setUpdates(await loadLiveUpdates());
+    const result = await loadLiveUpdates();
+    setUpdates(result.updates);
+    setDigest(result.digest);
     setLoading(false);
   }, []);
 
@@ -8727,6 +8737,32 @@ function LiveUpdatesBoard({ team }) {
           {loading ? "Loading…" : "Progress notes from Ahmed and Noel · updates automatically"}
         </div>
       </div>
+
+      {digest && (
+        <div style={{ background: COLORS.panel, border: `1px solid ${COLORS.gold}55`, borderRadius: 14, padding: 16, maxWidth: 640 }}>
+          <div style={{ fontSize: 11.5, fontWeight: 700, color: COLORS.gold, textTransform: "uppercase", letterSpacing: 0.5, marginBottom: 10 }}>Today's Digest</div>
+          <div style={{ display: "flex", gap: 24, flexWrap: "wrap", marginBottom: digest.byStaff.length ? 12 : 0 }}>
+            <div>
+              <div style={{ fontFamily: MONO_FONT, fontWeight: 700, fontSize: 26, color: COLORS.ink }}>{digest.finishedToday}</div>
+              <div style={{ fontSize: 11, color: COLORS.muted }}>jobs finished today</div>
+            </div>
+            <div>
+              <div style={{ fontFamily: MONO_FONT, fontWeight: 700, fontSize: 26, color: COLORS.ink }}>{digest.avgLabel || "—"}</div>
+              <div style={{ fontSize: 11, color: COLORS.muted }}>avg time per job</div>
+            </div>
+          </div>
+          {digest.byStaff.length > 0 && (
+            <div style={{ display: "flex", flexWrap: "wrap", gap: 8 }}>
+              {digest.byStaff.map(([name, count]) => (
+                <div key={name} style={{ fontSize: 12, color: COLORS.ink, background: COLORS.panel2, borderRadius: 999, padding: "5px 12px" }}>
+                  <span style={{ fontWeight: 700 }}>{name}</span> — {count}
+                </div>
+              ))}
+            </div>
+          )}
+        </div>
+      )}
+
       <div style={{ display: "flex", flexDirection: "column", gap: 10, maxWidth: 640 }}>
         {updates.length === 0 ? (
           <div style={{ textAlign: "center", color: COLORS.muted, fontSize: 13, marginTop: 40 }}>No updates posted yet</div>
