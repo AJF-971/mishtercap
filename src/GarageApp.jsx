@@ -7829,7 +7829,7 @@ function announceDispatchAssignment(staffName, vehicleLabel) {
   try {
     if (!window.speechSynthesis) return;
     const spokenVehicle = fixDispatchPronunciation(vehicleLabel);
-    const utter = new SpeechSynthesisUtterance(`${staffName}, you've been assigned the ${spokenVehicle}.`);
+    const utter = new SpeechSynthesisUtterance(`${staffName}, you've been assigned the ${spokenVehicle}. Please update who will be working on it.`);
     const voice = getBestDispatchVoice();
     if (voice) utter.voice = voice;
     utter.lang = voice?.lang || "en-GB";
@@ -8386,9 +8386,37 @@ function DispatchBoard({ team, session }) {
     return () => clearInterval(t);
   }, []);
 
+  const prevAssignedRef = useRef({}); // `${jobId}::${categoryKey}` -> array of assigned ids, as of the last poll
   const refresh = useCallback(async () => {
     const data = await loadDispatchJobs();
     if (Date.now() < suppressRefreshUntilRef.current) return; // a local write is still settling — don't clobber it
+    // Announce newly-added assignees on EVERY device that has the board
+    // open — not just whichever device did the tapping. This is what
+    // makes a remote assignment actually announce out loud on a tablet
+    // sitting near the person being assigned, instead of only on the
+    // assigner's own screen. Skipped on the very first load so opening
+    // the board doesn't announce every existing assignment at once.
+    if (!firstLoadRef.current) {
+      for (const job of data) {
+        for (const categoryKey of job.serviceTypes) {
+          const key = `${job.id}::${categoryKey}`;
+          const before = prevAssignedRef.current[key] || [];
+          const after = job.assignedTeam[categoryKey] || [];
+          const newlyAdded = after.filter((id) => !before.includes(id));
+          for (const id of newlyAdded) {
+            const staffName = team.find((m) => m.id === id)?.name || id;
+            announceDispatchAssignment(staffName, job.makeModel || job.plate);
+          }
+        }
+      }
+    }
+    const nextAssignedMap = {};
+    for (const job of data) {
+      for (const categoryKey of job.serviceTypes) {
+        nextAssignedMap[`${job.id}::${categoryKey}`] = job.assignedTeam[categoryKey] || [];
+      }
+    }
+    prevAssignedRef.current = nextAssignedMap;
     setJobs((prev) => {
       const prevById = new Map(prev.map((j) => [j.id, j]));
       return data.map((incoming) => {
@@ -8412,7 +8440,7 @@ function DispatchBoard({ team, session }) {
     }
     firstLoadRef.current = false;
     prevCountRef.current = data.length;
-  }, []);
+  }, [team]);
 
   useEffect(() => {
     refresh();
@@ -8445,7 +8473,12 @@ function DispatchBoard({ team, session }) {
     withActivitySummary(isRemoving
       ? `Dispatch board: removed ${staffName} from ${categoryKey} on ${job.plate}`
       : `Dispatch board: added ${staffName} to ${categoryKey} on ${job.plate}`);
-    if (!isRemoving) announceDispatchAssignment(staffName, job.makeModel || job.plate);
+    // No immediate local announcement here anymore — every open device
+    // (including this one) picks up the new assignment on its next poll
+    // and announces it then. That's what makes a remote assignment
+    // actually announce out loud on a tablet sitting near the person
+    // being assigned, instead of only confirming on the assigner's own
+    // screen while everyone else hears nothing.
     await sbFetch(`jobs?id=eq.${job.id}`, {
       method: "PATCH",
       headers: { Prefer: "return=minimal" },
