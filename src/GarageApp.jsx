@@ -1,4 +1,4 @@
-import React, { useState, useEffect, useRef, useCallback } from "react";
+import React, { useState, useEffect, useRef, useCallback, memo } from "react";
 import { createPortal } from "react-dom";
 import {
   Plus, ChevronLeft, Camera, Check, Wrench, Car, Search,
@@ -7669,21 +7669,37 @@ function TeamScreen({ team, setTeam, session, onBack, onImport, onServices, canS
    activity log. */
 
 async function loadDispatchJobs() {
+  // Deliberately NOT selecting photos/damage_diagram_image here — those
+  // are large base64 blobs (hundreds of KB each) and this query polls
+  // every 6 seconds. Pulling them on every poll was quietly costing
+  // several GB of bandwidth per hour the board sat open. The card's
+  // photo/diagram indicator icons are gone from the compact view as a
+  // result — the actual images still show fine once a job is opened,
+  // via the one-off fetch in loadDispatchJobExtras below.
   const { ok, data } = await sbFetch(
-    "jobs?select=id,plate,make_model,customer_name,description,damage_notes,damage_diagram_image,photos,priority,location,stage_index,service_types,assigned_to,assigned_team,service_done,service_started,treatments,parts,dispatch_hidden,created_at,updated_at&order=created_at.asc&limit=900"
+    "jobs?select=id,plate,make_model,customer_name,description,damage_notes,priority,location,stage_index,service_types,assigned_to,assigned_team,service_done,service_started,treatments,parts,dispatch_hidden,created_at,updated_at&order=created_at.asc&limit=900"
   );
   if (!ok || !data) return [];
   return data
     .filter((r) => r.stage_index !== 5) // 5 = Collected — done, doesn't belong on a live queue
     .map((r) => ({
       id: r.id, plate: r.plate, makeModel: r.make_model, customerName: r.customer_name,
-      description: r.description, damageNotes: r.damage_notes, damageDiagramImage: r.damage_diagram_image || null,
-      photos: r.photos || {}, priority: r.priority, location: r.location,
+      description: r.description, damageNotes: r.damage_notes,
+      damageDiagramImage: null, photos: {}, // filled in on-demand by loadDispatchJobExtras()
+      priority: r.priority, location: r.location,
       stageIndex: r.stage_index, serviceTypes: r.service_types || [], assignedTo: r.assigned_to || {}, assignedTeam: r.assigned_team || {},
       serviceDone: r.service_done || {}, serviceStarted: r.service_started || {}, treatments: r.treatments || {},
       parts: r.parts || [], dispatchHidden: !!r.dispatch_hidden,
       createdAt: new Date(r.created_at).getTime(), updatedAt: new Date(r.updated_at).getTime(),
     }));
+}
+
+// Fetches the heavy fields for exactly one job — called once when its
+// detail sheet actually opens, never as part of the recurring poll.
+async function loadDispatchJobExtras(jobId) {
+  const { ok, data } = await sbFetch(`jobs?id=eq.${jobId}&select=photos,damage_diagram_image`);
+  if (!ok || !data || !data[0]) return null;
+  return { photos: data[0].photos || {}, damageDiagramImage: data[0].damage_diagram_image || null };
 }
 
 function playDispatchBeep() {
@@ -7871,7 +7887,7 @@ function staffForRole(team, role) {
   return team.filter((m) => m.role !== "detailing" && m.role !== "admin" && m.role !== "intake");
 }
 
-function DispatchJobCard({ row, ticketNo, isDone, isStarted, startedAt, now, assignedNames, onClick }) {
+function DispatchJobCardImpl({ row, ticketNo, isDone, isStarted, startedAt, now, assignedNames, onClick }) {
   const { job, categoryLabel } = row;
   const isPartsRemoval = STAGES[job.stageIndex]?.key === "parts_removal";
   const isStaleUnassigned = (!assignedNames || assignedNames.length === 0) && !isStarted && !isDone && (now - job.createdAt) > STALE_UNASSIGNED_MS;
@@ -7903,7 +7919,6 @@ function DispatchJobCard({ row, ticketNo, isDone, isStarted, startedAt, now, ass
             {isDone && <CheckCircle2 size={15} color={COLORS.green} />}
             {!isDone && isStarted && <Clock size={14} color={COLORS.gold} />}
             {job.damageNotes && <AlertCircle size={14} color={COLORS.red} />}
-            {job.damageDiagramImage && <Car size={14} color={COLORS.gold} />}
             {ageTier.isNew && !isStale && (
               <span style={{ fontSize: 9, fontWeight: 700, color: "#3fb950", border: `1px solid #3fb950`, borderRadius: 999, padding: "1px 6px" }}>NEW</span>
             )}
@@ -7936,6 +7951,16 @@ function DispatchJobCard({ row, ticketNo, isDone, isStarted, startedAt, now, ass
     </div>
   );
 }
+// Custom comparator: `row.job` staying the SAME reference (from the
+// smart-merge in refresh() below) is what actually lets this skip
+// re-rendering on most polls. assignedNames is a fresh array every
+// render regardless, so it's compared by content instead of reference.
+const DispatchJobCard = memo(DispatchJobCardImpl, (prev, next) => (
+  prev.row.job === next.row.job && prev.row.categoryKey === next.row.categoryKey &&
+  prev.ticketNo === next.ticketNo && prev.isDone === next.isDone && prev.isStarted === next.isStarted &&
+  prev.startedAt === next.startedAt && prev.now === next.now &&
+  (prev.assignedNames || []).join(",") === (next.assignedNames || []).join(",")
+));
 
 // End-of-day "update the app" reminder — full-screen, flashing red,
 // impossible to dismiss accidentally (needs exactly 5 taps). Fires once
@@ -8235,6 +8260,16 @@ function DispatchBoard({ team, session }) {
   const [jobs, setJobs] = useState([]);
   const [loading, setLoading] = useState(true);
   const [selectedRowKey, setSelectedRowKey] = useState(null);
+  const loadedExtrasRef = useRef(new Set()); // job ids we've already fetched photos/diagram for this session
+  const openRow = (key, jobId) => {
+    setSelectedRowKey(key);
+    if (loadedExtrasRef.current.has(jobId)) return;
+    loadedExtrasRef.current.add(jobId);
+    loadDispatchJobExtras(jobId).then((extras) => {
+      if (!extras) return;
+      setJobs((prev) => prev.map((j) => (j.id === jobId ? { ...j, photos: extras.photos, damageDiagramImage: extras.damageDiagramImage } : j)));
+    });
+  };
   const [saving, setSaving] = useState(false);
   const [nowTick, setNowTick] = useState(() => Date.now());
   const [sortOrder, setSortOrder] = useState("oldest"); // "oldest" | "newest" | "priority"
@@ -8289,7 +8324,23 @@ function DispatchBoard({ team, session }) {
   const refresh = useCallback(async () => {
     const data = await loadDispatchJobs();
     if (Date.now() < suppressRefreshUntilRef.current) return; // a local write is still settling — don't clobber it
-    setJobs(data);
+    setJobs((prev) => {
+      const prevById = new Map(prev.map((j) => [j.id, j]));
+      return data.map((incoming) => {
+        const old = prevById.get(incoming.id);
+        if (!old) return incoming;
+        // Nothing meaningful changed — reuse the exact same object
+        // reference. This is what lets DispatchJobCard's memo
+        // comparator actually skip re-rendering that card, instead of
+        // every card on the board re-rendering on every 6-second poll
+        // even when nothing about it changed. That was the real
+        // structural cause of the lag, not just the poll interval.
+        if (old.updatedAt === incoming.updatedAt && old.dispatchHidden === incoming.dispatchHidden) return old;
+        // Something did change, but keep any already-fetched extras
+        // (photos/diagram) — the poll itself never carries those.
+        return { ...incoming, photos: old.photos, damageDiagramImage: old.damageDiagramImage };
+      });
+    });
     setLoading(false);
     if (!firstLoadRef.current && prevCountRef.current !== null && data.length > prevCountRef.current) {
       playDispatchBeep();
@@ -8540,7 +8591,7 @@ function DispatchBoard({ team, session }) {
                 startedAt={r.job.serviceStarted[r.categoryKey] || null}
                 now={nowTick}
                 assignedNames={(r.job.assignedTeam[r.categoryKey] || []).map((id) => team.find((m) => m.id === id)?.name || id)}
-                onClick={() => setSelectedRowKey(key)}
+                onClick={() => openRow(key, r.job.id)}
               />
             );
           })
@@ -8589,7 +8640,7 @@ function DispatchBoard({ team, session }) {
             {unclassifiedRows.map((r) => (
               <div
                 key={rowKey(r.job.id, r.categoryKey)}
-                onClick={() => setSelectedRowKey(rowKey(r.job.id, r.categoryKey))}
+                onClick={() => openRow(rowKey(r.job.id, r.categoryKey), r.job.id)}
                 className="mrcap-press"
                 style={{
                   flexShrink: 0, minWidth: 160, background: COLORS.panel, border: `1px solid ${COLORS.line}`,
