@@ -914,6 +914,47 @@ function saveLocalSession(session) {
   } catch (e) { /* ignore — worst case, they log in again next visit */ }
 }
 
+// Shop is open 9am–7pm — everyone gets logged out automatically around
+// 9pm each night (both the main app and the Dispatch Kiosk, tracked
+// separately since they're different devices/sessions). Whoever logs
+// back in next sees a bold reminder to reconcile the board with what's
+// actually in the shop, until they dismiss it. keyPrefix keeps the two
+// flows' localStorage flags independent of each other.
+const AUTO_LOGOUT_HOUR = 21; // 9pm
+function checkAutoLogout(keyPrefix, hasSession, clearSessionFn) {
+  if (!hasSession) return;
+  const now = new Date();
+  if (now.getHours() < AUTO_LOGOUT_HOUR) return;
+  const todayKey = now.toISOString().slice(0, 10);
+  try {
+    if (window.localStorage.getItem(`${keyPrefix}_auto_logout_date`) === todayKey) return; // already done tonight
+    window.localStorage.setItem(`${keyPrefix}_auto_logout_date`, todayKey);
+    window.localStorage.setItem(`${keyPrefix}_show_reminder`, "1");
+  } catch { /* ignore */ }
+  clearSessionFn();
+}
+function shouldShowMorningReminder(keyPrefix) {
+  try { return window.localStorage.getItem(`${keyPrefix}_show_reminder`) === "1"; } catch { return false; }
+}
+function dismissMorningReminder(keyPrefix) {
+  try { window.localStorage.removeItem(`${keyPrefix}_show_reminder`); } catch { /* ignore */ }
+}
+
+// Bold, dismissible — shown once after logging back in following the
+// nightly auto-logout, prompting a physical reconcile of the board.
+function MorningReminderBanner({ onDismiss }) {
+  return (
+    <div className="mrcap-fade" style={{ background: "#1a1408", border: `2px solid ${COLORS.gold}`, borderRadius: 12, padding: "14px 16px", margin: "12px 16px 0", display: "flex", alignItems: "flex-start", justifyContent: "space-between", gap: 12 }}>
+      <div style={{ fontWeight: 700, fontSize: 14.5, color: COLORS.ink, lineHeight: 1.4 }}>
+        Please update the app — remove any cars that aren't currently here and put the new ones that aren't on the app.
+      </div>
+      <button onClick={onDismiss} className="mrcap-press" style={{ background: "none", border: "none", cursor: "pointer", padding: 4, flexShrink: 0 }}>
+        <X size={18} color={COLORS.muted} />
+      </button>
+    </div>
+  );
+}
+
 // "New since I last opened" tracking — keyed per person (not per device),
 // so it's a genuine "what's happened since I checked" signal rather than
 // tied to a specific phone. Local only; not worth a Supabase round-trip
@@ -2340,6 +2381,7 @@ export default function GarageApp() {
   const [ready, setReady] = useState(false);
   const [team, setTeam] = useState(DEFAULT_TEAM);
   const [session, setSession] = useState(null); // {id, name, role}
+  const [showMorningReminder, setShowMorningReminder] = useState(false);
   const [view, setViewRaw] = useState("list");
   // Every existing `setView("xyz")` call site elsewhere in this file keeps
   // working completely unchanged — this wraps the raw state setter once,
@@ -2413,12 +2455,31 @@ export default function GarageApp() {
       const raw = loadLocalSession();
       if (raw) {
         const s = raw;
-        if (t.find((m) => m.id === s.id)) { setSession(s); setCurrentActor(s); }
+        if (t.find((m) => m.id === s.id)) {
+          setSession(s); setCurrentActor(s);
+          if (shouldShowMorningReminder("mrcap")) setShowMorningReminder(true);
+        }
       }
       await refreshIndex();
       setReady(true);
     })();
   }, [refreshIndex]);
+
+  // Auto-logout around 9pm (shop closes at 7) — checked on mount and
+  // every 5 minutes after. Whoever logs in next sees the morning
+  // reminder banner until they dismiss it.
+  useEffect(() => {
+    const check = () => {
+      checkAutoLogout("mrcap", !!session, () => {
+        setSession(null);
+        setCurrentActor(null);
+        saveLocalSession(null);
+      });
+    };
+    check();
+    const t = setInterval(check, 5 * 60 * 1000);
+    return () => clearInterval(t);
+  }, [session]);
 
   // Auto-refresh, so nobody has to remember to pull down/reload: a
   // background poll every 45s, plus an immediate refresh the moment the
@@ -2447,6 +2508,7 @@ export default function GarageApp() {
     saveLocalSession(s);
     setCurrentActor(s);
     logEvent("login", `${member.name} logged in`, s);
+    if (shouldShowMorningReminder("mrcap")) setShowMorningReminder(true);
   };
   const onLogout = () => {
     if (session) logEvent("login", `${session.name} logged out`);
@@ -2486,6 +2548,7 @@ export default function GarageApp() {
       {isSuperAdmin(session) && <DraggablePorscheEgg badgeCount={eggAttentionCount} onTap={() => setView("admindash")} />}
       <ReportIssueButton session={session} view={view} />
       <TopBar session={session} team={team} onLogout={onLogout} onNew={() => setView("new")} view={view} onBack={() => window.history.back()} onTeam={() => setView("team")} onArchive={() => setView("archive")} onCustomers={() => setView("customers")} onReports={() => setView("reports")} onQuotes={() => setView("quotes")} canArchive={canArchive} onAdminDash={() => setView("admindash")} onMsgTemplates={() => setView("msgtemplates")} onIssues={() => setView("issues")} onDispatch={() => setView("dispatch")} onLiveUpdates={() => setView("liveupdates")} />
+      {showMorningReminder && <MorningReminderBanner onDismiss={() => { setShowMorningReminder(false); dismissMorningReminder("mrcap"); }} />}
       {view === "list" && (
         ROLE_DEFS[session.role]?.simplified
           ? <SimplifiedDashboard index={index} session={session} onOpen={openJob} onRefresh={refreshIndex} syncState={syncState} lastSyncedAt={lastSyncedAt} />
@@ -7896,10 +7959,39 @@ function playDispatchAlarm() {
 
 const rowKey = (jobId, categoryKey) => `${jobId}::${categoryKey}`;
 
+// Shop is open 9am–7pm, Monday through Saturday — Sunday is fully off
+// (the main window for app updates/maintenance, not a working day at
+// all). Every timer, age color, and stale-warning on the Dispatch Board
+// counts only time within open hours on open days — so a car sitting
+// overnight, or through a Sunday, doesn't rack up "stale" or "in
+// progress 30 hours" the way raw wall-clock time would.
+const SHOP_OPEN_HOUR = 9;
+const SHOP_CLOSE_HOUR = 19;
+function businessMsElapsed(fromMs, toMs, openHour = SHOP_OPEN_HOUR, closeHour = SHOP_CLOSE_HOUR) {
+  if (!fromMs || toMs <= fromMs) return 0;
+  let total = 0;
+  let cursor = new Date(fromMs);
+  let guard = 0; // safety valve — never loop more than ~2 years of days
+  while (cursor.getTime() < toMs && guard < 800) {
+    guard += 1;
+    if (cursor.getDay() !== 0) { // 0 = Sunday — fully closed, contributes nothing
+      const dayOpen = new Date(cursor); dayOpen.setHours(openHour, 0, 0, 0);
+      const dayClose = new Date(cursor); dayClose.setHours(closeHour, 0, 0, 0);
+      const segStart = Math.max(cursor.getTime(), dayOpen.getTime());
+      const segEnd = Math.min(toMs, dayClose.getTime());
+      if (segEnd > segStart) total += segEnd - segStart;
+    }
+    const nextDay = new Date(cursor); nextDay.setDate(nextDay.getDate() + 1); nextDay.setHours(0, 0, 0, 0);
+    cursor = nextDay;
+  }
+  return total;
+}
+
 // Thresholds for the "this is going stale" warnings — tune these two
-// numbers if an hour/three hours turns out too eager or too lax.
-const STALE_UNASSIGNED_MS = 60 * 60 * 1000; // 1 hour sitting unassigned
-const STALE_IN_PROGRESS_MS = 3 * 60 * 60 * 1000; // 3 hours "in progress" with no update
+// numbers if an hour/three hours turns out too eager or too lax. These
+// are now business-hours thresholds (see businessMsElapsed above).
+const STALE_UNASSIGNED_MS = 60 * 60 * 1000; // 1 business hour sitting unassigned
+const STALE_IN_PROGRESS_MS = 3 * 60 * 60 * 1000; // 3 business hours "in progress" with no update
 
 const PRIORITY_RANK = { urgent: 3, high: 2, medium: 1, low: 0 };
 
@@ -7907,8 +7999,10 @@ const PRIORITY_RANK = { urgent: 3, high: 2, medium: 1, low: 0 };
 // red stale-warning above — this is a general "how long has this been
 // sitting" glance rather than an alert. Fresh jobs get a bright green
 // edge and a NEW badge; the longer it sits, the warmer the color gets.
+// Uses business hours, so a car dropped off at 6pm doesn't look "old"
+// by 8am the next morning after 14 hours of the shop being closed.
 function dispatchAgeTier(createdAt, now) {
-  const hours = (now - createdAt) / 3600000;
+  const hours = businessMsElapsed(createdAt, now) / 3600000;
   if (hours < 1) return { color: "#3fb950", label: "NEW", isNew: true };
   if (hours < 4) return { color: COLORS.line, label: null, isNew: false };
   if (hours < 8) return { color: "#d29922", label: null, isNew: false };
@@ -7927,10 +8021,12 @@ function dispatchWhatToDo(job, categoryKey) {
 }
 
 // "23m" / "1h 12m" — deliberately coarse (minutes, not seconds), since
-// this is a shop-floor glance-at-it label, not a stopwatch.
+// this is a shop-floor glance-at-it label, not a stopwatch. Counts only
+// business hours, so a job started at 6:45pm doesn't show as
+// "in progress 14h" by the next morning.
 function formatDispatchElapsed(startedAt, now) {
   if (!startedAt) return null;
-  const ms = Math.max(0, now - new Date(startedAt).getTime()); // clamp: the 30s tick can be a moment behind the exact click time
+  const ms = businessMsElapsed(new Date(startedAt).getTime(), now);
   const totalMin = Math.floor(ms / 60000);
   if (totalMin < 60) return `${totalMin}m`;
   const h = Math.floor(totalMin / 60);
@@ -7949,8 +8045,8 @@ function staffForRole(team, role) {
 function DispatchJobCardImpl({ row, ticketNo, isDone, isStarted, startedAt, now, assignedNames, onClick }) {
   const { job, categoryLabel } = row;
   const isPartsRemoval = STAGES[job.stageIndex]?.key === "parts_removal";
-  const isStaleUnassigned = (!assignedNames || assignedNames.length === 0) && !isStarted && !isDone && (now - job.createdAt) > STALE_UNASSIGNED_MS;
-  const isStaleInProgress = isStarted && !isDone && startedAt && (now - new Date(startedAt).getTime()) > STALE_IN_PROGRESS_MS;
+  const isStaleUnassigned = (!assignedNames || assignedNames.length === 0) && !isStarted && !isDone && businessMsElapsed(job.createdAt, now) > STALE_UNASSIGNED_MS;
+  const isStaleInProgress = isStarted && !isDone && startedAt && businessMsElapsed(new Date(startedAt).getTime(), now) > STALE_IN_PROGRESS_MS;
   const isStale = isStaleUnassigned || isStaleInProgress;
   const ageTier = dispatchAgeTier(job.createdAt, now);
   const edgeColor = isStale ? COLORS.red : ageTier.color;
@@ -8689,8 +8785,8 @@ function DispatchBoard({ team, session }) {
     const startedAt = r.job.serviceStarted[r.categoryKey];
     const isDone = r.job.serviceDone[r.categoryKey];
     if (isDone) continue;
-    if (!startedAt && assignedIds.length === 0 && (nowTick - r.job.createdAt) > STALE_UNASSIGNED_MS) staleUnassignedCount += 1;
-    else if (startedAt && (nowTick - new Date(startedAt).getTime()) > STALE_IN_PROGRESS_MS) staleInProgressCount += 1;
+    if (!startedAt && assignedIds.length === 0 && businessMsElapsed(r.job.createdAt, nowTick) > STALE_UNASSIGNED_MS) staleUnassignedCount += 1;
+    else if (startedAt && businessMsElapsed(new Date(startedAt).getTime(), nowTick) > STALE_IN_PROGRESS_MS) staleInProgressCount += 1;
   }
   const totalAlerts = staleUnassignedCount + staleInProgressCount + unclassifiedRows.length;
 
@@ -9015,6 +9111,7 @@ export function DispatchKiosk() {
   const [picked, setPicked] = useState(null);
   const [pin, setPin] = useState("");
   const [error, setError] = useState("");
+  const [showMorningReminder, setShowMorningReminder] = useState(() => shouldShowMorningReminder("mrcap_kiosk"));
 
   useEffect(() => {
     (async () => {
@@ -9023,10 +9120,26 @@ export function DispatchKiosk() {
     })();
   }, []);
 
+  // Auto-logout around 9pm (shop closes at 7) — checked on mount and
+  // every 5 minutes after. Whoever logs in next on this tablet sees the
+  // morning reminder banner until they dismiss it.
+  useEffect(() => {
+    const check = () => {
+      checkAutoLogout("mrcap_kiosk", !!session, () => {
+        setSession(null);
+        try { window.localStorage.removeItem("mrcap_kiosk_session"); } catch { /* ignore */ }
+      });
+    };
+    check();
+    const t = setInterval(check, 5 * 60 * 1000);
+    return () => clearInterval(t);
+  }, [session]);
+
   const loginAs = (member) => {
     const next = { id: member.id, name: member.name, role: member.role };
     setSession(next);
     try { window.localStorage.setItem("mrcap_kiosk_session", JSON.stringify(next)); } catch { /* ignore */ }
+    if (shouldShowMorningReminder("mrcap_kiosk")) setShowMorningReminder(true);
   };
 
   const pick = (member) => {
@@ -9080,6 +9193,7 @@ export function DispatchKiosk() {
             Switch user
           </button>
         </div>
+        {showMorningReminder && <MorningReminderBanner onDismiss={() => { setShowMorningReminder(false); dismissMorningReminder("mrcap_kiosk"); }} />}
         <DispatchBoard team={team} session={session} />
       </div>
     );
