@@ -390,6 +390,24 @@ const SUPABASE_KEY = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZ
 // who opens dev tools" and the database, once RLS denies anon writes
 // directly. Reads (GET) are unaffected and still go straight to Supabase.
 const GATEKEEPER_URL = `${SUPABASE_URL}/functions/v1/db-gatekeeper`;
+const VERIFY_PIN_URL = `${SUPABASE_URL}/functions/v1/verify-pin`;
+
+// The ONLY way a PIN is ever checked, from either login screen. The
+// real pin value never reaches the browser in either direction — this
+// just gets back pass/fail plus the safe profile fields to log in with.
+async function verifyPin(memberId, pin) {
+  try {
+    const res = await fetch(VERIFY_PIN_URL, {
+      method: "POST",
+      headers: { apikey: SUPABASE_KEY, Authorization: `Bearer ${SUPABASE_KEY}`, "Content-Type": "application/json" },
+      body: JSON.stringify({ memberId, pin }),
+    });
+    if (!res.ok) return { ok: false };
+    return await res.json();
+  } catch {
+    return { ok: false };
+  }
+}
 
 // Who's currently logged in, for the audit log — set on login/logout,
 // read by sbFetch on every write. Same mutable-global pattern already
@@ -501,7 +519,11 @@ async function logEvent(actionType, detail, actorOverride) {
 
 /* ---------------- Team ---------------- */
 async function loadTeam() {
-  const { ok, data } = await sbFetch("team_members?select=*&order=created_at.asc");
+  // Explicit column list, NOT select=* — Postgres errors on SELECT *
+  // entirely (not a silent omission) once any single column is
+  // restricted, which pin now is. has_pin stands in for the real pin
+  // value, which anon can no longer read at all.
+  const { ok, data } = await sbFetch("team_members?select=id,name,role,specialty,permissions,has_pin,created_at,updated_at&order=created_at.asc");
   if (!ok) return DEFAULT_TEAM;
   if (!data || data.length === 0) {
     // First run ever: seed the table with the full default roster.
@@ -523,15 +545,25 @@ async function loadTeam() {
       headers: { Prefer: "resolution=merge-duplicates,return=minimal" },
       body: JSON.stringify(missing.map((m) => ({ id: m.id, name: m.name, role: m.role, pin: m.pin, permissions: m.permissions }))),
     });
-    return [...data.map((m) => ({ id: m.id, name: m.name, role: m.role, pin: m.pin, specialty: m.specialty || null, permissions: m.permissions || {} })), ...missing];
+    return [...data.map((m) => ({ id: m.id, name: m.name, role: m.role, hasPin: !!m.has_pin, specialty: m.specialty || null, permissions: m.permissions || {} })), ...missing];
   }
-  return data.map((m) => ({ id: m.id, name: m.name, role: m.role, pin: m.pin, specialty: m.specialty || null, permissions: m.permissions || {} }));
+  return data.map((m) => ({ id: m.id, name: m.name, role: m.role, hasPin: !!m.has_pin, specialty: m.specialty || null, permissions: m.permissions || {} }));
 }
 async function saveTeam(team) {
   const { ok } = await sbFetch("team_members?on_conflict=id", {
     method: "POST",
     headers: { Prefer: "resolution=merge-duplicates,return=minimal" },
-    body: JSON.stringify(team.map((m) => ({ id: m.id, name: m.name, role: m.role, pin: m.pin, specialty: m.specialty || null, permissions: m.permissions || {}, updated_at: new Date().toISOString() }))),
+    body: JSON.stringify(team.map((m) => {
+      const row = { id: m.id, name: m.name, role: m.role, specialty: m.specialty || null, permissions: m.permissions || {}, updated_at: new Date().toISOString() };
+      // Only ever include `pin` when THIS call intentionally set or
+      // cleared it (first-time PIN creation, or Reset PIN) — never
+      // blindly resend it for untouched members. The client no longer
+      // has real pin values to resend at all (that's the point of the
+      // security fix); omitting the key entirely leaves that member's
+      // existing pin untouched server-side instead of wiping it.
+      if (Object.prototype.hasOwnProperty.call(m, "pin")) row.pin = m.pin;
+      return row;
+    })),
   });
   return ok;
 }
@@ -2546,7 +2578,7 @@ function LoginScreen({ team, setTeam, onLogin }) {
     setPicked(member);
     setPin("");
     setError("");
-    setMode(member.pin ? "enter" : "set");
+    setMode(member.hasPin ? "enter" : "set");
   };
 
   const press = (d) => { if (pin.length < 4) setPin((p) => p + d); };
@@ -2561,11 +2593,12 @@ function LoginScreen({ team, setTeam, onLogin }) {
         setTeam(next);
         await saveTeam(next);
         setFlash(true);
-        setTimeout(() => onLogin({ ...picked, pin }, viewMode), 420);
+        setTimeout(() => onLogin({ ...picked, hasPin: true }, viewMode), 420);
       } else {
-        if (pin === picked.pin) {
+        const result = await verifyPin(picked.id, pin);
+        if (result.ok) {
           setFlash(true);
-          setTimeout(() => onLogin(picked, viewMode), 420);
+          setTimeout(() => onLogin(result.member, viewMode), 420);
         } else {
           setError("Wrong PIN");
           setTimeout(() => setPin(""), 260);
@@ -8876,7 +8909,10 @@ export function DispatchKiosk() {
 
   const pick = (member) => {
     const needsPin = ["ajf", "ahmed", "laani", "mr.cap"].includes((member.name || "").toLowerCase());
-    if (needsPin && member.pin) {
+    // Gate on the admin name list alone now, not member.pin's presence
+    // — that field is never fetched anymore (verify-pin checks it
+    // server-side instead), so it would always be falsy here.
+    if (needsPin) {
       setPicked(member);
       setPin("");
       setError("");
@@ -8890,12 +8926,15 @@ export function DispatchKiosk() {
 
   useEffect(() => {
     if (pin.length !== 4 || !picked) return;
-    if (pin === picked.pin) {
-      loginAs(picked);
-    } else {
-      setError("Wrong PIN");
-      setTimeout(() => setPin(""), 260);
-    }
+    (async () => {
+      const result = await verifyPin(picked.id, pin);
+      if (result.ok) {
+        loginAs(result.member);
+      } else {
+        setError("Wrong PIN");
+        setTimeout(() => setPin(""), 260);
+      }
+    })();
     // eslint-disable-next-line
   }, [pin]);
 
