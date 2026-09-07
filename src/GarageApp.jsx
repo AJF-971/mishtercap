@@ -2606,7 +2606,7 @@ export default function GarageApp() {
       <ReportIssueButton session={session} view={view} />
       <TopBar session={session} team={team} onLogout={onLogout} onNew={() => setView("new")} view={view} onBack={() => window.history.back()} onTeam={() => setView("team")} onArchive={() => setView("archive")} onCustomers={() => setView("customers")} onReports={() => setView("reports")} onQuotes={() => setView("quotes")} canArchive={canArchive} onAdminDash={() => setView("admindash")} onMsgTemplates={() => setView("msgtemplates")} onIssues={() => setView("issues")} onDispatch={() => setView("dispatch")} onLiveUpdates={() => setView("liveupdates")} />
       {showMorningReminder && <MorningReminderBanner onDismiss={() => { setShowMorningReminder(false); dismissMorningReminder("mrcap"); }} />}
-      <LiveUpdateBroadcaster />
+      <LiveUpdateBroadcaster onOpenJob={(id) => openJob(id)} />
       {view === "list" && (
         isSimplifiedRole(session)
           ? <SimplifiedDashboard index={index} session={session} onOpen={openJob} onRefresh={refreshIndex} syncState={syncState} lastSyncedAt={lastSyncedAt} />
@@ -2672,7 +2672,7 @@ export default function GarageApp() {
       )}
       {view === "reports" && !hasPermission(session, team, "reports") && <AccessDenied onBack={() => window.history.back()} />}
       {view === "dispatch" && <DispatchBoard team={team} session={session} />}
-      {view === "liveupdates" && canSeeLiveUpdates(session) && <LiveUpdatesBoard team={team} />}
+      {view === "liveupdates" && canSeeLiveUpdates(session) && <LiveUpdatesBoard team={team} onOpenJob={(id) => openJob(id)} />}
       {view === "liveupdates" && !canSeeLiveUpdates(session) && <AccessDenied onBack={() => window.history.back()} />}
       {view === "admindash" && isSuperAdmin(session) && (
         <AdminStatsScreen team={team} onBack={() => window.history.back()} />
@@ -8102,13 +8102,13 @@ function playUpdateChime() {
 // across every job — deliberately lightweight (no photos/diagram, just
 // id/plate/model/history) since this polls frequently on every screen.
 async function loadRecentUpdates(sinceMs) {
-  const { ok, data } = await sbFetch("jobs?select=id,plate,make_model,history&order=updated_at.desc&limit=60");
+  const { ok, data } = await sbFetch("jobs?select=id,plate,make_model,customer_name,history&order=updated_at.desc&limit=60");
   if (!ok || !data) return [];
   const updates = [];
   for (const r of data) {
     for (const entry of r.history || []) {
       if (entry.stage === "progress_update" && entry.at > sinceMs) {
-        updates.push({ jobId: r.id, plate: r.plate, makeModel: r.make_model, by: entry.by, note: entry.note, categoryLabel: entry.label, at: entry.at });
+        updates.push({ jobId: r.id, plate: r.plate, makeModel: r.make_model, customerName: r.customer_name, by: entry.by, note: entry.note, categoryLabel: entry.label, at: entry.at });
       }
     }
   }
@@ -8121,8 +8121,9 @@ async function loadRecentUpdates(sinceMs) {
 // screen, with a sound and a toast popup. Only announces updates that
 // happened after this component mounted, so opening the app doesn't
 // replay the day's history all at once.
-function LiveUpdateBroadcaster() {
+function LiveUpdateBroadcaster({ onOpenJob }) {
   const [toasts, setToasts] = useState([]);
+  const [selected, setSelected] = useState(null);
   const lastSeenRef = useRef(Date.now());
 
   useEffect(() => {
@@ -8140,17 +8141,26 @@ function LiveUpdateBroadcaster() {
     return () => clearInterval(interval);
   }, []);
 
-  if (!toasts.length) return null;
-  return createPortal(
-    <div style={{ position: "fixed", bottom: 18, right: 18, left: 18, zIndex: 9999, display: "flex", flexDirection: "column", alignItems: "flex-end", gap: 8, pointerEvents: "none" }}>
-      {toasts.map((t) => (
-        <div key={t.key} className="mrcap-fade" style={{ pointerEvents: "auto", maxWidth: 340, width: "100%", background: COLORS.panel, border: `1px solid ${COLORS.gold}`, borderRadius: 12, padding: "12px 14px", boxShadow: "0 10px 26px rgba(0,0,0,0.5)" }}>
-          <div style={{ fontSize: 12.5, fontWeight: 700, color: COLORS.gold }}>{t.by} · {t.plate}{t.makeModel ? ` (${t.makeModel})` : ""}</div>
-          <div style={{ fontSize: 13, color: COLORS.ink, marginTop: 3, lineHeight: 1.35 }}>{t.note}</div>
-        </div>
-      ))}
-    </div>,
-    document.body
+  return (
+    <>
+      {toasts.length > 0 && createPortal(
+        <div style={{ position: "fixed", bottom: 18, right: 18, left: 18, zIndex: 9999, display: "flex", flexDirection: "column", alignItems: "flex-end", gap: 8, pointerEvents: "none" }}>
+          {toasts.map((t) => (
+            <div
+              key={t.key}
+              onClick={() => setSelected(t)}
+              className="mrcap-fade mrcap-press"
+              style={{ pointerEvents: "auto", cursor: "pointer", maxWidth: 340, width: "100%", background: COLORS.panel, border: `1px solid ${COLORS.gold}`, borderRadius: 12, padding: "12px 14px", boxShadow: "0 10px 26px rgba(0,0,0,0.5)" }}
+            >
+              <div style={{ fontSize: 12.5, fontWeight: 700, color: COLORS.gold }}>{t.by} · {t.plate}{t.makeModel ? ` (${t.makeModel})` : ""}</div>
+              <div style={{ fontSize: 13, color: COLORS.ink, marginTop: 3, lineHeight: 1.35 }}>{t.note}</div>
+            </div>
+          ))}
+        </div>,
+        document.body
+      )}
+      {selected && onOpenJob && <UpdatePreviewModal update={selected} onClose={() => setSelected(null)} onOpenJob={onOpenJob} />}
+    </>
   );
 }
 
@@ -9322,10 +9332,11 @@ async function loadLiveUpdates() {
   return { updates, digest };
 }
 
-function LiveUpdatesBoard({ team }) {
+function LiveUpdatesBoard({ team, onOpenJob }) {
   const [updates, setUpdates] = useState([]);
   const [digest, setDigest] = useState(null);
   const [loading, setLoading] = useState(true);
+  const [selected, setSelected] = useState(null);
 
   const refresh = useCallback(async () => {
     const result = await loadLiveUpdates();
@@ -9379,7 +9390,12 @@ function LiveUpdatesBoard({ team }) {
           <div style={{ textAlign: "center", color: COLORS.muted, fontSize: 13, marginTop: 40 }}>No updates posted yet</div>
         ) : (
           updates.map((u, i) => (
-            <div key={`${u.jobId}-${u.at}-${i}`} style={{ background: COLORS.panel, border: `1px solid ${COLORS.line}`, borderRadius: 12, padding: 14 }}>
+            <div
+              key={`${u.jobId}-${u.at}-${i}`}
+              onClick={() => setSelected(u)}
+              className="mrcap-press"
+              style={{ background: COLORS.panel, border: `1px solid ${COLORS.line}`, borderRadius: 12, padding: 14, cursor: "pointer" }}
+            >
               <div style={{ display: "flex", justifyContent: "space-between", alignItems: "flex-start", gap: 10 }}>
                 <div>
                   <span style={{ fontFamily: MONO_FONT, fontWeight: 700, fontSize: 14, color: COLORS.ink }}>{u.plate}</span>
@@ -9393,7 +9409,37 @@ function LiveUpdatesBoard({ team }) {
           ))
         )}
       </div>
+      {selected && <UpdatePreviewModal update={selected} onClose={() => setSelected(null)} onOpenJob={onOpenJob} />}
     </div>
+  );
+}
+
+// Tap a car mentioned in an update to "blow it up" into this — a quick
+// preview with a direct way into the full job card, instead of having
+// to go find that job manually from the Dashboard.
+function UpdatePreviewModal({ update, onClose, onOpenJob }) {
+  return createPortal(
+    <div onClick={onClose} style={{ position: "fixed", inset: 0, background: "rgba(0,0,0,0.6)", zIndex: 200, display: "flex", alignItems: "center", justifyContent: "center", padding: 20 }}>
+      <div onClick={(e) => e.stopPropagation()} className="mrcap-fade" style={{ background: COLORS.panel, border: `1px solid ${COLORS.line}`, borderRadius: 16, padding: 20, maxWidth: 400, width: "100%" }}>
+        <div style={{ display: "flex", justifyContent: "space-between", alignItems: "flex-start" }}>
+          <div>
+            <div style={{ fontFamily: MONO_FONT, fontWeight: 700, fontSize: 18, color: COLORS.ink }}>{update.plate}</div>
+            <div style={{ fontSize: 13, color: COLORS.muted, marginTop: 2 }}>{update.makeModel}{update.customerName ? ` · ${update.customerName}` : ""}</div>
+          </div>
+          <button onClick={onClose} className="mrcap-press" style={{ background: "none", border: "none", cursor: "pointer", padding: 4 }}><X size={18} color={COLORS.muted} /></button>
+        </div>
+        <div style={{ background: COLORS.panel2, borderRadius: 10, padding: 12, marginTop: 14, fontSize: 14, color: COLORS.ink, lineHeight: 1.4 }}>{update.note}</div>
+        <div style={{ fontSize: 12, color: COLORS.goldBright, marginTop: 10, fontWeight: 600 }}>{update.by} · {update.categoryLabel} · {new Date(update.at).toLocaleString([], { month: "short", day: "numeric", hour: "2-digit", minute: "2-digit" })}</div>
+        <button
+          onClick={() => { onOpenJob(update.jobId); onClose(); }}
+          className="mrcap-press"
+          style={{ ...primaryBtnStyle, width: "100%", marginTop: 16 }}
+        >
+          Open full job card
+        </button>
+      </div>
+    </div>,
+    document.body
   );
 }
 
