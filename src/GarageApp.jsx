@@ -2606,6 +2606,7 @@ export default function GarageApp() {
       <ReportIssueButton session={session} view={view} />
       <TopBar session={session} team={team} onLogout={onLogout} onNew={() => setView("new")} view={view} onBack={() => window.history.back()} onTeam={() => setView("team")} onArchive={() => setView("archive")} onCustomers={() => setView("customers")} onReports={() => setView("reports")} onQuotes={() => setView("quotes")} canArchive={canArchive} onAdminDash={() => setView("admindash")} onMsgTemplates={() => setView("msgtemplates")} onIssues={() => setView("issues")} onDispatch={() => setView("dispatch")} onLiveUpdates={() => setView("liveupdates")} />
       {showMorningReminder && <MorningReminderBanner onDismiss={() => { setShowMorningReminder(false); dismissMorningReminder("mrcap"); }} />}
+      <LiveUpdateBroadcaster />
       {view === "list" && (
         isSimplifiedRole(session)
           ? <SimplifiedDashboard index={index} session={session} onOpen={openJob} onRefresh={refreshIndex} syncState={syncState} lastSyncedAt={lastSyncedAt} />
@@ -5555,6 +5556,9 @@ function ReportsScreen({ onBack }) {
   const [byStageTime, setByStageTime] = useState([]);
   const [customerRepeat, setCustomerRepeat] = useState(null);
   const [error, setError] = useState(false);
+  const [completionsRange, setCompletionsRange] = useState("30d"); // "7d" | "30d" | "all"
+  const [completionsRaw, setCompletionsRaw] = useState([]); // every "Marked done" entry, unfiltered by range
+  const [completionsLoading, setCompletionsLoading] = useState(true);
 
   const load = useCallback(async () => {
     setLoading(true);
@@ -5579,6 +5583,41 @@ function ReportsScreen({ onBack }) {
 
   useEffect(() => { load(); }, [load]);
 
+  // "Who completed how many jobs" — specifically "Marked done" entries
+  // (not every logged action, like the delegate report above), so it
+  // answers "how many cards has Noel pressed complete on vs Ahmed"
+  // directly. Fetched once; the range selector below just filters the
+  // already-loaded data client-side rather than re-querying.
+  useEffect(() => {
+    (async () => {
+      setCompletionsLoading(true);
+      const { ok, data } = await sbFetch("jobs?select=id,history&order=created_at.desc&limit=900");
+      if (ok && data) {
+        const entries = [];
+        for (const r of data) {
+          for (const entry of r.history || []) {
+            if (entry.stage === "service" && entry.note === "Marked done" && entry.by) {
+              entries.push({ by: entry.by, at: entry.at });
+            }
+          }
+        }
+        setCompletionsRaw(entries);
+      }
+      setCompletionsLoading(false);
+    })();
+  }, []);
+
+  const completionsCutoff = completionsRange === "7d" ? Date.now() - 7 * 86400000 : completionsRange === "30d" ? Date.now() - 30 * 86400000 : 0;
+  const completionsByStaff = (() => {
+    const counts = {};
+    for (const e of completionsRaw) {
+      if (e.at < completionsCutoff) continue;
+      counts[e.by] = (counts[e.by] || 0) + 1;
+    }
+    return Object.entries(counts).sort((a, b) => b[1] - a[1]);
+  })();
+  const completionsMax = Math.max(1, ...completionsByStaff.map(([, c]) => c));
+
   const fmtMonth = (ts) => new Date(ts).toLocaleDateString([], { month: "short", year: "numeric" });
 
   return (
@@ -5596,6 +5635,45 @@ function ReportsScreen({ onBack }) {
 
       {!loading && !error && (
         <>
+          <ReportSection title="Jobs completed, by person" icon={<CheckCircle2 size={14} color={COLORS.gold} />}>
+            <div style={{ display: "flex", gap: 6, marginBottom: 14 }}>
+              {[["7d", "7 days"], ["30d", "30 days"], ["all", "All time"]].map(([key, label]) => (
+                <button
+                  key={key}
+                  onClick={() => setCompletionsRange(key)}
+                  className="mrcap-press"
+                  style={{
+                    padding: "5px 12px", borderRadius: 999, fontSize: 11.5, fontWeight: 700, cursor: "pointer",
+                    border: `1px solid ${completionsRange === key ? COLORS.gold : COLORS.line}`,
+                    background: completionsRange === key ? COLORS.gold : "transparent",
+                    color: completionsRange === key ? COLORS.darkText : COLORS.muted,
+                  }}
+                >
+                  {label}
+                </button>
+              ))}
+            </div>
+            {completionsLoading ? (
+              <SkeletonRows count={3} height={32} />
+            ) : completionsByStaff.length === 0 ? (
+              <ReportEmpty />
+            ) : (
+              <div style={{ display: "flex", flexDirection: "column", gap: 10 }}>
+                {completionsByStaff.map(([name, count]) => (
+                  <div key={name}>
+                    <div style={{ display: "flex", justifyContent: "space-between", fontSize: 12.5, marginBottom: 3 }}>
+                      <span style={{ color: COLORS.ink, fontWeight: 600 }}>{name}</span>
+                      <span style={{ color: COLORS.gold, fontWeight: 700 }}>{count}</span>
+                    </div>
+                    <div style={{ background: COLORS.panel2, borderRadius: 999, height: 8, overflow: "hidden" }}>
+                      <div style={{ width: `${(count / completionsMax) * 100}%`, height: "100%", background: COLORS.gold, borderRadius: 999 }} />
+                    </div>
+                  </div>
+                ))}
+              </div>
+            )}
+          </ReportSection>
+
           <ReportSection title="Jobs by month" icon={<Clock size={14} color={COLORS.gold} />}>
             {byMonth.map((r, i) => (
               <ReportRow key={i} label={fmtMonth(r.month)} value={r.job_count} sub={`${r.collected_count} collected`} />
@@ -7995,6 +8073,87 @@ function playDispatchBeep() {
   } catch { /* best-effort only — a silent tablet shouldn't block the board */ }
 }
 
+// Two soft rising notes — distinct from the flat "new job" beep above
+// and the harsh EOD alarm, so it reads as "someone posted an update"
+// specifically, not confused with either.
+function playUpdateChime() {
+  try {
+    const Ctx = window.AudioContext || window.webkitAudioContext;
+    if (!Ctx) return;
+    const ctx = new Ctx();
+    [520, 660].forEach((freq, i) => {
+      const osc = ctx.createOscillator();
+      const gain = ctx.createGain();
+      osc.connect(gain);
+      gain.connect(ctx.destination);
+      osc.frequency.value = freq;
+      osc.type = "sine";
+      const start = ctx.currentTime + i * 0.11;
+      gain.gain.setValueAtTime(0.001, start);
+      gain.gain.exponentialRampToValueAtTime(0.22, start + 0.02);
+      gain.gain.exponentialRampToValueAtTime(0.001, start + 0.3);
+      osc.start(start);
+      osc.stop(start + 0.3);
+    });
+  } catch { /* best-effort only */ }
+}
+
+// Fetches only progress-update history entries newer than sinceMs,
+// across every job — deliberately lightweight (no photos/diagram, just
+// id/plate/model/history) since this polls frequently on every screen.
+async function loadRecentUpdates(sinceMs) {
+  const { ok, data } = await sbFetch("jobs?select=id,plate,make_model,history&order=updated_at.desc&limit=60");
+  if (!ok || !data) return [];
+  const updates = [];
+  for (const r of data) {
+    for (const entry of r.history || []) {
+      if (entry.stage === "progress_update" && entry.at > sinceMs) {
+        updates.push({ jobId: r.id, plate: r.plate, makeModel: r.make_model, by: entry.by, note: entry.note, categoryLabel: entry.label, at: entry.at });
+      }
+    }
+  }
+  return updates;
+}
+
+// Mounted once at the root of both the main app and the Dispatch Kiosk
+// — polls for new Admin Update / hot-button progress updates every 15s
+// and broadcasts them to whoever has the app open at all, on any
+// screen, with a sound and a toast popup. Only announces updates that
+// happened after this component mounted, so opening the app doesn't
+// replay the day's history all at once.
+function LiveUpdateBroadcaster() {
+  const [toasts, setToasts] = useState([]);
+  const lastSeenRef = useRef(Date.now());
+
+  useEffect(() => {
+    const check = async () => {
+      const updates = await loadRecentUpdates(lastSeenRef.current);
+      if (!updates.length) return;
+      lastSeenRef.current = Math.max(...updates.map((u) => u.at));
+      playUpdateChime();
+      setToasts((prev) => [...prev, ...updates.map((u) => ({ ...u, key: `${u.jobId}-${u.at}` }))]);
+      updates.forEach((u) => {
+        setTimeout(() => setToasts((prev) => prev.filter((t) => t.key !== `${u.jobId}-${u.at}`)), 7000);
+      });
+    };
+    const interval = setInterval(check, 15000);
+    return () => clearInterval(interval);
+  }, []);
+
+  if (!toasts.length) return null;
+  return createPortal(
+    <div style={{ position: "fixed", bottom: 18, right: 18, left: 18, zIndex: 9999, display: "flex", flexDirection: "column", alignItems: "flex-end", gap: 8, pointerEvents: "none" }}>
+      {toasts.map((t) => (
+        <div key={t.key} className="mrcap-fade" style={{ pointerEvents: "auto", maxWidth: 340, width: "100%", background: COLORS.panel, border: `1px solid ${COLORS.gold}`, borderRadius: 12, padding: "12px 14px", boxShadow: "0 10px 26px rgba(0,0,0,0.5)" }}>
+          <div style={{ fontSize: 12.5, fontWeight: 700, color: COLORS.gold }}>{t.by} · {t.plate}{t.makeModel ? ` (${t.makeModel})` : ""}</div>
+          <div style={{ fontSize: 13, color: COLORS.ink, marginTop: 3, lineHeight: 1.35 }}>{t.note}</div>
+        </div>
+      ))}
+    </div>,
+    document.body
+  );
+}
+
 // Picks the best-sounding voice the tablet's browser already has for
 // free — modern Chrome ships genuinely decent voices (not the old
 // robotic screen-reader kind), so there's no need for a paid TTS
@@ -9344,6 +9503,7 @@ export function DispatchKiosk() {
           </button>
         </div>
         {showMorningReminder && <MorningReminderBanner onDismiss={() => { setShowMorningReminder(false); dismissMorningReminder("mrcap_kiosk"); }} />}
+        <LiveUpdateBroadcaster />
         <DispatchBoard team={team} session={session} />
       </div>
     );
