@@ -108,6 +108,28 @@ function canSeeLiveUpdates(session) {
   return !!session && (session.role === "admin" || (session.name || "").toLowerCase() === "noel");
 }
 
+// Full Dashboard/list-view access — normally admin and intake roles
+// only. Noel gets the same view as a named exception (per Suhail's
+// request), without actually becoming an admin or intake role — he
+// keeps his own existing individual permissions (Team screen), this
+// only affects which SCREENS show, not what he's separately allowed to
+// do on them. Takes a plain {role, name} shape so it works for both the
+// live session and a not-yet-logged-in member being previewed on the
+// login screen.
+function isFullDashboardRole(member) {
+  return !!member && (member.role === "admin" || member.role === "intake" || (member.name || "").toLowerCase() === "noel");
+}
+// Same named exception, for the Job Detail screen's simplified-vs-full
+// layout — Noel sees the full case file like an admin/intake login
+// would, instead of the stripped-down shop-floor version his
+// "Detailing" role normally gets. Scoped to Noel specifically so other
+// detailing staff (Ulysses, JP, etc.) are unaffected.
+function isSimplifiedRole(session) {
+  if (!session) return true;
+  if ((session.name || "").toLowerCase() === "noel") return false;
+  return !!ROLE_DEFS[session.role]?.simplified;
+}
+
 // Who can hide/show a car on the Dispatch Board entirely (e.g. it's
 // actually sitting at Smartech, not on-site) — a named list by request,
 // not a toggleable permission flag.
@@ -914,24 +936,59 @@ function saveLocalSession(session) {
   } catch (e) { /* ignore — worst case, they log in again next visit */ }
 }
 
+// Local calendar date as "YYYY-MM-DD" — deliberately NOT toISOString(),
+// which reports the UTC date. Dubai is UTC+4, so toISOString() rolls
+// over to a new day 4 hours before local midnight actually happens —
+// wrong for every "what day is it" check in a shop that runs on local
+// time. Used everywhere "today" needs to mean the shop's actual today.
+function localDateKey(d = new Date()) {
+  return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, "0")}-${String(d.getDate()).padStart(2, "0")}`;
+}
+
 // Shop is open 9am–7pm — everyone gets logged out automatically around
 // 9pm each night (both the main app and the Dispatch Kiosk, tracked
 // separately since they're different devices/sessions). Whoever logs
 // back in next sees a bold reminder to reconcile the board with what's
 // actually in the shop, until they dismiss it. keyPrefix keeps the two
 // flows' localStorage flags independent of each other.
+//
+// Two separate triggers, not one — this matters:
+//  1) It's currently 9pm or later today, and today hasn't been
+//     logged-out yet (the tablet stayed awake and the 5-minute check
+//     caught the moment it turned 9pm).
+//  2) This device is being checked for the first time on a NEW
+//     calendar day since it was last seen — this is what actually
+//     catches a tablet or phone that went to sleep overnight. Its
+//     5-minute timer never fires while asleep, so it can wake up the
+//     next morning with the clock reading 9am — which is *before*
+//     9pm, not after — and trigger #1 alone would wrongly conclude
+//     "it's not logout time" and leave last night's session logged in
+//     all day. Trigger #2 catches this: any time a device is checked
+//     on a different calendar day than it was last confirmed active,
+//     that's proof a night has passed, regardless of what hour it
+//     currently reads.
 const AUTO_LOGOUT_HOUR = 21; // 9pm
 function checkAutoLogout(keyPrefix, hasSession, clearSessionFn) {
   if (!hasSession) return;
   const now = new Date();
-  if (now.getHours() < AUTO_LOGOUT_HOUR) return;
-  const todayKey = now.toISOString().slice(0, 10);
+  const todayKey = localDateKey(now);
   try {
+    const lastActiveDate = window.localStorage.getItem(`${keyPrefix}_last_active_date`);
+    window.localStorage.setItem(`${keyPrefix}_last_active_date`, todayKey);
+    if (lastActiveDate && lastActiveDate !== todayKey) {
+      // Trigger #2 — a new day has started since this device was last seen.
+      window.localStorage.setItem(`${keyPrefix}_auto_logout_date`, todayKey);
+      window.localStorage.setItem(`${keyPrefix}_show_reminder`, "1");
+      clearSessionFn();
+      return;
+    }
+    // Trigger #1 — still the same day as last seen; only log out once we've crossed 9pm.
+    if (now.getHours() < AUTO_LOGOUT_HOUR) return;
     if (window.localStorage.getItem(`${keyPrefix}_auto_logout_date`) === todayKey) return; // already done tonight
     window.localStorage.setItem(`${keyPrefix}_auto_logout_date`, todayKey);
     window.localStorage.setItem(`${keyPrefix}_show_reminder`, "1");
+    clearSessionFn();
   } catch { /* ignore */ }
-  clearSessionFn();
 }
 function shouldShowMorningReminder(keyPrefix) {
   try { return window.localStorage.getItem(`${keyPrefix}_show_reminder`) === "1"; } catch { return false; }
@@ -2531,7 +2588,7 @@ export default function GarageApp() {
   // Desktop back-office mode: only offered at login to admin/intake (see
   // LoginScreen), and only takes effect for those roles even if the flag
   // is somehow set — shop-floor roles always get the normal mobile Shell.
-  const isDesktop = session.viewMode === "pc" && (session.role === "admin" || session.role === "intake");
+  const isDesktop = session.viewMode === "pc" && isFullDashboardRole(session);
   const ActiveShell = isDesktop ? DesktopShell : Shell;
 
   // Same "attention needed" definition as the Follow-ups Due banner and
@@ -2550,14 +2607,14 @@ export default function GarageApp() {
       <TopBar session={session} team={team} onLogout={onLogout} onNew={() => setView("new")} view={view} onBack={() => window.history.back()} onTeam={() => setView("team")} onArchive={() => setView("archive")} onCustomers={() => setView("customers")} onReports={() => setView("reports")} onQuotes={() => setView("quotes")} canArchive={canArchive} onAdminDash={() => setView("admindash")} onMsgTemplates={() => setView("msgtemplates")} onIssues={() => setView("issues")} onDispatch={() => setView("dispatch")} onLiveUpdates={() => setView("liveupdates")} />
       {showMorningReminder && <MorningReminderBanner onDismiss={() => { setShowMorningReminder(false); dismissMorningReminder("mrcap"); }} />}
       {view === "list" && (
-        ROLE_DEFS[session.role]?.simplified
+        isSimplifiedRole(session)
           ? <SimplifiedDashboard index={index} session={session} onOpen={openJob} onRefresh={refreshIndex} syncState={syncState} lastSyncedAt={lastSyncedAt} />
           : <Dashboard index={index} session={session} onOpen={openJob} canArchive={canArchive} onRefresh={refreshIndex} syncState={syncState} lastSyncedAt={lastSyncedAt} />
       )}
       {view === "list" && hasPermission(session, team, "newJob") && (
-        <FloatingNewJobButton onClick={() => setView("new")} />
+        <FloatingNewJobButton onClick={() => setView("quickintake")} />
       )}
-      {view === "list" && (session.role === "admin" || session.role === "intake") && (
+      {view === "list" && isFullDashboardRole(session) && (
         <button
           onClick={() => setView("park")}
           className="mrcap-press"
@@ -2574,14 +2631,18 @@ export default function GarageApp() {
           <PauseCircle size={14} /> Park a Vehicle
         </button>
       )}
+      {view === "quickintake" && hasPermission(session, team, "newJob") && (
+        <QuickIntakeForm session={session} onCreated={(job, saved) => { upsertIndex(job); setSyncState(saved ? "ok" : "failed"); if (saved) setLastSyncedAt(Date.now()); openJob(job.id, job); }} onCancel={() => window.history.back()} onFullForm={() => setView("new")} />
+      )}
+      {view === "quickintake" && !hasPermission(session, team, "newJob") && <AccessDenied onBack={() => window.history.back()} />}
       {view === "new" && hasPermission(session, team, "newJob") && (
         <NewJobForm session={session} team={team} onCreated={(job, saved) => { upsertIndex(job); setSyncState(saved ? "ok" : "failed"); if (saved) setLastSyncedAt(Date.now()); openJob(job.id, job); }} onCancel={() => window.history.back()} />
       )}
       {view === "new" && !hasPermission(session, team, "newJob") && <AccessDenied onBack={() => window.history.back()} />}
-      {view === "park" && (session.role === "admin" || session.role === "intake") && (
+      {view === "park" && isFullDashboardRole(session) && (
         <ParkVehicleForm session={session} onCreated={(job, saved) => { upsertIndex(job); setSyncState(saved ? "ok" : "failed"); if (saved) setLastSyncedAt(Date.now()); openJob(job.id, job); }} onCancel={() => window.history.back()} />
       )}
-      {view === "park" && !(session.role === "admin" || session.role === "intake") && <AccessDenied onBack={() => window.history.back()} />}
+      {view === "park" && !isFullDashboardRole(session) && <AccessDenied onBack={() => window.history.back()} />}
       {view === "detail" && activeId && (
         <JobDetail id={activeId} initialJob={activeJob} session={session} team={team} onChanged={(job, saved) => { upsertIndex(job); setActiveJob(job); setSyncState(saved ? "ok" : "failed"); if (saved) setLastSyncedAt(Date.now()); }} onBack={() => window.history.back()} canArchive={canArchive} onDeleted={(jobId) => { removeFromIndex(jobId); window.history.back(); }} />
       )}
@@ -2740,7 +2801,7 @@ function LoginScreen({ team, setTeam, onLogin }) {
           <button onClick={backspace} style={keyBtnStyle} className="mrcap-press"><Delete size={17} color={COLORS.ink} /></button>
         </div>
 
-        {(picked.role === "admin" || picked.role === "intake") && (
+        {isFullDashboardRole(picked) && (
           <div style={{ marginTop: 30, display: "flex", flexDirection: "column", alignItems: "center", gap: 8 }}>
             <div style={{ fontSize: 9.5, color: COLORS.muted, letterSpacing: 1, textTransform: "uppercase" }}>View as</div>
             <div style={{ display: "flex", gap: 6, background: COLORS.panel2, borderRadius: 10, padding: 4 }}>
@@ -2792,7 +2853,7 @@ const keyBtnStyle = { height: 54, borderRadius: 12, border: `1px solid ${COLORS.
 /* ---------------- Top bar ---------------- */
 
 function TopBar({ session, team, onLogout, onNew, view, onBack, onTeam, onArchive, onCustomers, onReports, onQuotes, canArchive, onAdminDash, onMsgTemplates, onIssues, onDispatch, onLiveUpdates }) {
-  const isSimplified = !!ROLE_DEFS[session.role]?.simplified;
+  const isSimplified = isSimplifiedRole(session);
   return (
     <div className="mrcap-view">
       <div style={{ height: 2, background: `linear-gradient(90deg, transparent, ${COLORS.gold}, transparent)` }} />
@@ -3444,6 +3505,95 @@ function ParkVehicleForm({ session, onCreated, onCancel }) {
           {saving ? "Saving…" : "Park Vehicle (On Hold)"}
         </button>
       </div>
+    </div>
+  );
+}
+
+// Quick Intake — deliberately the opposite of the full Job Card below:
+// plate and a photo, nothing else required. Built because staff kept
+// posting new cars to the WhatsApp group instead of the app, since
+// snapping a photo there was faster than the full form here. This is
+// meant to actually beat that — get the car into the system in under
+// 15 seconds, then classify service type, pricing, damage notes, and
+// the rest later (it lands unclassified, exactly like any job missing
+// a service type — it'll show up in the Dispatch Board's "needs a
+// service type" strip automatically). No signature or terms step here;
+// that's still captured whenever the full details get filled in.
+function QuickIntakeForm({ session, onCreated, onCancel, onFullForm }) {
+  const [plate, setPlate] = useState("");
+  const [customerName, setCustomerName] = useState("");
+  const [photos, setPhotos] = useState([]);
+  const [saving, setSaving] = useState(false);
+  const [saveError, setSaveError] = useState(false);
+  const fileRef = useRef(null);
+
+  const addPhotos = async (files) => {
+    const compressed = await Promise.all(Array.from(files).map((f) => compressImage(f)));
+    setPhotos((p) => [...p, ...compressed]);
+  };
+
+  const submit = async () => {
+    if (!plate.trim()) return;
+    setSaving(true);
+    const now = Date.now();
+    const job = {
+      plate: plate.trim().toUpperCase(), makeModel: "", customerName: customerName.trim() || "—", customerPhone: "",
+      description: "", damageNotes: "", priority: "Medium", location: LOCATIONS[0],
+      serviceTypes: [], treatments: {}, treatmentPrices: {}, discountPercent: 0, priceHistory: [],
+      serviceDone: {}, assignedTo: {}, stageIndex: 0,
+      photos: { intake: photos, parts_removal: [], service: {} },
+      startTime: null, stopTime: null, invoiceAmount: "", signature: null, signedAt: null,
+      damagePanels: [], damageDiagramImage: null,
+      history: [{ stage: "intake", label: "Intake", by: session.name, role: session.role, note: "Quick intake — full details to follow", at: now }],
+      createdAt: now, updatedAt: now, createdBy: session.name,
+    };
+    const result = await createJob(job);
+    setSaving(false);
+    if (!result.ok || !result.job.id) { setSaveError(true); return; }
+    onCreated(result.job, result.ok);
+  };
+
+  return (
+    <div className="mrcap-view" style={{ padding: "4px 18px 30px" }}>
+      <SectionTitle>Quick Intake</SectionTitle>
+      <div style={{ fontSize: 12, color: COLORS.muted, marginTop: -10, marginBottom: 16 }}>
+        Get it into the system now — plate and a photo. Everything else (service type, pricing, damage notes) can be filled in later.
+      </div>
+
+      <Field label="Plate number"><PlatePicker value={plate} onChange={setPlate} /></Field>
+      <Field label="Whose car (optional)"><input style={inputStyle} value={customerName} onChange={(e) => setCustomerName(e.target.value)} placeholder="Skip if you don't know it yet" /></Field>
+
+      <Field label="Photo">
+        <input ref={fileRef} type="file" accept="image/*" capture="environment" multiple style={{ display: "none" }} onChange={(e) => { if (e.target.files.length) addPhotos(e.target.files); e.target.value = ""; }} />
+        <button onClick={() => fileRef.current.click()} className="mrcap-press" style={{ ...cameraBtnStyle, width: "100%", justifyContent: "center", padding: "16px" }}>
+          <Camera size={18} /> {photos.length ? `${photos.length} photo${photos.length === 1 ? "" : "s"} added — add more` : "Take a photo"}
+        </button>
+        {photos.length > 0 && (
+          <div style={{ display: "flex", gap: 7, overflowX: "auto", marginTop: 10 }}>
+            {photos.map((src, i) => (
+              <img key={i} src={src} alt="" style={{ width: 64, height: 64, objectFit: "cover", borderRadius: 8, border: `1px solid ${COLORS.line}`, flexShrink: 0 }} />
+            ))}
+          </div>
+        )}
+      </Field>
+
+      {saveError && (
+        <div style={{ background: "rgba(168,64,47,0.15)", border: `1px solid ${COLORS.red}`, borderRadius: 10, padding: "10px 12px", marginBottom: 14, fontSize: 12.5, color: "#E08A78" }}>
+          Couldn't save to the server. {lastStorageError && <span style={{ fontFamily: "monospace", display: "block", marginTop: 4, fontSize: 10.5 }}>{lastStorageError}</span>}
+        </div>
+      )}
+
+      <div style={{ display: "flex", gap: 10, marginTop: 20 }}>
+        <button onClick={onCancel} className="mrcap-press" style={{ ...secondaryBtnStyle, flex: 1 }}>Cancel</button>
+        <button onClick={submit} disabled={!plate.trim() || saving} className="mrcap-press" style={{ ...primaryBtnStyle, flex: 2, opacity: !plate.trim() ? 0.5 : 1 }}>
+          {saving ? "Saving…" : "Save — finish details later"}
+        </button>
+      </div>
+      {onFullForm && (
+        <button onClick={onFullForm} className="mrcap-press" style={{ width: "100%", marginTop: 12, background: "none", border: "none", color: COLORS.muted, fontSize: 12, textDecoration: "underline", cursor: "pointer" }}>
+          Have all the details now? Fill in the full job card instead
+        </button>
+      )}
     </div>
   );
 }
@@ -4303,7 +4453,7 @@ function JobDetail({ id, initialJob, session, team, onChanged, onBack, canArchiv
   // screen). This is what "everyone can fix their own honest mistake,
   // without full edit power" actually means in practice.
   const canToggleService = (key) => {
-    if (!ROLE_DEFS[session.role]?.simplified) return true;
+    if (!isSimplifiedRole(session)) return true;
     if (!job.serviceDone[key]) return true; // marking done for the first time is always fine
     const relevant = (job.history || []).filter((h) => h.stage === "service" && (SERVICES.find((s) => s.key === key)?.label) === h.label);
     const last = relevant[relevant.length - 1];
@@ -4546,7 +4696,7 @@ function JobDetail({ id, initialJob, session, team, onChanged, onBack, canArchiv
   // service(s) only, huge tap targets, nothing to configure. Reuses the
   // same toggleServiceDone/setServiceNote/photo handlers as the full view
   // so the underlying data and history logging stay identical.
-  if (ROLE_DEFS[session.role]?.simplified) {
+  if (isSimplifiedRole(session)) {
     const myServices = activeServices.filter((s) => s.role === session.role);
     return (
       <div className="mrcap-view" style={{ padding: "0 18px 34px" }}>
@@ -4716,7 +4866,7 @@ function JobDetail({ id, initialJob, session, team, onChanged, onBack, canArchiv
         </div>
       )}
 
-      {(session.role === "admin" || session.role === "intake") && (
+      {isFullDashboardRole(session) && (
         job.onHold ? (
           <button onClick={takeOffHold} disabled={busy} className="mrcap-press" style={{ display: "flex", alignItems: "center", justifyContent: "center", gap: 8, width: "100%", padding: "12px", borderRadius: 10, border: `1.5px solid ${COLORS.green}`, background: "rgba(74,122,87,0.1)", color: "#7BC494", fontWeight: 700, fontSize: 13, cursor: "pointer", marginBottom: 12, opacity: busy ? 0.6 : 1 }}>
             <PauseCircle size={15} /> Take Off Hold
@@ -4737,7 +4887,7 @@ function JobDetail({ id, initialJob, session, team, onChanged, onBack, canArchiv
         )
       )}
 
-      {(session.role === "admin" || session.role === "intake") && (
+      {isFullDashboardRole(session) && (
         <button
           onClick={() => {
             const doc = generateJobCardPDF(job);
@@ -8459,7 +8609,7 @@ function DispatchBoard({ team, session }) {
     }
     const check = () => {
       const now = new Date();
-      const todayKey = now.toISOString().slice(0, 10);
+      const todayKey = localDateKey(now);
       const alreadyDismissed = window.localStorage?.getItem("mrcap_eod_reminder_dismissed") === todayKey;
       if (!alreadyDismissed && now.getHours() === 18 && now.getMinutes() === 45) {
         setShowEndOfDayReminder(true);
@@ -8470,7 +8620,7 @@ function DispatchBoard({ team, session }) {
     return () => clearInterval(t);
   }, []);
   const dismissEndOfDayReminder = () => {
-    const todayKey = new Date().toISOString().slice(0, 10);
+    const todayKey = localDateKey();
     try { window.localStorage?.setItem("mrcap_eod_reminder_dismissed", todayKey); } catch { /* ignore */ }
     setShowEndOfDayReminder(false);
   };
@@ -8974,7 +9124,7 @@ async function loadLiveUpdates() {
   );
   if (!ok || !data) return { updates: [], digest: null };
   const updates = [];
-  const todayKey = new Date().toISOString().slice(0, 10);
+  const todayKey = localDateKey();
   let finishedToday = 0;
   const byStaff = {}; // name -> count
   const durations = []; // minutes, only where a matching start timestamp exists
@@ -8987,7 +9137,7 @@ async function loadLiveUpdates() {
           categoryLabel: entry.label, by: entry.by, note: entry.note, at: entry.at,
         });
       }
-      if (entry.stage === "service" && entry.note === "Marked done" && new Date(entry.at).toISOString().slice(0, 10) === todayKey) {
+      if (entry.stage === "service" && entry.note === "Marked done" && localDateKey(new Date(entry.at)) === todayKey) {
         finishedToday += 1;
         if (entry.by) byStaff[entry.by] = (byStaff[entry.by] || 0) + 1;
         // Best-effort: service_started only ever holds the *current* start
