@@ -101,11 +101,11 @@ function isSuperAdmin(session) {
   return !!session && session.id === "suhail";
 }
 
-// Live Updates access — any admin login, plus Noel specifically (a
-// named exception, same pattern as isSuperAdmin above, not a toggleable
-// permission).
+// Live Updates access — any admin login, plus Noel and Laani
+// specifically (named exceptions, same pattern as isSuperAdmin above,
+// not a toggleable permission).
 function canSeeLiveUpdates(session) {
-  return !!session && (session.role === "admin" || (session.name || "").toLowerCase() === "noel");
+  return !!session && (session.role === "admin" || ["noel", "laani"].includes((session.name || "").toLowerCase()));
 }
 
 // Full Dashboard/list-view access — normally admin and intake roles
