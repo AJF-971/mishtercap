@@ -1738,7 +1738,30 @@ async function convertQuoteToJob(quote, session) {
   return { ok: true, job: result.job, quote: updatedQuote };
 }
 
+// Blocks logging the same plate twice while it's already an active job
+// in the shop (stage before "Collected") — this happened for real, the
+// same car got double-intaked as two separate job cards. Checked
+// against live Supabase state (not just the local index) so it still
+// catches a duplicate even when two people are intaking near-
+// simultaneously on different devices.
+async function findActiveJobByPlate(plate) {
+  const normalized = (plate || "").trim();
+  if (!normalized) return null;
+  const collectedIndex = STAGES.findIndex((s) => s.key === "collected");
+  const { ok, data } = await sbFetch(`jobs?plate=ilike.${encodeURIComponent(normalized)}&stage_index=lt.${collectedIndex}&select=id,plate,make_model,customer_name,stage_index&order=created_at.desc&limit=1`);
+  if (!ok || !data || !data.length) return null;
+  return data[0];
+}
+
 async function createJob(job, { reassignVehicle = false, customerType = null } = {}) {
+  const dupe = await findActiveJobByPlate(job.plate);
+  if (dupe) {
+    return {
+      ok: false, duplicate: true, job,
+      reason: `${dupe.plate} is already an active job (${dupe.make_model || "vehicle"}${dupe.customer_name ? ` · ${dupe.customer_name}` : ""}, ${STAGES[dupe.stage_index]?.label || "in progress"}). Open that job instead of creating a new one.`,
+      existingJobId: dupe.id,
+    };
+  }
   const customer = await findOrCreateCustomer(job.customerName, job.customerPhone, customerType);
   const vehicle = customer ? await findOrCreateVehicle(customer.id, job.plate, job.makeModel) : null;
   // Ownership only changes here, explicitly, when intake staff confirmed
@@ -2811,7 +2834,7 @@ export default function GarageApp() {
       <TopBar session={session} team={team} onLogout={onLogout} onNew={() => setView("new")} view={view} onBack={() => window.history.back()} onTeam={() => setView("team")} onArchive={() => setView("archive")} onCustomers={() => setView("customers")} onReports={() => setView("reports")} onQuotes={() => setView("quotes")} canArchive={canArchive} onAdminDash={() => setView("admindash")} onMsgTemplates={() => setView("msgtemplates")} onIssues={() => setView("issues")} onDispatch={() => setView("dispatch")} onLiveUpdates={() => setView("liveupdates")} />
       {showMorningReminder && <MorningReminderBanner onDismiss={() => { setShowMorningReminder(false); dismissMorningReminder("mrcap"); }} />}
       <LiveUpdateBroadcaster onOpenJob={(id) => openJob(id)} />
-      {canSeeLiveUpdates(session) && <InternalUpdatesWidget team={team} onOpenJob={(id) => openJob(id)} />}
+      {canSeeLiveUpdates(session) && <InternalUpdatesWidget team={team} session={session} index={index} onOpenJob={(id) => openJob(id)} />}
       {view === "list" && (
         isSimplifiedRole(session)
           ? <SimplifiedDashboard index={index} session={session} onOpen={openJob} onRefresh={refreshIndex} syncState={syncState} lastSyncedAt={lastSyncedAt} />
@@ -2877,7 +2900,7 @@ export default function GarageApp() {
       )}
       {view === "reports" && !hasPermission(session, team, "reports") && <AccessDenied onBack={() => window.history.back()} />}
       {view === "dispatch" && <DispatchBoard team={team} session={session} />}
-      {view === "liveupdates" && canSeeLiveUpdates(session) && <LiveUpdatesBoard team={team} onOpenJob={(id) => openJob(id)} />}
+      {view === "liveupdates" && canSeeLiveUpdates(session) && <LiveUpdatesBoard team={team} session={session} index={index} onOpenJob={(id) => openJob(id)} />}
       {view === "liveupdates" && !canSeeLiveUpdates(session) && <AccessDenied onBack={() => window.history.back()} />}
       {view === "admindash" && isSuperAdmin(session) && (
         <AdminStatsScreen team={team} onBack={() => window.history.back()} />
@@ -3641,7 +3664,7 @@ function NewQuoteForm({ session, onCreated, onCancel }) {
 
       {saveError && (
         <div style={{ background: "rgba(168,64,47,0.15)", border: `1px solid ${COLORS.red}`, borderRadius: 10, padding: "10px 12px", marginBottom: 14, fontSize: 12.5, color: "#E08A78" }}>
-          Couldn't save to the server. {lastStorageError && <span style={{ fontFamily: "monospace", display: "block", marginTop: 4, fontSize: 10.5 }}>{lastStorageError}</span>}
+          {typeof saveError === "string" ? saveError : "Couldn't save to the server."} {lastStorageError && <span style={{ fontFamily: "monospace", display: "block", marginTop: 4, fontSize: 10.5 }}>{lastStorageError}</span>}
         </div>
       )}
 
@@ -3684,7 +3707,7 @@ function ParkVehicleForm({ session, onCreated, onCancel }) {
     };
     const result = await createJob(job);
     setSaving(false);
-    if (!result.ok || !result.job.id) { setSaveError(true); return; }
+    if (!result.ok || !result.job.id) { setSaveError(result.reason || true); return; }
     onCreated(result.job, result.ok);
   };
 
@@ -3703,7 +3726,7 @@ function ParkVehicleForm({ session, onCreated, onCancel }) {
 
       {saveError && (
         <div style={{ background: "rgba(168,64,47,0.15)", border: `1px solid ${COLORS.red}`, borderRadius: 10, padding: "10px 12px", marginBottom: 14, fontSize: 12.5, color: "#E08A78" }}>
-          Couldn't save to the server. {lastStorageError && <span style={{ fontFamily: "monospace", display: "block", marginTop: 4, fontSize: 10.5 }}>{lastStorageError}</span>}
+          {typeof saveError === "string" ? saveError : "Couldn't save to the server."} {lastStorageError && <span style={{ fontFamily: "monospace", display: "block", marginTop: 4, fontSize: 10.5 }}>{lastStorageError}</span>}
         </div>
       )}
 
@@ -3757,7 +3780,7 @@ function QuickIntakeForm({ session, onCreated, onCancel, onFullForm }) {
     };
     const result = await createJob(job);
     setSaving(false);
-    if (!result.ok || !result.job.id) { setSaveError(true); return; }
+    if (!result.ok || !result.job.id) { setSaveError(result.reason || true); return; }
     onCreated(result.job, result.ok);
   };
 
@@ -3787,7 +3810,7 @@ function QuickIntakeForm({ session, onCreated, onCancel, onFullForm }) {
 
       {saveError && (
         <div style={{ background: "rgba(168,64,47,0.15)", border: `1px solid ${COLORS.red}`, borderRadius: 10, padding: "10px 12px", marginBottom: 14, fontSize: 12.5, color: "#E08A78" }}>
-          Couldn't save to the server. {lastStorageError && <span style={{ fontFamily: "monospace", display: "block", marginTop: 4, fontSize: 10.5 }}>{lastStorageError}</span>}
+          {typeof saveError === "string" ? saveError : "Couldn't save to the server."} {lastStorageError && <span style={{ fontFamily: "monospace", display: "block", marginTop: 4, fontSize: 10.5 }}>{lastStorageError}</span>}
         </div>
       )}
 
@@ -3979,7 +4002,7 @@ function NewJobForm({ session, team, onCreated, onCancel }) {
     };
     const result = await createJob(job, { reassignVehicle: ownerChoice === "different", customerType });
     setSaving(false);
-    if (!result.ok || !result.job.id) { setSaveError(true); return; }
+    if (!result.ok || !result.job.id) { setSaveError(result.reason || true); return; }
     onCreated(result.job, result.ok);
   };
 
@@ -4180,7 +4203,7 @@ function NewJobForm({ session, team, onCreated, onCancel }) {
 
       {saveError && (
         <div style={{ background: "rgba(168,64,47,0.15)", border: `1px solid ${COLORS.red}`, borderRadius: 10, padding: "10px 12px", marginBottom: 14, fontSize: 12.5, color: "#E08A78" }}>
-          Couldn't save to the server. {lastStorageError && <span style={{ fontFamily: "monospace", display: "block", marginTop: 4, fontSize: 10.5 }}>{lastStorageError}</span>}
+          {typeof saveError === "string" ? saveError : "Couldn't save to the server."} {lastStorageError && <span style={{ fontFamily: "monospace", display: "block", marginTop: 4, fontSize: 10.5 }}>{lastStorageError}</span>}
         </div>
       )}
 
@@ -4538,6 +4561,7 @@ function JobDetail({ id, initialJob, session, team, onChanged, onBack, canArchiv
   const [savingMarkup, setSavingMarkup] = useState(false);
   const [savingStatusNote, setSavingStatusNote] = useState(false);
   const [customStatusNote, setCustomStatusNote] = useState("");
+  const [dupeUpdateWarning, setDupeUpdateWarning] = useState("");
   const addCompletionPhotos = async (files) => {
     setUploadingCompletion(true);
     const compressed = await Promise.all(Array.from(files).map((f) => compressImage(f)));
@@ -4761,12 +4785,26 @@ function JobDetail({ id, initialJob, session, team, onChanged, onBack, canArchiv
   // it also shows up on the admin Live Updates board. Customers no
   // longer receive anything from this section — their tracking page
   // falls back to the plain stage label instead.
+  // 30s gate against double-posting the exact same update on this job —
+  // catches an accidental double-tap on the same preset (e.g. "Started
+  // work" twice in a row), which happened for real and cluttered both
+  // the job history and the Live Updates board with duplicates.
+  const DUPE_UPDATE_WINDOW_MS = 30000;
   const postAdminUpdate = async (text) => {
-    if (!text.trim()) return;
+    const trimmed = text.trim();
+    if (!trimmed) return;
+    const recentSame = (job.history || [])
+      .filter((h) => h.stage === "progress_update" && h.note === trimmed)
+      .slice(-1)[0];
+    if (recentSame && Date.now() - recentSame.at < DUPE_UPDATE_WINDOW_MS) {
+      setDupeUpdateWarning(`Already posted "${trimmed}" — wait a moment before posting it again.`);
+      setTimeout(() => setDupeUpdateWarning(""), 3000);
+      return;
+    }
     setSavingStatusNote(true);
     const updated = {
       ...job,
-      history: [...(job.history || []), { stage: "progress_update", label: stage.label, by: session.name, role: session.role, note: text.trim(), at: Date.now() }],
+      history: [...(job.history || []), { stage: "progress_update", label: stage.label, by: session.name, role: session.role, note: trimmed, at: Date.now() }],
       updatedAt: Date.now(),
     };
     const saved = await saveJob(updated);
@@ -5240,6 +5278,11 @@ function JobDetail({ id, initialJob, session, team, onChanged, onBack, canArchiv
             </div>
           )}
 
+          {dupeUpdateWarning && (
+            <div style={{ fontSize: 11.5, color: COLORS.gold, background: "rgba(201,162,39,0.12)", border: `1px solid ${COLORS.gold}`, borderRadius: 8, padding: "7px 10px", marginBottom: 10 }}>
+              {dupeUpdateWarning}
+            </div>
+          )}
           <div style={{ display: "flex", flexWrap: "wrap", gap: 6, marginBottom: 10 }}>
             {DISPATCH_UPDATE_PRESETS.map((preset) => (
               <button
@@ -8359,7 +8402,7 @@ async function loadRecentUpdates(sinceMs) {
 // the existing LiveUpdatesBoard in a slide-over panel so it's reachable
 // from wherever someone happens to be in the app, without navigating
 // away from what they're doing.
-function InternalUpdatesWidget({ team, onOpenJob }) {
+function InternalUpdatesWidget({ team, onOpenJob, session, index }) {
   const [open, setOpen] = useState(false);
   return (
     <>
@@ -8384,7 +8427,7 @@ function InternalUpdatesWidget({ team, onOpenJob }) {
               <div style={{ fontFamily: DISPLAY_FONT, fontWeight: 700, fontSize: 15, color: COLORS.ink }}>Internal Updates</div>
               <button onClick={() => setOpen(false)} className="mrcap-press" style={{ background: "none", border: "none", cursor: "pointer", color: COLORS.muted, padding: 4 }}><X size={18} /></button>
             </div>
-            <LiveUpdatesBoard team={team} onOpenJob={(id) => { setOpen(false); onOpenJob(id); }} />
+            <LiveUpdatesBoard team={team} session={session} index={index} onOpenJob={(id) => { setOpen(false); onOpenJob(id); }} />
           </div>
         </div>,
         document.body
@@ -9022,6 +9065,7 @@ function DispatchBoard({ team, session }) {
     });
   };
   const [saving, setSaving] = useState(false);
+  const [dupeUpdateToast, setDupeUpdateToast] = useState("");
   const [nowTick, setNowTick] = useState(() => Date.now());
   const [showAlertsDetail, setShowAlertsDetail] = useState(false);
   const [sortOrder, setSortOrder] = useState("oldest"); // "oldest" | "newest" | "priority"
@@ -9276,12 +9320,26 @@ function DispatchBoard({ team, session }) {
   // these out of the mix without picking up every Started/Finished/
   // Moved/Assigned entry too.
   const canWriteUpdate = ["ahmed", "noel"].includes((session.name || "").toLowerCase());
+  // Same 30s dupe gate as the JobDetail Admin Update box — stops a
+  // double-tap on the same preset (e.g. "Started work" twice) from
+  // logging twice, checked against the freshly-fetched history so it
+  // still catches a duplicate posted from another device moments ago.
+  const DISPATCH_DUPE_UPDATE_WINDOW_MS = 30000;
   const addProgressUpdate = async (row, text) => {
     markLocalWrite();
     setSaving(true);
     const { job, categoryLabel } = row;
     const { ok, data } = await sbFetch(`jobs?id=eq.${job.id}&select=history`);
     const current = ok && data && data[0] ? data[0] : { history: [] };
+    const recentSame = (current.history || [])
+      .filter((h) => h.stage === "progress_update" && h.note === text)
+      .slice(-1)[0];
+    if (recentSame && Date.now() - recentSame.at < DISPATCH_DUPE_UPDATE_WINDOW_MS) {
+      setSaving(false);
+      setDupeUpdateToast(`Already posted "${text}" on ${job.plate} — wait a moment before posting it again.`);
+      setTimeout(() => setDupeUpdateToast(""), 3000);
+      return;
+    }
     const nextHistory = [
       ...(current.history || []),
       { stage: "progress_update", label: categoryLabel, by: session.name, role: session.role, note: text, at: Date.now() },
@@ -9420,6 +9478,14 @@ function DispatchBoard({ team, session }) {
 
   return (
     <div className="mrcap-view" style={{ padding: 16, display: "flex", flexDirection: "column", gap: 14, minHeight: "calc(100vh - 80px)" }}>
+      {dupeUpdateToast && createPortal(
+        <div style={{ position: "fixed", bottom: 18, right: 18, left: 18, zIndex: 9999, display: "flex", justifyContent: "flex-end", pointerEvents: "none" }}>
+          <div style={{ maxWidth: 340, width: "100%", background: COLORS.panel, border: `1px solid ${COLORS.gold}`, borderRadius: 12, padding: "12px 14px", boxShadow: "0 10px 26px rgba(0,0,0,0.5)", color: COLORS.gold, fontSize: 12.5, fontWeight: 600 }}>
+            {dupeUpdateToast}
+          </div>
+        </div>,
+        document.body
+      )}
       <div style={{ display: "flex", justifyContent: "space-between", alignItems: "flex-end", flexWrap: "wrap", gap: 10 }}>
         <div style={{ display: "flex", alignItems: "center", gap: 12 }}>
           <div style={{ width: 46, height: 46, borderRadius: 11, background: "#fff", display: "flex", alignItems: "center", justifyContent: "center", padding: "7px 9px", boxSizing: "border-box", flexShrink: 0, border: `1px solid ${COLORS.line}`, boxShadow: `0 0 0 1px rgba(74,100,120,0.35), 0 8px 20px -10px rgba(0,0,0,0.6)` }}>
@@ -9564,6 +9630,35 @@ function DispatchBoard({ team, session }) {
    6s urgency since it's a monitoring view, not something staff act on
    in real time. */
 
+// Shared post path for an internal progress update tied to a specific
+// job, used by the Internal Updates widget's composer (pick a car, or
+// reply inside an existing update) — same shape and same 30s dupe gate
+// as postAdminUpdate/addProgressUpdate elsewhere in the app, so an
+// update posted from here shows up identically on the job's own
+// history and on the Live Updates board.
+const PROGRESS_UPDATE_DUPE_WINDOW_MS = 30000;
+async function postProgressUpdateToJob(jobId, text, session) {
+  const trimmed = (text || "").trim();
+  if (!trimmed || !jobId || !session) return { ok: false };
+  const { ok, data } = await sbFetch(`jobs?id=eq.${jobId}&select=history,plate,make_model`);
+  const current = ok && data && data[0] ? data[0] : null;
+  if (!current) return { ok: false };
+  const recentSame = (current.history || [])
+    .filter((h) => h.stage === "progress_update" && h.note === trimmed)
+    .slice(-1)[0];
+  if (recentSame && Date.now() - recentSame.at < PROGRESS_UPDATE_DUPE_WINDOW_MS) {
+    return { ok: false, dupe: true };
+  }
+  const entry = { stage: "progress_update", label: current.make_model || "", by: session.name, role: session.role, note: trimmed, at: Date.now() };
+  const nextHistory = [...(current.history || []), entry];
+  await sbFetch(`jobs?id=eq.${jobId}`, {
+    method: "PATCH",
+    headers: { Prefer: "return=minimal" },
+    body: JSON.stringify({ history: nextHistory, updated_at: new Date().toISOString() }),
+  });
+  return { ok: true, entry: { jobId, plate: current.plate, makeModel: current.make_model, ...entry } };
+}
+
 async function loadLiveUpdates() {
   const { ok, data } = await sbFetch(
     "jobs?select=id,plate,make_model,customer_name,stage_index,history,service_started&order=updated_at.desc&limit=300"
@@ -9609,11 +9704,115 @@ async function loadLiveUpdates() {
   return { updates, digest };
 }
 
-function LiveUpdatesBoard({ team, onOpenJob }) {
+// Search-as-you-type car picker for the Live Updates composer — matches
+// on plate, customer name or make/model against the already-loaded
+// index, so picking a car to post about doesn't need its own fetch.
+function LiveUpdatesCarPicker({ index, onPick }) {
+  const [query, setQuery] = useState("");
+  const matches = query.trim().length < 1 ? [] : (index || [])
+    .filter((j) => {
+      const q = query.trim().toLowerCase();
+      return (j.plate || "").toLowerCase().includes(q)
+        || (j.customerName || "").toLowerCase().includes(q)
+        || (j.makeModel || "").toLowerCase().includes(q);
+    })
+    .slice(0, 8);
+  return (
+    <div>
+      <input
+        value={query}
+        onChange={(e) => setQuery(e.target.value)}
+        placeholder="Search plate, customer or model…"
+        style={{ ...inputStyle, marginTop: 0 }}
+      />
+      {matches.length > 0 && (
+        <div style={{ marginTop: 8, display: "flex", flexDirection: "column", gap: 6 }}>
+          {matches.map((j) => (
+            <button
+              key={j.id}
+              onClick={() => { onPick(j); setQuery(""); }}
+              className="mrcap-press"
+              style={{ textAlign: "left", padding: "9px 11px", borderRadius: 9, border: `1px solid ${COLORS.line}`, background: COLORS.panel2, cursor: "pointer" }}
+            >
+              <span style={{ fontFamily: MONO_FONT, fontWeight: 700, fontSize: 13, color: COLORS.ink }}>{j.plate}</span>
+              <span style={{ fontSize: 12, color: COLORS.muted, marginLeft: 8 }}>{j.makeModel}{j.customerName ? ` · ${j.customerName}` : ""}</span>
+            </button>
+          ))}
+        </div>
+      )}
+    </div>
+  );
+}
+
+// Shared "pick a preset or type your own, then post" body — used both
+// by the Live Updates composer (car picked from the search box above)
+// and by UpdatePreviewModal's reply box (car already known from the
+// update being viewed). Same 30s dupe gate as everywhere else, via
+// postProgressUpdateToJob.
+function PostUpdateComposer({ jobId, session, onPosted }) {
+  const [text, setText] = useState("");
+  const [posting, setPosting] = useState(false);
+  const [warning, setWarning] = useState("");
+
+  const post = async (value) => {
+    const trimmed = (value || text).trim();
+    if (!trimmed || posting) return;
+    setPosting(true);
+    const result = await postProgressUpdateToJob(jobId, trimmed, session);
+    setPosting(false);
+    if (result.dupe) {
+      setWarning(`Already posted "${trimmed}" — wait a moment before posting it again.`);
+      setTimeout(() => setWarning(""), 3000);
+      return;
+    }
+    if (result.ok) {
+      setText("");
+      onPosted && onPosted(result.entry);
+    }
+  };
+
+  return (
+    <div>
+      {warning && (
+        <div style={{ fontSize: 11.5, color: COLORS.gold, background: "rgba(201,162,39,0.12)", border: `1px solid ${COLORS.gold}`, borderRadius: 8, padding: "7px 10px", marginBottom: 8 }}>
+          {warning}
+        </div>
+      )}
+      <div style={{ display: "flex", flexWrap: "wrap", gap: 6, marginBottom: 8 }}>
+        {DISPATCH_UPDATE_PRESETS.map((preset) => (
+          <button
+            key={preset}
+            onClick={() => post(preset)}
+            disabled={posting}
+            className="mrcap-press"
+            style={{ padding: "7px 11px", borderRadius: 999, fontSize: 11.5, cursor: "pointer", border: `1.5px solid ${COLORS.line}`, background: COLORS.panel2, color: COLORS.ink, fontWeight: 500, opacity: posting ? 0.6 : 1 }}
+          >
+            {preset}
+          </button>
+        ))}
+      </div>
+      <div style={{ display: "flex", gap: 8 }}>
+        <input
+          value={text}
+          onChange={(e) => setText(e.target.value)}
+          placeholder="Or type your own update…"
+          style={{ ...inputStyle, marginTop: 0, flex: 1 }}
+          onKeyDown={(e) => { if (e.key === "Enter") post(); }}
+        />
+        <button onClick={() => post()} disabled={posting || !text.trim()} className="mrcap-press" style={{ ...secondaryBtnStyle, padding: "0 16px", opacity: posting || !text.trim() ? 0.5 : 1 }}>
+          Post
+        </button>
+      </div>
+    </div>
+  );
+}
+
+function LiveUpdatesBoard({ team, onOpenJob, session, index }) {
   const [updates, setUpdates] = useState([]);
   const [digest, setDigest] = useState(null);
   const [loading, setLoading] = useState(true);
   const [selected, setSelected] = useState(null);
+  const [composerJob, setComposerJob] = useState(null); // {id, plate, makeModel} once a car is picked
 
   const refresh = useCallback(async () => {
     const result = await loadLiveUpdates();
@@ -9636,6 +9835,28 @@ function LiveUpdatesBoard({ team, onOpenJob }) {
           {loading ? "Loading…" : "Progress notes from Ahmed and Noel · updates automatically"}
         </div>
       </div>
+
+      {session && (
+        <div style={{ background: COLORS.panel, border: `1px solid ${COLORS.line}`, borderRadius: 12, padding: 14, maxWidth: 640 }}>
+          <div style={{ fontSize: 11.5, fontWeight: 700, color: COLORS.muted, textTransform: "uppercase", letterSpacing: 0.5, marginBottom: 8 }}>
+            Post an update
+          </div>
+          {!composerJob ? (
+            <LiveUpdatesCarPicker index={index} onPick={(j) => setComposerJob(j)} />
+          ) : (
+            <div>
+              <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", marginBottom: 10 }}>
+                <div>
+                  <span style={{ fontFamily: MONO_FONT, fontWeight: 700, fontSize: 13, color: COLORS.ink }}>{composerJob.plate}</span>
+                  <span style={{ fontSize: 12, color: COLORS.muted, marginLeft: 8 }}>{composerJob.makeModel}</span>
+                </div>
+                <button onClick={() => setComposerJob(null)} className="mrcap-press" style={{ background: "none", border: "none", color: COLORS.muted, fontSize: 11.5, cursor: "pointer", textDecoration: "underline" }}>Change car</button>
+              </div>
+              <PostUpdateComposer jobId={composerJob.id} session={session} onPosted={() => { refresh(); }} />
+            </div>
+          )}
+        </div>
+      )}
 
       {digest && (
         <div style={{ background: COLORS.panel, border: `1px solid ${COLORS.gold}55`, borderRadius: 14, padding: 16, maxWidth: 640 }}>
@@ -9686,15 +9907,25 @@ function LiveUpdatesBoard({ team, onOpenJob }) {
           ))
         )}
       </div>
-      {selected && <UpdatePreviewModal update={selected} onClose={() => setSelected(null)} onOpenJob={onOpenJob} />}
+      {selected && (
+        <UpdatePreviewModal
+          update={selected}
+          onClose={() => setSelected(null)}
+          onOpenJob={onOpenJob}
+          session={session}
+          onPosted={() => refresh()}
+        />
+      )}
     </div>
   );
 }
 
 // Tap a car mentioned in an update to "blow it up" into this — a quick
 // preview with a direct way into the full job card, instead of having
-// to go find that job manually from the Dashboard.
-function UpdatePreviewModal({ update, onClose, onOpenJob }) {
+// to go find that job manually from the Dashboard. Also doubles as a
+// reply box: whoever tapped it can post another update to that same
+// car right here, without leaving the chat.
+function UpdatePreviewModal({ update, onClose, onOpenJob, session, onPosted }) {
   return createPortal(
     <div onClick={onClose} style={{ position: "fixed", inset: 0, background: "rgba(0,0,0,0.6)", zIndex: 200, display: "flex", alignItems: "center", justifyContent: "center", padding: 20 }}>
       <div onClick={(e) => e.stopPropagation()} className="mrcap-fade" style={{ background: COLORS.panel, border: `1px solid ${COLORS.line}`, borderRadius: 16, padding: 20, maxWidth: 400, width: "100%" }}>
@@ -9707,6 +9938,14 @@ function UpdatePreviewModal({ update, onClose, onOpenJob }) {
         </div>
         <div style={{ background: COLORS.panel2, borderRadius: 10, padding: 12, marginTop: 14, fontSize: 14, color: COLORS.ink, lineHeight: 1.4 }}>{update.note}</div>
         <div style={{ fontSize: 12, color: COLORS.goldBright, marginTop: 10, fontWeight: 600 }}>{update.by} · {update.categoryLabel} · {new Date(update.at).toLocaleString([], { month: "short", day: "numeric", hour: "2-digit", minute: "2-digit" })}</div>
+        {session && (
+          <div style={{ borderTop: `1px dashed ${COLORS.line}`, marginTop: 14, paddingTop: 14 }}>
+            <div style={{ fontSize: 11.5, fontWeight: 700, color: COLORS.muted, textTransform: "uppercase", letterSpacing: 0.5, marginBottom: 8 }}>
+              Reply on this car
+            </div>
+            <PostUpdateComposer jobId={update.jobId} session={session} onPosted={onPosted} />
+          </div>
+        )}
         <button
           onClick={() => { onOpenJob(update.jobId); onClose(); }}
           className="mrcap-press"
