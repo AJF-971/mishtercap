@@ -137,16 +137,21 @@ function canManageDispatchVisibility(session) {
   return !!session && ["ajf", "ahmed", "laani", "mr.cap"].includes((session.name || "").toLowerCase());
 }
 
-const LOCATIONS = ["Mr CAP (Main)", "Beneloom (Upholstery)", "Smartech (Body & Paint)"];
+const BASE_LOCATIONS = ["Mr.CAP. (Main)", "Beneloom (Upholstery)", "Smartech (Body & Paint)"];
+
+// Default app view only loads/displays records from this date onward
+// (older rows still exist for audit trail / CSV history but are no
+// longer shown in the main Board/Archive list by default).
+const DEFAULT_VIEW_CUTOFF = "2026-09-01T00:00:00Z";
 // Placeholder until the shop's real Terms & Conditions text is provided —
 // swap this single constant, nothing else needs to change.
-const TERMS_AND_CONDITIONS_TEXT = `The Customer has agreed with the below terms and conditions to perform the Service Program mentioned in the Vehicle receipt with Z Cars Technologies (Master Franchisee of Mr CAP in the UAE) hereafter will be mentioned as the Company.
+const TERMS_AND_CONDITIONS_TEXT = `The Customer has agreed with the below terms and conditions to perform the Service Program mentioned in the Vehicle receipt with Z Cars Technologies (Master Franchisee of Mr.CAP. in the UAE) hereafter will be mentioned as the Company.
 
 Valuables:
 The Company does not bear any responsibility for any valuables left inside the vehicle. The Customer is required to take out all valuable items from the Vehicle before the Company start to perform the Service Program.
 
 Delivery time:
-The vehicle is ready for delivery on the agreed date and time in the Vehicle receipt. Agreed delivery time can be extended upon agreement with the customer in case of any hidden defects noted after vehicle collection on the car's exterior or interior which require extra time to guarantee Mr CAP quality standard.
+The vehicle is ready for delivery on the agreed date and time in the Vehicle receipt. Agreed delivery time can be extended upon agreement with the customer in case of any hidden defects noted after vehicle collection on the car's exterior or interior which require extra time to guarantee Mr.CAP. quality standard.
 
 Vehicle collection:
 Vehicle is to be collected by the Customer within max 48 hours after the Service Program completion and the Customer informing by the Company by any means of communication like telephone, SMS, e-mail. Vehicles collected after 48 hours will be charged 100 AED per working day for overstay.
@@ -659,15 +664,25 @@ function visibleServices(selectedKeys) {
 // current value without prop-drilling it through the whole tree.
 const DEFAULT_WHATSAPP_TEMPLATES = {
   ready_for_collection: "Hi {customerName}, your {makeModel} ({plate}) is ready for collection at Mr.CAP. Thank you! Track it anytime: {trackingLink}",
-  job_started: "Hi {customerName}, we've received your {makeModel} ({plate}) at Mr.CAP and work is underway. Track progress here: {trackingLink}",
-  quote_sent: "Hi {customerName}, here's your quote from Mr.CAP for your {makeModel} ({plate}): AED {total}. View and accept it here: {quoteLink}",
+  job_started: "Hi {customerName}, we've received your {makeModel} ({plate}) at Mr.CAP. and work is underway. Track progress here: {trackingLink}",
+  quote_sent: "Hi {customerName}, here's your quote from Mr.CAP. for your {makeModel} ({plate}): AED {total}. View and accept it here: {quoteLink}",
   follow_up: "Hi {customerName}, just checking in on your {makeModel} ({plate}) — {reason}. Let us know if you'd like to book it in with Mr.CAP.",
-  warranty_reminder: "Hi {customerName}, a friendly reminder that the warranty on your {makeModel} ({plate}) work with Mr.CAP expires on {expiryDate}. Reach out if you'd like it looked at before then.",
-  google_review: "Hi {customerName}, thank you for trusting Mr.CAP with your {makeModel}! If you had a great experience, we'd really appreciate a quick Google review: {reviewLink}",
+  warranty_reminder: "Hi {customerName}, a friendly reminder that the warranty on your {makeModel} ({plate}) work with Mr.CAP. expires on {expiryDate}. Reach out if you'd like it looked at before then.",
+  google_review: "Hi {customerName}, thank you for trusting Mr.CAP. with your {makeModel}! If you had a great experience, we'd really appreciate a quick Google review: {reviewLink}",
 };
 let WHATSAPP_TEMPLATES = { ...DEFAULT_WHATSAPP_TEMPLATES };
 let GOOGLE_REVIEW_LINK = "";
 let PILOT_BASELINE = null; // { date, revenue, jobCount, collectedCount } | null
+
+// Locations a job/quote can be assigned to. BASE_LOCATIONS is the fixed
+// in-house set; CUSTOM_LOCATIONS holds shop-added external garages/workshops
+// (e.g. "Big Foot Automotive") entered once from the New/Edit Job form and
+// persisted to app_settings so every device sees them on next load. Same
+// cache-on-boot pattern as WHATSAPP_TEMPLATES/SERVICES above.
+let CUSTOM_LOCATIONS = [];
+function getLocations() {
+  return [...BASE_LOCATIONS, ...CUSTOM_LOCATIONS];
+}
 
 async function loadAppSettings() {
   const { ok, data } = await sbFetch("app_settings?select=*");
@@ -684,6 +699,31 @@ async function loadAppSettings() {
   if (baselineRow?.value) {
     try { PILOT_BASELINE = JSON.parse(baselineRow.value); } catch { /* leave null */ }
   }
+  const customLocationsRow = data.find((r) => r.key === "custom_locations");
+  if (customLocationsRow?.value) {
+    try { CUSTOM_LOCATIONS = JSON.parse(customLocationsRow.value); } catch { /* leave empty */ }
+  }
+}
+
+// Adds a new external location once and persists it for every device/user
+// going forward. Case-insensitive de-dupe against both the fixed base list
+// and anything already added, so re-typing "big foot automotive" doesn't
+// create a second near-identical entry. Returns the final (possibly
+// already-existing) label to select in the form that called this.
+async function addCustomLocation(rawName, session) {
+  const name = (rawName || "").trim();
+  if (!name) return null;
+  const existing = getLocations().find((l) => l.toLowerCase() === name.toLowerCase());
+  if (existing) return existing;
+  const next = [...CUSTOM_LOCATIONS, name];
+  const { ok } = await sbFetch("app_settings?on_conflict=key", {
+    method: "POST",
+    headers: { Prefer: "resolution=merge-duplicates,return=minimal" },
+    body: JSON.stringify([{ key: "custom_locations", value: JSON.stringify(next), updated_by: session?.id || null, updated_at: new Date().toISOString() }]),
+  });
+  if (!ok) return null;
+  CUSTOM_LOCATIONS = next;
+  return name;
 }
 
 async function savePilotBaseline(baseline, session) {
@@ -1090,7 +1130,7 @@ function generateJobCardPDF(job) {
   // the shop's own physical job card, so clients recognize it immediately.
   try { doc.addImage(LOGO_SRC, "PNG", margin, y, 31, 42); } catch (e) { /* logo optional — never block the PDF over an image error */ }
   doc.setFont("helvetica", "bold"); doc.setFontSize(15); doc.setTextColor(...DARK);
-  doc.text("Mr.CAP", margin + 50, y + 18);
+  doc.text("Mr.CAP.", margin + 50, y + 18);
   doc.setFont("helvetica", "normal"); doc.setFontSize(8); doc.setTextColor(...GREY);
   doc.text("The Car Appearance & Restyling Experts", margin + 50, y + 30);
   doc.setFont("helvetica", "bold"); doc.setFontSize(13); doc.setTextColor(...DARK);
@@ -1284,7 +1324,7 @@ function generateQuotePDF(quote) {
 
   try { doc.addImage(LOGO_SRC, "PNG", margin, y, 37, 50); } catch (e) { /* logo optional */ }
   doc.setFont("helvetica", "bold"); doc.setFontSize(20); doc.setTextColor(20);
-  doc.text("Mr.CAP", margin + 60, y + 22);
+  doc.text("Mr.CAP.", margin + 60, y + 22);
   doc.setFont("helvetica", "normal"); doc.setFontSize(9); doc.setTextColor(110);
   doc.text("The Car Appearance & Restyling Experts", margin + 60, y + 36);
   doc.setFontSize(8);
@@ -1405,7 +1445,7 @@ function generateQuotePDF(quote) {
   }
 
   doc.setFont("helvetica", "normal"); doc.setFontSize(7.5); doc.setTextColor(150);
-  doc.text("Mr.CAP — The Car Appearance & Restyling Experts — Al Hammar, Dubai", margin, 812);
+  doc.text("Mr.CAP. — The Car Appearance & Restyling Experts — Al Hammar, Dubai", margin, 812);
   return doc;
 }
 
@@ -1427,7 +1467,7 @@ async function loadIndex() {
   // pilot where job volume keeps climbing. Still ordered newest-first,
   // so the jobs that actually matter for the working list are never
   // the ones that would get dropped if this cap is ever hit.
-  const { ok, data } = await sbFetch("jobs?select=id,plate,make_model,customer_name,customer_phone,priority,location,stage_index,service_types,service_done,service_reviewed,history,on_hold,on_hold_note,on_hold_since,followup_date,followup_note,warranty_expiry,created_at,updated_at&order=updated_at.desc&limit=900");
+  const { ok, data } = await sbFetch(`jobs?select=id,plate,make_model,customer_name,customer_phone,priority,location,stage_index,service_types,service_done,service_reviewed,history,on_hold,on_hold_note,on_hold_since,followup_date,followup_note,warranty_expiry,created_at,updated_at&created_at=gte.${DEFAULT_VIEW_CUTOFF}&order=updated_at.desc&limit=900`);
   if (!ok || !data) return [];
   return data.map((r) => {
     const stage = STAGES[r.stage_index] || STAGES[0];
@@ -1484,7 +1524,6 @@ function parseCSV(text) {
 }
 
 let VALID_SERVICE_KEYS = new Set(SERVICES.map((s) => s.key));
-const VALID_LOCATIONS = new Set(LOCATIONS);
 const VALID_PRIORITIES = new Set(PRIORITIES);
 
 // Imports one CSV row as a fully-collected historical job. Reuses the same
@@ -1514,7 +1553,7 @@ async function importRow(row, importedBy) {
   const serviceTypes = (row.service_types || "")
     .split(";").map((s) => s.trim()).filter((s) => VALID_SERVICE_KEYS.has(s));
   const priority = VALID_PRIORITIES.has(row.priority) ? row.priority : "Medium";
-  const location = VALID_LOCATIONS.has(row.location) ? row.location : LOCATIONS[0];
+  const location = getLocations().includes(row.location) ? row.location : BASE_LOCATIONS[0];
 
   let jobDate = Date.now();
   if (row.job_date) {
@@ -1625,7 +1664,7 @@ async function convertQuoteToJob(quote, session) {
     plate: quote.plate || "", makeModel: quote.makeModel || "",
     customerName: quote.customerName, customerPhone: quote.customerPhone,
     description: quote.description || "", damageNotes: "",
-    priority: "Medium", location: LOCATIONS[0],
+    priority: "Medium", location: BASE_LOCATIONS[0],
     serviceTypes: quote.serviceTypes, treatments: quote.treatments,
     treatmentPrices: quote.treatmentPrices, discountPercent: quote.discountPercent, parts: quote.parts || [],
     serviceDone, assignedTo: {}, stageIndex: 0,
@@ -1829,7 +1868,7 @@ function DesktopShell({ session, team, view, setView, onLogout, canArchive, chil
       <style>{GLOBAL_STYLES}</style>
       <div style={{ width: 232, flexShrink: 0, background: "#15181C", minHeight: "100vh", display: "flex", flexDirection: "column", padding: "20px 12px", position: "sticky", top: 0, alignSelf: "flex-start" }}>
         <div style={{ padding: "6px 10px 22px" }}>
-          <div style={{ fontFamily: DISPLAY_FONT, fontWeight: 700, fontSize: 18, color: COLORS.gold, letterSpacing: 0.5 }}>Mr.CAP</div>
+          <div style={{ fontFamily: DISPLAY_FONT, fontWeight: 700, fontSize: 18, color: COLORS.gold, letterSpacing: 0.5 }}>Mr.CAP.</div>
           <div style={{ fontSize: 10, color: "#7A828C", marginTop: 2, textTransform: "uppercase", letterSpacing: 0.5 }}>Back Office</div>
         </div>
         <div style={{ display: "flex", flexDirection: "column", gap: 3, flex: 1 }}>
@@ -1889,6 +1928,56 @@ function FloatingNewJobButton({ onClick, label = "New Job" }) {
 function SectionTitle({ children }) {
   return <div style={{ fontFamily: DISPLAY_FONT, fontWeight: 600, fontSize: 19, color: COLORS.ink, margin: "12px 0 16px" }}>{children}</div>;
 }
+// Location picker for the New/Edit Job forms. Starts from the fixed
+// in-house locations (BASE_LOCATIONS) plus whatever external
+// garages/workshops have been added so far (CUSTOM_LOCATIONS, loaded on
+// boot). "+ Add a location" lets someone type a new one (e.g. "Big Foot
+// Automotive") once — it's persisted to app_settings via
+// addCustomLocation and immediately available in this picker and every
+// picker after it, on every device, with no redeploy needed.
+function LocationPicker({ location, setLocation, session }) {
+  const [locations, setLocations] = useState(() => getLocations());
+  const [adding, setAdding] = useState(false);
+  const [newName, setNewName] = useState("");
+  const [saving, setSaving] = useState(false);
+
+  const submitNew = async () => {
+    const name = newName.trim();
+    if (!name || saving) return;
+    setSaving(true);
+    const finalName = await addCustomLocation(name, session);
+    setSaving(false);
+    if (!finalName) return; // save failed — leave the input open so they can retry
+    setLocations(getLocations());
+    setLocation(finalName);
+    setNewName("");
+    setAdding(false);
+  };
+
+  return (
+    <div style={{ display: "flex", flexDirection: "column", gap: 8 }}>
+      {locations.map((l) => (
+        <button key={l} onClick={() => setLocation(l)} className="mrcap-press" style={{ padding: "10px", borderRadius: 9, border: `1.5px solid ${location === l ? COLORS.gold : COLORS.line}`, background: location === l ? COLORS.gold : COLORS.panel2, color: location === l ? COLORS.darkText : COLORS.ink, fontWeight: 600, fontSize: 13, cursor: "pointer", textAlign: "left" }}>{l}</button>
+      ))}
+      {adding ? (
+        <div style={{ display: "flex", gap: 6 }}>
+          <input
+            autoFocus
+            value={newName}
+            onChange={(e) => setNewName(e.target.value)}
+            onKeyDown={(e) => { if (e.key === "Enter") submitNew(); if (e.key === "Escape") { setAdding(false); setNewName(""); } }}
+            placeholder="e.g. Big Foot Automotive"
+            style={{ ...inputStyle, flex: 1 }}
+          />
+          <button onClick={submitNew} disabled={!newName.trim() || saving} className="mrcap-press" style={{ padding: "0 14px", borderRadius: 9, border: "none", background: COLORS.gold, color: COLORS.darkText, fontWeight: 700, fontSize: 13, cursor: newName.trim() && !saving ? "pointer" : "default", opacity: !newName.trim() || saving ? 0.6 : 1 }}>{saving ? "Adding…" : "Add"}</button>
+        </div>
+      ) : (
+        <button onClick={() => setAdding(true)} className="mrcap-press" style={{ padding: "10px", borderRadius: 9, border: `1.5px dashed ${COLORS.line}`, background: "transparent", color: COLORS.muted, fontWeight: 600, fontSize: 13, cursor: "pointer", textAlign: "left" }}>+ Add a location</button>
+      )}
+    </div>
+  );
+}
+
 function Field({ label, children }) {
   return <div style={{ marginBottom: 14 }}><label style={labelStyle}>{label}</label><div style={{ marginTop: 6 }}>{children}</div></div>;
 }
@@ -2880,11 +2969,11 @@ function LoginScreen({ team, setTeam, onLogin }) {
     <div className="mrcap-view" style={{ padding: "44px 22px" }}>
       <div style={{ textAlign: "center", marginBottom: 34 }}>
         <div style={{ width: 260, height: 78, borderRadius: 14, background: "#fff", margin: "0 auto 18px", display: "flex", alignItems: "center", justifyContent: "center", padding: "12px 16px", boxSizing: "border-box", border: `1px solid ${COLORS.line}`, boxShadow: `0 0 0 1px rgba(201,162,39,0.15), 0 12px 30px -12px rgba(0,0,0,0.6)` }}>
-          <img src={LOGO_HEADER_SRC} alt="Mr.CAP" style={{ width: "100%", height: "100%", objectFit: "contain" }} />
+          <img src={LOGO_HEADER_SRC} alt="Mr.CAP." style={{ width: "100%", height: "100%", objectFit: "contain" }} />
         </div>
         <div style={{ fontSize: 10.5, color: COLORS.gold, letterSpacing: 3, textTransform: "uppercase", marginBottom: 6 }}>Field Access</div>
         <div style={{ fontFamily: DISPLAY_FONT, fontWeight: 600, fontSize: 25, color: COLORS.ink }}>Who's this?</div>
-        <div style={{ fontSize: 12.5, color: COLORS.muted, marginTop: 6, letterSpacing: 0.2 }}>Mr.CAP — Al Hammar, Dubai</div>
+        <div style={{ fontSize: 12.5, color: COLORS.muted, marginTop: 6, letterSpacing: 0.2 }}>Mr.CAP. — Al Hammar, Dubai</div>
       </div>
       <div style={{ display: "flex", flexDirection: "column", gap: 8 }}>
         {team.map((m, i) => (
@@ -2925,7 +3014,7 @@ function TopBar({ session, team, onLogout, onNew, view, onBack, onTeam, onArchiv
                 <img src={LOGO_SRC} alt="" style={{ width: "100%", height: "100%", objectFit: "contain" }} />
               </div>
               <div>
-                <div style={{ fontFamily: DISPLAY_FONT, fontWeight: 700, fontSize: 16, color: COLORS.ink, lineHeight: 1.1 }}>MR.CAP</div>
+                <div style={{ fontFamily: DISPLAY_FONT, fontWeight: 700, fontSize: 16, color: COLORS.ink, lineHeight: 1.1 }}>Mr.CAP.</div>
                 <div style={{ fontSize: 9.5, color: COLORS.gold, letterSpacing: 2, textTransform: "uppercase", lineHeight: 1.3 }}>Job Tracker</div>
               </div>
             </div>
@@ -3598,7 +3687,7 @@ function QuickIntakeForm({ session, onCreated, onCancel, onFullForm }) {
     const now = Date.now();
     const job = {
       plate: plate.trim().toUpperCase(), makeModel: "", customerName: customerName.trim() || "—", customerPhone: "",
-      description: "", damageNotes: "", priority: "Medium", location: LOCATIONS[0],
+      description: "", damageNotes: "", priority: "Medium", location: BASE_LOCATIONS[0],
       serviceTypes: [], treatments: {}, treatmentPrices: {}, discountPercent: 0, priceHistory: [],
       serviceDone: {}, assignedTo: {}, stageIndex: 0,
       photos: { intake: photos, parts_removal: [], service: {} },
@@ -3667,7 +3756,7 @@ function NewJobForm({ session, team, onCreated, onCancel }) {
   const [description, setDescription] = useState("");
   const [damageNotes, setDamageNotes] = useState("");
   const [priority, setPriority] = useState("Medium");
-  const [location, setLocation] = useState(LOCATIONS[0]);
+  const [location, setLocation] = useState(BASE_LOCATIONS[0]);
   const [serviceTypes, setServiceTypes] = useState([]);
   const [treatments, setTreatments] = useState({}); // serviceKey -> [treatment names]
   const [assignedTo, setAssignedTo] = useState({}); // serviceKey -> team member id
@@ -3911,11 +4000,7 @@ function NewJobForm({ session, team, onCreated, onCancel }) {
       </Field>
 
       <Field label="Location">
-        <div style={{ display: "flex", flexDirection: "column", gap: 8 }}>
-          {LOCATIONS.map((l) => (
-            <button key={l} onClick={() => setLocation(l)} className="mrcap-press" style={{ padding: "10px", borderRadius: 9, border: `1.5px solid ${location === l ? COLORS.gold : COLORS.line}`, background: location === l ? COLORS.gold : COLORS.panel2, color: location === l ? COLORS.darkText : COLORS.ink, fontWeight: 600, fontSize: 13, cursor: "pointer", textAlign: "left" }}>{l}</button>
-          ))}
-        </div>
+        <LocationPicker location={location} setLocation={setLocation} session={session} />
       </Field>
 
       <Field label="Service needed (select all that apply)">
@@ -4275,11 +4360,7 @@ function EditJobScreen({ job, session, onSaved, onCancel }) {
         </div>
       </Field>
       <Field label="Location">
-        <div style={{ display: "flex", flexDirection: "column", gap: 8 }}>
-          {LOCATIONS.map((l) => (
-            <button key={l} onClick={() => setLocation(l)} className="mrcap-press" style={{ padding: "10px", borderRadius: 9, border: `1.5px solid ${location === l ? COLORS.gold : COLORS.line}`, background: location === l ? COLORS.gold : COLORS.panel2, color: location === l ? COLORS.darkText : COLORS.ink, fontWeight: 600, fontSize: 13, cursor: "pointer", textAlign: "left" }}>{l}</button>
-          ))}
-        </div>
+        <LocationPicker location={location} setLocation={setLocation} session={session} />
       </Field>
 
       <Field label="Services & treatments">
@@ -5942,7 +6023,7 @@ function MessageTemplatesScreen({ onBack }) {
           <div style={{ fontFamily: DISPLAY_FONT, fontWeight: 600, fontSize: 14.5, color: COLORS.ink }}>Google Review Link</div>
         </div>
         <div style={{ fontSize: 11.5, color: COLORS.muted, marginBottom: 12 }}>
-          Your Google Business review link — from Google Maps, search Mr.CAP, tap "Share", then "Ask for reviews", and copy the link. Used by the {"{reviewLink}"} token below and the review banner on collected jobs.
+          Your Google Business review link — from Google Maps, search Mr.CAP., tap "Share", then "Ask for reviews", and copy the link. Used by the {"{reviewLink}"} token below and the review banner on collected jobs.
         </div>
         <input
           value={reviewLink}
@@ -6239,7 +6320,7 @@ async function exportFullBackup(onProgress) {
 function exportAdminStatsCSV({ rangeLabel, totalRevenue, revenueInRange, activeJobsCount, collectedInRange, avgTurnaroundDays, revenueByMonth, byCategory, staffLeaderboard }) {
   const esc = (v) => `"${String(v).replace(/"/g, '""')}"`;
   const lines = [];
-  lines.push("Mr.CAP Admin Dashboard Export");
+  lines.push("Mr.CAP. Admin Dashboard Export");
   lines.push(`Generated,${esc(new Date().toLocaleString())}`);
   lines.push(`Range,${esc(rangeLabel)}`);
   lines.push("");
@@ -6284,7 +6365,7 @@ function exportAdminStatsPDF({ rangeLabel, totalRevenue, revenueInRange, activeJ
 
   try { doc.addImage(LOGO_SRC, "PNG", margin, y, 33, 44); } catch (e) { /* logo optional */ }
   doc.setFont("helvetica", "bold"); doc.setFontSize(18); doc.setTextColor(20);
-  doc.text("Mr.CAP — Admin Dashboard", margin + 54, y + 20);
+  doc.text("Mr.CAP. — Admin Dashboard", margin + 54, y + 20);
   doc.setFont("helvetica", "normal"); doc.setFontSize(9); doc.setTextColor(110);
   doc.text(`Generated ${new Date().toLocaleString()} · Range: ${rangeLabel}`, margin + 54, y + 34);
 
@@ -6326,7 +6407,7 @@ function exportAdminStatsPDF({ rangeLabel, totalRevenue, revenueInRange, activeJ
   table("Staff leaderboard (in range)", staffLeaderboard);
 
   doc.setFont("helvetica", "normal"); doc.setFontSize(7.5); doc.setTextColor(150);
-  doc.text("Mr.CAP — Internal admin report — not for customer distribution", margin, 812);
+  doc.text("Mr.CAP. — Internal admin report — not for customer distribution", margin, 812);
   doc.save(`MrCAP-Dashboard-${new Date().toISOString().slice(0, 10)}.pdf`);
 }
 
@@ -7350,9 +7431,9 @@ function PublicPageShell({ children }) {
   return (
     <div style={{ minHeight: "100vh", background: COLORS.paper, display: "flex", flexDirection: "column", alignItems: "center", padding: "40px 18px" }}>
       <div style={{ width: 190, height: 58, borderRadius: 12, background: "#fff", marginBottom: 12, display: "flex", alignItems: "center", justifyContent: "center", padding: "8px 12px", boxSizing: "border-box", border: `1px solid ${COLORS.line}`, boxShadow: `0 0 0 1px rgba(201,162,39,0.15), 0 12px 30px -12px rgba(0,0,0,0.6)` }}>
-        <img src={LOGO_HEADER_SRC} alt="Mr.CAP" style={{ width: "100%", height: "100%", objectFit: "contain" }} />
+        <img src={LOGO_HEADER_SRC} alt="Mr.CAP." style={{ width: "100%", height: "100%", objectFit: "contain" }} />
       </div>
-      <div style={{ fontFamily: DISPLAY_FONT, fontWeight: 700, fontSize: 15, color: COLORS.ink, letterSpacing: 0.5, marginBottom: 28 }}>Mr.CAP</div>
+      <div style={{ fontFamily: DISPLAY_FONT, fontWeight: 700, fontSize: 15, color: COLORS.ink, letterSpacing: 0.5, marginBottom: 28 }}>Mr.CAP.</div>
       <div style={{ width: "100%", maxWidth: 440 }}>{children}</div>
     </div>
   );
@@ -9214,7 +9295,11 @@ function DispatchBoard({ team, session }) {
   return (
     <div className="mrcap-view" style={{ padding: 16, display: "flex", flexDirection: "column", gap: 14, minHeight: "calc(100vh - 80px)" }}>
       <div style={{ display: "flex", justifyContent: "space-between", alignItems: "flex-end", flexWrap: "wrap", gap: 10 }}>
-        <div>
+        <div style={{ display: "flex", alignItems: "center", gap: 12 }}>
+          <div style={{ width: 46, height: 46, borderRadius: 11, background: "#fff", display: "flex", alignItems: "center", justifyContent: "center", padding: "7px 9px", boxSizing: "border-box", flexShrink: 0, border: `1px solid ${COLORS.line}`, boxShadow: `0 0 0 1px rgba(74,100,120,0.35), 0 8px 20px -10px rgba(0,0,0,0.6)` }}>
+            <img src={LOGO_LOCKUP_SRC} alt="Mr.CAP. / Beneloom" style={{ width: "100%", height: "100%", objectFit: "contain" }} />
+          </div>
+          <div>
           <div style={{ display: "flex", alignItems: "center", gap: 10 }}>
             <div style={{ fontFamily: DISPLAY_FONT, fontWeight: 700, fontSize: 20, color: COLORS.ink }}>Dispatch Board</div>
             {totalAlerts > 0 && (
@@ -9238,6 +9323,7 @@ function DispatchBoard({ team, session }) {
               {unclassifiedRows.length > 0 && <div>• {unclassifiedRows.length} still need a service type</div>}
             </div>
           )}
+        </div>
         </div>
         <div style={{ display: "flex", gap: 6, background: COLORS.panel2, borderRadius: 10, padding: 3 }}>
           {["oldest", "newest", "priority"].map((opt) => (
@@ -9648,7 +9734,7 @@ export function DispatchKiosk() {
     <div className="mrcap-view" style={{ minHeight: "100vh", background: "#0b0b0c", padding: "44px 22px" }}>
       <div style={{ textAlign: "center", marginBottom: 34 }}>
         <div style={{ width: 260, height: 78, borderRadius: 14, background: "#fff", margin: "0 auto 18px", display: "flex", alignItems: "center", justifyContent: "center", padding: "12px 16px", boxSizing: "border-box", border: `1px solid ${COLORS.line}`, boxShadow: `0 0 0 1px rgba(74,100,120,0.35), 0 12px 30px -12px rgba(0,0,0,0.6)` }}>
-          <img src={LOGO_HEADER_SRC} alt="Mr.CAP" style={{ width: "100%", height: "100%", objectFit: "contain" }} />
+          <img src={LOGO_HEADER_SRC} alt="Mr.CAP." style={{ width: "100%", height: "100%", objectFit: "contain" }} />
         </div>
         <div style={{ fontSize: 10.5, color: COLORS.blue, letterSpacing: 3, textTransform: "uppercase", marginBottom: 6 }}>Dispatch Board</div>
         <div style={{ fontFamily: DISPLAY_FONT, fontWeight: 600, fontSize: 25, color: COLORS.ink }}>Who's working the board?</div>
