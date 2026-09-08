@@ -709,6 +709,34 @@ async function loadAppSettings() {
   if (customLocationsRow?.value) {
     try { CUSTOM_LOCATIONS = JSON.parse(customLocationsRow.value); } catch { /* leave empty */ }
   }
+  const outTodayRow = data.find((r) => r.key === "staff_out_today");
+  if (outTodayRow?.value) {
+    try {
+      const parsed = JSON.parse(outTodayRow.value);
+      // Auto-resets daily — a stored value from a previous day is treated
+      // as empty rather than needing someone to remember to clear it.
+      STAFF_OUT_TODAY = parsed.date === localDateKey() ? (parsed.names || []) : [];
+    } catch { STAFF_OUT_TODAY = []; }
+  }
+}
+
+// Who covers for whom, from the scope-of-work doc — Ahmed/Lani are each
+// other's backup on intake & updates, Noel/Regan are each other's backup
+// on detailing/QC. Lowercased, matching how names are compared elsewhere.
+const BACKUP_MAP = { ahmed: "laani", laani: "ahmed", noel: "regan", regan: "noel" };
+
+// "Who's out today" — persisted to app_settings like the other shop-wide
+// settings above, keyed by today's date so it auto-resets without anyone
+// having to remember to clear it.
+let STAFF_OUT_TODAY = [];
+async function saveStaffOutToday(names, session) {
+  const { ok } = await sbFetch("app_settings?on_conflict=key", {
+    method: "POST",
+    headers: { Prefer: "resolution=merge-duplicates,return=minimal" },
+    body: JSON.stringify([{ key: "staff_out_today", value: JSON.stringify({ date: localDateKey(), names }), updated_by: session?.id || null, updated_at: new Date().toISOString() }]),
+  });
+  if (ok) STAFF_OUT_TODAY = names;
+  return ok;
 }
 
 // Adds a new external location once and persists it for every device/user
@@ -992,6 +1020,7 @@ function rowToJob(r) {
     onHold: !!r.on_hold, onHoldNote: r.on_hold_note || null, onHoldSince: r.on_hold_since ? new Date(r.on_hold_since).getTime() : null,
     warrantyExpiry: r.warranty_expiry || null, followupDate: r.followup_date || null, followupNote: r.followup_note || null,
     customerStatusNote: r.customer_status_note || null, customerStatusUpdatedAt: r.customer_status_updated_at ? new Date(r.customer_status_updated_at).getTime() : null,
+    customerNotify: r.customer_notify || {},
     createdBy: r.created_by, createdAt: new Date(r.created_at).getTime(), updatedAt: new Date(r.updated_at).getTime(),
   };
 }
@@ -1013,6 +1042,7 @@ function jobToRow(job) {
     on_hold: !!job.onHold, on_hold_note: job.onHoldNote || null, on_hold_since: job.onHoldSince ? new Date(job.onHoldSince).toISOString() : null,
     warranty_expiry: job.warrantyExpiry || null, followup_date: job.followupDate || null, followup_note: job.followupNote || null,
     customer_status_note: job.customerStatusNote || null, customer_status_updated_at: job.customerStatusUpdatedAt ? new Date(job.customerStatusUpdatedAt).toISOString() : null,
+    customer_notify: job.customerNotify || {},
     created_by: job.createdBy, updated_at: new Date().toISOString(),
   };
 }
@@ -1525,7 +1555,7 @@ async function loadIndex() {
   // pilot where job volume keeps climbing. Still ordered newest-first,
   // so the jobs that actually matter for the working list are never
   // the ones that would get dropped if this cap is ever hit.
-  const { ok, data } = await sbFetch(`jobs?select=id,plate,make_model,customer_name,customer_phone,priority,location,stage_index,service_types,service_done,service_reviewed,history,on_hold,on_hold_note,on_hold_since,followup_date,followup_note,warranty_expiry,created_at,updated_at&created_at=gte.${DEFAULT_VIEW_CUTOFF}&order=updated_at.desc&limit=900`);
+  const { ok, data } = await sbFetch(`jobs?select=id,plate,make_model,customer_name,customer_phone,priority,location,stage_index,service_types,service_done,service_reviewed,history,on_hold,on_hold_note,on_hold_since,followup_date,followup_note,warranty_expiry,customer_notify,created_at,updated_at&created_at=gte.${DEFAULT_VIEW_CUTOFF}&order=updated_at.desc&limit=900`);
   if (!ok || !data) return [];
   return data.map((r) => {
     const stage = STAGES[r.stage_index] || STAGES[0];
@@ -1536,6 +1566,7 @@ async function loadIndex() {
       history: r.history || [],
       onHold: !!r.on_hold, onHoldNote: r.on_hold_note || null, onHoldSince: r.on_hold_since ? new Date(r.on_hold_since).getTime() : null,
       followupDate: r.followup_date || null, followupNote: r.followup_note || null, warrantyExpiry: r.warranty_expiry || null,
+      customerNotify: r.customer_notify || {},
       updatedAt: new Date(r.updated_at).getTime(), createdAt: new Date(r.created_at).getTime(),
     };
   });
@@ -3258,6 +3289,16 @@ function Dashboard({ index, session, onOpen, canArchive, onRefresh, syncState, l
   const [filter, setFilter] = useState("open");
   const [search, setSearch] = useState("");
   const isAdmin = session.role === "admin";
+  const [outToday, setOutToday] = useState(STAFF_OUT_TODAY);
+  const [savingOutToday, setSavingOutToday] = useState(false);
+  const toggleOutToday = async (name) => {
+    const lower = name.toLowerCase();
+    const next = outToday.includes(lower) ? outToday.filter((n) => n !== lower) : [...outToday, lower];
+    setOutToday(next);
+    setSavingOutToday(true);
+    await saveStaffOutToday(next, session);
+    setSavingOutToday(false);
+  };
 
   // Jobs with at least one service where this person is the reviewer,
   // that service is marked done by the doer, but not yet reviewed —
@@ -3319,6 +3360,12 @@ function Dashboard({ index, session, onOpen, canArchive, onRefresh, syncState, l
     .filter((j) => j.warrantyExpiry && j.warrantyExpiry >= todayStr && j.warrantyExpiry <= in30DaysStr)
     .sort((a, b) => (a.warrantyExpiry < b.warrantyExpiry ? -1 : 1));
 
+  // Ready for collection, but nobody's ticked "Customer informed" —
+  // the checkbox is only useful as a record if something actually
+  // surfaces the gap, otherwise it's easy for a car to sit ready with
+  // no one having actually told the customer.
+  const readyNotInformed = index.filter((j) => j.stageKey === "ready" && !(j.customerNotify || {}).ready_for_collection?.informedBy);
+
   return (
     <div className="mrcap-view" style={{ padding: "0 18px 90px" }}>
       <SyncBar syncState={syncState} lastSyncedAt={lastSyncedAt} onRefresh={onRefresh} />
@@ -3334,6 +3381,47 @@ function Dashboard({ index, session, onOpen, canArchive, onRefresh, syncState, l
           <div style={{ position: "relative", fontSize: 11, color: COLORS.gold, marginTop: 6 }}>{onHoldJobs.length} of those on hold</div>
         )}
       </div>
+
+      {(isAdmin || CORE_FOUR.includes((session.name || "").toLowerCase())) && (
+        <div style={{ background: COLORS.panel, border: `1px solid ${COLORS.line}`, borderRadius: 12, padding: "12px 13px", marginBottom: 16 }}>
+          <div style={{ fontSize: 11, fontWeight: 700, color: COLORS.muted, textTransform: "uppercase", letterSpacing: 0.5, marginBottom: 8 }}>
+            Who's Out Today
+          </div>
+          <div style={{ display: "flex", flexWrap: "wrap", gap: 6, marginBottom: outToday.length ? 8 : 0 }}>
+            {CORE_FOUR.map((name) => {
+              const isOut = outToday.includes(name);
+              const label = name.charAt(0).toUpperCase() + name.slice(1);
+              return (
+                <button
+                  key={name}
+                  onClick={() => toggleOutToday(name)}
+                  disabled={savingOutToday}
+                  className="mrcap-press"
+                  style={{
+                    padding: "6px 12px", borderRadius: 999, fontSize: 12, fontWeight: 600, cursor: "pointer",
+                    border: `1.5px solid ${isOut ? COLORS.red : COLORS.line}`,
+                    background: isOut ? "rgba(168,64,47,0.15)" : COLORS.panel2,
+                    color: isOut ? "#E08A78" : COLORS.ink, opacity: savingOutToday ? 0.6 : 1,
+                  }}
+                >
+                  {label}{isOut ? " — Out" : ""}
+                </button>
+              );
+            })}
+          </div>
+          {outToday.map((name) => {
+            const backup = BACKUP_MAP[name];
+            if (!backup) return null;
+            const nameLabel = name.charAt(0).toUpperCase() + name.slice(1);
+            const backupLabel = backup.charAt(0).toUpperCase() + backup.slice(1);
+            return (
+              <div key={name} style={{ fontSize: 12, color: COLORS.gold, marginTop: 4 }}>
+                {nameLabel} is out — {backupLabel} is covering.
+              </div>
+            );
+          })}
+        </div>
+      )}
 
       {followupsDue.length > 0 && (
         <div style={{ marginBottom: 16 }}>
@@ -3391,6 +3479,24 @@ function Dashboard({ index, session, onOpen, canArchive, onRefresh, syncState, l
                     />
                   )}
                 </div>
+              </div>
+            ))}
+          </div>
+        </div>
+      )}
+
+      {readyNotInformed.length > 0 && (
+        <div style={{ marginBottom: 16 }}>
+          <div style={{ display: "flex", alignItems: "center", gap: 7, marginBottom: 8 }}>
+            <Send size={14} color={COLORS.red} />
+            <div style={{ fontFamily: DISPLAY_FONT, fontWeight: 600, fontSize: 14.5, color: COLORS.ink }}>Ready — Customer Not Yet Informed</div>
+            <Pill tone="red">{readyNotInformed.length}</Pill>
+          </div>
+          <div style={{ display: "flex", flexDirection: "column", gap: 8 }}>
+            {readyNotInformed.map((j) => (
+              <div key={j.id} onClick={() => onOpen(j.id)} className="mrcap-press" style={{ textAlign: "left", background: "rgba(168,64,47,0.08)", border: `1.5px solid ${COLORS.red}`, borderRadius: 10, padding: "12px 13px", cursor: "pointer", width: "100%", boxSizing: "border-box" }}>
+                <div style={{ fontFamily: MONO_FONT, fontWeight: 600, fontSize: 14.5, color: COLORS.ink }}>{j.plate || "—"} · {j.makeModel}</div>
+                <div style={{ fontSize: 12, color: COLORS.muted, marginTop: 2 }}>Ready for collection — nobody's ticked "Customer informed" yet</div>
               </div>
             ))}
           </div>
@@ -3861,6 +3967,7 @@ function NewJobForm({ session, team, onCreated, onCancel }) {
   const [possibleMatches, setPossibleMatches] = useState([]);
   const [matchDismissed, setMatchDismissed] = useState(false);
   const [plateMatch, setPlateMatch] = useState(null);
+  const [plateHistory, setPlateHistory] = useState(null); // most recent past job on this plate, if any
   const [ownerChoice, setOwnerChoice] = useState(null); // 'same' | 'different' | null (undecided)
 
   // VIN entries aren't guaranteed unique the way a plate is — staff have
@@ -3925,11 +4032,16 @@ function NewJobForm({ session, team, onCreated, onCancel }) {
 
   useEffect(() => {
     const p = plate.trim().toUpperCase();
-    if (isVinMode || p.length < 3) { setPlateMatch(null); setOwnerChoice(null); return; }
+    if (isVinMode || p.length < 3) { setPlateMatch(null); setOwnerChoice(null); setPlateHistory(null); return; }
     const t = setTimeout(async () => {
       const { ok, data } = await sbFetch(`vehicles?plate=eq.${encodeURIComponent(p)}&select=*,customers(name,phone,customer_type)&limit=1`);
       setPlateMatch(ok && data && data.length ? data[0] : null);
       setOwnerChoice(null);
+      // Most recent past job on this plate (any stage) — a quick "we've
+      // seen this car before, here's what was last done" note at intake,
+      // so Ahmed/Lani don't have to go dig through the archive.
+      const { ok: histOk, data: histData } = await sbFetch(`jobs?plate=eq.${encodeURIComponent(p)}&select=service_types,stage_index,updated_at&order=updated_at.desc&limit=1`);
+      setPlateHistory(histOk && histData && histData.length ? histData[0] : null);
     }, 350);
     return () => clearTimeout(t);
   }, [plate, isVinMode]);
@@ -4017,6 +4129,13 @@ function NewJobForm({ session, team, onCreated, onCancel }) {
           <div style={{ fontSize: 12, color: COLORS.muted }}>
             {plateMatch.make_model || "Vehicle"} — on file for: {plateMatch.customers?.name || "unknown"}{plateMatch.customers?.phone ? ` · ${plateMatch.customers.phone}` : ""}
           </div>
+          {plateHistory && (
+            <div style={{ fontSize: 11.5, color: COLORS.muted, marginTop: 4 }}>
+              Last seen: {new Date(plateHistory.updated_at).toLocaleDateString([], { month: "short", day: "numeric", year: "numeric" })}
+              {(plateHistory.service_types || []).length > 0 && ` — ${plateHistory.service_types.map((k) => SERVICES.find((s) => s.key === k)?.label || k).join(", ")}`}
+              {STAGES[plateHistory.stage_index]?.key !== "collected" && " (still active)"}
+            </div>
+          )}
 
           {plateMatch.customers?.name && !customerName.trim() && (
             <button onClick={() => { setCustomerName(plateMatch.customers.name); setCustomerPhone(plateMatch.customers.phone || ""); setCustomerType(plateMatch.customers.customer_type === "b2b" ? "b2b" : "retail"); setOwnerChoice("same"); }} className="mrcap-press" style={{ marginTop: 8, fontSize: 11.5, fontWeight: 600, color: COLORS.darkText, background: COLORS.gold, border: "none", borderRadius: 7, padding: "6px 10px", cursor: "pointer" }}>
@@ -8404,10 +8523,38 @@ async function loadRecentUpdates(sinceMs) {
 // away from what they're doing.
 function InternalUpdatesWidget({ team, onOpenJob, session, index }) {
   const [open, setOpen] = useState(false);
+  const [unread, setUnread] = useState(0);
+  // Persisted per-device so the badge survives a page reload instead of
+  // resetting to 0 every time the app opens — same idea as the local
+  // session, just for "last time this device looked at updates".
+  const lastSeenRef = useRef((() => {
+    try {
+      const stored = Number(window.localStorage.getItem("mrcap_updates_last_seen"));
+      return stored || Date.now();
+    } catch { return Date.now(); }
+  })());
+
+  useEffect(() => {
+    const check = async () => {
+      const updates = await loadRecentUpdates(lastSeenRef.current);
+      if (updates.length) setUnread((n) => n + updates.length);
+    };
+    check();
+    const interval = setInterval(check, 15000);
+    return () => clearInterval(interval);
+  }, []);
+
+  const openPanel = () => {
+    setOpen(true);
+    setUnread(0);
+    lastSeenRef.current = Date.now();
+    try { window.localStorage.setItem("mrcap_updates_last_seen", String(lastSeenRef.current)); } catch {}
+  };
+
   return (
     <>
       <button
-        onClick={() => setOpen(true)}
+        onClick={openPanel}
         className="mrcap-press"
         title="Internal Updates"
         style={{
@@ -8419,6 +8566,16 @@ function InternalUpdatesWidget({ team, onOpenJob, session, index }) {
         }}
       >
         <MessageSquare size={21} />
+        {unread > 0 && (
+          <span style={{
+            position: "absolute", top: -3, right: -3, minWidth: 18, height: 18, borderRadius: 9,
+            background: COLORS.red, color: "#fff", fontSize: 10.5, fontWeight: 700,
+            display: "flex", alignItems: "center", justifyContent: "center", padding: "0 4px",
+            border: `1.5px solid ${COLORS.paper}`,
+          }}>
+            {unread > 9 ? "9+" : unread}
+          </span>
+        )}
       </button>
       {open && createPortal(
         <div onClick={() => setOpen(false)} style={{ position: "fixed", inset: 0, background: "rgba(0,0,0,0.55)", zIndex: 300, display: "flex", justifyContent: "flex-end" }}>
@@ -9314,12 +9471,14 @@ function DispatchBoard({ team, session }) {
     setSelectedRowKey(null); // the old (job, category) row this modal was showing no longer exists
   };
 
-  // Restricted to Ahmed and Noel by request — not a general permission,
-  // just these two names. Written as its own history entry type
-  // ("progress_update") so the Live Updates admin board can pull just
-  // these out of the mix without picking up every Started/Finished/
-  // Moved/Assigned entry too.
-  const canWriteUpdate = ["ahmed", "noel"].includes((session.name || "").toLowerCase());
+  // Restricted by name, not a general permission. Originally Ahmed and
+  // Noel; Regan added alongside Noel now that Regan's scope of work
+  // includes Dispatch Board oversight (making sure the board's kept
+  // updated, and covering Noel's detailing/QC work). Written as its own
+  // history entry type ("progress_update") so the Live Updates admin
+  // board can pull just these out of the mix without picking up every
+  // Started/Finished/Moved/Assigned entry too.
+  const canWriteUpdate = ["ahmed", "noel", "regan"].includes((session.name || "").toLowerCase());
   // Same 30s dupe gate as the JobDetail Admin Update box — stops a
   // double-tap on the same preset (e.g. "Started work" twice) from
   // logging twice, checked against the freshly-fetched history so it
