@@ -1892,6 +1892,58 @@ function SectionTitle({ children }) {
 function Field({ label, children }) {
   return <div style={{ marginBottom: 14 }}><label style={labelStyle}>{label}</label><div style={{ marginTop: 6 }}>{children}</div></div>;
 }
+
+// "Didn't find the pricing module? Add one here" — sits at the end of
+// the services/treatments picker on a job or quote. Saves straight into
+// the shared treatments catalog (same table the Services & Pricing
+// screen manages), so it's instantly available everywhere, including
+// right here on this same card via onAdded — never touches the job's
+// own fields, so there's nothing to lose by adding one mid-edit.
+function AddTreatmentPrompt({ categories, onAdded }) {
+  const [open, setOpen] = useState(false);
+  const [categoryKey, setCategoryKey] = useState(categories[0]?.key || "");
+  const [name, setName] = useState("");
+  const [retail, setRetail] = useState("");
+  const [b2b, setB2b] = useState("");
+  const [saving, setSaving] = useState(false);
+
+  const save = async () => {
+    if (!categoryKey || !name.trim()) return;
+    setSaving(true);
+    const ok = await saveServiceTreatment({ category_key: categoryKey, name: name.trim(), retail: Number(retail) || 0, b2b: Number(b2b) || 0 });
+    setSaving(false);
+    if (ok) {
+      setOpen(false); setName(""); setRetail(""); setB2b("");
+      onAdded?.();
+    }
+  };
+
+  if (!open) {
+    return (
+      <button onClick={() => setOpen(true)} className="mrcap-press" style={{ marginTop: 6, width: "100%", textAlign: "left", background: "none", border: "none", color: COLORS.gold, fontSize: 12, fontWeight: 600, cursor: "pointer", padding: "6px 4px" }}>
+        Didn't find the pricing module? Add one here
+      </button>
+    );
+  }
+
+  return (
+    <div style={{ marginTop: 8, background: COLORS.panel2, border: `1px solid ${COLORS.gold}55`, borderRadius: 10, padding: 12 }}>
+      <div style={{ fontSize: 11.5, fontWeight: 700, color: COLORS.gold, textTransform: "uppercase", letterSpacing: 0.4, marginBottom: 8 }}>New pricing module</div>
+      <select value={categoryKey} onChange={(e) => setCategoryKey(e.target.value)} style={{ ...inputStyle, marginTop: 0, marginBottom: 8 }}>
+        {categories.map((c) => <option key={c.key} value={c.key}>{c.label}</option>)}
+      </select>
+      <input value={name} onChange={(e) => setName(e.target.value)} placeholder="Treatment name" style={{ ...inputStyle, marginTop: 0, marginBottom: 8 }} />
+      <div style={{ display: "flex", gap: 8, marginBottom: 10 }}>
+        <input type="number" value={retail} onChange={(e) => setRetail(e.target.value)} placeholder="Retail AED" style={{ ...inputStyle, marginTop: 0, flex: 1 }} />
+        <input type="number" value={b2b} onChange={(e) => setB2b(e.target.value)} placeholder="B2B AED" style={{ ...inputStyle, marginTop: 0, flex: 1 }} />
+      </div>
+      <div style={{ display: "flex", gap: 8 }}>
+        <button onClick={() => setOpen(false)} className="mrcap-press" style={{ ...secondaryBtnStyle, flex: 1, padding: "8px" }}>Cancel</button>
+        <button onClick={save} disabled={!name.trim() || saving} className="mrcap-press" style={{ ...primaryBtnStyle, flex: 2, padding: "8px", opacity: !name.trim() ? 0.5 : 1 }}>{saving ? "Saving…" : "Save & use it now"}</button>
+      </div>
+    </div>
+  );
+}
 function PhotoGrid({ photos, onRemove, onView }) {
   if (!photos.length) return null;
   return (
@@ -2319,6 +2371,7 @@ function PlatePicker({ value, onChange, onModeChange, onVinPhotosChange }) {
   const [emirate, setEmirate] = useState(null);
   const [category, setCategory] = useState(null);
   const [manualCategory, setManualCategory] = useState(false);
+  const [isClassic, setIsClassic] = useState(false); // classic plates: emirate + number, no letter code
   const [number, setNumber] = useState("");
   const [vin, setVin] = useState("");
   const [vinPhotos, setVinPhotos] = useState([]);
@@ -2344,12 +2397,13 @@ function PlatePicker({ value, onChange, onModeChange, onVinPhotosChange }) {
   // Keep the parent's plain string in sync whenever any piece changes.
   useEffect(() => {
     if (mode === "vin") { onChange(vin.trim()); return; }
+    if (isClassic) { if (emirate && number) onChange(`${emirate.code} ${number}`.trim()); else onChange(""); return; }
     if (emirate && category && number) onChange(`${emirate.code} ${category} ${number}`.trim());
     else onChange("");
     // eslint-disable-next-line
-  }, [mode, emirate, category, number, vin]);
+  }, [mode, emirate, category, isClassic, number, vin]);
 
-  const reset = () => { setEmirate(null); setCategory(null); setManualCategory(false); setNumber(""); };
+  const reset = () => { setEmirate(null); setCategory(null); setManualCategory(false); setIsClassic(false); setNumber(""); };
 
   return (
     <div>
@@ -2389,8 +2443,8 @@ function PlatePicker({ value, onChange, onModeChange, onVinPhotosChange }) {
             </div>
           )}
 
-          {/* Step 2: category */}
-          {emirate && !category && (
+          {/* Step 2: category — skipped entirely for classic plates, which are emirate + number only */}
+          {emirate && !category && !isClassic && (
             <div>
               <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", marginBottom: 8 }}>
                 <span style={{ fontSize: 11.5, color: COLORS.muted }}>{emirate.name} · category</span>
@@ -2403,7 +2457,10 @@ function PlatePicker({ value, onChange, onModeChange, onVinPhotosChange }) {
                       <button key={c} onClick={() => setCategory(c)} className="mrcap-press" style={{ padding: "8px 2px", borderRadius: 7, border: `1px solid ${COLORS.line}`, background: COLORS.panel, color: COLORS.ink, fontFamily: MONO_FONT, fontSize: 12, fontWeight: 600, cursor: "pointer" }}>{c}</button>
                     ))}
                   </div>
-                  <button onClick={() => setManualCategory(true)} className="mrcap-press" style={{ marginTop: 8, fontSize: 11.5, color: COLORS.gold, background: "none", border: "none", cursor: "pointer", padding: 0 }}>Type it manually instead</button>
+                  <div style={{ display: "flex", gap: 14, marginTop: 8 }}>
+                    <button onClick={() => setManualCategory(true)} className="mrcap-press" style={{ fontSize: 11.5, color: COLORS.gold, background: "none", border: "none", cursor: "pointer", padding: 0 }}>Type it manually instead</button>
+                    <button onClick={() => setIsClassic(true)} className="mrcap-press" style={{ fontSize: 11.5, color: COLORS.gold, background: "none", border: "none", cursor: "pointer", padding: 0 }}>Classic plate — no letters</button>
+                  </div>
                 </>
               ) : (
                 <div style={{ display: "flex", gap: 8 }}>
@@ -2415,11 +2472,11 @@ function PlatePicker({ value, onChange, onModeChange, onVinPhotosChange }) {
           )}
 
           {/* Step 3: number */}
-          {emirate && category && (
+          {emirate && (category || isClassic) && (
             <div>
               <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", marginBottom: 8 }}>
-                <span style={{ fontSize: 11.5, color: COLORS.muted, fontFamily: MONO_FONT }}>{emirate.code} {category} · number</span>
-                <button onClick={() => { setCategory(null); setManualCategory(false); }} className="mrcap-press" style={{ fontSize: 11, color: COLORS.gold, background: "none", border: "none", cursor: "pointer" }}>Change category</button>
+                <span style={{ fontSize: 11.5, color: COLORS.muted, fontFamily: MONO_FONT }}>{emirate.code} {isClassic ? "(classic)" : category} · number</span>
+                <button onClick={() => { setCategory(null); setManualCategory(false); setIsClassic(false); }} className="mrcap-press" style={{ fontSize: 11, color: COLORS.gold, background: "none", border: "none", cursor: "pointer" }}>{isClassic ? "Not classic — pick a category" : "Change category"}</button>
               </div>
               <input autoFocus inputMode="numeric" style={{ ...inputStyle, marginTop: 0, fontFamily: MONO_FONT, fontSize: 18, letterSpacing: 1, textAlign: "center" }} value={number} onChange={(e) => setNumber(e.target.value.replace(/[^0-9]/g, "").slice(0, 5))} placeholder="12345" />
             </div>
@@ -3287,6 +3344,7 @@ function StatCard({ label, value, tone }) {
 
 /* ---------------- New Quote (fully parallel to NewJobForm, no team/stage) ---------------- */
 function NewQuoteForm({ session, onCreated, onCancel }) {
+  const [, setRefreshTick] = useState(0); // forces a re-render so a just-added pricing module shows immediately
   const [plate, setPlate] = useState("");
   const [makeModel, setMakeModel] = useState("");
   const [customerName, setCustomerName] = useState("");
@@ -3394,6 +3452,7 @@ function NewQuoteForm({ session, onCreated, onCancel }) {
               )}
             </div>
           ))}
+          <AddTreatmentPrompt categories={visibleServices(serviceTypes)} onAdded={() => setRefreshTick((t) => t + 1)} />
         </div>
       </Field>
 
@@ -3600,6 +3659,7 @@ function QuickIntakeForm({ session, onCreated, onCancel, onFullForm }) {
 }
 
 function NewJobForm({ session, team, onCreated, onCancel }) {
+  const [, setRefreshTick] = useState(0); // forces a re-render so a just-added pricing module shows immediately
   const [plate, setPlate] = useState("");
   const [makeModel, setMakeModel] = useState("");
   const [customerName, setCustomerName] = useState("");
@@ -3918,6 +3978,7 @@ function NewJobForm({ session, team, onCreated, onCancel }) {
               </div>
             );
           })}
+          <AddTreatmentPrompt categories={visibleServices(serviceTypes)} onAdded={() => setRefreshTick((t) => t + 1)} />
         </div>
       </Field>
 
@@ -4067,6 +4128,7 @@ function PartsEditor({ parts, onChange, showTotal }) {
 }
 
 function EditJobScreen({ job, session, onSaved, onCancel }) {
+  const [, setRefreshTick] = useState(0); // forces a re-render so a just-added pricing module shows immediately
   const [plate, setPlate] = useState(job.plate);
   const [makeModel, setMakeModel] = useState(job.makeModel);
   const [customerName, setCustomerName] = useState(job.customerName);
@@ -4256,6 +4318,7 @@ function EditJobScreen({ job, session, onSaved, onCancel }) {
               )}
             </div>
           ))}
+          <AddTreatmentPrompt categories={visibleServices(serviceTypes)} onAdded={() => setRefreshTick((t) => t + 1)} />
         </div>
       </Field>
 
@@ -6933,6 +6996,7 @@ function QuotesScreen({ onBack, onOpen, onNew }) {
 
 /* ---------------- Edit Quote (creator or admin) ---------------- */
 function EditQuoteScreen({ quote, session, onSaved, onCancel }) {
+  const [, setRefreshTick] = useState(0); // forces a re-render so a just-added pricing module shows immediately
   const [plate, setPlate] = useState(quote.plate || "");
   const [makeModel, setMakeModel] = useState(quote.makeModel || "");
   const [customerName, setCustomerName] = useState(quote.customerName);
@@ -7036,6 +7100,7 @@ function EditQuoteScreen({ quote, session, onSaved, onCancel }) {
               )}
             </div>
           ))}
+          <AddTreatmentPrompt categories={visibleServices(serviceTypes)} onAdded={() => setRefreshTick((t) => t + 1)} />
         </div>
       </Field>
 
