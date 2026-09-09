@@ -5,7 +5,8 @@ import {
   Clock, User, Building2, X, CheckCircle2, Lock, Delete,
   LayoutDashboard, ListChecks, UserPlus, ShieldCheck, Archive, ShieldAlert,
   Users, BarChart3, Phone, Download, Upload, FileText, Send, PauseCircle,
-  MessageSquare, TrendingUp, RotateCcw, ExternalLink, Star, AlertCircle
+  MessageSquare, TrendingUp, RotateCcw, ExternalLink, Star, AlertCircle,
+  Sparkles, Hammer, Armchair
 } from "lucide-react";
 import { jsPDF } from "jspdf";
 
@@ -260,6 +261,27 @@ let SERVICES = [
     treatments: ["Upholstery", "RoofLifting", "SteerRefresh", "QuietCar", "CarbonFiber", "StarLiner", "DashRenew"]
       .map((name) => ({ name, retail: null, b2b: null })) },
 ];
+
+// One small icon per service category, purely for the dashboard job card's
+// icon row — keyed off SERVICES[].key so it stays in sync automatically if
+// a category is ever renamed. Not shown anywhere else.
+const SERVICE_ICONS = {
+  detailing: Sparkles,
+  ppf: ShieldCheck,
+  dentrepair: Hammer,
+  bodyshop: Car,
+  upholstery: Armchair,
+};
+
+// Given a job's serviceTypes (array of SERVICES[].key), returns the
+// headline "primary" service (whichever comes first in SERVICES, i.e.
+// lowest sort order) plus every other matched service as `rest`. Used by
+// the dashboard job card to show one bold label + small icons for the
+// rest, instead of a wall of text when a job spans 2-3 services at once.
+function splitPrimaryService(serviceTypeKeys) {
+  const matched = SERVICES.filter((s) => (serviceTypeKeys || []).includes(s.key));
+  return { primary: matched[0] || null, rest: matched.slice(1) };
+}
 
 // UAE plate reference data. Dubai and Abu Dhabi are precisely confirmed
 // (RTA/DMT public sources, Aug 2026). The other five emirates' full code
@@ -3288,6 +3310,15 @@ function SimplifiedDashboard({ index, session, onOpen, onRefresh, syncState, las
 function Dashboard({ index, session, onOpen, canArchive, onRefresh, syncState, lastSyncedAt }) {
   const [filter, setFilter] = useState("open");
   const [search, setSearch] = useState("");
+  // Tapping a stat card toggles this: null (no extra filter), "high"
+  // (High priority only), or "qc" (Ready for QC only). Tapping the same
+  // card again, or "Active", clears it back to null.
+  const [statFilter, setStatFilter] = useState(null);
+  // Tapping a location chip toggles this to that location's exact string,
+  // or back to null for "all locations". Uses getLocations() (the app's
+  // real BASE_LOCATIONS + CUSTOM_LOCATIONS list) so it never falls out of
+  // sync with whatever locations actually exist.
+  const [locationFilter, setLocationFilter] = useState(null);
   const isAdmin = session.role === "admin";
   const [outToday, setOutToday] = useState(STAFF_OUT_TODAY);
   const [savingOutToday, setSavingOutToday] = useState(false);
@@ -3328,6 +3359,9 @@ function Dashboard({ index, session, onOpen, canArchive, onRefresh, syncState, l
     if (filter === "open" && j.stageKey === "collected") return false;
     if (filter === "mine" && j.stageKey !== "service") return false;
     if (filter === "collected" && j.stageKey !== "collected") return false;
+    if (statFilter === "high" && j.priority !== "High") return false;
+    if (statFilter === "qc" && j.stageKey !== "qc") return false;
+    if (locationFilter && j.location !== locationFilter) return false;
     if (search) {
       const q = search.toLowerCase();
       return (j.plate || "").toLowerCase().includes(q) || (j.customerName || "").toLowerCase().includes(q) || (j.makeModel || "").toLowerCase().includes(q);
@@ -3522,12 +3556,34 @@ function Dashboard({ index, session, onOpen, canArchive, onRefresh, syncState, l
       )}
 
       {isAdmin && (
-        <div style={{ display: "grid", gridTemplateColumns: "repeat(3, 1fr)", gap: 8, marginBottom: 14 }}>
-          <StatCard label="Active" value={active.length} />
-          <StatCard label="High priority" value={highPriority.length} tone={highPriority.length ? COLORS.red : undefined} />
-          <StatCard label="Ready for QC" value={readyForQC.length} tone={readyForQC.length ? COLORS.blue : undefined} />
+        <div style={{ display: "grid", gridTemplateColumns: "repeat(3, 1fr)", gap: 8, marginBottom: 10 }}>
+          <StatCard label="Active" value={active.length} onClick={() => setStatFilter(null)} isActive={statFilter === null} />
+          <StatCard label="High priority" value={highPriority.length} tone={highPriority.length ? COLORS.red : undefined} onClick={() => setStatFilter((f) => (f === "high" ? null : "high"))} isActive={statFilter === "high"} />
+          <StatCard label="Ready for QC" value={readyForQC.length} tone={readyForQC.length ? COLORS.blue : undefined} onClick={() => setStatFilter((f) => (f === "qc" ? null : "qc"))} isActive={statFilter === "qc"} />
         </div>
       )}
+
+      {/* Location filter chips — reads the app's real location list
+          (in-house + any shop-added external locations), so a new location
+          added from Settings shows up here automatically, no code change
+          needed. Tapping the active chip again clears back to "all". */}
+      <div style={{ display: "flex", gap: 6, marginBottom: 14, overflowX: "auto" }}>
+        {getLocations().map((loc) => (
+          <button
+            key={loc}
+            onClick={() => setLocationFilter((f) => (f === loc ? null : loc))}
+            className="mrcap-press"
+            style={{
+              padding: "6px 12px", borderRadius: 999, fontSize: 11.5, fontWeight: 600, whiteSpace: "nowrap", cursor: "pointer", flexShrink: 0,
+              border: `1.5px solid ${locationFilter === loc ? COLORS.gold : COLORS.line}`,
+              background: locationFilter === loc ? COLORS.gold : COLORS.panel2,
+              color: locationFilter === loc ? COLORS.darkText : COLORS.muted,
+            }}
+          >
+            {loc}
+          </button>
+        ))}
+      </div>
 
       <div style={{ position: "relative", marginBottom: 12 }}>
         <Search size={15} color={COLORS.muted} style={{ position: "absolute", left: 12, top: 12 }} />
@@ -3565,6 +3621,23 @@ function Dashboard({ index, session, onOpen, canArchive, onRefresh, syncState, l
                   </div>
                   <Pill tone={priorityTone(j.priority)}>{j.priority}</Pill>
                 </div>
+                {(() => {
+                  const { primary, rest } = splitPrimaryService(j.serviceTypes);
+                  if (!primary) return null;
+                  return (
+                    <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
+                      <div style={{ fontSize: 13, fontWeight: 600, color: COLORS.ink }}>{primary.label}</div>
+                      {rest.length > 0 && (
+                        <div style={{ display: "flex", gap: 5 }}>
+                          {rest.map((s) => {
+                            const Icon = SERVICE_ICONS[s.key];
+                            return Icon ? <Icon key={s.key} size={13} color={COLORS.muted} /> : null;
+                          })}
+                        </div>
+                      )}
+                    </div>
+                  );
+                })()}
                 <div style={{ fontSize: 11, color: COLORS.muted, display: "flex", alignItems: "center", gap: 5 }}>
                   <Clock size={11} /> {fmtTime(j.updatedAt)} · <Building2 size={11} /> {j.location}
                 </div>
@@ -3608,12 +3681,21 @@ function Dashboard({ index, session, onOpen, canArchive, onRefresh, syncState, l
   );
 }
 
-function StatCard({ label, value, tone }) {
+function StatCard({ label, value, tone, onClick, isActive }) {
+  const borderColor = isActive ? (tone || COLORS.gold) : (tone || COLORS.line);
   return (
-    <div className="mrcap-fade" style={{ background: COLORS.panel, border: `1px solid ${tone || COLORS.line}`, borderRadius: 10, padding: "13px 11px", position: "relative", overflow: "hidden" }}>
+    <button
+      onClick={onClick}
+      className="mrcap-fade mrcap-press"
+      style={{
+        background: COLORS.panel, border: `1.5px solid ${borderColor}`, borderRadius: 10, padding: "13px 11px",
+        position: "relative", overflow: "hidden", textAlign: "left", cursor: onClick ? "pointer" : "default",
+        width: "100%", boxSizing: "border-box",
+      }}
+    >
       <div style={{ fontSize: 9.5, color: COLORS.muted, fontWeight: 600, textTransform: "uppercase", letterSpacing: 0.6 }}>{label}</div>
       <div style={{ fontFamily: MONO_FONT, fontWeight: 600, fontSize: 24, color: tone || COLORS.gold, marginTop: 3 }}>{String(value).padStart(2, "0")}</div>
-    </div>
+    </button>
   );
 }
 
