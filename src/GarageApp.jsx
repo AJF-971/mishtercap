@@ -9305,6 +9305,11 @@ function DispatchBoard({ team, session }) {
   };
   const [saving, setSaving] = useState(false);
   const [dupeUpdateToast, setDupeUpdateToast] = useState("");
+  // Shown when a tap-to-assign write fails to actually save (e.g. a weak
+  // phone connection dropping the request). Previously this failed
+  // completely silently — the tap looked like it worked until the next
+  // poll quietly reverted it a few seconds later with no explanation.
+  const [assignErrorToast, setAssignErrorToast] = useState("");
   const [nowTick, setNowTick] = useState(() => Date.now());
   const [showAlertsDetail, setShowAlertsDetail] = useState(false);
   const [sortOrder, setSortOrder] = useState("oldest"); // "oldest" | "newest" | "priority"
@@ -9438,6 +9443,7 @@ function DispatchBoard({ team, session }) {
     if (!isRemoving && current.length >= DISPATCH_MAX_ASSIGNEES) return; // cap reached — no-op
     const nextList = isRemoving ? current.filter((id) => id !== memberId) : [...current, memberId];
     const nextAssignedTeam = { ...job.assignedTeam, [categoryKey]: nextList };
+    const previousAssignedTeam = job.assignedTeam; // kept so we can revert cleanly if the save fails
     setJobs((prev) => prev.map((j) => (j.id === job.id ? { ...j, assignedTeam: nextAssignedTeam } : j)));
     const staffName = team.find((m) => m.id === memberId)?.name || memberId;
     withActivitySummary(isRemoving
@@ -9449,11 +9455,20 @@ function DispatchBoard({ team, session }) {
     // actually announce out loud on a tablet sitting near the person
     // being assigned, instead of only confirming on the assigner's own
     // screen while everyone else hears nothing.
-    await sbFetch(`jobs?id=eq.${job.id}`, {
+    const { ok } = await sbFetch(`jobs?id=eq.${job.id}`, {
       method: "PATCH",
       headers: { Prefer: "return=minimal" },
       body: JSON.stringify({ assigned_team: nextAssignedTeam }),
     });
+    if (!ok) {
+      // Revert the optimistic update immediately and say so, rather than
+      // letting it silently snap back on the next 6s poll with nothing
+      // shown — that gap is exactly what made this look like it "worked"
+      // on a phone with a flaky connection.
+      setJobs((prev) => prev.map((j) => (j.id === job.id ? { ...j, assignedTeam: previousAssignedTeam } : j)));
+      setAssignErrorToast(`Couldn't save ${isRemoving ? "removing" : "assigning"} ${staffName} — check your connection and try again.`);
+      setTimeout(() => setAssignErrorToast(""), 6000);
+    }
   };
 
   // Mirrors JobDetail's toggleServiceDone exactly (same serviceDone shape,
@@ -9723,6 +9738,14 @@ function DispatchBoard({ team, session }) {
         <div style={{ position: "fixed", bottom: 18, right: 18, left: 18, zIndex: 9999, display: "flex", justifyContent: "flex-end", pointerEvents: "none" }}>
           <div style={{ maxWidth: 340, width: "100%", background: COLORS.panel, border: `1px solid ${COLORS.gold}`, borderRadius: 12, padding: "12px 14px", boxShadow: "0 10px 26px rgba(0,0,0,0.5)", color: COLORS.gold, fontSize: 12.5, fontWeight: 600 }}>
             {dupeUpdateToast}
+          </div>
+        </div>,
+        document.body
+      )}
+      {assignErrorToast && createPortal(
+        <div style={{ position: "fixed", top: 18, right: 18, left: 18, zIndex: 9999, display: "flex", justifyContent: "flex-end", pointerEvents: "none" }}>
+          <div style={{ maxWidth: 340, width: "100%", background: COLORS.panel, border: `1px solid ${COLORS.red}`, borderRadius: 12, padding: "12px 14px", boxShadow: "0 10px 26px rgba(0,0,0,0.5)", color: COLORS.red, fontSize: 12.5, fontWeight: 600 }}>
+            {assignErrorToast}
           </div>
         </div>,
         document.body
