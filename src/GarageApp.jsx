@@ -6561,7 +6561,7 @@ function AnnouncementComposer({ session, team, onBack }) {
   const [posted, setPosted] = useState(false);
   const [items, setItems] = useState([]);
   const [loadingItems, setLoadingItems] = useState(true);
-  const { locations } = useMemo(() => ({ locations: getLocations() }), []);
+  const locations = getLocations();
 
   const loadItems = async () => {
     setLoadingItems(true);
