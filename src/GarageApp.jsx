@@ -1031,6 +1031,7 @@ function rowToJob(r) {
     plate: r.plate, makeModel: r.make_model, customerName: r.customer_name, customerPhone: r.customer_phone,
     description: r.description, damageNotes: r.damage_notes, priority: r.priority, location: r.location,
     serviceTypes: r.service_types || [], serviceDone: r.service_done || {}, assignedTo: r.assigned_to || {},
+    assignedTeam: r.assigned_team || {},
     serviceNotes: r.service_notes || {}, serviceReviewed: r.service_reviewed || {}, treatments: r.treatments || {},
     treatmentPrices: r.treatment_prices || {}, discountPercent: r.discount_percent || 0, priceHistory: r.price_history || [],
     parts: r.parts || [], markupEntries: r.markup_entries || [],
@@ -1052,6 +1053,7 @@ function jobToRow(job) {
     plate: job.plate, make_model: job.makeModel, customer_name: job.customerName, customer_phone: job.customerPhone,
     description: job.description, damage_notes: job.damageNotes, priority: job.priority, location: job.location,
     service_types: job.serviceTypes || [], service_done: job.serviceDone || {}, assigned_to: job.assignedTo || {},
+    assigned_team: job.assignedTeam || {},
     service_notes: job.serviceNotes || {}, service_reviewed: job.serviceReviewed || {}, treatments: job.treatments || {},
     treatment_prices: job.treatmentPrices || {}, discount_percent: job.discountPercent || 0, price_history: job.priceHistory || [],
     parts: job.parts || [], markup_entries: job.markupEntries || [],
@@ -4186,6 +4188,14 @@ function NewJobForm({ session, team, onCreated, onCancel }) {
       treatmentPrices, discountPercent, priceHistory: [],
       serviceDone: {},
       assignedTo,
+      // Mirrors assignedTo into the Dispatch Board's field at creation
+      // time too — same reasoning as the assignService fix: one person
+      // can create a job and assign someone in the same step, and that
+      // should show up on the Dispatch Board immediately, not just
+      // assignments made after the job already exists.
+      assignedTeam: Object.fromEntries(
+        Object.entries(assignedTo).filter(([, memberId]) => memberId).map(([key, memberId]) => [key, [memberId]])
+      ),
       stageIndex: 0,
       photos: { intake: [...photos, ...vinPhotos], parts_removal: [], service: {}, },
       startTime: null, stopTime: null, invoiceAmount: "",
@@ -5033,9 +5043,21 @@ function JobDetail({ id, initialJob, session, team, onChanged, onBack, canArchiv
     const newlyAssignedMember = team.find((m) => m.id === memberId);
     const now = Date.now();
     const isUnassigning = current === memberId;
+    // Keep assignedTeam (what the Dispatch Board actually reads) in sync
+    // with assignedTo (what this screen writes) right here, at the single
+    // place this action happens — so the Dispatch Board can never again
+    // silently miss an assignment made from the normal job screen.
+    // Unioned, not replaced: assigning here adds memberId to the
+    // category's team without removing anyone the Dispatch Board already
+    // added there; unassigning here only removes this one person.
+    const currentTeamForKey = (job.assignedTeam || {})[key] || [];
+    const nextTeamForKey = isUnassigning
+      ? currentTeamForKey.filter((id) => id !== memberId)
+      : (currentTeamForKey.includes(memberId) ? currentTeamForKey : [...currentTeamForKey, memberId]);
     const updated = {
       ...job,
       assignedTo: { ...(job.assignedTo || {}), [key]: isUnassigning ? undefined : memberId },
+      assignedTeam: { ...(job.assignedTeam || {}), [key]: nextTeamForKey },
       history: [...job.history, { stage: "service", label: svc?.label || key, by: session.name, role: session.role, note: isUnassigning ? "Unassigned" : `Assigned to ${newlyAssignedMember?.name || "someone"}`, at: now }],
       updatedAt: now,
     };
@@ -9480,21 +9502,30 @@ function DispatchBoard({ team, session }) {
     markLocalWrite();
     setSaving(true);
     const { job, categoryKey, categoryLabel } = row;
-    const { ok, data } = await sbFetch(`jobs?id=eq.${job.id}&select=service_done,history`);
-    const current = ok && data && data[0] ? data[0] : { service_done: job.serviceDone, history: [] };
+    const { ok: fetchOk, data } = await sbFetch(`jobs?id=eq.${job.id}&select=service_done,history`);
+    const current = fetchOk && data && data[0] ? data[0] : { service_done: job.serviceDone, history: [] };
     const nextServiceDone = { ...(current.service_done || {}), [categoryKey]: nowDone };
     const nextHistory = [
       ...(current.history || []),
       { stage: "service", label: categoryLabel, by: session.name, role: session.role, note: nowDone ? "Marked done" : "Un-marked", at: Date.now() },
     ];
     withActivitySummary(`Dispatch board: ${nowDone ? "marked" : "un-marked"} ${categoryLabel} done on ${job.plate}`);
-    await sbFetch(`jobs?id=eq.${job.id}`, {
+    const { ok } = await sbFetch(`jobs?id=eq.${job.id}`, {
       method: "PATCH",
       headers: { Prefer: "return=minimal" },
       body: JSON.stringify({ service_done: nextServiceDone, history: nextHistory, updated_at: new Date().toISOString() }),
     });
-    setJobs((prev) => prev.map((j) => (j.id === job.id ? { ...j, serviceDone: nextServiceDone } : j)));
     setSaving(false);
+    if (!ok) {
+      // Previously this applied the optimistic update regardless of
+      // whether the save succeeded — on a dropped connection it looked
+      // done until the next 6s poll quietly reverted it with no
+      // explanation, same failure shape as the assignment bug.
+      setAssignErrorToast(`Couldn't save ${nowDone ? "marking" : "un-marking"} ${categoryLabel} done on ${job.plate} — check your connection and try again.`);
+      setTimeout(() => setAssignErrorToast(""), 6000);
+      return;
+    }
+    setJobs((prev) => prev.map((j) => (j.id === job.id ? { ...j, serviceDone: nextServiceDone } : j)));
     if (nowDone) playDispatchDoneChime();
   };
 
@@ -9510,21 +9541,26 @@ function DispatchBoard({ team, session }) {
     markLocalWrite();
     setSaving(true);
     const { job, categoryKey, categoryLabel } = row;
-    const { ok, data } = await sbFetch(`jobs?id=eq.${job.id}&select=service_started,history`);
-    const current = ok && data && data[0] ? data[0] : { service_started: job.serviceStarted, history: [] };
+    const { ok: fetchOk, data } = await sbFetch(`jobs?id=eq.${job.id}&select=service_started,history`);
+    const current = fetchOk && data && data[0] ? data[0] : { service_started: job.serviceStarted, history: [] };
     const nextServiceStarted = { ...(current.service_started || {}), [categoryKey]: nowStarted ? new Date().toISOString() : false };
     const nextHistory = [
       ...(current.history || []),
       { stage: "service", label: categoryLabel, by: session.name, role: session.role, note: nowStarted ? "Started" : "Un-started", at: Date.now() },
     ];
     withActivitySummary(`Dispatch board: ${nowStarted ? "started" : "un-started"} ${categoryLabel} on ${job.plate}`);
-    await sbFetch(`jobs?id=eq.${job.id}`, {
+    const { ok } = await sbFetch(`jobs?id=eq.${job.id}`, {
       method: "PATCH",
       headers: { Prefer: "return=minimal" },
       body: JSON.stringify({ service_started: nextServiceStarted, history: nextHistory, updated_at: new Date().toISOString() }),
     });
-    setJobs((prev) => prev.map((j) => (j.id === job.id ? { ...j, serviceStarted: nextServiceStarted } : j)));
     setSaving(false);
+    if (!ok) {
+      setAssignErrorToast(`Couldn't save ${nowStarted ? "starting" : "un-starting"} ${categoryLabel} on ${job.plate} — check your connection and try again.`);
+      setTimeout(() => setAssignErrorToast(""), 6000);
+      return;
+    }
+    setJobs((prev) => prev.map((j) => (j.id === job.id ? { ...j, serviceStarted: nextServiceStarted } : j)));
   };
 
   // Moves a job from one service category to another — this is how a
@@ -9538,8 +9574,8 @@ function DispatchBoard({ team, session }) {
     setSaving(true);
     const { job, categoryKey, categoryLabel } = row;
     const newLabel = SERVICES.find((s) => s.key === newCategoryKey)?.label || newCategoryKey;
-    const { ok, data } = await sbFetch(`jobs?id=eq.${job.id}&select=service_types,assigned_to,assigned_team,service_done,service_started,history`);
-    const current = ok && data && data[0]
+    const { ok: fetchOk, data } = await sbFetch(`jobs?id=eq.${job.id}&select=service_types,assigned_to,assigned_team,service_done,service_started,history`);
+    const current = fetchOk && data && data[0]
       ? data[0]
       : { service_types: job.serviceTypes, assigned_to: job.assignedTo, assigned_team: job.assignedTeam, service_done: job.serviceDone, service_started: job.serviceStarted, history: [] };
     const nextServiceTypes = (current.service_types || []).filter((k) => k !== categoryKey);
@@ -9553,7 +9589,7 @@ function DispatchBoard({ team, session }) {
       { stage: "service", label: `${categoryLabel} → ${newLabel}`, by: session.name, role: session.role, note: "Moved", at: Date.now() },
     ];
     withActivitySummary(`Dispatch board: moved ${job.plate} from ${categoryLabel} to ${newLabel}`);
-    await sbFetch(`jobs?id=eq.${job.id}`, {
+    const { ok } = await sbFetch(`jobs?id=eq.${job.id}`, {
       method: "PATCH",
       headers: { Prefer: "return=minimal" },
       body: JSON.stringify({
@@ -9561,10 +9597,15 @@ function DispatchBoard({ team, session }) {
         service_started: nextServiceStarted, history: nextHistory, updated_at: new Date().toISOString(),
       }),
     });
+    setSaving(false);
+    if (!ok) {
+      setAssignErrorToast(`Couldn't move ${job.plate} to ${newLabel} — check your connection and try again.`);
+      setTimeout(() => setAssignErrorToast(""), 6000);
+      return;
+    }
     setJobs((prev) => prev.map((j) => (j.id === job.id
       ? { ...j, serviceTypes: nextServiceTypes, assignedTo: nextAssignedTo, assignedTeam: nextAssignedTeam, serviceDone: nextServiceDone, serviceStarted: nextServiceStarted }
       : j)));
-    setSaving(false);
     setSelectedRowKey(null); // the old (job, category) row this modal was showing no longer exists
   };
 
@@ -9585,8 +9626,8 @@ function DispatchBoard({ team, session }) {
     markLocalWrite();
     setSaving(true);
     const { job, categoryLabel } = row;
-    const { ok, data } = await sbFetch(`jobs?id=eq.${job.id}&select=history`);
-    const current = ok && data && data[0] ? data[0] : { history: [] };
+    const { ok: fetchOk, data } = await sbFetch(`jobs?id=eq.${job.id}&select=history`);
+    const current = fetchOk && data && data[0] ? data[0] : { history: [] };
     const recentSame = (current.history || [])
       .filter((h) => h.stage === "progress_update" && h.note === text)
       .slice(-1)[0];
@@ -9601,12 +9642,16 @@ function DispatchBoard({ team, session }) {
       { stage: "progress_update", label: categoryLabel, by: session.name, role: session.role, note: text, at: Date.now() },
     ];
     withActivitySummary(`Dispatch board: ${session.name} posted an update on ${job.plate}`);
-    await sbFetch(`jobs?id=eq.${job.id}`, {
+    const { ok } = await sbFetch(`jobs?id=eq.${job.id}`, {
       method: "PATCH",
       headers: { Prefer: "return=minimal" },
       body: JSON.stringify({ history: nextHistory, updated_at: new Date().toISOString() }),
     });
     setSaving(false);
+    if (!ok) {
+      setAssignErrorToast(`Couldn't post the update on ${job.plate} — check your connection and try again.`);
+      setTimeout(() => setAssignErrorToast(""), 6000);
+    }
   };
 
   // Fully manual by request — no automatic location-based hiding.
@@ -9616,20 +9661,29 @@ function DispatchBoard({ team, session }) {
   const toggleDispatchHidden = async (job, hide) => {
     markLocalWrite();
     setSaving(true);
-    const { ok, data } = await sbFetch(`jobs?id=eq.${job.id}&select=history`);
-    const current = ok && data && data[0] ? data[0] : { history: [] };
+    const { ok: fetchOk, data } = await sbFetch(`jobs?id=eq.${job.id}&select=history`);
+    const current = fetchOk && data && data[0] ? data[0] : { history: [] };
     const nextHistory = [
       ...(current.history || []),
       { stage: "dispatch_visibility", label: job.plate, by: session.name, role: session.role, note: hide ? "Hidden from Dispatch Board" : "Shown on Dispatch Board again", at: Date.now() },
     ];
     withActivitySummary(`Dispatch board: ${session.name} ${hide ? "hid" : "unhid"} ${job.plate}`);
     setJobs((prev) => prev.map((j) => (j.id === job.id ? { ...j, dispatchHidden: hide } : j)));
-    await sbFetch(`jobs?id=eq.${job.id}`, {
+    const { ok } = await sbFetch(`jobs?id=eq.${job.id}`, {
       method: "PATCH",
       headers: { Prefer: "return=minimal" },
       body: JSON.stringify({ dispatch_hidden: hide, history: nextHistory, updated_at: new Date().toISOString() }),
     });
     setSaving(false);
+    if (!ok) {
+      // This one applies its optimistic update before the write (unlike
+      // the others above), so on failure it needs an actual revert, not
+      // just skipping the update.
+      setJobs((prev) => prev.map((j) => (j.id === job.id ? { ...j, dispatchHidden: !hide } : j)));
+      setAssignErrorToast(`Couldn't ${hide ? "hide" : "unhide"} ${job.plate} — check your connection and try again.`);
+      setTimeout(() => setAssignErrorToast(""), 6000);
+      return;
+    }
     if (hide) setSelectedRowKey(null); // it's about to disappear from the visible columns
   };
 
@@ -9915,11 +9969,12 @@ async function postProgressUpdateToJob(jobId, text, session) {
   }
   const entry = { stage: "progress_update", label: current.make_model || "", by: session.name, role: session.role, note: trimmed, at: Date.now() };
   const nextHistory = [...(current.history || []), entry];
-  await sbFetch(`jobs?id=eq.${jobId}`, {
+  const { ok: writeOk } = await sbFetch(`jobs?id=eq.${jobId}`, {
     method: "PATCH",
     headers: { Prefer: "return=minimal" },
     body: JSON.stringify({ history: nextHistory, updated_at: new Date().toISOString() }),
   });
+  if (!writeOk) return { ok: false };
   return { ok: true, entry: { jobId, plate: current.plate, makeModel: current.make_model, ...entry } };
 }
 
@@ -10032,6 +10087,11 @@ function PostUpdateComposer({ jobId, session, onPosted }) {
     if (result.ok) {
       setText("");
       onPosted && onPosted(result.entry);
+    } else {
+      // Genuine save failure (e.g. dropped connection) — leave the typed
+      // text in place rather than clearing it as if the post succeeded.
+      setWarning("Couldn't post — check your connection and try again.");
+      setTimeout(() => setWarning(""), 4000);
     }
   };
 
