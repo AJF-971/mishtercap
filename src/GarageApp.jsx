@@ -3313,8 +3313,9 @@ function Dashboard({ index, session, onOpen, canArchive, onRefresh, syncState, l
   const [filter, setFilter] = useState("open");
   const [search, setSearch] = useState("");
   // Tapping a stat card toggles this: null (no extra filter), "high"
-  // (High priority only), or "qc" (Ready for QC only). Tapping the same
-  // card again, or "Active", clears it back to null.
+  // (High priority only), "qc" (Ready for QC only), or "ready" (Ready for
+  // Collection only). Tapping the same card again, or "Active", clears it
+  // back to null.
   const [statFilter, setStatFilter] = useState(null);
   // Tapping a location chip toggles this to that location's exact string,
   // or back to null for "all locations". Uses getLocations() (the app's
@@ -3356,6 +3357,7 @@ function Dashboard({ index, session, onOpen, canArchive, onRefresh, syncState, l
   const active = visible.filter((j) => j.stageKey !== "collected");
   const highPriority = active.filter((j) => j.priority === "High");
   const readyForQC = visible.filter((j) => j.stageKey === "qc");
+  const readyForCollection = visible.filter((j) => j.stageKey === "ready");
 
   const filtered = visible.filter((j) => {
     if (filter === "open" && j.stageKey === "collected") return false;
@@ -3363,6 +3365,7 @@ function Dashboard({ index, session, onOpen, canArchive, onRefresh, syncState, l
     if (filter === "collected" && j.stageKey !== "collected") return false;
     if (statFilter === "high" && j.priority !== "High") return false;
     if (statFilter === "qc" && j.stageKey !== "qc") return false;
+    if (statFilter === "ready" && j.stageKey !== "ready") return false;
     if (locationFilter && j.location !== locationFilter) return false;
     if (search) {
       const q = search.toLowerCase();
@@ -3558,10 +3561,11 @@ function Dashboard({ index, session, onOpen, canArchive, onRefresh, syncState, l
       )}
 
       {isAdmin && (
-        <div style={{ display: "grid", gridTemplateColumns: "repeat(3, 1fr)", gap: 8, marginBottom: 10 }}>
+        <div style={{ display: "grid", gridTemplateColumns: "repeat(2, 1fr)", gap: 8, marginBottom: 10 }}>
           <StatCard label="Active" value={active.length} onClick={() => setStatFilter(null)} isActive={statFilter === null} />
           <StatCard label="High priority" value={highPriority.length} tone={highPriority.length ? COLORS.red : undefined} onClick={() => setStatFilter((f) => (f === "high" ? null : "high"))} isActive={statFilter === "high"} />
           <StatCard label="Ready for QC" value={readyForQC.length} tone={readyForQC.length ? COLORS.blue : undefined} onClick={() => setStatFilter((f) => (f === "qc" ? null : "qc"))} isActive={statFilter === "qc"} />
+          <StatCard label="Ready for Collection" value={readyForCollection.length} tone={readyForCollection.length ? COLORS.gold : undefined} onClick={() => setStatFilter((f) => (f === "ready" ? null : "ready"))} isActive={statFilter === "ready"} />
         </div>
       )}
 
@@ -5077,6 +5081,15 @@ function JobDetail({ id, initialJob, session, team, onChanged, onBack, canArchiv
     }
     updated.history = [...updated.history, { stage: stage.key, label: stage.label, by: session.name, role: session.role, note: note.trim() || undefined, at: now }];
     updated.stageIndex = Math.min(job.stageIndex + 1, STAGES.length - 1);
+    // Once a job reaches QC, it's no longer "High priority" in the
+    // urgent-attention sense — the urgent part of the work is done, it's
+    // just waiting on review. Auto-revoke to Medium so the High-priority
+    // stat/filter reflects cars that still genuinely need to be rushed,
+    // not ones sitting in QC. Logged explicitly, not silent.
+    if (STAGES[updated.stageIndex].key === "qc" && updated.priority === "High") {
+      updated.priority = "Medium";
+      updated.history = [...updated.history, { stage: "priority", label: "Priority", by: "System", role: "system", note: "High priority automatically revoked — job reached QC", at: now }];
+    }
     updated.updatedAt = now;
     const saved = await saveJob(updated);
     setJob(updated);
