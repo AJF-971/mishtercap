@@ -1164,6 +1164,75 @@ function MorningReminderBanner({ onDismiss }) {
   );
 }
 
+// Boss-composed broadcast messages (see AnnouncementComposer) — unlike
+// the local-only MorningReminderBanner above, these are saved to Supabase
+// so they reach every open device, not just this one. Dismissal is still
+// tracked locally per-device though — nobody needs a server round-trip
+// just to hide a banner they've already read, and the message stays
+// visible to everyone else who hasn't seen it yet.
+function isAnnouncementDismissed(id) {
+  try { return window.localStorage.getItem(`mrcap_announcement_dismissed_${id}`) === "1"; } catch { return false; }
+}
+function dismissAnnouncement(id) {
+  try { window.localStorage.setItem(`mrcap_announcement_dismissed_${id}`, "1"); } catch { /* ignore */ }
+}
+// "Location" audience can't be precisely filtered — team_members has no
+// home-location field, so there's no reliable way to know who's
+// physically at which site. Rather than build a filter that silently
+// fails, location-targeted messages show to everyone, clearly labeled
+// with which location they're about. "Staff" audience matches exactly
+// against session.id, which is reliable since PIN login ties a session
+// to one specific team member.
+function announcementAppliesToSession(announcement, session) {
+  const aud = announcement.audience || { type: "all" };
+  if (aud.type === "staff") return (aud.ids || []).includes(session.id);
+  return true;
+}
+
+function AnnouncementBanner({ session }) {
+  const [items, setItems] = useState([]);
+
+  useEffect(() => {
+    let cancelled = false;
+    async function poll() {
+      const { ok, data } = await sbFetch(
+        `announcements?active=eq.true&show_at=lte.${encodeURIComponent(new Date().toISOString())}&order=show_at.desc&limit=5`
+      );
+      if (!cancelled && ok && data) {
+        setItems(data.filter((a) => announcementAppliesToSession(a, session) && !isAnnouncementDismissed(a.id)));
+      }
+    }
+    poll();
+    const interval = setInterval(poll, 20000);
+    return () => { cancelled = true; clearInterval(interval); };
+  }, [session.id]);
+
+  if (!items.length) return null;
+
+  return (
+    <>
+      {items.map((a) => {
+        const aud = a.audience || { type: "all" };
+        const prefix = aud.type === "location" ? `📍 ${aud.location}: ` : "";
+        return (
+          <div key={a.id} className="mrcap-fade" style={{ background: "#1a1408", border: `2px solid ${COLORS.gold}`, borderRadius: 12, padding: "14px 16px", margin: "12px 16px 0", display: "flex", alignItems: "flex-start", justifyContent: "space-between", gap: 12 }}>
+            <div style={{ fontWeight: 700, fontSize: 14.5, color: COLORS.ink, lineHeight: 1.4 }}>
+              {prefix}{a.message}
+              <div style={{ fontWeight: 400, fontSize: 11, color: COLORS.muted, marginTop: 4 }}>— {a.created_by}</div>
+            </div>
+            <button
+              onClick={() => { dismissAnnouncement(a.id); setItems((prev) => prev.filter((x) => x.id !== a.id)); }}
+              className="mrcap-press" style={{ background: "none", border: "none", cursor: "pointer", padding: 4, flexShrink: 0 }}
+            >
+              <X size={18} color={COLORS.muted} />
+            </button>
+          </div>
+        );
+      })}
+    </>
+  );
+}
+
 // "New since I last opened" tracking — keyed per person (not per device),
 // so it's a genuine "what's happened since I checked" signal rather than
 // tied to a specific phone. Local only; not worth a Supabase round-trip
@@ -2019,6 +2088,7 @@ function DesktopShell({ session, team, view, setView, onLogout, canArchive, chil
           {navItem("admindash", "Admin Dashboard", TrendingUp, () => setView("admindash"), isSuperAdmin(session))}
           {navItem("liveupdates", "Live Updates", MessageSquare, () => setView("liveupdates"), canSeeLiveUpdates(session))}
           {navItem("msgtemplates", "WhatsApp Messages", MessageSquare, () => setView("msgtemplates"), isSuperAdmin(session))}
+          {navItem("announcements", "Post Announcement", Send, () => setView("announcements"), isSuperAdmin(session))}
           {navItem("issues", "Issue Reports", AlertCircle, () => setView("issues"), isSuperAdmin(session))}
         </div>
         <div style={{ borderTop: "1px solid #262A30", paddingTop: 12, marginTop: 12 }}>
@@ -2886,8 +2956,9 @@ export default function GarageApp() {
     <ActiveShell session={session} team={team} view={view} setView={setView} onLogout={onLogout} canArchive={canArchive}>
       {isSuperAdmin(session) && <DraggablePorscheEgg badgeCount={eggAttentionCount} onTap={() => setView("admindash")} />}
       <ReportIssueButton session={session} view={view} />
-      <TopBar session={session} team={team} onLogout={onLogout} onNew={() => setView("new")} view={view} onBack={() => window.history.back()} onTeam={() => setView("team")} onArchive={() => setView("archive")} onCustomers={() => setView("customers")} onReports={() => setView("reports")} onQuotes={() => setView("quotes")} canArchive={canArchive} onAdminDash={() => setView("admindash")} onMsgTemplates={() => setView("msgtemplates")} onIssues={() => setView("issues")} onDispatch={() => setView("dispatch")} onLiveUpdates={() => setView("liveupdates")} />
+      <TopBar session={session} team={team} onLogout={onLogout} onNew={() => setView("new")} view={view} onBack={() => window.history.back()} onTeam={() => setView("team")} onArchive={() => setView("archive")} onCustomers={() => setView("customers")} onReports={() => setView("reports")} onQuotes={() => setView("quotes")} canArchive={canArchive} onAdminDash={() => setView("admindash")} onMsgTemplates={() => setView("msgtemplates")} onIssues={() => setView("issues")} onDispatch={() => setView("dispatch")} onLiveUpdates={() => setView("liveupdates")} onAnnouncements={() => setView("announcements")} />
       {showMorningReminder && <MorningReminderBanner onDismiss={() => { setShowMorningReminder(false); dismissMorningReminder("mrcap"); }} />}
+      <AnnouncementBanner session={session} />
       <LiveUpdateBroadcaster onOpenJob={(id) => openJob(id)} />
       {canSeeLiveUpdates(session) && <InternalUpdatesWidget team={team} session={session} index={index} onOpenJob={(id) => openJob(id)} />}
       {view === "list" && (
@@ -2965,6 +3036,10 @@ export default function GarageApp() {
         <MessageTemplatesScreen onBack={() => window.history.back()} />
       )}
       {view === "msgtemplates" && !isSuperAdmin(session) && <AccessDenied onBack={() => window.history.back()} />}
+      {view === "announcements" && isSuperAdmin(session) && (
+        <AnnouncementComposer session={session} team={team} onBack={() => window.history.back()} />
+      )}
+      {view === "announcements" && !isSuperAdmin(session) && <AccessDenied onBack={() => window.history.back()} />}
       {view === "issues" && isSuperAdmin(session) && (
         <IssueReportsScreen onBack={() => window.history.back()} />
       )}
@@ -3136,7 +3211,7 @@ const keyBtnStyle = { height: 54, borderRadius: 12, border: `1px solid ${COLORS.
 
 /* ---------------- Top bar ---------------- */
 
-function TopBar({ session, team, onLogout, onNew, view, onBack, onTeam, onArchive, onCustomers, onReports, onQuotes, canArchive, onAdminDash, onMsgTemplates, onIssues, onDispatch, onLiveUpdates }) {
+function TopBar({ session, team, onLogout, onNew, view, onBack, onTeam, onArchive, onCustomers, onReports, onQuotes, canArchive, onAdminDash, onMsgTemplates, onIssues, onDispatch, onLiveUpdates, onAnnouncements }) {
   const isSimplified = isSimplifiedRole(session);
   return (
     <div className="mrcap-view">
@@ -3184,6 +3259,9 @@ function TopBar({ session, team, onLogout, onNew, view, onBack, onTeam, onArchiv
           )}
           {view === "list" && isSuperAdmin(session) && (
             <button onClick={onMsgTemplates} style={iconBtnStyle} className="mrcap-press" title="WhatsApp Messages"><MessageSquare size={16} color={COLORS.ink} /></button>
+          )}
+          {view === "list" && isSuperAdmin(session) && (
+            <button onClick={onAnnouncements} style={iconBtnStyle} className="mrcap-press" title="Post Announcement"><Send size={16} color={COLORS.ink} /></button>
           )}
           {view === "list" && isSuperAdmin(session) && (
             <button onClick={onIssues} style={iconBtnStyle} className="mrcap-press" title="Issue Reports"><AlertCircle size={16} color={COLORS.ink} /></button>
@@ -6460,6 +6538,209 @@ function MessageTemplatesScreen({ onBack }) {
       })}
 
       <button onClick={onBack} className="mrcap-press" style={{ ...secondaryBtnStyle, width: "100%", marginTop: 4 }}>Back</button>
+    </div>
+  );
+}
+
+/* ---------------- Post Announcement (Suhail-only) ---------------- */
+// Boss-composed broadcast messages, shown via AnnouncementBanner on every
+// open device (main app + the Dispatch Kiosk) once their show_at time
+// passes — same visual style as the existing local-only morning
+// reminder, but this one is saved to Supabase so it actually reaches
+// other people's screens. See the comment above
+// announcementAppliesToSession for why "location" targeting is
+// best-effort (labeled, shown to all) while "staff" and "all" are exact.
+function AnnouncementComposer({ session, team, onBack }) {
+  const [message, setMessage] = useState("");
+  const [showAt, setShowAt] = useState(() => new Date().toISOString().slice(0, 16));
+  const [audienceType, setAudienceType] = useState("all");
+  const [audienceLocation, setAudienceLocation] = useState("");
+  const [audienceStaffIds, setAudienceStaffIds] = useState([]);
+  const [saving, setSaving] = useState(false);
+  const [error, setError] = useState("");
+  const [posted, setPosted] = useState(false);
+  const [items, setItems] = useState([]);
+  const [loadingItems, setLoadingItems] = useState(true);
+  const { locations } = useMemo(() => ({ locations: getLocations() }), []);
+
+  const loadItems = async () => {
+    setLoadingItems(true);
+    const { ok, data } = await sbFetch("announcements?active=eq.true&order=show_at.desc&limit=20");
+    if (ok && data) setItems(data);
+    setLoadingItems(false);
+  };
+
+  useEffect(() => { loadItems(); }, []);
+
+  const toggleStaff = (id) => {
+    setAudienceStaffIds((prev) => (prev.includes(id) ? prev.filter((x) => x !== id) : [...prev, id]));
+  };
+
+  const post = async () => {
+    const trimmed = message.trim();
+    if (!trimmed) { setError("Type a message first."); return; }
+    if (audienceType === "location" && !audienceLocation) { setError("Pick a location."); return; }
+    if (audienceType === "staff" && audienceStaffIds.length === 0) { setError("Pick at least one person."); return; }
+
+    setSaving(true);
+    setError("");
+    const audience = audienceType === "all"
+      ? { type: "all" }
+      : audienceType === "location"
+      ? { type: "location", location: audienceLocation }
+      : { type: "staff", ids: audienceStaffIds };
+
+    const { ok } = await sbFetch("announcements", {
+      method: "POST",
+      headers: { Prefer: "return=minimal" },
+      body: JSON.stringify({
+        message: trimmed,
+        show_at: new Date(showAt).toISOString(),
+        audience,
+        created_by: session.name,
+      }),
+    });
+    setSaving(false);
+    if (!ok) { setError("Couldn't post — check your connection and try again."); return; }
+
+    setMessage("");
+    setAudienceType("all");
+    setAudienceLocation("");
+    setAudienceStaffIds([]);
+    setPosted(true);
+    setTimeout(() => setPosted(false), 2200);
+    loadItems();
+  };
+
+  const cancel = async (id) => {
+    await sbFetch(`announcements?id=eq.${id}`, {
+      method: "PATCH",
+      headers: { Prefer: "return=minimal" },
+      body: JSON.stringify({ active: false }),
+    });
+    setItems((prev) => prev.filter((a) => a.id !== id));
+  };
+
+  const audienceSummary = (a) => {
+    const aud = a.audience || { type: "all" };
+    if (aud.type === "location") return `📍 ${aud.location}`;
+    if (aud.type === "staff") return `👤 ${(aud.ids || []).map((id) => team.find((m) => m.id === id)?.name || id).join(", ")}`;
+    return "Everyone";
+  };
+
+  return (
+    <div className="mrcap-view" style={{ padding: "0 18px 34px" }}>
+      <SectionTitle>Post Announcement</SectionTitle>
+      <div style={{ fontSize: 12.5, color: COLORS.muted, marginBottom: 18, lineHeight: 1.5 }}>
+        Shows as a banner on everyone's app the moment it goes live — same as "everyone come up at 2pm for group lunch."
+      </div>
+
+      {error && (
+        <div style={{ background: "rgba(168,64,47,0.15)", border: `1px solid ${COLORS.red}`, borderRadius: 10, padding: "10px 13px", marginBottom: 14, fontSize: 12.5, color: "#E08A78" }}>
+          {error}
+        </div>
+      )}
+      {posted && (
+        <div style={{ background: "rgba(212,175,55,0.12)", border: `1px solid ${COLORS.gold}`, borderRadius: 10, padding: "10px 13px", marginBottom: 14, fontSize: 12.5, color: COLORS.gold }}>
+          Posted.
+        </div>
+      )}
+
+      <textarea
+        value={message}
+        onChange={(e) => setMessage(e.target.value)}
+        placeholder="Everyone come up at 2pm for group lunch"
+        rows={3}
+        style={{ width: "100%", boxSizing: "border-box", background: COLORS.panel2, border: `1px solid ${COLORS.line}`, borderRadius: 10, padding: "10px 12px", color: COLORS.ink, fontSize: 14, fontFamily: "inherit", resize: "vertical", marginBottom: 12 }}
+      />
+
+      <div style={{ fontSize: 11, color: COLORS.muted, marginBottom: 4 }}>SHOW AT</div>
+      <input
+        type="datetime-local"
+        value={showAt}
+        onChange={(e) => setShowAt(e.target.value)}
+        style={{ width: "100%", boxSizing: "border-box", background: COLORS.panel2, border: `1px solid ${COLORS.line}`, borderRadius: 10, padding: "10px 12px", color: COLORS.ink, fontSize: 14, fontFamily: "inherit", marginBottom: 14 }}
+      />
+
+      <div style={{ fontSize: 11, color: COLORS.muted, marginBottom: 6 }}>WHO SEES THIS</div>
+      <div style={{ display: "flex", gap: 6, marginBottom: 10 }}>
+        {[["all", "Everyone"], ["location", "A location"], ["staff", "Specific people"]].map(([key, label]) => (
+          <button
+            key={key}
+            onClick={() => setAudienceType(key)}
+            className="mrcap-press"
+            style={{ flex: 1, padding: "9px 8px", borderRadius: 8, fontSize: 12, fontWeight: 600, cursor: "pointer",
+              border: `1.5px solid ${audienceType === key ? COLORS.gold : COLORS.line}`,
+              background: audienceType === key ? COLORS.gold : "transparent",
+              color: audienceType === key ? COLORS.darkText : COLORS.ink }}
+          >
+            {label}
+          </button>
+        ))}
+      </div>
+
+      {audienceType === "location" && (
+        <div style={{ display: "flex", gap: 6, flexWrap: "wrap", marginBottom: 16 }}>
+          {locations.map((loc) => (
+            <button
+              key={loc}
+              onClick={() => setAudienceLocation(loc)}
+              className="mrcap-press"
+              style={{ padding: "6px 12px", borderRadius: 999, fontSize: 11.5, fontWeight: 600, cursor: "pointer",
+                border: `1.5px solid ${audienceLocation === loc ? COLORS.gold : COLORS.line}`,
+                background: audienceLocation === loc ? COLORS.gold : COLORS.panel2,
+                color: audienceLocation === loc ? COLORS.darkText : COLORS.muted }}
+            >
+              {loc}
+            </button>
+          ))}
+        </div>
+      )}
+
+      {audienceType === "staff" && (
+        <div style={{ display: "flex", gap: 6, flexWrap: "wrap", marginBottom: 16 }}>
+          {team.filter((m) => m.active !== false).map((m) => (
+            <button
+              key={m.id}
+              onClick={() => toggleStaff(m.id)}
+              className="mrcap-press"
+              style={{ padding: "6px 12px", borderRadius: 999, fontSize: 11.5, fontWeight: 600, cursor: "pointer",
+                border: `1.5px solid ${audienceStaffIds.includes(m.id) ? COLORS.gold : COLORS.line}`,
+                background: audienceStaffIds.includes(m.id) ? COLORS.gold : COLORS.panel2,
+                color: audienceStaffIds.includes(m.id) ? COLORS.darkText : COLORS.muted }}
+            >
+              {m.name}
+            </button>
+          ))}
+        </div>
+      )}
+
+      <button onClick={post} disabled={saving} className="mrcap-press" style={{ ...primaryBtnStyle, width: "100%", marginBottom: 26 }}>
+        {saving ? "Posting..." : "Post"}
+      </button>
+
+      <div style={{ fontSize: 11, color: COLORS.muted, marginBottom: 8, textTransform: "uppercase", letterSpacing: 0.6 }}>Live / Scheduled</div>
+      {loadingItems ? (
+        <div style={{ fontSize: 13, color: COLORS.muted }}>Loading...</div>
+      ) : items.length === 0 ? (
+        <div style={{ fontSize: 13, color: COLORS.muted }}>Nothing posted right now.</div>
+      ) : (
+        items.map((a) => (
+          <div key={a.id} style={{ background: COLORS.panel, border: `1px solid ${COLORS.line}`, borderRadius: 10, padding: "10px 12px", marginBottom: 8, display: "flex", justifyContent: "space-between", alignItems: "flex-start", gap: 8 }}>
+            <div>
+              <div style={{ fontSize: 13, color: COLORS.ink, marginBottom: 3 }}>{a.message}</div>
+              <div style={{ fontSize: 11, color: COLORS.muted }}>
+                {audienceSummary(a)} · {new Date(a.show_at) > new Date() ? "scheduled for " : "since "}{new Date(a.show_at).toLocaleString([], { month: "short", day: "numeric", hour: "numeric", minute: "2-digit" })}
+              </div>
+            </div>
+            <button onClick={() => cancel(a.id)} className="mrcap-press" style={{ ...secondaryBtnStyle, padding: "6px 10px", fontSize: 11, flexShrink: 0 }}>
+              Cancel
+            </button>
+          </div>
+        ))
+      )}
+
+      <button onClick={onBack} className="mrcap-press" style={{ ...secondaryBtnStyle, width: "100%", marginTop: 18 }}>Back</button>
     </div>
   );
 }
@@ -10402,6 +10683,7 @@ export function DispatchKiosk() {
           </button>
         </div>
         {showMorningReminder && <MorningReminderBanner onDismiss={() => { setShowMorningReminder(false); dismissMorningReminder("mrcap_kiosk"); }} />}
+        <AnnouncementBanner session={session} />
         <LiveUpdateBroadcaster />
         <DispatchBoard team={team} session={session} />
       </div>
