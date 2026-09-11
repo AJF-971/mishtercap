@@ -1032,6 +1032,9 @@ function rowToJob(r) {
     description: r.description, damageNotes: r.damage_notes, priority: r.priority, location: r.location,
     serviceTypes: r.service_types || [], serviceDone: r.service_done || {}, assignedTo: r.assigned_to || {},
     assignedTeam: r.assigned_team || {},
+    commissionEntity: r.commission_entity || null,
+    invoiceFinalizedAt: r.invoice_finalized_at ? new Date(r.invoice_finalized_at).getTime() : null,
+    invoiceFinalizedBy: r.invoice_finalized_by || null,
     serviceNotes: r.service_notes || {}, serviceReviewed: r.service_reviewed || {}, treatments: r.treatments || {},
     treatmentPrices: r.treatment_prices || {}, discountPercent: r.discount_percent || 0, priceHistory: r.price_history || [],
     parts: r.parts || [], markupEntries: r.markup_entries || [],
@@ -1054,6 +1057,9 @@ function jobToRow(job) {
     description: job.description, damage_notes: job.damageNotes, priority: job.priority, location: job.location,
     service_types: job.serviceTypes || [], service_done: job.serviceDone || {}, assigned_to: job.assignedTo || {},
     assigned_team: job.assignedTeam || {},
+    commission_entity: job.commissionEntity || null,
+    invoice_finalized_at: job.invoiceFinalizedAt ? new Date(job.invoiceFinalizedAt).toISOString() : null,
+    invoice_finalized_by: job.invoiceFinalizedBy || null,
     service_notes: job.serviceNotes || {}, service_reviewed: job.serviceReviewed || {}, treatments: job.treatments || {},
     treatment_prices: job.treatmentPrices || {}, discount_percent: job.discountPercent || 0, price_history: job.priceHistory || [],
     parts: job.parts || [], markup_entries: job.markupEntries || [],
@@ -1270,6 +1276,49 @@ const INVOICE_ISSUER = {
 };
 const VAT_RATE = 0.05;
 
+// Head Office / Branch / General — which manager (if any) gets commission
+// credit for a job. Separate concept from the job's physical `location`:
+// a car can be sitting at any site and still be a Head Office or Branch
+// job commission-wise. Codes match First Bit's own ZH/ZB/ZG prefixes, so
+// Mr.CAP's invoice numbers stay conceptually aligned with the real
+// accounting system even before any direct integration exists.
+const COMMISSION_ENTITIES = [
+  { code: "ZH", key: "head_office", label: "Head Office" },
+  { code: "ZB", key: "branch", label: "Branch" },
+  { code: "ZG", key: "general", label: "General (no commission)" },
+];
+
+// Builds this job's real, permanent invoice number the first time it's
+// finalized — atomically incremented server-side via next_invoice_number(),
+// so two people finalizing at the same moment can never collide. Once a
+// job already has an invoiceNo, this returns it unchanged rather than
+// consuming another number — finalizing is a one-time, idempotent action.
+// The "MCAP-" prefix is deliberate: this is Mr.CAP's own series, kept
+// visually distinct from an actual First Bit-issued number so the two
+// are never confused with each other, until a real integration exists.
+async function finalizeInvoiceNumber(job, session) {
+  if (job.invoiceNo) return { ok: true, invoiceNo: job.invoiceNo, alreadyFinalized: true };
+  const entity = COMMISSION_ENTITIES.find((e) => e.key === job.commissionEntity);
+  if (!entity) return { ok: false, error: "Pick a commission entity (Head Office / Branch / General) before finalizing." };
+
+  const year = new Date().getFullYear();
+  const { ok, data } = await sbFetch("rpc/next_invoice_number", {
+    method: "POST",
+    body: JSON.stringify({ p_entity: entity.code, p_year: year }),
+  });
+  if (!ok || typeof data !== "number") {
+    return { ok: false, error: "Couldn't get the next invoice number — check your connection and try again." };
+  }
+  const invoiceNo = `MCAP-${entity.code}-${year}-${String(data).padStart(6, "0")}`;
+  const now = Date.now();
+  const updated = { ...job, invoiceNo, invoiceFinalizedAt: now, invoiceFinalizedBy: session.name };
+  const saveResult = await saveJob(updated);
+  if (!saveResult.ok) {
+    return { ok: false, error: "Got a number but couldn't save it to the job — check your connection and try again." };
+  }
+  return { ok: true, invoiceNo, job: updated };
+}
+
 function numberToWordsAED(n) {
   // Minimal English number-to-words for the "TOTAL OF SUPPLY" line, AED
   // only (no fils spelled out) — matches the reference invoice's style
@@ -1316,6 +1365,10 @@ function generateJobCardPDF(job) {
   doc.text("The Car Appearance & Restyling Experts", margin + 50, y + 30);
   doc.setFont("helvetica", "bold"); doc.setFontSize(13); doc.setTextColor(...DARK);
   doc.text("TAX INVOICE", pageW - margin, y + 22, { align: "right" });
+  if (job.invoiceNo) {
+    doc.setFont("helvetica", "normal"); doc.setFontSize(9); doc.setTextColor(...GREY);
+    doc.text(job.invoiceNo, pageW - margin, y + 34, { align: "right" });
+  }
   y += 56;
 
   // ---- Issued By / Bank Details header block ----
@@ -4869,6 +4922,8 @@ function JobDetail({ id, initialJob, session, team, onChanged, onBack, canArchiv
     onChanged(updated, saved);
   };
   const [pickerFor, setPickerFor] = useState(null); // service key currently showing the reassign list
+  const [finalizingInvoice, setFinalizingInvoice] = useState(false);
+  const [finalizeError, setFinalizeError] = useState("");
 
   // Three sub-screens inside JobDetail that aren't top-level view changes
   // (the global view stays "detail" throughout) but still feel like a
@@ -5462,16 +5517,61 @@ function JobDetail({ id, initialJob, session, team, onChanged, onBack, canArchiv
       )}
 
       {isFullDashboardRole(session) && (
-        <button
-          onClick={() => {
-            const doc = generateJobCardPDF(job);
-            doc.save(`MrCAP-JobCard-${job.plate.replace(/\s+/g, "-")}.pdf`);
-          }}
-          className="mrcap-press"
-          style={{ display: "flex", alignItems: "center", justifyContent: "center", gap: 8, width: "100%", padding: "12px", borderRadius: 10, border: "none", background: COLORS.gold, color: COLORS.darkText, fontWeight: 700, fontSize: 13, cursor: "pointer", marginBottom: 12 }}
-        >
-          <FileText size={15} /> Generate E-Job Card (PDF)
-        </button>
+        <div style={{ marginBottom: 12 }}>
+          {finalizeError && (
+            <div style={{ fontSize: 11.5, color: COLORS.red, marginBottom: 8 }}>{finalizeError}</div>
+          )}
+
+          {job.invoiceNo ? (
+            <div style={{ fontSize: 11, color: COLORS.muted, marginBottom: 8 }}>
+              Invoice <span style={{ fontFamily: MONO_FONT, color: COLORS.gold }}>{job.invoiceNo}</span> — finalized by {job.invoiceFinalizedBy} on {job.invoiceFinalizedAt ? new Date(job.invoiceFinalizedAt).toLocaleDateString() : ""}
+            </div>
+          ) : (
+            <>
+              <div style={{ fontSize: 11, color: COLORS.muted, marginBottom: 5 }}>COMMISSION ENTITY</div>
+              <div style={{ display: "flex", gap: 6, marginBottom: 10 }}>
+                {COMMISSION_ENTITIES.map((e) => (
+                  <button
+                    key={e.key}
+                    onClick={() => { setJob({ ...job, commissionEntity: e.key }); setFinalizeError(""); }}
+                    className="mrcap-press"
+                    style={{ flex: 1, padding: "8px 6px", borderRadius: 8, fontSize: 11, fontWeight: 600, cursor: "pointer",
+                      border: `1.5px solid ${job.commissionEntity === e.key ? COLORS.gold : COLORS.line}`,
+                      background: job.commissionEntity === e.key ? COLORS.gold : "transparent",
+                      color: job.commissionEntity === e.key ? COLORS.darkText : COLORS.ink }}
+                  >
+                    {e.label}
+                  </button>
+                ))}
+              </div>
+            </>
+          )}
+
+          <button
+            onClick={async () => {
+              setFinalizeError("");
+              if (!job.invoiceNo) {
+                setFinalizingInvoice(true);
+                const result = await finalizeInvoiceNumber(job, session);
+                setFinalizingInvoice(false);
+                if (!result.ok) { setFinalizeError(result.error); return; }
+                setJob(result.job);
+                const doc = generateJobCardPDF(result.job);
+                doc.save(`MrCAP-Invoice-${result.invoiceNo}.pdf`);
+              } else {
+                // Already finalized — reprint the exact same number, no
+                // new number is ever consumed for the same job.
+                const doc = generateJobCardPDF(job);
+                doc.save(`MrCAP-Invoice-${job.invoiceNo}.pdf`);
+              }
+            }}
+            disabled={finalizingInvoice}
+            className="mrcap-press"
+            style={{ display: "flex", alignItems: "center", justifyContent: "center", gap: 8, width: "100%", padding: "12px", borderRadius: 10, border: "none", background: COLORS.gold, color: COLORS.darkText, fontWeight: 700, fontSize: 13, cursor: finalizingInvoice ? "default" : "pointer", opacity: finalizingInvoice ? 0.7 : 1 }}
+          >
+            <FileText size={15} /> {finalizingInvoice ? "Finalizing..." : job.invoiceNo ? "Reprint Invoice" : "Finalize & Generate Invoice"}
+          </button>
+        </div>
       )}
 
       {(hasPermission(session, team, "editJob") || hasPermission(session, team, "sendBack")) && (
