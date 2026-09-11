@@ -1313,7 +1313,7 @@ async function finalizeInvoiceNumber(job, session) {
   const now = Date.now();
   const updated = { ...job, invoiceNo, invoiceFinalizedAt: now, invoiceFinalizedBy: session.name };
   const saveResult = await saveJob(updated);
-  if (!saveResult.ok) {
+  if (!saveResult) {
     return { ok: false, error: "Got a number but couldn't save it to the job — check your connection and try again." };
   }
   return { ok: true, invoiceNo, job: updated };
