@@ -1310,8 +1310,16 @@ async function finalizeInvoiceNumber(job, session) {
     return { ok: false, error: "Couldn't get the next invoice number — check your connection and try again." };
   }
   const invoiceNo = `MCAP-${entity.code}-${year}-${String(data).padStart(6, "0")}`;
+  // Same calculation the printed PDF uses (via buildInvoiceLineItems) —
+  // saving it here is what makes this job actually count toward revenue.
+  // invoice_amount was previously only ever set by the historical CSV
+  // import; nothing in the live app ever computed and saved a real total,
+  // so every job created since Mr.CAP replaced the old system was
+  // silently excluded from every revenue figure in Reports/Admin
+  // Dashboard (invoicedJobs filters on invoice_amount > 0).
+  const { grandTotal } = buildInvoiceLineItems(job);
   const now = Date.now();
-  const updated = { ...job, invoiceNo, invoiceFinalizedAt: now, invoiceFinalizedBy: session.name };
+  const updated = { ...job, invoiceNo, invoiceAmount: grandTotal, invoiceFinalizedAt: now, invoiceFinalizedBy: session.name };
   const saveResult = await saveJob(updated);
   if (!saveResult) {
     return { ok: false, error: "Got a number but couldn't save it to the job — check your connection and try again." };
@@ -1341,6 +1349,40 @@ function numberToWordsAED(n) {
   if (thousands) words += chunk(thousands) + " Thousand ";
   if (rest) words += chunk(rest);
   return `${words.trim()} AED ONLY`;
+}
+
+// Builds the exact same line items (services + parts/fees) used on the
+// printed tax invoice, given a job. Shared by generateJobCardPDF (what
+// gets printed) and finalizeInvoiceNumber (what gets saved as
+// job.invoiceAmount) so the two can never disagree — one calculation,
+// two consumers, instead of the same math written twice and risking
+// drift if either copy is ever edited alone.
+function buildInvoiceLineItems(job) {
+  const activeServices = SERVICES.filter((s) => (job.serviceTypes || []).includes(s.key));
+  const rows = [];
+  activeServices.forEach((s) => {
+    const picks = (job.treatments || {})[s.key] || [];
+    picks.forEach((name) => {
+      const priceKey = `${s.key}::${name}`;
+      const price = Number((job.treatmentPrices || {})[priceKey]) || 0;
+      const discountPct = job.discountPercent || 0;
+      const excl = price;
+      const amountExcl = excl * (1 - discountPct / 100);
+      const vatAmount = amountExcl * VAT_RATE;
+      rows.push({ desc: name, qty: 1, price: excl, discount: discountPct, amountExcl, vatAmount, amountIncl: amountExcl + vatAmount });
+    });
+  });
+  (job.parts || []).forEach((p) => {
+    const qty = Number(p.qty) || 1;
+    const price = Number(p.price) || 0;
+    const discountPct = Number(p.discountPercent) || 0;
+    const excl = price * qty;
+    const amountExcl = excl * (1 - discountPct / 100);
+    const vatAmount = amountExcl * VAT_RATE;
+    rows.push({ desc: p.description || (p.type === "fee" ? "Fee" : "Part"), qty, price, discount: discountPct, amountExcl, vatAmount, amountIncl: amountExcl + vatAmount });
+  });
+  const grandTotal = rows.reduce((sum, r) => sum + r.amountIncl, 0);
+  return { rows, grandTotal };
 }
 
 function generateJobCardPDF(job) {
@@ -1416,34 +1458,7 @@ function generateJobCardPDF(job) {
   y += billH + 14;
 
   // ---- Line items table ----
-  const activeServices = SERVICES.filter((s) => (job.serviceTypes || []).includes(s.key));
-  const rows = [];
-  activeServices.forEach((s) => {
-    const picks = (job.treatments || {})[s.key] || [];
-    picks.forEach((name) => {
-      const priceKey = `${s.key}::${name}`;
-      const price = Number((job.treatmentPrices || {})[priceKey]) || 0;
-      const discountPct = job.discountPercent || 0;
-      const excl = price;
-      const amountExcl = excl * (1 - discountPct / 100);
-      const vatAmount = amountExcl * VAT_RATE;
-      rows.push({ desc: name, qty: 1, price: excl, discount: discountPct, amountExcl, vatAmount, amountIncl: amountExcl + vatAmount });
-    });
-  });
-  // External parts and fees (windshields, rims, off-road lights, a tow
-  // truck recovery fee, etc.) get their own line, own quantity, and their
-  // own optional per-line discount — matching how the shop's existing
-  // First Bit invoices break these out, separate from the job's overall
-  // service discount.
-  (job.parts || []).forEach((p) => {
-    const qty = Number(p.qty) || 1;
-    const price = Number(p.price) || 0;
-    const discountPct = Number(p.discountPercent) || 0;
-    const excl = price * qty;
-    const amountExcl = excl * (1 - discountPct / 100);
-    const vatAmount = amountExcl * VAT_RATE;
-    rows.push({ desc: p.description || (p.type === "fee" ? "Fee" : "Part"), qty, price, discount: discountPct, amountExcl, vatAmount, amountIncl: amountExcl + vatAmount });
-  });
+  const { rows } = buildInvoiceLineItems(job);
 
   const colX = [margin, margin + 22, margin + 200, margin + 232, margin + 262, margin + 335, margin + 400, margin + 425, margin + 470];
   const tableRight = pageW - margin;
