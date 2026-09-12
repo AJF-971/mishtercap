@@ -357,6 +357,7 @@ const COLORS = {
   red: "#A8402F",        // desaturated crimson
   green: "#4A7A57",      // desaturated forest
   blue: "#4A6478",       // desaturated steel
+  purple: "#7A5FA0",     // desaturated violet — awaiting approval / in transit
 };
 
 const FONT_IMPORT = `@import url('https://fonts.googleapis.com/css2?family=Playfair+Display:wght@500;600;700&family=IBM+Plex+Mono:wght@400;500;600&family=Inter:wght@400;500;600;700&display=swap');`;
@@ -1045,6 +1046,9 @@ function rowToJob(r) {
     invoiceAmount: r.invoice_amount, invoiceNo: r.invoice_no, signature: r.signature, signedAt: r.signed_at ? new Date(r.signed_at).getTime() : null,
     damagePanels: r.damage_panels || [], damageDiagramImage: r.damage_diagram_image, history: r.history || [],
     onHold: !!r.on_hold, onHoldNote: r.on_hold_note || null, onHoldSince: r.on_hold_since ? new Date(r.on_hold_since).getTime() : null,
+    awaitingApproval: !!r.awaiting_approval, awaitingApprovalNote: r.awaiting_approval_note || null, awaitingApprovalSince: r.awaiting_approval_since ? new Date(r.awaiting_approval_since).getTime() : null,
+    transferTo: r.transfer_to || null, transferNote: r.transfer_note || null,
+    transferInitiatedAt: r.transfer_initiated_at ? new Date(r.transfer_initiated_at).getTime() : null, transferInitiatedBy: r.transfer_initiated_by || null,
     warrantyExpiry: r.warranty_expiry || null, followupDate: r.followup_date || null, followupNote: r.followup_note || null,
     customerStatusNote: r.customer_status_note || null, customerStatusUpdatedAt: r.customer_status_updated_at ? new Date(r.customer_status_updated_at).getTime() : null,
     customerNotify: r.customer_notify || {},
@@ -1071,6 +1075,9 @@ function jobToRow(job) {
     signature: job.signature || null, signed_at: job.signedAt ? new Date(job.signedAt).toISOString() : null,
     damage_panels: job.damagePanels || [], damage_diagram_image: job.damageDiagramImage || null, history: job.history,
     on_hold: !!job.onHold, on_hold_note: job.onHoldNote || null, on_hold_since: job.onHoldSince ? new Date(job.onHoldSince).toISOString() : null,
+    awaiting_approval: !!job.awaitingApproval, awaiting_approval_note: job.awaitingApprovalNote || null, awaiting_approval_since: job.awaitingApprovalSince ? new Date(job.awaitingApprovalSince).toISOString() : null,
+    transfer_to: job.transferTo || null, transfer_note: job.transferNote || null,
+    transfer_initiated_at: job.transferInitiatedAt ? new Date(job.transferInitiatedAt).toISOString() : null, transfer_initiated_by: job.transferInitiatedBy || null,
     warranty_expiry: job.warrantyExpiry || null, followup_date: job.followupDate || null, followup_note: job.followupNote || null,
     customer_status_note: job.customerStatusNote || null, customer_status_updated_at: job.customerStatusUpdatedAt ? new Date(job.customerStatusUpdatedAt).toISOString() : null,
     customer_notify: job.customerNotify || {},
@@ -1717,7 +1724,7 @@ async function loadIndex() {
   // pilot where job volume keeps climbing. Still ordered newest-first,
   // so the jobs that actually matter for the working list are never
   // the ones that would get dropped if this cap is ever hit.
-  const { ok, data } = await sbFetch(`jobs?select=id,plate,make_model,customer_name,customer_phone,priority,location,stage_index,service_types,service_done,service_reviewed,history,on_hold,on_hold_note,on_hold_since,followup_date,followup_note,warranty_expiry,customer_notify,created_at,updated_at&created_at=gte.${DEFAULT_VIEW_CUTOFF}&order=updated_at.desc&limit=900`);
+  const { ok, data } = await sbFetch(`jobs?select=id,plate,make_model,customer_name,customer_phone,priority,location,stage_index,service_types,service_done,service_reviewed,history,on_hold,on_hold_note,on_hold_since,awaiting_approval,awaiting_approval_note,awaiting_approval_since,transfer_to,transfer_note,transfer_initiated_at,transfer_initiated_by,followup_date,followup_note,warranty_expiry,customer_notify,created_at,updated_at&created_at=gte.${DEFAULT_VIEW_CUTOFF}&order=updated_at.desc&limit=900`);
   if (!ok || !data) return [];
   return data.map((r) => {
     const stage = STAGES[r.stage_index] || STAGES[0];
@@ -1727,6 +1734,9 @@ async function loadIndex() {
       serviceTypes: r.service_types || [], serviceDone: r.service_done || {}, serviceReviewed: r.service_reviewed || {},
       history: r.history || [],
       onHold: !!r.on_hold, onHoldNote: r.on_hold_note || null, onHoldSince: r.on_hold_since ? new Date(r.on_hold_since).getTime() : null,
+      awaitingApproval: !!r.awaiting_approval, awaitingApprovalNote: r.awaiting_approval_note || null, awaitingApprovalSince: r.awaiting_approval_since ? new Date(r.awaiting_approval_since).getTime() : null,
+      transferTo: r.transfer_to || null, transferNote: r.transfer_note || null,
+      transferInitiatedAt: r.transfer_initiated_at ? new Date(r.transfer_initiated_at).getTime() : null, transferInitiatedBy: r.transfer_initiated_by || null,
       followupDate: r.followup_date || null, followupNote: r.followup_note || null, warrantyExpiry: r.warranty_expiry || null,
       customerNotify: r.customer_notify || {},
       updatedAt: new Date(r.updated_at).getTime(), createdAt: new Date(r.created_at).getTime(),
@@ -3505,6 +3515,13 @@ function Dashboard({ index, session, onOpen, canArchive, onRefresh, syncState, l
   const highPriority = active.filter((j) => j.priority === "High");
   const readyForQC = visible.filter((j) => j.stageKey === "qc");
   const readyForCollection = visible.filter((j) => j.stageKey === "ready");
+  const awaitingApprovalJobs = active.filter((j) => j.awaitingApproval);
+  // "In transit" jobs are shown at BOTH ends of the move: to the sender
+  // (still tracked, not lost) and to the receiver (so they know something's
+  // incoming before it physically shows up) — matches how the shop actually
+  // asked for this: right now nobody at the destination knows a car is
+  // coming until someone calls or WhatsApps them.
+  const inTransitJobs = active.filter((j) => j.transferTo);
 
   const filtered = visible.filter((j) => {
     if (filter === "open" && j.stageKey === "collected") return false;
@@ -3513,6 +3530,8 @@ function Dashboard({ index, session, onOpen, canArchive, onRefresh, syncState, l
     if (statFilter === "high" && j.priority !== "High") return false;
     if (statFilter === "qc" && j.stageKey !== "qc") return false;
     if (statFilter === "ready" && j.stageKey !== "ready") return false;
+    if (statFilter === "approval" && !j.awaitingApproval) return false;
+    if (statFilter === "transit" && !j.transferTo) return false;
     if (locationFilter && j.location !== locationFilter) return false;
     if (search) {
       const q = search.toLowerCase();
@@ -3713,6 +3732,8 @@ function Dashboard({ index, session, onOpen, canArchive, onRefresh, syncState, l
           <StatCard label="High priority" value={highPriority.length} tone={highPriority.length ? COLORS.red : undefined} onClick={() => setStatFilter((f) => (f === "high" ? null : "high"))} isActive={statFilter === "high"} />
           <StatCard label="Ready for QC" value={readyForQC.length} tone={readyForQC.length ? COLORS.blue : undefined} onClick={() => setStatFilter((f) => (f === "qc" ? null : "qc"))} isActive={statFilter === "qc"} />
           <StatCard label="Ready for Collection" value={readyForCollection.length} tone={readyForCollection.length ? COLORS.gold : undefined} onClick={() => setStatFilter((f) => (f === "ready" ? null : "ready"))} isActive={statFilter === "ready"} />
+          <StatCard label="Awaiting Approval" value={awaitingApprovalJobs.length} tone={awaitingApprovalJobs.length ? COLORS.purple : undefined} onClick={() => setStatFilter((f) => (f === "approval" ? null : "approval"))} isActive={statFilter === "approval"} />
+          <StatCard label="In Transit" value={inTransitJobs.length} tone={inTransitJobs.length ? COLORS.blue : undefined} onClick={() => setStatFilter((f) => (f === "transit" ? null : "transit"))} isActive={statFilter === "transit"} />
         </div>
       )}
 
@@ -3774,6 +3795,12 @@ function Dashboard({ index, session, onOpen, canArchive, onRefresh, syncState, l
                   </div>
                   <Pill tone={priorityTone(j.priority)}>{j.priority}</Pill>
                 </div>
+                {(j.awaitingApproval || j.transferTo) && (
+                  <div style={{ display: "flex", gap: 6, flexWrap: "wrap" }}>
+                    {j.awaitingApproval && <Pill tone="purple">Awaiting Approval</Pill>}
+                    {j.transferTo && <Pill tone="blue">→ {j.transferTo}</Pill>}
+                  </div>
+                )}
                 {(() => {
                   const { primary, rest } = splitPrimaryService(j.serviceTypes);
                   if (!primary) return null;
@@ -4986,6 +5013,11 @@ function JobDetail({ id, initialJob, session, team, onChanged, onBack, canArchiv
   const [clearReviewsOnReverse, setClearReviewsOnReverse] = useState(false);
   const [showHoldPrompt, setShowHoldPrompt] = useState(false); // admin/intake-only "put on hold" note entry
   const [holdNoteInput, setHoldNoteInput] = useState("");
+  const [showApprovalPrompt, setShowApprovalPrompt] = useState(false); // "awaiting customer approval" note entry
+  const [approvalNoteInput, setApprovalNoteInput] = useState("");
+  const [showTransferPrompt, setShowTransferPrompt] = useState(false); // "send to another location" picker
+  const [transferTarget, setTransferTarget] = useState("");
+  const [transferNoteInput, setTransferNoteInput] = useState("");
   const [showDeleteConfirm, setShowDeleteConfirm] = useState(false); // first tap
   const [deleteConfirmText, setDeleteConfirmText] = useState(""); // must type DELETE to actually confirm
   const [deleting, setDeleting] = useState(false);
@@ -5314,6 +5346,96 @@ function JobDetail({ id, initialJob, session, team, onChanged, onBack, canArchiv
     onChanged(updated, saved);
   };
 
+  // Distinct from On Hold: this is specifically "we're waiting on the
+  // customer to confirm parts/pricing before work continues" — the exact
+  // gap Laani and Suhail both flagged (parts price confirmation stalling a
+  // job with no visible trace of why). Doesn't touch stageIndex, same as
+  // On Hold — the job is still sitting wherever it actually is.
+  const putAwaitingApproval = async (noteText) => {
+    if (!noteText.trim()) return;
+    setBusy(true);
+    const now = Date.now();
+    const updated = {
+      ...job,
+      awaitingApproval: true,
+      awaitingApprovalNote: noteText.trim(),
+      awaitingApprovalSince: now,
+      history: [...job.history, { stage: "approval", label: "Awaiting Approval", by: session.name, role: session.role, note: noteText.trim(), at: now }],
+      updatedAt: now,
+    };
+    const saved = await saveJob(updated);
+    setJob(updated);
+    setBusy(false);
+    setShowApprovalPrompt(false);
+    setApprovalNoteInput("");
+    onChanged(updated, saved);
+  };
+
+  const clearAwaitingApproval = async () => {
+    setBusy(true);
+    const now = Date.now();
+    const updated = {
+      ...job,
+      awaitingApproval: false,
+      history: [...job.history, { stage: "approval", label: "Approved", by: session.name, role: session.role, note: job.awaitingApprovalNote ? `Cleared (was: "${job.awaitingApprovalNote}")` : "Cleared", at: now }],
+      awaitingApprovalNote: null,
+      awaitingApprovalSince: null,
+      updatedAt: now,
+    };
+    const saved = await saveJob(updated);
+    setJob(updated);
+    setBusy(false);
+    onChanged(updated, saved);
+  };
+
+  // Internal transfer between locations. Sending doesn't move the job —
+  // `location` stays where it physically still is until the receiving side
+  // confirms arrival — it just flags where it's headed so the destination
+  // sees "incoming" instead of finding out by phone call, per every single
+  // survey respondent naming WhatsApp/calling as today's only mechanism.
+  const sendTransfer = async (targetLocation, noteText) => {
+    if (!targetLocation || targetLocation === job.location) return;
+    setBusy(true);
+    const now = Date.now();
+    const updated = {
+      ...job,
+      transferTo: targetLocation,
+      transferNote: noteText.trim() || null,
+      transferInitiatedAt: now,
+      transferInitiatedBy: session.name,
+      history: [...job.history, { stage: "transfer", label: "Sent", by: session.name, role: session.role, note: `${job.location} → ${targetLocation}${noteText.trim() ? ` — ${noteText.trim()}` : ""}`, at: now }],
+      updatedAt: now,
+    };
+    const saved = await saveJob(updated);
+    setJob(updated);
+    setBusy(false);
+    setShowTransferPrompt(false);
+    setTransferTarget("");
+    setTransferNoteInput("");
+    onChanged(updated, saved);
+  };
+
+  const receiveTransfer = async () => {
+    if (!job.transferTo) return;
+    setBusy(true);
+    const now = Date.now();
+    const arrivedAt = job.transferTo;
+    const updated = {
+      ...job,
+      location: arrivedAt,
+      transferTo: null,
+      transferNote: null,
+      transferInitiatedAt: null,
+      transferInitiatedBy: null,
+      history: [...job.history, { stage: "transfer", label: "Arrived", by: session.name, role: session.role, note: `Confirmed at ${arrivedAt}`, at: now }],
+      updatedAt: now,
+    };
+    const saved = await saveJob(updated);
+    setJob(updated);
+    setBusy(false);
+    onChanged(updated, saved);
+  };
+
   const handleDelete = async () => {
     if (deleteConfirmText !== "DELETE") return;
     setDeleting(true);
@@ -5528,6 +5650,74 @@ function JobDetail({ id, initialJob, session, team, onChanged, onBack, canArchiv
         ) : (
           <button onClick={() => setShowHoldPrompt(true)} className="mrcap-press" style={{ display: "flex", alignItems: "center", justifyContent: "center", gap: 8, width: "100%", padding: "12px", borderRadius: 10, border: `1.5px dashed ${COLORS.gold}`, background: "rgba(201,162,39,0.08)", color: COLORS.gold, fontWeight: 600, fontSize: 12.5, cursor: "pointer", marginBottom: 12 }}>
             <PauseCircle size={15} /> Put On Hold
+          </button>
+        )
+      )}
+
+      {job.awaitingApproval && (
+        <div style={{ display: "flex", alignItems: "flex-start", gap: 10, padding: "12px 13px", borderRadius: 10, border: `1.5px solid ${COLORS.purple}`, background: "rgba(122,95,160,0.14)", marginBottom: 12 }}>
+          <AlertCircle size={18} color={COLORS.purple} style={{ flexShrink: 0, marginTop: 1 }} />
+          <div style={{ flex: 1 }}>
+            <div style={{ fontFamily: DISPLAY_FONT, fontWeight: 600, fontSize: 14, color: COLORS.purple }}>Awaiting Approval since {fmtTime(job.awaitingApprovalSince)}</div>
+            {job.awaitingApprovalNote && <div style={{ fontSize: 12.5, color: COLORS.ink, marginTop: 3 }}>"{job.awaitingApprovalNote}"</div>}
+          </div>
+        </div>
+      )}
+
+      {isFullDashboardRole(session) && (
+        job.awaitingApproval ? (
+          <button onClick={clearAwaitingApproval} disabled={busy} className="mrcap-press" style={{ display: "flex", alignItems: "center", justifyContent: "center", gap: 8, width: "100%", padding: "12px", borderRadius: 10, border: `1.5px solid ${COLORS.green}`, background: "rgba(74,122,87,0.1)", color: "#7BC494", fontWeight: 700, fontSize: 13, cursor: "pointer", marginBottom: 12, opacity: busy ? 0.6 : 1 }}>
+            <CheckCircle2 size={15} /> Mark Approved
+          </button>
+        ) : showApprovalPrompt ? (
+          <div style={{ padding: "12px 13px", borderRadius: 10, border: `1.5px solid ${COLORS.purple}`, background: COLORS.panel, marginBottom: 12, display: "flex", flexDirection: "column", gap: 8 }}>
+            <div style={{ fontSize: 12.5, color: COLORS.ink, fontWeight: 600 }}>What's waiting on the customer?</div>
+            <input autoFocus value={approvalNoteInput} onChange={(e) => setApprovalNoteInput(e.target.value)} placeholder="e.g. Confirming extra parts price — AED 450" style={{ ...inputStyle, marginTop: 0 }} />
+            <div style={{ display: "flex", gap: 8 }}>
+              <button onClick={() => putAwaitingApproval(approvalNoteInput)} disabled={busy || !approvalNoteInput.trim()} className="mrcap-press" style={{ flex: 1, padding: "10px", borderRadius: 9, border: "none", background: COLORS.purple, color: COLORS.ink, fontWeight: 700, fontSize: 12.5, cursor: "pointer", opacity: busy || !approvalNoteInput.trim() ? 0.5 : 1 }}>Confirm</button>
+              <button onClick={() => { setShowApprovalPrompt(false); setApprovalNoteInput(""); }} className="mrcap-press" style={{ padding: "10px 14px", borderRadius: 9, border: `1px solid ${COLORS.line}`, background: "none", color: COLORS.muted, cursor: "pointer" }}>Cancel</button>
+            </div>
+          </div>
+        ) : (
+          <button onClick={() => setShowApprovalPrompt(true)} className="mrcap-press" style={{ display: "flex", alignItems: "center", justifyContent: "center", gap: 8, width: "100%", padding: "12px", borderRadius: 10, border: `1.5px dashed ${COLORS.purple}`, background: "rgba(122,95,160,0.08)", color: COLORS.purple, fontWeight: 600, fontSize: 12.5, cursor: "pointer", marginBottom: 12 }}>
+            <AlertCircle size={15} /> Awaiting Customer Approval
+          </button>
+        )
+      )}
+
+      {job.transferTo && (
+        <div style={{ display: "flex", alignItems: "flex-start", gap: 10, padding: "12px 13px", borderRadius: 10, border: `1.5px solid ${COLORS.blue}`, background: "rgba(74,100,120,0.14)", marginBottom: 12 }}>
+          <Send size={18} color={COLORS.blue} style={{ flexShrink: 0, marginTop: 1 }} />
+          <div style={{ flex: 1 }}>
+            <div style={{ fontFamily: DISPLAY_FONT, fontWeight: 600, fontSize: 14, color: "#8FB4CC" }}>In transit: {job.location} → {job.transferTo}</div>
+            <div style={{ fontSize: 12, color: COLORS.muted, marginTop: 2 }}>Sent by {job.transferInitiatedBy} · {fmtTime(job.transferInitiatedAt)}</div>
+            {job.transferNote && <div style={{ fontSize: 12.5, color: COLORS.ink, marginTop: 3 }}>"{job.transferNote}"</div>}
+          </div>
+        </div>
+      )}
+
+      {isFullDashboardRole(session) && (
+        job.transferTo ? (
+          <button onClick={receiveTransfer} disabled={busy} className="mrcap-press" style={{ display: "flex", alignItems: "center", justifyContent: "center", gap: 8, width: "100%", padding: "12px", borderRadius: 10, border: `1.5px solid ${COLORS.green}`, background: "rgba(74,122,87,0.1)", color: "#7BC494", fontWeight: 700, fontSize: 13, cursor: "pointer", marginBottom: 12, opacity: busy ? 0.6 : 1 }}>
+            <CheckCircle2 size={15} /> Confirm Arrived at {job.transferTo}
+          </button>
+        ) : showTransferPrompt ? (
+          <div style={{ padding: "12px 13px", borderRadius: 10, border: `1.5px solid ${COLORS.blue}`, background: COLORS.panel, marginBottom: 12, display: "flex", flexDirection: "column", gap: 8 }}>
+            <div style={{ fontSize: 12.5, color: COLORS.ink, fontWeight: 600 }}>Send this car to which location?</div>
+            <div style={{ display: "flex", flexDirection: "column", gap: 6 }}>
+              {getLocations().filter((l) => l !== job.location).map((l) => (
+                <button key={l} onClick={() => setTransferTarget(l)} className="mrcap-press" style={{ padding: "10px", borderRadius: 9, border: `1.5px solid ${transferTarget === l ? COLORS.blue : COLORS.line}`, background: transferTarget === l ? COLORS.blue : COLORS.panel2, color: transferTarget === l ? "#fff" : COLORS.ink, fontWeight: 600, fontSize: 13, cursor: "pointer", textAlign: "left" }}>{l}</button>
+              ))}
+            </div>
+            <input value={transferNoteInput} onChange={(e) => setTransferNoteInput(e.target.value)} placeholder="Note (optional) — e.g. needs paint match first" style={{ ...inputStyle, marginTop: 0 }} />
+            <div style={{ display: "flex", gap: 8 }}>
+              <button onClick={() => sendTransfer(transferTarget, transferNoteInput)} disabled={busy || !transferTarget} className="mrcap-press" style={{ flex: 1, padding: "10px", borderRadius: 9, border: "none", background: COLORS.blue, color: "#fff", fontWeight: 700, fontSize: 12.5, cursor: "pointer", opacity: busy || !transferTarget ? 0.5 : 1 }}>Send</button>
+              <button onClick={() => { setShowTransferPrompt(false); setTransferTarget(""); setTransferNoteInput(""); }} className="mrcap-press" style={{ padding: "10px 14px", borderRadius: 9, border: `1px solid ${COLORS.line}`, background: "none", color: COLORS.muted, cursor: "pointer" }}>Cancel</button>
+            </div>
+          </div>
+        ) : (
+          <button onClick={() => setShowTransferPrompt(true)} className="mrcap-press" style={{ display: "flex", alignItems: "center", justifyContent: "center", gap: 8, width: "100%", padding: "12px", borderRadius: 10, border: `1.5px dashed ${COLORS.blue}`, background: "rgba(74,100,120,0.08)", color: "#8FB4CC", fontWeight: 600, fontSize: 12.5, cursor: "pointer", marginBottom: 12 }}>
+            <Send size={15} /> Send to Another Location
           </button>
         )
       )}
