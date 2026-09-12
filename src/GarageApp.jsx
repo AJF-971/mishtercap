@@ -6,7 +6,7 @@ import {
   LayoutDashboard, ListChecks, UserPlus, ShieldCheck, Archive, ShieldAlert,
   Users, BarChart3, Phone, Download, Upload, FileText, Send, PauseCircle,
   MessageSquare, TrendingUp, RotateCcw, ExternalLink, Star, AlertCircle,
-  Sparkles, Hammer, Armchair
+  Sparkles, Hammer, Armchair, ChevronUp, ChevronDown
 } from "lucide-react";
 import { jsPDF } from "jspdf";
 
@@ -969,6 +969,53 @@ async function loadAllServiceData() {
     categories: catsRes.ok ? (catsRes.data || []) : [],
     treatments: treatsRes.ok ? (treatsRes.data || []) : [],
   };
+}
+
+/* ---------------- Workflow Builder (per-category customizable step list) ----------------
+   Each service category (Detailing, PPF & Films, Dent Repair, Body Work,
+   Upholstery) has its own ordered list of steps a job's module in that
+   category moves through — e.g. Tint (a PPF & Films treatment) doesn't
+   need a Parts Removal step, Dent Repair might. Admins add/rename/remove/
+   reorder steps per category here; nothing else in the app reads these
+   yet (that's the next phase — wiring job cards to render each module's
+   progress against its category's real step list instead of the fixed
+   started/done flags). */
+async function loadWorkflowSteps() {
+  const { ok, data } = await sbFetch("module_workflow_steps?select=*&order=category_key.asc,sort_order.asc");
+  return ok ? (data || []) : [];
+}
+async function saveWorkflowStep(step) {
+  // step: { id?, category_key, step_key, label, sort_order, active }
+  const isNew = !step.id;
+  const { ok } = await sbFetch(isNew ? "module_workflow_steps" : `module_workflow_steps?id=eq.${encodeURIComponent(step.id)}`, {
+    method: isNew ? "POST" : "PATCH",
+    headers: { Prefer: "return=minimal" },
+    body: JSON.stringify(isNew
+      ? [{ category_key: step.category_key, step_key: step.step_key, label: step.label, sort_order: step.sort_order ?? 0, active: true }]
+      : { label: step.label, updated_at: new Date().toISOString() }),
+  });
+  return ok;
+}
+async function deleteWorkflowStep(id) {
+  const { ok } = await sbFetch(`module_workflow_steps?id=eq.${encodeURIComponent(id)}`, {
+    method: "DELETE",
+    headers: { Prefer: "return=minimal" },
+  });
+  return ok;
+}
+// Reorder is a batch of {id, sort_order} PATCHes — sent as one PATCH per
+// row (PostgREST has no native "bulk update different values per row" via
+// a single request without an RPC) but fired together so the UI can await
+// them all before reloading.
+async function reorderWorkflowSteps(steps) {
+  const results = await Promise.all(steps.map((s, i) =>
+    sbFetch(`module_workflow_steps?id=eq.${encodeURIComponent(s.id)}`, {
+      method: "PATCH",
+      headers: { Prefer: "return=minimal" },
+      body: JSON.stringify({ sort_order: i, updated_at: new Date().toISOString() }),
+    })
+  ));
+  return results.every((r) => r.ok);
 }
 
 /* ---------------- Customers & Vehicles (CRM layer) ---------------- */
@@ -8403,16 +8450,18 @@ function ServicesManagementScreen({ onBack }) {
   const [roles, setRoles] = useState([]);
   const [categories, setCategories] = useState([]);
   const [treatments, setTreatments] = useState([]);
+  const [steps, setSteps] = useState([]);
   const [expanded, setExpanded] = useState(null); // category id currently open
   const [showNewCategory, setShowNewCategory] = useState(false);
   const [busy, setBusy] = useState(false);
 
   const reload = useCallback(async () => {
     setLoading(true);
-    const data = await loadAllServiceData();
+    const [data, stepRows] = await Promise.all([loadAllServiceData(), loadWorkflowSteps()]);
     setRoles(data.roles);
     setCategories(data.categories);
     setTreatments(data.treatments);
+    setSteps(stepRows);
     setLoading(false);
   }, []);
 
@@ -8468,6 +8517,11 @@ function ServicesManagementScreen({ onBack }) {
 
                   <NewTreatmentInline categoryKey={cat.id} nextSort={catTreatments.length} onCreated={reload} />
 
+                  <div style={{ marginTop: 14, paddingTop: 12, borderTop: `1px solid ${COLORS.line}` }}>
+                    <div style={{ fontSize: 10.5, color: COLORS.muted, textTransform: "uppercase", letterSpacing: 0.6, marginBottom: 8 }}>Workflow steps for this module</div>
+                    <WorkflowStepsInline categoryKey={cat.id} steps={steps.filter((s) => s.category_key === cat.id).sort((a, b) => a.sort_order - b.sort_order)} onChange={reload} />
+                  </div>
+
                   <button
                     onClick={() => toggleCategoryActive(cat)}
                     disabled={busy}
@@ -8490,6 +8544,90 @@ function ServicesManagementScreen({ onBack }) {
           <Plus size={15} /> New Service Category
         </button>
       )}
+    </div>
+  );
+}
+
+// Reordering is tap-based (Up/Down), not drag-and-drop — the Dispatch
+// Board already tried native HTML5 drag on the shop's touchscreen tablet
+// and found it doesn't reliably fire on touch devices (see the project
+// log); this sidesteps that exact failure mode while still giving a full
+// reorder capability that works the same on phone, tablet, or desktop.
+function WorkflowStepsInline({ categoryKey, steps, onChange }) {
+  const [busy, setBusy] = useState(false);
+  const [newLabel, setNewLabel] = useState("");
+  const [editingId, setEditingId] = useState(null);
+  const [editLabel, setEditLabel] = useState("");
+
+  const move = async (index, dir) => {
+    const target = index + dir;
+    if (target < 0 || target >= steps.length) return;
+    const next = [...steps];
+    const [moved] = next.splice(index, 1);
+    next.splice(target, 0, moved);
+    setBusy(true);
+    await reorderWorkflowSteps(next);
+    await onChange();
+    setBusy(false);
+  };
+
+  const addStep = async () => {
+    const label = newLabel.trim();
+    if (!label) return;
+    setBusy(true);
+    const stepKey = label.toLowerCase().replace(/[^a-z0-9]+/g, "_").replace(/^_+|_+$/g, "") || `step_${Date.now()}`;
+    await saveWorkflowStep({ category_key: categoryKey, step_key: stepKey, label, sort_order: steps.length });
+    setNewLabel("");
+    await onChange();
+    setBusy(false);
+  };
+
+  const startEdit = (s) => { setEditingId(s.id); setEditLabel(s.label); };
+  const saveEdit = async (s) => {
+    if (!editLabel.trim()) return;
+    setBusy(true);
+    await saveWorkflowStep({ id: s.id, label: editLabel.trim() });
+    setEditingId(null);
+    await onChange();
+    setBusy(false);
+  };
+
+  const removeStep = async (s) => {
+    setBusy(true);
+    await deleteWorkflowStep(s.id);
+    await onChange();
+    setBusy(false);
+  };
+
+  return (
+    <div style={{ display: "flex", flexDirection: "column", gap: 6 }}>
+      {steps.length === 0 && <div style={{ fontSize: 12, color: COLORS.muted, marginBottom: 4 }}>No steps yet — add the first one below.</div>}
+      {steps.map((s, i) => (
+        <div key={s.id} style={{ display: "flex", alignItems: "center", gap: 8, padding: "7px 9px", borderRadius: 8, background: COLORS.panel2 }}>
+          <div style={{ display: "flex", flexDirection: "column" }}>
+            <button onClick={() => move(i, -1)} disabled={busy || i === 0} className="mrcap-press" style={{ background: "none", border: "none", color: i === 0 ? COLORS.line : COLORS.muted, cursor: i === 0 ? "default" : "pointer", padding: 0, lineHeight: 1 }}><ChevronUp size={14} /></button>
+            <button onClick={() => move(i, 1)} disabled={busy || i === steps.length - 1} className="mrcap-press" style={{ background: "none", border: "none", color: i === steps.length - 1 ? COLORS.line : COLORS.muted, cursor: i === steps.length - 1 ? "default" : "pointer", padding: 0, lineHeight: 1 }}><ChevronDown size={14} /></button>
+          </div>
+          <div style={{ fontSize: 10.5, color: COLORS.gold, fontFamily: MONO_FONT, width: 16, textAlign: "center", flexShrink: 0 }}>{i + 1}</div>
+          {editingId === s.id ? (
+            <>
+              <input autoFocus value={editLabel} onChange={(e) => setEditLabel(e.target.value)} style={{ ...inputStyle, marginTop: 0, padding: "6px 8px", fontSize: 13, flex: 1 }} />
+              <button onClick={() => saveEdit(s)} disabled={busy} className="mrcap-press" style={{ fontSize: 11, color: "#fff", background: COLORS.green, border: "none", borderRadius: 7, padding: "6px 9px", cursor: "pointer", fontWeight: 600 }}>Save</button>
+              <button onClick={() => setEditingId(null)} className="mrcap-press" style={{ fontSize: 11, color: COLORS.muted, background: "none", border: `1px solid ${COLORS.line}`, borderRadius: 7, padding: "6px 9px", cursor: "pointer" }}>Cancel</button>
+            </>
+          ) : (
+            <>
+              <div style={{ fontSize: 13, color: COLORS.ink, flex: 1 }}>{s.label}</div>
+              <button onClick={() => startEdit(s)} className="mrcap-press" style={{ fontSize: 10.5, color: COLORS.muted, background: "none", border: `1px solid ${COLORS.line}`, borderRadius: 7, padding: "5px 7px", cursor: "pointer" }}>Rename</button>
+              <button onClick={() => removeStep(s)} disabled={busy} className="mrcap-press" style={{ fontSize: 10.5, color: COLORS.red, background: "none", border: `1px solid ${COLORS.line}`, borderRadius: 7, padding: "5px 7px", cursor: "pointer" }}>Remove</button>
+            </>
+          )}
+        </div>
+      ))}
+      <div style={{ display: "flex", gap: 6, marginTop: 4 }}>
+        <input value={newLabel} onChange={(e) => setNewLabel(e.target.value)} onKeyDown={(e) => { if (e.key === "Enter") addStep(); }} placeholder="New step name (e.g. Parts Removal)" style={{ ...inputStyle, marginTop: 0, padding: "7px 9px", fontSize: 13, flex: 1 }} />
+        <button onClick={addStep} disabled={busy || !newLabel.trim()} className="mrcap-press" style={{ fontSize: 11.5, color: COLORS.darkText, background: COLORS.gold, border: "none", borderRadius: 8, padding: "8px 12px", cursor: "pointer", fontWeight: 600, opacity: busy || !newLabel.trim() ? 0.6 : 1 }}>Add</button>
+      </div>
     </div>
   );
 }
