@@ -6,7 +6,7 @@ import {
   LayoutDashboard, ListChecks, UserPlus, ShieldCheck, Archive, ShieldAlert,
   Users, BarChart3, Phone, Download, Upload, FileText, Send, PauseCircle,
   MessageSquare, TrendingUp, RotateCcw, ExternalLink, Star, AlertCircle,
-  Sparkles, Hammer, Armchair, ChevronUp, ChevronDown
+  Sparkles, Hammer, Armchair, ChevronUp, ChevronDown, GripVertical
 } from "lucide-react";
 import { jsPDF } from "jspdf";
 
@@ -688,6 +688,30 @@ function visibleServices(selectedKeys) {
   return SERVICES.filter((s) => s.active !== false || sel.has(s.key));
 }
 
+// Same mutable-module-global pattern as SERVICES/ROLE_DEFS above, for the
+// Workflow Builder's per-category step lists (module_workflow_steps).
+// Loaded once at boot and refreshed whenever the Workflow Builder screen
+// saves a change, so every job screen reading stepsForCategory() picks up
+// edits without needing its own fetch.
+let WORKFLOW_STEPS = {}; // category_key -> ordered [{ key, label }]
+async function loadWorkflowStepsMap() {
+  const rows = await loadWorkflowSteps();
+  const map = {};
+  for (const r of rows) {
+    if (r.active === false) continue;
+    (map[r.category_key] ||= []).push({ key: r.step_key, label: r.label });
+  }
+  WORKFLOW_STEPS = map;
+  return map;
+}
+// Falls back to the same Queued/In Progress/Done shape the app already
+// behaved as, for any category that hasn't been customized (or whose
+// steps haven't loaded yet) — so nothing ever renders with zero steps.
+function stepsForCategory(key) {
+  const s = WORKFLOW_STEPS[key];
+  return s && s.length ? s : [{ key: "queued", label: "Queued" }, { key: "in_progress", label: "In Progress" }, { key: "done", label: "Done" }];
+}
+
 /* ---------------- App settings (generic key/value, e.g. WhatsApp templates) ---------------- */
 // Same shape as everything else in this file that needs to be editable
 // without a redeploy — one small table, read on boot, written through
@@ -1082,7 +1106,7 @@ function rowToJob(r) {
     plate: r.plate, makeModel: r.make_model, customerName: r.customer_name, customerPhone: r.customer_phone,
     description: r.description, damageNotes: r.damage_notes, priority: r.priority, location: r.location,
     serviceTypes: r.service_types || [], serviceDone: r.service_done || {}, assignedTo: r.assigned_to || {},
-    assignedTeam: r.assigned_team || {},
+    assignedTeam: r.assigned_team || {}, serviceStep: r.service_step || {},
     commissionEntity: r.commission_entity || null,
     invoiceFinalizedAt: r.invoice_finalized_at ? new Date(r.invoice_finalized_at).getTime() : null,
     invoiceFinalizedBy: r.invoice_finalized_by || null,
@@ -1107,7 +1131,7 @@ function jobToRow(job) {
     plate: job.plate, make_model: job.makeModel, customer_name: job.customerName, customer_phone: job.customerPhone,
     description: job.description, damage_notes: job.damageNotes, priority: job.priority, location: job.location,
     service_types: job.serviceTypes || [], service_done: job.serviceDone || {}, assigned_to: job.assignedTo || {},
-    assigned_team: job.assignedTeam || {},
+    assigned_team: job.assignedTeam || {}, service_step: job.serviceStep || {},
     commission_entity: job.commissionEntity || null,
     invoice_finalized_at: job.invoiceFinalizedAt ? new Date(job.invoiceFinalizedAt).toISOString() : null,
     invoice_finalized_by: job.invoiceFinalizedBy || null,
@@ -2089,6 +2113,47 @@ function stageTone(k) {
 }
 function priorityTone(p) { return p === "High" ? "red" : p === "Medium" ? "yellow" : "default"; }
 
+// Tappable row of a module's real, admin-defined steps (from the Workflow
+// Builder) — used inside a job's Service checklist so staff can move a
+// service through whatever sequence its category actually has (Tint may
+// skip "Parts Removal", Bodyshop may not), not just a binary done toggle.
+// Big enough targets on purpose: this renders on phones/APK as the primary
+// shop-floor interaction, so taps need to land reliably one-handed.
+function ServiceStepPills({ steps, currentKey, onSelect, disabled, size = "normal" }) {
+  const currentIndex = Math.max(0, steps.findIndex((s) => s.key === currentKey));
+  const pad = size === "large" ? "11px 15px" : "7px 11px";
+  const fontSize = size === "large" ? 13.5 : 11.5;
+  return (
+    <div style={{ display: "flex", flexWrap: "wrap", gap: 7 }}>
+      {steps.map((st, i) => {
+        const isCurrent = i === currentIndex;
+        const isPast = i < currentIndex;
+        return (
+          <button
+            key={st.key}
+            type="button"
+            disabled={disabled}
+            onClick={(e) => { e.stopPropagation(); onSelect(st.key); }}
+            className="mrcap-press"
+            style={{
+              display: "flex", alignItems: "center", gap: 5,
+              padding: pad, borderRadius: 999,
+              border: `1.5px solid ${isCurrent ? COLORS.gold : isPast ? COLORS.green : COLORS.line}`,
+              background: isCurrent ? "rgba(201,162,39,0.18)" : isPast ? "rgba(74,122,87,0.15)" : COLORS.panel2,
+              color: isCurrent ? COLORS.gold : isPast ? "#7BC494" : COLORS.muted,
+              fontSize, fontWeight: 700, cursor: disabled ? "not-allowed" : "pointer",
+              opacity: disabled ? 0.6 : 1, whiteSpace: "nowrap",
+            }}
+          >
+            {isPast && <CheckCircle2 size={12} color="#7BC494" />}
+            {st.label}
+          </button>
+        );
+      })}
+    </div>
+  );
+}
+
 const labelStyle = { fontSize: 12, fontWeight: 600, color: COLORS.muted, textTransform: "uppercase", letterSpacing: 0.4 };
 const inputStyle = { width: "100%", marginTop: 8, padding: "11px 12px", borderRadius: 10, border: `1.5px solid ${COLORS.line}`, background: COLORS.panel2, fontSize: 15, fontFamily: "Inter, sans-serif", boxSizing: "border-box", color: COLORS.ink };
 const textareaStyle = { ...inputStyle, minHeight: 72, resize: "vertical" };
@@ -2978,7 +3043,7 @@ export default function GarageApp() {
 
   useEffect(() => {
     (async () => {
-      const [t] = await Promise.all([loadTeam(), loadDynamicServicesAndRoles(), loadAppSettings()]);
+      const [t] = await Promise.all([loadTeam(), loadDynamicServicesAndRoles(), loadAppSettings(), loadWorkflowStepsMap()]);
       setTeam(t);
       const raw = loadLocalSession();
       if (raw) {
@@ -5133,6 +5198,37 @@ function JobDetail({ id, initialJob, session, team, onChanged, onBack, canArchiv
     onChanged(updated, saved);
   };
 
+  // Moves a service module to a specific step in its category's real,
+  // admin-defined step list (module_workflow_steps / stepsForCategory).
+  // Kept in sync with the legacy serviceDone flag so every screen that
+  // still reads serviceDone (Dispatch Board, reviewer/QC gate, completion
+  // checks) keeps working unchanged: reaching the LAST step in the list
+  // sets serviceDone true, any earlier step sets it false — exactly the
+  // same boundary toggleServiceDone already enforced, just reachable at
+  // any step instead of only via a single done/not-done tap. Re-uses
+  // canToggleService's own-undo guard at that same boundary so shop-floor
+  // staff can't step someone else's finished work back to not-done.
+  const advanceServiceStep = async (key, stepKey) => {
+    const list = stepsForCategory(key);
+    const isTerminal = list.length > 0 && list[list.length - 1].key === stepKey;
+    const wasDone = !!job.serviceDone[key];
+    if (isTerminal !== wasDone && !canToggleService(key)) return;
+    const svc = SERVICES.find((s) => s.key === key);
+    const stepLabel = (list.find((st) => st.key === stepKey) || {}).label || stepKey;
+    const note = !wasDone && isTerminal ? "Marked done" : (wasDone && !isTerminal ? "Un-marked" : `Step: ${stepLabel}`);
+    const now = Date.now();
+    const updated = {
+      ...job,
+      serviceStep: { ...(job.serviceStep || {}), [key]: stepKey },
+      serviceDone: { ...job.serviceDone, [key]: isTerminal },
+      history: [...job.history, { stage: "service", label: svc?.label || key, by: session.name, role: session.role, note, at: now }],
+      updatedAt: now,
+    };
+    const saved = await saveJob(updated);
+    setJob(updated);
+    onChanged(updated, saved);
+  };
+
   const setServiceNote = async (key, text) => {
     const updated = { ...job, serviceNotes: { ...(job.serviceNotes || {}), [key]: text }, updatedAt: Date.now() };
     const saved = await saveJob(updated);
@@ -5436,6 +5532,8 @@ function JobDetail({ id, initialJob, session, team, onChanged, onBack, canArchiv
           const review = (job.serviceReviewed || {})[s.key];
           const myTreatments = (job.treatments || {})[s.key] || [];
           const canToggle = canToggleService(s.key);
+          const stepList = stepsForCategory(s.key);
+          const currentStepKey = (job.serviceStep || {})[s.key] || (done ? stepList[stepList.length - 1].key : stepList[0].key);
           return (
             <div key={s.key} style={{ marginBottom: 16 }}>
               {s.key === "bodyshop" && job.damageDiagramImage && (
@@ -5459,18 +5557,27 @@ function JobDetail({ id, initialJob, session, team, onChanged, onBack, canArchiv
                   </div>
                 </div>
               )}
-              <button
-                onClick={() => toggleServiceDone(s.key)}
-                disabled={!canToggle}
-                className="mrcap-press"
-                style={{ width: "100%", boxSizing: "border-box", display: "flex", alignItems: "center", justifyContent: "center", gap: 10, padding: "22px", borderRadius: 14, border: `2px solid ${done ? COLORS.green : COLORS.gold}`, background: done ? "rgba(74,122,87,0.18)" : "rgba(201,162,39,0.12)", cursor: canToggle ? "pointer" : "not-allowed", opacity: canToggle ? 1 : 0.6 }}
-              >
-                {done ? (canToggle ? <CheckCircle2 size={28} color={COLORS.green} /> : <Lock size={24} color={COLORS.green} />) : <div style={{ width: 26, height: 26, borderRadius: "50%", border: `3px solid ${COLORS.gold}` }} />}
-                <span style={{ fontSize: 17, fontWeight: 700, color: COLORS.ink }}>{done ? "Marked Done" : "Mark Done"}</span>
-              </button>
+              <div style={{ width: "100%", boxSizing: "border-box", display: "flex", alignItems: "center", justifyContent: "center", gap: 10, padding: "18px", borderRadius: 14, border: `2px solid ${done ? COLORS.green : COLORS.gold}`, background: done ? "rgba(74,122,87,0.18)" : "rgba(201,162,39,0.12)" }}>
+                {done ? (canToggle ? <CheckCircle2 size={26} color={COLORS.green} /> : <Lock size={22} color={COLORS.green} />) : <div style={{ width: 22, height: 22, borderRadius: "50%", border: `3px solid ${COLORS.gold}` }} />}
+                <span style={{ fontSize: 16, fontWeight: 700, color: COLORS.ink }}>{stepList.find((st) => st.key === currentStepKey)?.label || (done ? "Marked Done" : "Not Started")}</span>
+              </div>
               {done && !canToggle && (
                 <div style={{ textAlign: "center", fontSize: 11.5, color: COLORS.muted, marginTop: 6 }}>Marked by someone else — ask an admin to undo</div>
               )}
+
+              {/* Same real, admin-defined steps as the office view — big
+                  touch targets since this is the primary phone/APK screen
+                  shop-floor staff will actually use. Tap a step to jump to
+                  it; the last step marks the module Done automatically. */}
+              <div style={{ marginTop: 10 }}>
+                <ServiceStepPills
+                  steps={stepList}
+                  currentKey={currentStepKey}
+                  onSelect={(stepKey) => advanceServiceStep(s.key, stepKey)}
+                  disabled={done && !canToggle}
+                  size="large"
+                />
+              </div>
 
               {s.reviewerRole && done && (
                 <div style={{ marginTop: 8, textAlign: "center", fontSize: 12.5, color: review ? "#7BC494" : COLORS.gold }}>
@@ -5947,19 +6054,21 @@ function JobDetail({ id, initialJob, session, team, onChanged, onBack, canArchiv
               const review = (job.serviceReviewed || {})[s.key];
               const needsReview = s.reviewerRole && job.serviceDone[s.key] && !review;
               const canReview = s.reviewerRole && session.role === s.reviewerRole;
+              const stepList = stepsForCategory(s.key);
+              const currentStepKey = (job.serviceStep || {})[s.key] || (job.serviceDone[s.key] ? stepList[stepList.length - 1].key : stepList[0].key);
               return (
                 <div key={s.key} style={{ borderRadius: 10, border: `1.5px solid ${complete ? COLORS.green : needsReview ? COLORS.gold : COLORS.line}`, background: complete ? "rgba(74,122,87,0.15)" : needsReview ? "rgba(201,162,39,0.1)" : COLORS.panel, overflow: "hidden" }}>
                   <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", padding: "11px 12px" }}>
-                    <button onClick={() => toggleServiceDone(s.key)} className="mrcap-press" style={{ display: "flex", alignItems: "center", gap: 8, background: "none", border: "none", padding: 0, cursor: "pointer", flex: 1, textAlign: "left" }}>
+                    <div style={{ display: "flex", alignItems: "center", gap: 8, flex: 1, minWidth: 0 }}>
                       {job.serviceDone[s.key] ? <CheckCircle2 size={17} color={complete ? COLORS.green : COLORS.gold} style={{ flexShrink: 0 }} /> : <div style={{ width: 17, height: 17, borderRadius: "50%", border: `2px solid ${COLORS.muted}`, flexShrink: 0 }} />}
-                      <span>
+                      <span style={{ minWidth: 0 }}>
                         <div style={{ fontSize: 13.5, fontWeight: 600, color: COLORS.ink }}>{s.label}</div>
                         {(job.treatments || {})[s.key]?.length > 0 && (
                           <div style={{ fontSize: 10.5, color: COLORS.muted, marginTop: 1 }}>{(job.treatments[s.key] || []).join(", ")}</div>
                         )}
                       </span>
-                    </button>
-                    <button onClick={() => setPickerFor(pickerFor === s.key ? null : s.key)} className="mrcap-press" style={{ background: "none", border: "none", padding: 0, cursor: "pointer" }}>
+                    </div>
+                    <button onClick={() => setPickerFor(pickerFor === s.key ? null : s.key)} className="mrcap-press" style={{ background: "none", border: "none", padding: 0, cursor: "pointer", flexShrink: 0 }}>
                       {assignedMember ? (
                         <Pill bg={`${ROLE_DEFS[s.role].color}33`} fg={ROLE_DEFS[s.role].color}>{assignedMember.name}</Pill>
                       ) : (
@@ -5967,6 +6076,21 @@ function JobDetail({ id, initialJob, session, team, onChanged, onBack, canArchiv
                       )}
                     </button>
                   </div>
+
+                  {/* Real step-by-step control for this module — steps come from
+                      the admin's Workflow Builder for this category, so Tint can
+                      skip Parts Removal while Bodyshop keeps it. Tapping a step
+                      jumps straight there; reaching the last step marks the
+                      module done exactly as the old toggle did. */}
+                  <div style={{ padding: "0 12px 11px" }}>
+                    <ServiceStepPills
+                      steps={stepList}
+                      currentKey={currentStepKey}
+                      onSelect={(stepKey) => advanceServiceStep(s.key, stepKey)}
+                      disabled={isSimplifiedRole(session) && session.role !== s.role}
+                    />
+                  </div>
+
                   {pickerFor === s.key && (
                     <div style={{ display: "flex", flexWrap: "wrap", gap: 6, padding: "0 12px 11px" }}>
                       {candidates.length === 0 && <span style={{ fontSize: 11.5, color: COLORS.muted }}>No one set up for this role yet.</span>}
@@ -8462,6 +8586,7 @@ function ServicesManagementScreen({ onBack }) {
     setCategories(data.categories);
     setTreatments(data.treatments);
     setSteps(stepRows);
+    await loadWorkflowStepsMap(); // refresh the shared cache job screens read from
     setLoading(false);
   }, []);
 
@@ -8558,17 +8683,67 @@ function WorkflowStepsInline({ categoryKey, steps, onChange }) {
   const [newLabel, setNewLabel] = useState("");
   const [editingId, setEditingId] = useState(null);
   const [editLabel, setEditLabel] = useState("");
+  // Local, live-reorderable copy of steps. Kept in sync with the real
+  // data from the server EXCEPT while a drag is in progress — otherwise
+  // a background reload would fight the reordering happening live under
+  // the user's finger.
+  const [order, setOrder] = useState(steps);
+  const [dragId, setDragId] = useState(null);
+  const rowRefs = useRef(new Map());
+
+  useEffect(() => { if (!dragId) setOrder(steps); }, [steps, dragId]);
+
+  const persistOrder = async (finalOrder) => {
+    setBusy(true);
+    await reorderWorkflowSteps(finalOrder);
+    await onChange();
+    setBusy(false);
+  };
 
   const move = async (index, dir) => {
     const target = index + dir;
-    if (target < 0 || target >= steps.length) return;
-    const next = [...steps];
+    if (target < 0 || target >= order.length) return;
+    const next = [...order];
     const [moved] = next.splice(index, 1);
     next.splice(target, 0, moved);
-    setBusy(true);
-    await reorderWorkflowSteps(next);
-    await onChange();
-    setBusy(false);
+    setOrder(next);
+    await persistOrder(next);
+  };
+
+  // Real drag-and-drop via Pointer Events, not the native HTML5 drag API —
+  // the Dispatch Board already found that native drag doesn't reliably
+  // fire on a touchscreen (see the project log), and a Capacitor WebView
+  // has the same DOM underneath so it would hit the same wall. Pointer
+  // Events work the same on mouse, touch, and inside the Android APK.
+  const onGripPointerDown = (e, id) => {
+    e.preventDefault();
+    setDragId(id);
+    try { e.currentTarget.setPointerCapture(e.pointerId); } catch { /* ignore */ }
+  };
+  const onGripPointerMove = (e) => {
+    if (!dragId) return;
+    const draggedIndex = order.findIndex((s) => s.id === dragId);
+    if (draggedIndex === -1) return;
+    let targetIndex = order.length - 1;
+    for (let i = 0; i < order.length; i++) {
+      const node = rowRefs.current.get(order[i].id);
+      if (!node) continue;
+      const rect = node.getBoundingClientRect();
+      if (e.clientY < rect.top + rect.height / 2) { targetIndex = i; break; }
+    }
+    if (targetIndex !== draggedIndex) {
+      const next = [...order];
+      const [moved] = next.splice(draggedIndex, 1);
+      next.splice(targetIndex, 0, moved);
+      setOrder(next);
+    }
+  };
+  const onGripPointerUp = async (e) => {
+    if (!dragId) return;
+    try { e.currentTarget.releasePointerCapture(e.pointerId); } catch { /* ignore */ }
+    const finalOrder = order;
+    setDragId(null);
+    await persistOrder(finalOrder);
   };
 
   const addStep = async () => {
@@ -8576,7 +8751,7 @@ function WorkflowStepsInline({ categoryKey, steps, onChange }) {
     if (!label) return;
     setBusy(true);
     const stepKey = label.toLowerCase().replace(/[^a-z0-9]+/g, "_").replace(/^_+|_+$/g, "") || `step_${Date.now()}`;
-    await saveWorkflowStep({ category_key: categoryKey, step_key: stepKey, label, sort_order: steps.length });
+    await saveWorkflowStep({ category_key: categoryKey, step_key: stepKey, label, sort_order: order.length });
     setNewLabel("");
     await onChange();
     setBusy(false);
@@ -8601,12 +8776,32 @@ function WorkflowStepsInline({ categoryKey, steps, onChange }) {
 
   return (
     <div style={{ display: "flex", flexDirection: "column", gap: 6 }}>
-      {steps.length === 0 && <div style={{ fontSize: 12, color: COLORS.muted, marginBottom: 4 }}>No steps yet — add the first one below.</div>}
-      {steps.map((s, i) => (
-        <div key={s.id} style={{ display: "flex", alignItems: "center", gap: 8, padding: "7px 9px", borderRadius: 8, background: COLORS.panel2 }}>
+      {order.length === 0 && <div style={{ fontSize: 12, color: COLORS.muted, marginBottom: 4 }}>No steps yet — add the first one below.</div>}
+      {order.map((s, i) => (
+        <div
+          key={s.id}
+          ref={(node) => { if (node) rowRefs.current.set(s.id, node); else rowRefs.current.delete(s.id); }}
+          style={{
+            display: "flex", alignItems: "center", gap: 8, padding: "7px 9px", borderRadius: 8,
+            background: dragId === s.id ? COLORS.panel : COLORS.panel2,
+            border: `1px solid ${dragId === s.id ? COLORS.gold : "transparent"}`,
+            opacity: dragId && dragId !== s.id ? 0.7 : 1,
+            touchAction: "none",
+          }}
+        >
+          <div
+            onPointerDown={(e) => onGripPointerDown(e, s.id)}
+            onPointerMove={onGripPointerMove}
+            onPointerUp={onGripPointerUp}
+            onPointerCancel={onGripPointerUp}
+            className="mrcap-press"
+            style={{ display: "flex", alignItems: "center", color: COLORS.muted, cursor: "grab", touchAction: "none", padding: "2px 2px 2px 0", flexShrink: 0 }}
+          >
+            <GripVertical size={15} />
+          </div>
           <div style={{ display: "flex", flexDirection: "column" }}>
             <button onClick={() => move(i, -1)} disabled={busy || i === 0} className="mrcap-press" style={{ background: "none", border: "none", color: i === 0 ? COLORS.line : COLORS.muted, cursor: i === 0 ? "default" : "pointer", padding: 0, lineHeight: 1 }}><ChevronUp size={14} /></button>
-            <button onClick={() => move(i, 1)} disabled={busy || i === steps.length - 1} className="mrcap-press" style={{ background: "none", border: "none", color: i === steps.length - 1 ? COLORS.line : COLORS.muted, cursor: i === steps.length - 1 ? "default" : "pointer", padding: 0, lineHeight: 1 }}><ChevronDown size={14} /></button>
+            <button onClick={() => move(i, 1)} disabled={busy || i === order.length - 1} className="mrcap-press" style={{ background: "none", border: "none", color: i === order.length - 1 ? COLORS.line : COLORS.muted, cursor: i === order.length - 1 ? "default" : "pointer", padding: 0, lineHeight: 1 }}><ChevronDown size={14} /></button>
           </div>
           <div style={{ fontSize: 10.5, color: COLORS.gold, fontFamily: MONO_FONT, width: 16, textAlign: "center", flexShrink: 0 }}>{i + 1}</div>
           {editingId === s.id ? (
