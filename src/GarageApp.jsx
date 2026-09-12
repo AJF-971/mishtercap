@@ -579,7 +579,7 @@ async function loadTeam() {
   // entirely (not a silent omission) once any single column is
   // restricted, which pin now is. has_pin stands in for the real pin
   // value, which anon can no longer read at all.
-  const { ok, data } = await sbFetch("team_members?select=id,name,role,specialty,permissions,has_pin,created_at,updated_at&order=created_at.asc");
+  const { ok, data } = await sbFetch("team_members?select=id,name,role,specialty,permissions,has_pin,failed_pin_attempts,pin_locked_at,created_at,updated_at&order=created_at.asc");
   if (!ok) return DEFAULT_TEAM;
   if (!data || data.length === 0) {
     // First run ever: seed the table with the full default roster.
@@ -601,9 +601,9 @@ async function loadTeam() {
       headers: { Prefer: "resolution=merge-duplicates,return=minimal" },
       body: JSON.stringify(missing.map((m) => ({ id: m.id, name: m.name, role: m.role, pin: m.pin, permissions: m.permissions }))),
     });
-    return [...data.map((m) => ({ id: m.id, name: m.name, role: m.role, hasPin: !!m.has_pin, specialty: m.specialty || null, permissions: m.permissions || {} })), ...missing];
+    return [...data.map((m) => ({ id: m.id, name: m.name, role: m.role, hasPin: !!m.has_pin, locked: !!m.pin_locked_at, failedAttempts: m.failed_pin_attempts || 0, specialty: m.specialty || null, permissions: m.permissions || {} })), ...missing];
   }
-  return data.map((m) => ({ id: m.id, name: m.name, role: m.role, hasPin: !!m.has_pin, specialty: m.specialty || null, permissions: m.permissions || {} }));
+  return data.map((m) => ({ id: m.id, name: m.name, role: m.role, hasPin: !!m.has_pin, locked: !!m.pin_locked_at, failedAttempts: m.failed_pin_attempts || 0, specialty: m.specialty || null, permissions: m.permissions || {} }));
 }
 async function saveTeam(team) {
   const { ok } = await sbFetch("team_members?on_conflict=id", {
@@ -618,6 +618,10 @@ async function saveTeam(team) {
       // security fix); omitting the key entirely leaves that member's
       // existing pin untouched server-side instead of wiping it.
       if (Object.prototype.hasOwnProperty.call(m, "pin")) row.pin = m.pin;
+      // Same intentional-only pattern for the lockout bookkeeping —
+      // only sent when Reset PIN or Unlock explicitly touched it.
+      if (Object.prototype.hasOwnProperty.call(m, "failed_pin_attempts")) row.failed_pin_attempts = m.failed_pin_attempts;
+      if (Object.prototype.hasOwnProperty.call(m, "pin_locked_at")) row.pin_locked_at = m.pin_locked_at;
       return row;
     })),
   });
@@ -3138,6 +3142,7 @@ function LoginScreen({ team, setTeam, onLogin }) {
   const [pin, setPin] = useState("");
   const [mode, setMode] = useState(null); // 'set' | 'enter'
   const [error, setError] = useState("");
+  const [locked, setLocked] = useState(false); // 5 wrong PINs — refuses further attempts until an admin unlocks/resets from Team
   const [flash, setFlash] = useState(false); // success flash before handoff
   // PC/Phone view choice — only offered to admin/intake, chosen fresh at
   // every login (not remembered) since the same person may use both a
@@ -3148,11 +3153,12 @@ function LoginScreen({ team, setTeam, onLogin }) {
     setPicked(member);
     setPin("");
     setError("");
+    setLocked(false);
     setMode(member.hasPin ? "enter" : "set");
   };
 
-  const press = (d) => { if (pin.length < 4) setPin((p) => p + d); };
-  const backspace = () => setPin((p) => p.slice(0, -1));
+  const press = (d) => { if (!locked && pin.length < 4) setPin((p) => p + d); };
+  const backspace = () => { if (!locked) setPin((p) => p.slice(0, -1)); };
   const dialRotation = pin.length * 90; // one quarter-turn per digit — the dial "clicks" shut
 
   useEffect(() => {
@@ -3169,6 +3175,10 @@ function LoginScreen({ team, setTeam, onLogin }) {
         if (result.ok) {
           setFlash(true);
           setTimeout(() => onLogin(result.member, viewMode), 420);
+        } else if (result.locked) {
+          setLocked(true);
+          setError("Locked — see admin");
+          setPin("");
         } else {
           setError("Wrong PIN");
           setTimeout(() => setPin(""), 260);
@@ -3214,12 +3224,12 @@ function LoginScreen({ team, setTeam, onLogin }) {
 
         <div style={{ fontFamily: DISPLAY_FONT, fontWeight: 600, fontSize: 20, color: COLORS.ink }}>{picked.name}</div>
         <div style={{ fontSize: 12, color: COLORS.muted, marginTop: 3, marginBottom: 22, letterSpacing: 0.3, textTransform: "uppercase" }}>
-          {flash ? "Access granted" : mode === "set" ? "Set a 4-digit PIN" : "Enter your PIN"}
+          {flash ? "Access granted" : locked ? "5 wrong PINs" : mode === "set" ? "Set a 4-digit PIN" : "Enter your PIN"}
         </div>
 
         {error && <div className="mrcap-fade" style={{ color: COLORS.red, fontSize: 12.5, marginBottom: 12, letterSpacing: 0.3, textTransform: "uppercase" }}>{error}</div>}
 
-        <div style={{ display: "grid", gridTemplateColumns: "repeat(3, 1fr)", gap: 12, maxWidth: 240, margin: "0 auto" }}>
+        <div style={{ display: "grid", gridTemplateColumns: "repeat(3, 1fr)", gap: 12, maxWidth: 240, margin: "0 auto", opacity: locked ? 0.35 : 1, pointerEvents: locked ? "none" : "auto" }}>
           {[1, 2, 3, 4, 5, 6, 7, 8, 9].map((n) => (
             <button key={n} onClick={() => press(String(n))} style={keyBtnStyle} className="mrcap-press">{n}</button>
           ))}
@@ -3227,6 +3237,12 @@ function LoginScreen({ team, setTeam, onLogin }) {
           <button onClick={() => press("0")} style={keyBtnStyle} className="mrcap-press">0</button>
           <button onClick={backspace} style={keyBtnStyle} className="mrcap-press"><Delete size={17} color={COLORS.ink} /></button>
         </div>
+
+        {locked && (
+          <div style={{ marginTop: 16, fontSize: 11.5, color: COLORS.muted, maxWidth: 220, marginLeft: "auto", marginRight: "auto" }}>
+            Ask an admin to unlock this account or reset the PIN from Team.
+          </div>
+        )}
 
         {isFullDashboardRole(picked) && (
           <div style={{ marginTop: 30, display: "flex", flexDirection: "column", alignItems: "center", gap: 8 }}>
@@ -8749,7 +8765,16 @@ function TeamScreen({ team, setTeam, session, onBack, onImport, onServices, canS
     setName("");
   };
   const resetPin = async (id) => {
-    const next = team.map((m) => (m.id === id ? { ...m, pin: null } : m));
+    // Full reset: forces a fresh PIN pick next login, and clears any
+    // lockout at the same time so a reset always leaves the account usable.
+    const next = team.map((m) => (m.id === id ? { ...m, pin: null, failed_pin_attempts: 0, pin_locked_at: null, hasPin: false, locked: false, failedAttempts: 0 } : m));
+    setTeam(next);
+    await saveTeam(next);
+  };
+  const unlockMember = async (id) => {
+    // Lighter touch than Reset PIN — clears the lockout and attempt count
+    // but keeps their existing PIN, so they don't have to re-set it.
+    const next = team.map((m) => (m.id === id ? { ...m, failed_pin_attempts: 0, pin_locked_at: null, locked: false, failedAttempts: 0 } : m));
     setTeam(next);
     await saveTeam(next);
   };
@@ -8807,13 +8832,20 @@ function TeamScreen({ team, setTeam, session, onBack, onImport, onServices, canS
                   <>
                     <div>
                       <div style={{ fontFamily: MONO_FONT, fontSize: 14, fontWeight: 600, color: COLORS.ink }}>{m.name}</div>
-                      <div style={{ display: "flex", gap: 5, alignItems: "center", marginTop: 2 }}>
+                      <div style={{ display: "flex", gap: 5, alignItems: "center", marginTop: 2, flexWrap: "wrap" }}>
                         <Pill bg={`${ROLE_DEFS[m.role].color}33`} fg={ROLE_DEFS[m.role].color}>{ROLE_DEFS[m.role].label}</Pill>
                         {m.specialty && <span style={{ fontSize: 10.5, color: COLORS.gold, fontWeight: 600 }}>· {m.specialty}</span>}
+                        {m.locked && <Pill bg="rgba(168,64,47,0.2)" fg={COLORS.red}>Locked</Pill>}
+                        {!m.locked && m.failedAttempts > 0 && (
+                          <span style={{ fontSize: 10, color: COLORS.muted }}>{m.failedAttempts}/5 wrong PIN{m.failedAttempts === 1 ? "" : "s"}</span>
+                        )}
                       </div>
                     </div>
-                    <div style={{ display: "flex", gap: 6 }}>
+                    <div style={{ display: "flex", gap: 6, flexWrap: "wrap", justifyContent: "flex-end" }}>
                       <button onClick={() => startEdit(m)} className="mrcap-press" style={{ fontSize: 11, color: COLORS.ink, background: "none", border: `1px solid ${COLORS.line}`, borderRadius: 7, padding: "5px 7px", cursor: "pointer" }}>Rename</button>
+                      {m.locked && (
+                        <button onClick={() => unlockMember(m.id)} className="mrcap-press" style={{ fontSize: 11, color: COLORS.green, background: "none", border: `1px solid ${COLORS.green}`, borderRadius: 7, padding: "5px 7px", cursor: "pointer", fontWeight: 600 }}>Unlock</button>
+                      )}
                       <button onClick={() => resetPin(m.id)} className="mrcap-press" style={{ fontSize: 11, color: COLORS.muted, background: "none", border: `1px solid ${COLORS.line}`, borderRadius: 7, padding: "5px 7px", cursor: "pointer" }}>PIN</button>
                       {m.id !== session.id && (
                         <button onClick={() => removeMember(m.id)} className="mrcap-press" style={{ fontSize: 11, color: COLORS.red, background: "none", border: `1px solid ${COLORS.line}`, borderRadius: 7, padding: "5px 7px", cursor: "pointer" }}>Remove</button>
@@ -10715,6 +10747,7 @@ export function DispatchKiosk() {
   const [picked, setPicked] = useState(null);
   const [pin, setPin] = useState("");
   const [error, setError] = useState("");
+  const [locked, setLocked] = useState(false);
   const [showMorningReminder, setShowMorningReminder] = useState(() => shouldShowMorningReminder("mrcap_kiosk"));
 
   useEffect(() => {
@@ -10755,13 +10788,14 @@ export function DispatchKiosk() {
       setPicked(member);
       setPin("");
       setError("");
+      setLocked(false);
     } else {
       loginAs(member);
     }
   };
 
-  const press = (d) => { if (pin.length < 4) setPin((p) => p + d); };
-  const backspace = () => setPin((p) => p.slice(0, -1));
+  const press = (d) => { if (!locked && pin.length < 4) setPin((p) => p + d); };
+  const backspace = () => { if (!locked) setPin((p) => p.slice(0, -1)); };
 
   useEffect(() => {
     if (pin.length !== 4 || !picked) return;
@@ -10769,6 +10803,10 @@ export function DispatchKiosk() {
       const result = await verifyPin(picked.id, pin);
       if (result.ok) {
         loginAs(result.member);
+      } else if (result.locked) {
+        setLocked(true);
+        setError("Locked — see admin");
+        setPin("");
       } else {
         setError("Wrong PIN");
         setTimeout(() => setPin(""), 260);
@@ -10817,7 +10855,7 @@ export function DispatchKiosk() {
             <div key={i} style={{ width: 10, height: 10, borderRadius: "50%", background: i < pin.length ? COLORS.blue : "transparent", border: `1.5px solid ${i < pin.length ? COLORS.blue : COLORS.muted}` }} />
           ))}
         </div>
-        <div style={{ display: "grid", gridTemplateColumns: "repeat(3, 1fr)", gap: 12, maxWidth: 240, margin: "0 auto" }}>
+        <div style={{ display: "grid", gridTemplateColumns: "repeat(3, 1fr)", gap: 12, maxWidth: 240, margin: "0 auto", opacity: locked ? 0.35 : 1, pointerEvents: locked ? "none" : "auto" }}>
           {[1, 2, 3, 4, 5, 6, 7, 8, 9].map((n) => (
             <button key={n} onClick={() => press(String(n))} style={keyBtnStyle} className="mrcap-press">{n}</button>
           ))}
@@ -10825,6 +10863,11 @@ export function DispatchKiosk() {
           <button onClick={() => press("0")} style={keyBtnStyle} className="mrcap-press">0</button>
           <button onClick={backspace} style={keyBtnStyle} className="mrcap-press"><Delete size={17} color={COLORS.ink} /></button>
         </div>
+        {locked && (
+          <div style={{ marginTop: 16, fontSize: 11.5, color: COLORS.muted, maxWidth: 220, marginLeft: "auto", marginRight: "auto" }}>
+            Ask an admin to unlock this account or reset the PIN from Team.
+          </div>
+        )}
       </div>
     );
   }
