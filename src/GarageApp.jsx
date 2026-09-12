@@ -486,6 +486,82 @@ function withActivitySummary(summary) { nextActivitySummary = summary; }
 // the previous key-value version, now applied to real table operations.
 let lastStorageError = null;
 
+/* ---------------- Offline write queue + read cache ----------------
+   The APK is a thin wrapper around the live site with nothing bundled
+   locally, so before this a wifi drop on the shop floor meant every tap
+   silently failed and screens could go blank. This makes both
+   survivable: every successful GET is cached to localStorage so a
+   screen still renders (marked stale) with zero signal, and a write
+   that fails because the network genuinely couldn't be reached gets
+   queued locally and replayed in order the instant connectivity is
+   back — never treated the same as a real rejection. An actual error
+   response FROM the gatekeeper (invalid table, the PIN-overwrite
+   guard, a validation failure) means the server was reached and said
+   no on purpose, so that is never queued — it fails exactly as it
+   always has. */
+const OFFLINE_QUEUE_KEY = "mrcap_offline_queue";
+const CACHE_PREFIX = "mrcap_cache_";
+
+function getOfflineQueue() {
+  try { return JSON.parse(window.localStorage.getItem(OFFLINE_QUEUE_KEY) || "[]"); } catch { return []; }
+}
+function setOfflineQueue(q) {
+  try { window.localStorage.setItem(OFFLINE_QUEUE_KEY, JSON.stringify(q)); } catch { /* full/unavailable — not worth blocking over */ }
+  try { window.dispatchEvent(new CustomEvent("mrcap-queue-changed", { detail: { length: q.length } })); } catch { /* ignore */ }
+}
+function queueOfflineWrite(envelope) {
+  const q = getOfflineQueue();
+  q.push({ id: uid("queued"), envelope, queuedAt: Date.now() });
+  setOfflineQueue(q);
+}
+function readCache(path) {
+  try {
+    const raw = window.localStorage.getItem(CACHE_PREFIX + path);
+    return raw ? JSON.parse(raw) : null;
+  } catch { return null; }
+}
+function writeCache(path, data) {
+  try { window.localStorage.setItem(CACHE_PREFIX + path, JSON.stringify({ data, at: Date.now() })); } catch { /* localStorage full — not worth blocking over, cache is best-effort */ }
+}
+
+// Replays the queue strictly in order, one at a time — stops the moment
+// a replay throws (still offline) so nothing gets skipped or reordered.
+// Whether the server then accepts or rejects a replayed write, the
+// round-trip happened, so it's removed either way — a rejected write
+// was never going to succeed by itself retrying again unattended.
+let flushingOfflineQueue = false;
+async function flushOfflineQueue() {
+  if (flushingOfflineQueue) return;
+  flushingOfflineQueue = true;
+  try {
+    let q = getOfflineQueue();
+    while (q.length) {
+      const item = q[0];
+      try {
+        await fetch(GATEKEEPER_URL, {
+          method: "POST",
+          headers: { apikey: SUPABASE_KEY, Authorization: `Bearer ${SUPABASE_KEY}`, "Content-Type": "application/json" },
+          body: JSON.stringify(item.envelope),
+        });
+      } catch {
+        break; // still offline — leave this and everything after it queued
+      }
+      q = q.slice(1);
+      setOfflineQueue(q);
+    }
+  } finally {
+    flushingOfflineQueue = false;
+  }
+}
+if (typeof window !== "undefined") {
+  window.addEventListener("online", () => flushOfflineQueue());
+  // Belt-and-braces on top of the 'online' event: Android WebViews and
+  // flaky/captive-portal wifi don't always fire it reliably, so poll
+  // whenever there's actually a backlog rather than trusting the event.
+  setInterval(() => { if (getOfflineQueue().length) flushOfflineQueue(); }, 20000);
+  if (getOfflineQueue().length) flushOfflineQueue();
+}
+
 async function sbFetch(path, options = {}) {
   const method = (options.method || "GET").toUpperCase();
   const isWrite = method !== "GET";
@@ -500,26 +576,48 @@ async function sbFetch(path, options = {}) {
       if (options.body !== undefined) {
         try { parsedBody = JSON.parse(options.body); } catch { parsedBody = options.body; }
       }
-      res = await fetch(GATEKEEPER_URL, {
-        method: "POST",
-        headers: {
-          apikey: SUPABASE_KEY,
-          Authorization: `Bearer ${SUPABASE_KEY}`,
-          "Content-Type": "application/json",
-        },
-        body: JSON.stringify({ path, method, body: parsedBody, headers: options.headers || {}, actor: currentActor, summary: nextActivitySummary || undefined }),
-      });
+      const envelope = { path, method, body: parsedBody, headers: options.headers || {}, actor: currentActor, summary: nextActivitySummary || undefined };
       nextActivitySummary = null;
+      try {
+        res = await fetch(GATEKEEPER_URL, {
+          method: "POST",
+          headers: {
+            apikey: SUPABASE_KEY,
+            Authorization: `Bearer ${SUPABASE_KEY}`,
+            "Content-Type": "application/json",
+          },
+          body: JSON.stringify(envelope),
+        });
+      } catch {
+        // The request never reached the server at all — genuinely offline,
+        // not a rejection. Queue it (with the actor/summary already
+        // resolved above, so attribution stays correct even if someone
+        // else is logged in on this device by the time it syncs) and tell
+        // the caller it "succeeded" so the existing optimistic-update code
+        // in every screen keeps working unchanged; the pending-sync badge
+        // is what tells the truth about it not being on the server yet.
+        queueOfflineWrite(envelope);
+        return { ok: true, data: null, queued: true };
+      }
     } else {
-      res = await fetch(`${SUPABASE_URL}/rest/v1/${path}`, {
-        ...options,
-        headers: {
-          apikey: SUPABASE_KEY,
-          Authorization: `Bearer ${SUPABASE_KEY}`,
-          "Content-Type": "application/json",
-          ...(options.headers || {}),
-        },
-      });
+      try {
+        res = await fetch(`${SUPABASE_URL}/rest/v1/${path}`, {
+          ...options,
+          headers: {
+            apikey: SUPABASE_KEY,
+            Authorization: `Bearer ${SUPABASE_KEY}`,
+            "Content-Type": "application/json",
+            ...(options.headers || {}),
+          },
+        });
+      } catch {
+        // No network at all — fall back to whatever this exact query last
+        // returned successfully, rather than the screen going blank.
+        const cached = readCache(path);
+        if (cached) return { ok: true, data: cached.data, stale: true, cachedAt: cached.at };
+        lastStorageError = `${method} ${path.split("?")[0]}: offline, nothing cached yet`;
+        return { ok: false, data: null };
+      }
     }
     if (!res.ok) {
       const body = await res.text().catch(() => "");
@@ -528,7 +626,14 @@ async function sbFetch(path, options = {}) {
     }
     lastStorageError = null;
     const text = await res.text();
-    return { ok: true, data: text ? JSON.parse(text) : null };
+    const data = text ? JSON.parse(text) : null;
+    if (!isWrite) writeCache(path, data);
+    // A write just went through live, so if there's a backlog from earlier
+    // taps made while offline, this is as good a sign as any that
+    // connectivity is back — catch it up now instead of waiting for the
+    // next poll.
+    if (isWrite && getOfflineQueue().length) flushOfflineQueue();
+    return { ok: true, data };
   } catch (e) {
     lastStorageError = `${method} ${path.split("?")[0]} threw: ${String(e && e.message || e).slice(0, 200)}`;
     return { ok: false, data: null };
@@ -3476,9 +3581,73 @@ function TopBar({ session, team, onLogout, onNew, view, onBack, onTeam, onArchiv
 
 /* ---------------- Dashboard / Board ---------------- */
 
+// Tracks the browser's own connectivity signal. Not perfect on its own
+// (a WebView can say "online" on a captive/dead wifi router) but combined
+// with the offline queue length below — which only grows when a real
+// fetch actually failed to reach the server — the two together give an
+// honest picture instead of the old silent-failure behaviour.
+function useOnlineStatus() {
+  const [online, setOnline] = useState(() => (typeof navigator !== "undefined" ? navigator.onLine : true));
+  useEffect(() => {
+    const on = () => setOnline(true);
+    const off = () => setOnline(false);
+    window.addEventListener("online", on);
+    window.addEventListener("offline", off);
+    return () => { window.removeEventListener("online", on); window.removeEventListener("offline", off); };
+  }, []);
+  return online;
+}
+function useOfflineQueueLength() {
+  const [len, setLen] = useState(() => getOfflineQueue().length);
+  useEffect(() => {
+    const onChange = (e) => setLen(e?.detail?.length ?? getOfflineQueue().length);
+    window.addEventListener("mrcap-queue-changed", onChange);
+    // Also re-check on a slow interval — the flush loop only fires the
+    // event on change, but this catches the case where the queue was
+    // populated before this component mounted.
+    const t = setInterval(onChange, 5000);
+    return () => { window.removeEventListener("mrcap-queue-changed", onChange); clearInterval(t); };
+  }, []);
+  return len;
+}
+
+// Small standalone pill version of the same offline/pending signal, for
+// screens (like an open job) that don't otherwise show a SyncBar but are
+// exactly where a shop-floor tap is most likely to happen while offline.
+function OfflineBadge() {
+  const online = useOnlineStatus();
+  const pending = useOfflineQueueLength();
+  if (online && pending === 0) return null;
+  return (
+    <Pill bg={!online ? "rgba(201,162,39,0.22)" : "rgba(74,122,87,0.22)"} fg={!online ? COLORS.gold : "#7BC494"}>
+      {!online ? (pending > 0 ? `Offline · ${pending} pending` : "Offline") : `Syncing ${pending}…`}
+    </Pill>
+  );
+}
+
 function SyncBar({ syncState, lastSyncedAt, onRefresh }) {
   const [refreshing, setRefreshing] = useState(false);
   const doRefresh = async () => { setRefreshing(true); await onRefresh(); setRefreshing(false); };
+  const online = useOnlineStatus();
+  const pending = useOfflineQueueLength();
+
+  // Offline / pending-sync banner takes priority over everything else —
+  // this is the honest "your last few taps haven't reached the server
+  // yet" signal the old silent-failure behaviour never gave anyone.
+  if (!online || pending > 0) {
+    return (
+      <div style={{ background: !online ? "#3A2E14" : "#1F2A1E", border: `1px solid ${!online ? COLORS.gold : COLORS.green}`, borderRadius: 10, padding: "9px 12px", marginBottom: 12 }}>
+        <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", gap: 8 }}>
+          <span style={{ fontSize: 12, color: !online ? COLORS.gold : "#7BC494", fontWeight: 600 }}>
+            {!online
+              ? (pending > 0 ? `Offline — ${pending} change${pending === 1 ? "" : "s"} saved on this device, waiting for signal` : "Offline — working from the last data this device saw")
+              : `Syncing ${pending} change${pending === 1 ? "" : "s"}…`}
+          </span>
+          {online && <button onClick={doRefresh} style={{ fontSize: 11.5, color: COLORS.darkText, background: COLORS.gold, border: "none", borderRadius: 7, padding: "5px 9px", cursor: "pointer", fontWeight: 600, flexShrink: 0 }}>{refreshing ? "…" : "Refresh"}</button>}
+        </div>
+      </div>
+    );
+  }
 
   if (syncState === "failed") {
     return (
@@ -5494,7 +5663,10 @@ function JobDetail({ id, initialJob, session, team, onChanged, onBack, canArchiv
     const myServices = activeServices.filter((s) => s.role === session.role);
     return (
       <div className="mrcap-view" style={{ padding: "0 18px 34px" }}>
-        <button onClick={onBack} className="mrcap-press" style={{ ...iconBtnStyle, marginBottom: 16 }}><ChevronLeft size={20} color={COLORS.ink} /></button>
+        <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", marginBottom: 16 }}>
+          <button onClick={onBack} className="mrcap-press" style={iconBtnStyle}><ChevronLeft size={20} color={COLORS.ink} /></button>
+          <OfflineBadge />
+        </div>
 
         <div style={{ textAlign: "center", marginBottom: 22 }}>
           <div style={{ fontFamily: MONO_FONT, fontWeight: 700, fontSize: 28, color: COLORS.ink, letterSpacing: 0.5 }}>{job.plate}</div>
@@ -5620,7 +5792,10 @@ function JobDetail({ id, initialJob, session, team, onChanged, onBack, canArchiv
           <span style={{ fontFamily: MONO_FONT, fontWeight: 700, fontSize: 13, color: COLORS.ink, flexShrink: 0 }}>{job.plate}</span>
           <span style={{ fontSize: 11.5, color: COLORS.muted, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{job.makeModel}</span>
         </div>
-        <Pill tone={stageTone(stage.key)}>{stage.label}</Pill>
+        <div style={{ display: "flex", alignItems: "center", gap: 6, flexShrink: 0 }}>
+          <OfflineBadge />
+          <Pill tone={stageTone(stage.key)}>{stage.label}</Pill>
+        </div>
       </div>
       {stage.key === "ready" && job.customerPhone && (
         <>
