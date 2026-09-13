@@ -102,38 +102,41 @@ function isSuperAdmin(session) {
   return !!session && session.id === "suhail";
 }
 
-// The 4 front-line names Ahmed, Lani, Regan and Noel are held to the
-// same screen access as each other, per Suhail's request — this is the
-// one list every named exception below reads from, so keeping the 4 in
-// sync only ever means editing this array.
+// The 4 front-line names tracked on the "Who's Out Today" attendance
+// widget, per Suhail's request. Dashboard/screen access no longer reads
+// from this list (see dashboardMode / hasFullDashboard below) — this is
+// now purely the attendance-tracker roster.
 const CORE_FOUR = ["ahmed", "laani", "regan", "noel"];
 
-// Live Updates access — any admin login, plus the core 4 by name
-// (named exceptions, same pattern as isSuperAdmin above, not a
-// toggleable permission).
+// Which screens a team member sees: the full admin-style dashboard/case
+// file, or the stripped-down workshop-floor view. Used to be a hardcoded
+// name list (CORE_FOUR) that only a developer could edit — now it's a
+// real per-employee setting (`dashboardMode`, on team_members), set from
+// the Team screen when adding or editing someone. 'auto' (the default)
+// keeps the original role-based rule so nobody needs to be reconfigured
+// by hand; 'full' or 'workshop' explicitly overrides that for one person
+// regardless of role — this only changes which SCREENS show, never
+// their separately-set individual permissions. Takes a plain
+// {role, dashboardMode} shape so it works for both the live session and
+// a not-yet-logged-in member being previewed on the login screen.
+function hasFullDashboard(member) {
+  if (!member) return false;
+  if (member.dashboardMode === "full") return true;
+  if (member.dashboardMode === "workshop") return false;
+  return member.role === "admin" || member.role === "intake";
+}
 function canSeeLiveUpdates(session) {
-  return !!session && (session.role === "admin" || CORE_FOUR.includes((session.name || "").toLowerCase()));
+  return !!session && (session.role === "admin" || hasFullDashboard(session));
 }
-
-// Full Dashboard/list-view access — normally admin and intake roles
-// only. Regan and Noel get the same view as named exceptions (per
-// Suhail's request), without actually becoming an admin or intake role
-// — they keep their own existing individual permissions (Team screen),
-// this only affects which SCREENS show, not what they're separately
-// allowed to do on them. Takes a plain {role, name} shape so it works
-// for both the live session and a not-yet-logged-in member being
-// previewed on the login screen.
 function isFullDashboardRole(member) {
-  return !!member && (member.role === "admin" || member.role === "intake" || CORE_FOUR.includes((member.name || "").toLowerCase()));
+  return hasFullDashboard(member);
 }
-// Same named exception, for the Job Detail screen's simplified-vs-full
-// layout — Regan and Noel see the full case file like an admin/intake
-// login would, instead of the stripped-down shop-floor version their
-// "Detailing" role normally gets. Scoped to the core 4 by name so other
-// detailing staff (Ulysses, JP, etc.) are unaffected.
+// Same setting, for the Job Detail screen's simplified-vs-full layout —
+// whoever's set to the full dashboard sees the full case file instead of
+// the stripped-down shop-floor version their role would normally get.
 function isSimplifiedRole(session) {
   if (!session) return true;
-  if (CORE_FOUR.includes((session.name || "").toLowerCase())) return false;
+  if (hasFullDashboard(session)) return false;
   return !!ROLE_DEFS[session.role]?.simplified;
 }
 
@@ -684,7 +687,7 @@ async function loadTeam() {
   // entirely (not a silent omission) once any single column is
   // restricted, which pin now is. has_pin stands in for the real pin
   // value, which anon can no longer read at all.
-  const { ok, data } = await sbFetch("team_members?select=id,name,role,specialty,permissions,has_pin,failed_pin_attempts,pin_locked_at,created_at,updated_at&order=created_at.asc");
+  const { ok, data } = await sbFetch("team_members?select=id,name,role,specialty,permissions,has_pin,failed_pin_attempts,pin_locked_at,dashboard_mode,created_at,updated_at&order=created_at.asc");
   if (!ok) return DEFAULT_TEAM;
   if (!data || data.length === 0) {
     // First run ever: seed the table with the full default roster.
@@ -706,16 +709,16 @@ async function loadTeam() {
       headers: { Prefer: "resolution=merge-duplicates,return=minimal" },
       body: JSON.stringify(missing.map((m) => ({ id: m.id, name: m.name, role: m.role, pin: m.pin, permissions: m.permissions }))),
     });
-    return [...data.map((m) => ({ id: m.id, name: m.name, role: m.role, hasPin: !!m.has_pin, locked: !!m.pin_locked_at, failedAttempts: m.failed_pin_attempts || 0, specialty: m.specialty || null, permissions: m.permissions || {} })), ...missing];
+    return [...data.map((m) => ({ id: m.id, name: m.name, role: m.role, hasPin: !!m.has_pin, locked: !!m.pin_locked_at, failedAttempts: m.failed_pin_attempts || 0, specialty: m.specialty || null, permissions: m.permissions || {}, dashboardMode: m.dashboard_mode || "auto" })), ...missing];
   }
-  return data.map((m) => ({ id: m.id, name: m.name, role: m.role, hasPin: !!m.has_pin, locked: !!m.pin_locked_at, failedAttempts: m.failed_pin_attempts || 0, specialty: m.specialty || null, permissions: m.permissions || {} }));
+  return data.map((m) => ({ id: m.id, name: m.name, role: m.role, hasPin: !!m.has_pin, locked: !!m.pin_locked_at, failedAttempts: m.failed_pin_attempts || 0, specialty: m.specialty || null, permissions: m.permissions || {}, dashboardMode: m.dashboard_mode || "auto" }));
 }
 async function saveTeam(team) {
   const { ok } = await sbFetch("team_members?on_conflict=id", {
     method: "POST",
     headers: { Prefer: "resolution=merge-duplicates,return=minimal" },
     body: JSON.stringify(team.map((m) => {
-      const row = { id: m.id, name: m.name, role: m.role, specialty: m.specialty || null, permissions: m.permissions || {}, updated_at: new Date().toISOString() };
+      const row = { id: m.id, name: m.name, role: m.role, specialty: m.specialty || null, permissions: m.permissions || {}, dashboard_mode: m.dashboardMode || "auto", updated_at: new Date().toISOString() };
       // Only ever include `pin` when THIS call intentionally set or
       // cleared it (first-time PIN creation, or Reset PIN) — never
       // blindly resend it for untouched members. The client no longer
@@ -3201,7 +3204,7 @@ export default function GarageApp() {
   }, [ready, session, refreshIndex]);
 
   const onLogin = async (member, viewMode = "phone") => {
-    const s = { id: member.id, name: member.name, role: member.role, viewMode };
+    const s = { id: member.id, name: member.name, role: member.role, viewMode, dashboardMode: member.dashboardMode || "auto" };
     setSession(s);
     saveLocalSession(s);
     setCurrentActor(s);
@@ -9272,14 +9275,16 @@ function TeamScreen({ team, setTeam, session, onBack, onImport, onServices, canS
   const [confirmResetId, setConfirmResetId] = useState(null);
   const [busyMemberId, setBusyMemberId] = useState(null);
   const [pinActionDone, setPinActionDone] = useState(null); // { id, label } — brief success flash
+  const [dashboardMode, setDashboardMode] = useState("auto"); // for the Add member form
 
   const addMember = async () => {
     if (!name.trim()) return;
     const blankPerms = Object.fromEntries(PERMISSIONS.map((p) => [p.key, false]));
-    const next = [...team, { id: uid("member"), name: name.trim(), role, pin: null, permissions: { ...blankPerms, newJob: true } }];
+    const next = [...team, { id: uid("member"), name: name.trim(), role, pin: null, permissions: { ...blankPerms, newJob: true }, dashboardMode }];
     setTeam(next);
     await saveTeam(next);
     setName("");
+    setDashboardMode("auto");
   };
   const resetPin = async (id) => {
     // Full reset: forces a fresh PIN pick next login, and clears any
@@ -9303,6 +9308,11 @@ function TeamScreen({ team, setTeam, session, onBack, onImport, onServices, canS
     setBusyMemberId(null);
     setPinActionDone({ id, label: "Unlocked — same PIN still works" });
     setTimeout(() => setPinActionDone((cur) => (cur && cur.id === id ? null : cur)), 3000);
+  };
+  const changeDashboardMode = async (id, mode) => {
+    const next = team.map((m) => (m.id === id ? { ...m, dashboardMode: mode } : m));
+    setTeam(next);
+    await saveTeam(next);
   };
   const togglePermission = async (id, key) => {
     const next = team.map((m) => (m.id === id ? { ...m, permissions: { ...m.permissions, [key]: !m.permissions?.[key] } } : m));
@@ -9430,6 +9440,16 @@ function TeamScreen({ team, setTeam, session, onBack, onImport, onServices, canS
                   );
                 })}
               </div>
+
+              {/* Which screens this person sees — full admin-style
+                  dashboard/case file, or the stripped-down workshop-floor
+                  view. "Auto" follows their role (admin/intake get the
+                  full view, everyone else workshop) — set it explicitly
+                  here to override that for just this one person. */}
+              <div style={{ padding: "0 12px 12px" }}>
+                <div style={{ fontSize: 10.5, color: COLORS.muted, textTransform: "uppercase", letterSpacing: 0.5, marginBottom: 6 }}>Dashboard view</div>
+                <DashboardModePicker value={m.dashboardMode || "auto"} onChange={(mode) => changeDashboardMode(m.id, mode)} />
+              </div>
             </div>
           );
         })}
@@ -9445,8 +9465,44 @@ function TeamScreen({ team, setTeam, session, onBack, onImport, onServices, canS
             ))}
           </div>
         </Field>
+        <Field label="Dashboard view">
+          <DashboardModePicker value={dashboardMode} onChange={setDashboardMode} />
+        </Field>
         <button onClick={addMember} disabled={!name.trim()} className="mrcap-press" style={{ ...primaryBtnStyle, width: "100%", opacity: name.trim() ? 1 : 0.5 }}>Add</button>
       </div>
+    </div>
+  );
+}
+
+// Three-way picker for how much of the app someone sees: Auto (follow
+// their role's usual default), Full Dashboard (admin-style, even for a
+// shop-floor role — e.g. a senior technician who should see everything),
+// or Workshop Floor (the stripped-down view, even for admin/intake —
+// e.g. someone who should only ever see their own assigned jobs).
+function DashboardModePicker({ value, onChange }) {
+  const options = [
+    { key: "auto", label: "Auto (by role)" },
+    { key: "full", label: "Full Dashboard" },
+    { key: "workshop", label: "Workshop Floor" },
+  ];
+  return (
+    <div style={{ display: "flex", flexWrap: "wrap", gap: 6 }}>
+      {options.map((o) => (
+        <button
+          key={o.key}
+          onClick={() => onChange(o.key)}
+          className="mrcap-press"
+          type="button"
+          style={{
+            padding: "7px 10px", borderRadius: 8, fontSize: 11.5, fontWeight: 600, cursor: "pointer",
+            border: `1.5px solid ${value === o.key ? COLORS.gold : COLORS.line}`,
+            background: value === o.key ? COLORS.gold : COLORS.panel2,
+            color: value === o.key ? COLORS.darkText : COLORS.muted,
+          }}
+        >
+          {o.label}
+        </button>
+      ))}
     </div>
   );
 }
