@@ -9263,6 +9263,15 @@ function TeamScreen({ team, setTeam, session, onBack, onImport, onServices, canS
   const [role, setRole] = useState("intake");
   const [editingId, setEditingId] = useState(null);
   const [editName, setEditName] = useState("");
+  // Reset PIN used to fire instantly with zero feedback — one tap and
+  // nothing visibly happened, which read as a dead/disabled button even
+  // though it was quietly wiping the PIN in the background. Now it asks
+  // first (it's a real, disruptive action — they can't log in with their
+  // old PIN until they set a new one) and confirms after, same as every
+  // other destructive action in this app already does.
+  const [confirmResetId, setConfirmResetId] = useState(null);
+  const [busyMemberId, setBusyMemberId] = useState(null);
+  const [pinActionDone, setPinActionDone] = useState(null); // { id, label } — brief success flash
 
   const addMember = async () => {
     if (!name.trim()) return;
@@ -9275,16 +9284,25 @@ function TeamScreen({ team, setTeam, session, onBack, onImport, onServices, canS
   const resetPin = async (id) => {
     // Full reset: forces a fresh PIN pick next login, and clears any
     // lockout at the same time so a reset always leaves the account usable.
+    setBusyMemberId(id);
     const next = team.map((m) => (m.id === id ? { ...m, pin: null, failed_pin_attempts: 0, pin_locked_at: null, hasPin: false, locked: false, failedAttempts: 0 } : m));
     setTeam(next);
     await saveTeam(next);
+    setBusyMemberId(null);
+    setConfirmResetId(null);
+    setPinActionDone({ id, label: "PIN reset — they'll set a new one at next login" });
+    setTimeout(() => setPinActionDone((cur) => (cur && cur.id === id ? null : cur)), 3000);
   };
   const unlockMember = async (id) => {
     // Lighter touch than Reset PIN — clears the lockout and attempt count
     // but keeps their existing PIN, so they don't have to re-set it.
+    setBusyMemberId(id);
     const next = team.map((m) => (m.id === id ? { ...m, failed_pin_attempts: 0, pin_locked_at: null, locked: false, failedAttempts: 0 } : m));
     setTeam(next);
     await saveTeam(next);
+    setBusyMemberId(null);
+    setPinActionDone({ id, label: "Unlocked — same PIN still works" });
+    setTimeout(() => setPinActionDone((cur) => (cur && cur.id === id ? null : cur)), 3000);
   };
   const togglePermission = async (id, key) => {
     const next = team.map((m) => (m.id === id ? { ...m, permissions: { ...m.permissions, [key]: !m.permissions?.[key] } } : m));
@@ -9352,9 +9370,9 @@ function TeamScreen({ team, setTeam, session, onBack, onImport, onServices, canS
                     <div style={{ display: "flex", gap: 6, flexWrap: "wrap", justifyContent: "flex-end" }}>
                       <button onClick={() => startEdit(m)} className="mrcap-press" style={{ fontSize: 11, color: COLORS.ink, background: "none", border: `1px solid ${COLORS.line}`, borderRadius: 7, padding: "5px 7px", cursor: "pointer" }}>Rename</button>
                       {m.locked && (
-                        <button onClick={() => unlockMember(m.id)} className="mrcap-press" style={{ fontSize: 11, color: COLORS.green, background: "none", border: `1px solid ${COLORS.green}`, borderRadius: 7, padding: "5px 7px", cursor: "pointer", fontWeight: 600 }}>Unlock</button>
+                        <button onClick={() => unlockMember(m.id)} disabled={busyMemberId === m.id} className="mrcap-press" style={{ fontSize: 11, color: COLORS.green, background: "none", border: `1px solid ${COLORS.green}`, borderRadius: 7, padding: "5px 7px", cursor: busyMemberId === m.id ? "default" : "pointer", opacity: busyMemberId === m.id ? 0.6 : 1, fontWeight: 600 }}>{busyMemberId === m.id ? "…" : "Unlock"}</button>
                       )}
-                      <button onClick={() => resetPin(m.id)} className="mrcap-press" style={{ fontSize: 11, color: COLORS.muted, background: "none", border: `1px solid ${COLORS.line}`, borderRadius: 7, padding: "5px 7px", cursor: "pointer" }}>PIN</button>
+                      <button onClick={() => setConfirmResetId(m.id)} disabled={busyMemberId === m.id} className="mrcap-press" style={{ fontSize: 11, color: COLORS.muted, background: "none", border: `1px solid ${COLORS.line}`, borderRadius: 7, padding: "5px 7px", cursor: busyMemberId === m.id ? "default" : "pointer", opacity: busyMemberId === m.id ? 0.6 : 1 }}>Reset PIN</button>
                       {m.id !== session.id && (
                         <button onClick={() => removeMember(m.id)} className="mrcap-press" style={{ fontSize: 11, color: COLORS.red, background: "none", border: `1px solid ${COLORS.line}`, borderRadius: 7, padding: "5px 7px", cursor: "pointer" }}>Remove</button>
                       )}
@@ -9362,6 +9380,27 @@ function TeamScreen({ team, setTeam, session, onBack, onImport, onServices, canS
                   </>
                 )}
               </div>
+
+              {/* Reset PIN is disruptive — they can't log in with their old
+                  PIN again until they set a new one — so it asks first
+                  instead of firing silently on a single tap. */}
+              {confirmResetId === m.id && (
+                <div style={{ padding: "10px 12px", borderBottom: `1px solid ${COLORS.line}`, background: "rgba(168,64,47,0.08)" }}>
+                  <div style={{ fontSize: 12, color: COLORS.ink, marginBottom: 8 }}>Reset {m.name}'s PIN? They'll pick a new one the next time they log in.</div>
+                  <div style={{ display: "flex", gap: 8 }}>
+                    <button onClick={() => resetPin(m.id)} disabled={busyMemberId === m.id} className="mrcap-press" style={{ fontSize: 11.5, color: "#fff", background: COLORS.red, border: "none", borderRadius: 7, padding: "7px 11px", cursor: "pointer", fontWeight: 600 }}>
+                      {busyMemberId === m.id ? "Resetting…" : "Yes, reset it"}
+                    </button>
+                    <button onClick={() => setConfirmResetId(null)} disabled={busyMemberId === m.id} className="mrcap-press" style={{ fontSize: 11.5, color: COLORS.muted, background: "none", border: `1px solid ${COLORS.line}`, borderRadius: 7, padding: "7px 11px", cursor: "pointer" }}>Cancel</button>
+                  </div>
+                </div>
+              )}
+              {pinActionDone && pinActionDone.id === m.id && (
+                <div style={{ padding: "8px 12px", borderBottom: `1px solid ${COLORS.line}`, display: "flex", alignItems: "center", gap: 6, background: "rgba(74,122,87,0.1)" }}>
+                  <CheckCircle2 size={13} color={COLORS.green} />
+                  <span style={{ fontSize: 11.5, color: "#7BC494" }}>{pinActionDone.label}</span>
+                </div>
+              )}
 
               {/* Permission grid — every real capability, individually
                   toggleable. Admins always show every permission as
