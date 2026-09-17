@@ -6,9 +6,13 @@ import {
   LayoutDashboard, ListChecks, UserPlus, ShieldCheck, Archive, ShieldAlert,
   Users, BarChart3, Phone, Download, Upload, FileText, Send, PauseCircle,
   MessageSquare, TrendingUp, RotateCcw, ExternalLink, Star, AlertCircle,
-  Sparkles, Hammer, Armchair, ChevronUp, ChevronDown, GripVertical
+  Sparkles, Hammer, Armchair, ChevronUp, ChevronDown, GripVertical,
+  XCircle, Trash2
 } from "lucide-react";
 import { jsPDF } from "jspdf";
+import { Capacitor } from "@capacitor/core";
+import { PushNotifications } from "@capacitor/push-notifications";
+import { Bell } from "lucide-react";
 
 /* ---------------------------------------------------------------
    Mr.CAP — Vehicle Workflow Tracker
@@ -734,6 +738,56 @@ async function saveTeam(team) {
     })),
   });
   return ok;
+}
+
+// Registers this device for push notifications and upserts its token
+// against the logged-in member — a no-op on the web version (only the
+// APK actually has a native push channel), and never lets a permission
+// denial or missing Firebase setup interrupt login, since push is a
+// nice-to-have on top of the app, not something login should ever be
+// blocked by.
+async function registerForPush(memberId) {
+  if (!Capacitor.isNativePlatform()) return;
+  try {
+    let perm = await PushNotifications.checkPermissions();
+    if (perm.receive === "prompt" || perm.receive === "prompt-with-rationale") {
+      perm = await PushNotifications.requestPermissions();
+    }
+    if (perm.receive !== "granted") return;
+    await PushNotifications.removeAllListeners();
+    PushNotifications.addListener("registration", async (token) => {
+      await sbFetch("device_push_tokens?on_conflict=token", {
+        method: "POST",
+        headers: { Prefer: "resolution=merge-duplicates,return=minimal" },
+        body: JSON.stringify([{ member_id: memberId, token: token.value, platform: "android", updated_at: new Date().toISOString() }]),
+      });
+    });
+    PushNotifications.addListener("registrationError", () => { /* best-effort — nothing for the user to act on */ });
+    await PushNotifications.register();
+  } catch {
+    // Push is best-effort — a device that can't register for it should
+    // never be blocked from using the rest of the app.
+  }
+}
+
+// Sends a push via the send-push-notification edge function — targeting
+// specific employees (targetMemberIds) or, when omitted/empty, blasting
+// every registered device. Uses the same direct-fetch pattern as
+// verify-pin (a dedicated function, not the general gatekeeper) since
+// this isn't a table write.
+async function sendPushNotification({ senderId, title, body, targetMemberIds }) {
+  try {
+    const res = await fetch(`${SUPABASE_URL}/functions/v1/send-push-notification`, {
+      method: "POST",
+      headers: { apikey: SUPABASE_KEY, Authorization: `Bearer ${SUPABASE_KEY}`, "Content-Type": "application/json" },
+      body: JSON.stringify({ senderId, title, body, targetMemberIds: targetMemberIds && targetMemberIds.length ? targetMemberIds : undefined }),
+    });
+    const data = await res.json().catch(() => ({}));
+    if (!res.ok) return { ok: false, error: data?.error || `Failed (${res.status})` };
+    return { ok: true, ...data };
+  } catch (e) {
+    return { ok: false, error: String(e && e.message || e) };
+  }
 }
 
 /* ---------------- Services & Roles (admin-editable, DB-backed) ----------------
@@ -3159,6 +3213,7 @@ export default function GarageApp() {
         if (t.find((m) => m.id === s.id)) {
           setSession(s); setCurrentActor(s);
           if (shouldShowMorningReminder("mrcap")) setShowMorningReminder(true);
+          registerForPush(s.id);
         }
       }
       await refreshIndex();
@@ -3210,6 +3265,7 @@ export default function GarageApp() {
     setCurrentActor(s);
     logEvent("login", `${member.name} logged in`, s);
     if (shouldShowMorningReminder("mrcap")) setShowMorningReminder(true);
+    registerForPush(s.id);
   };
   const onLogout = () => {
     if (session) logEvent("login", `${session.name} logged out`);
@@ -3294,7 +3350,7 @@ export default function GarageApp() {
         <JobDetail id={activeId} initialJob={activeJob} session={session} team={team} onChanged={(job, saved) => { upsertIndex(job); setActiveJob(job); setSyncState(saved ? "ok" : "failed"); if (saved) setLastSyncedAt(Date.now()); }} onBack={() => window.history.back()} canArchive={canArchive} onDeleted={(jobId) => { removeFromIndex(jobId); window.history.back(); }} />
       )}
       {view === "team" && hasPermission(session, team, "team") && (
-        <TeamScreen team={team} setTeam={setTeam} session={session} onBack={() => window.history.back()} onImport={() => setView("import")} onServices={() => setView("services")} canServices={hasPermission(session, team, "services")} onActivityLog={() => setView("activitylog")} />
+        <TeamScreen team={team} setTeam={setTeam} session={session} onBack={() => window.history.back()} onImport={() => setView("import")} onServices={() => setView("services")} canServices={hasPermission(session, team, "services")} onActivityLog={() => setView("activitylog")} onNotify={() => setView("notify")} />
       )}
       {view === "team" && !hasPermission(session, team, "team") && <AccessDenied onBack={() => window.history.back()} />}
       {view === "services" && hasPermission(session, team, "services") && (
@@ -3305,6 +3361,10 @@ export default function GarageApp() {
         <ActivityLogScreen onBack={() => window.history.back()} />
       )}
       {view === "activitylog" && session.id !== "owner" && <AccessDenied onBack={() => window.history.back()} />}
+      {view === "notify" && session.role === "admin" && (
+        <SendNotificationScreen team={team} session={session} onBack={() => window.history.back()} />
+      )}
+      {view === "notify" && session.role !== "admin" && <AccessDenied onBack={() => window.history.back()} />}
       {view === "archive" && canArchive && (
         <ArchiveScreen index={index} onOpen={openJob} onBack={() => window.history.back()} />
       )}
@@ -6617,6 +6677,12 @@ function ReportsScreen({ onBack }) {
   const [completionsRange, setCompletionsRange] = useState("30d"); // "7d" | "30d" | "all"
   const [completionsRaw, setCompletionsRaw] = useState([]); // every "Marked done" entry, unfiltered by range
   const [completionsLoading, setCompletionsLoading] = useState(true);
+  // "What got cancelled" — declined quotes and deleted jobs, side by side,
+  // so a manager can see the two ways a job never happens without digging
+  // through the raw Activity Log. Both are read-only, most-recent-first.
+  const [cancelledQuotes, setCancelledQuotes] = useState([]);
+  const [deletedJobs, setDeletedJobs] = useState([]);
+  const [cancelledLoading, setCancelledLoading] = useState(true);
 
   const load = useCallback(async () => {
     setLoading(true);
@@ -6637,6 +6703,19 @@ function ReportsScreen({ onBack }) {
     setByStageTime(st.data || []);
     setCustomerRepeat((cr.data || [])[0] || null);
     setLoading(false);
+  }, []);
+
+  useEffect(() => {
+    (async () => {
+      setCancelledLoading(true);
+      const [q, dj] = await Promise.all([
+        sbFetch("quotes?select=id,plate,make_model,customer_name,updated_at&status=eq.declined&order=updated_at.desc&limit=25"),
+        sbFetch("deletion_log?select=*&order=deleted_at.desc&limit=25"),
+      ]);
+      if (q.ok) setCancelledQuotes(q.data || []);
+      if (dj.ok) setDeletedJobs(dj.data || []);
+      setCancelledLoading(false);
+    })();
   }, []);
 
   useEffect(() => { load(); }, [load]);
@@ -6775,6 +6854,40 @@ function ReportsScreen({ onBack }) {
               </>
             ) : (
               <ReportEmpty />
+            )}
+          </ReportSection>
+
+          <ReportSection title="Cancelled quotes" icon={<XCircle size={14} color={COLORS.gold} />}>
+            {cancelledLoading ? (
+              <SkeletonRows count={3} height={32} />
+            ) : cancelledQuotes.length === 0 ? (
+              <ReportEmpty />
+            ) : (
+              cancelledQuotes.map((q) => (
+                <ReportRow
+                  key={q.id}
+                  label={`${q.plate || "—"} · ${q.customer_name || "Unknown"}`}
+                  sub={`${q.make_model || ""}${q.make_model ? " · " : ""}declined ${new Date(q.updated_at).toLocaleDateString([], { month: "short", day: "numeric" })}`}
+                  value=""
+                />
+              ))
+            )}
+          </ReportSection>
+
+          <ReportSection title="Deleted jobs" icon={<Trash2 size={14} color={COLORS.gold} />}>
+            {cancelledLoading ? (
+              <SkeletonRows count={3} height={32} />
+            ) : deletedJobs.length === 0 ? (
+              <ReportEmpty />
+            ) : (
+              deletedJobs.map((d) => (
+                <ReportRow
+                  key={d.id}
+                  label={`${d.plate || "—"} · ${d.customer_name || "Unknown"}`}
+                  sub={`deleted by ${d.deleted_by || "unknown"} · ${new Date(d.deleted_at).toLocaleDateString([], { month: "short", day: "numeric" })}`}
+                  value=""
+                />
+              ))
             )}
           </ReportSection>
         </>
@@ -7469,6 +7582,54 @@ function exportAdminStatsCSV({ rangeLabel, totalRevenue, revenueInRange, activeJ
   URL.revokeObjectURL(url);
 }
 
+// Renders a plain bar chart to a PNG data URL via an offscreen canvas —
+// no charting library needed for one bar chart shape, and jsPDF can only
+// place images/vectors it's handed, not chart data directly. Drawn at
+// 2x pixel density (crisp when placed into a PDF) with the bar's value
+// printed above each bar and its label below, so the image is legible
+// on its own without needing the text table next to it.
+function renderBarChartPNG(rows, { width = 700, height = 260, color = "#D4AF37", formatValue } = {}) {
+  if (!rows || !rows.length) return null;
+  const dpr = 2;
+  const canvas = document.createElement("canvas");
+  canvas.width = width * dpr; canvas.height = height * dpr;
+  const ctx = canvas.getContext("2d");
+  if (!ctx) return null;
+  ctx.scale(dpr, dpr);
+  ctx.fillStyle = "#ffffff"; ctx.fillRect(0, 0, width, height);
+
+  const max = Math.max(1, ...rows.map((r) => r.value || 0));
+  const padL = 8, padR = 8, padTop = 22, padBottom = 32;
+  const chartW = width - padL - padR;
+  const chartH = height - padTop - padBottom;
+
+  ctx.strokeStyle = "#e8e8e8"; ctx.lineWidth = 1;
+  for (let i = 0; i <= 4; i++) {
+    const gy = padTop + chartH - (chartH * i) / 4;
+    ctx.beginPath(); ctx.moveTo(padL, gy); ctx.lineTo(width - padR, gy); ctx.stroke();
+  }
+
+  const gap = 14;
+  const barW = Math.max(4, (chartW - gap * (rows.length - 1)) / rows.length);
+  rows.forEach((r, i) => {
+    const barH = ((r.value || 0) / max) * chartH;
+    const x = padL + i * (barW + gap);
+    const y = padTop + chartH - barH;
+    ctx.fillStyle = color;
+    ctx.fillRect(x, y, barW, Math.max(1, barH));
+
+    ctx.fillStyle = "#1a1a1a";
+    ctx.font = "bold 11px Helvetica, Arial, sans-serif";
+    ctx.textAlign = "center";
+    ctx.fillText(formatValue ? formatValue(r.value) : String(r.value), x + barW / 2, Math.max(12, y - 6));
+
+    ctx.fillStyle = "#777";
+    ctx.font = "10px Helvetica, Arial, sans-serif";
+    ctx.fillText(String(r.label).slice(0, 12), x + barW / 2, height - padBottom + 15);
+  });
+  return canvas.toDataURL("image/png");
+}
+
 // PDF export — a one-page summary, same jsPDF conventions as the quote
 // and invoice PDFs already in this file (logo header, helvetica, gold
 // accents dropped to plain black/grey since this is an internal report).
@@ -7502,6 +7663,24 @@ function exportAdminStatsPDF({ rangeLabel, totalRevenue, revenueInRange, activeJ
   statLine("Active jobs right now", activeJobsCount);
   statLine("Collected in range", collectedInRange);
   statLine("Avg turnaround", avgTurnaroundDays != null ? `${avgTurnaroundDays.toFixed(1)} days` : "Not enough data");
+
+  const chart = (title, rows, formatValue) => {
+    const png = renderBarChartPNG(rows, { formatValue });
+    if (!png) return;
+    const imgW = pageW - margin * 2;
+    const imgH = imgW * (260 / 700);
+    if (y + 24 + imgH > 780) { doc.addPage(); y = 50; }
+    y += 14;
+    doc.setDrawColor(210); doc.line(margin, y, pageW - margin, y);
+    y += 20;
+    doc.setFont("helvetica", "bold"); doc.setFontSize(11.5); doc.setTextColor(20);
+    doc.text(title, margin, y);
+    y += 10;
+    doc.addImage(png, "PNG", margin, y, imgW, imgH);
+    y += imgH + 4;
+  };
+  chart("Revenue by month", revenueByMonth, fmtAED);
+  chart("Jobs by service category (in range)", byCategory);
 
   const table = (title, rows, formatValue) => {
     y += 12;
@@ -9261,7 +9440,7 @@ function ActivityLogScreen({ onBack }) {
   );
 }
 
-function TeamScreen({ team, setTeam, session, onBack, onImport, onServices, canServices, onActivityLog }) {
+function TeamScreen({ team, setTeam, session, onBack, onImport, onServices, canServices, onActivityLog, onNotify }) {
   const [name, setName] = useState("");
   const [role, setRole] = useState("intake");
   const [editingId, setEditingId] = useState(null);
@@ -9346,6 +9525,11 @@ function TeamScreen({ team, setTeam, session, onBack, onImport, onServices, canS
       {session.id === "owner" && (
         <button onClick={onActivityLog} className="mrcap-press" style={{ display: "flex", alignItems: "center", justifyContent: "center", gap: 8, width: "100%", padding: "11px", borderRadius: 10, border: `1.5px dashed ${COLORS.gold}`, background: "rgba(201,162,39,0.1)", color: COLORS.gold, fontWeight: 600, fontSize: 13, cursor: "pointer", marginBottom: 10 }}>
           <ShieldAlert size={15} /> Activity Log
+        </button>
+      )}
+      {session.role === "admin" && (
+        <button onClick={onNotify} className="mrcap-press" style={{ display: "flex", alignItems: "center", justifyContent: "center", gap: 8, width: "100%", padding: "11px", borderRadius: 10, border: `1.5px dashed ${COLORS.gold}`, background: "rgba(201,162,39,0.1)", color: COLORS.gold, fontWeight: 600, fontSize: 13, cursor: "pointer", marginBottom: 10 }}>
+          <Bell size={15} /> Send Notification
         </button>
       )}
       <button onClick={onImport} className="mrcap-press" style={{ display: "flex", alignItems: "center", justifyContent: "center", gap: 8, width: "100%", padding: "11px", borderRadius: 10, border: `1.5px dashed ${COLORS.gold}`, background: "rgba(201,162,39,0.1)", color: COLORS.gold, fontWeight: 600, fontSize: 13, cursor: "pointer", marginBottom: 18 }}>
@@ -9503,6 +9687,91 @@ function DashboardModePicker({ value, onChange }) {
           {o.label}
         </button>
       ))}
+    </div>
+  );
+}
+
+// Admin-only push composer — send to specific employees or blast
+// everyone. The server (send-push-notification) independently re-checks
+// that the sender is actually an admin, so this screen being reachable
+// isn't itself the security boundary — same belt-and-braces pattern as
+// the PIN-overwrite guard.
+function SendNotificationScreen({ team, session, onBack }) {
+  const [audience, setAudience] = useState("everyone"); // 'everyone' | 'specific'
+  const [selectedIds, setSelectedIds] = useState([]);
+  const [title, setTitle] = useState("");
+  const [body, setBody] = useState("");
+  const [sending, setSending] = useState(false);
+  const [result, setResult] = useState(null); // { ok, sent, failed, error }
+
+  const toggleId = (id) => setSelectedIds((cur) => (cur.includes(id) ? cur.filter((x) => x !== id) : [...cur, id]));
+
+  const canSend = title.trim() && body.trim() && (audience === "everyone" || selectedIds.length > 0) && !sending;
+
+  const send = async () => {
+    if (!canSend) return;
+    setSending(true);
+    setResult(null);
+    const res = await sendPushNotification({
+      senderId: session.id,
+      title: title.trim(),
+      body: body.trim(),
+      targetMemberIds: audience === "specific" ? selectedIds : undefined,
+    });
+    setSending(false);
+    setResult(res);
+    if (res.ok) {
+      setTitle("");
+      setBody("");
+      setSelectedIds([]);
+    }
+  };
+
+  return (
+    <div className="mrcap-view" style={{ padding: "0 18px 30px" }}>
+      <SectionTitle>Send Notification</SectionTitle>
+      <div style={{ fontSize: 11.5, color: COLORS.muted, marginBottom: 16 }}>
+        Sends a real push notification straight to the app on their phone — only reaches devices that have opened the app at least once since it was set up.
+      </div>
+
+      <Field label="Send to">
+        <div style={{ display: "flex", gap: 8 }}>
+          <button onClick={() => setAudience("everyone")} className="mrcap-press" style={{ flex: 1, padding: "10px", borderRadius: 9, border: `1.5px solid ${audience === "everyone" ? COLORS.gold : COLORS.line}`, background: audience === "everyone" ? COLORS.gold : COLORS.panel2, color: audience === "everyone" ? COLORS.darkText : COLORS.ink, fontSize: 13, fontWeight: 600, cursor: "pointer" }}>Everyone (blast)</button>
+          <button onClick={() => setAudience("specific")} className="mrcap-press" style={{ flex: 1, padding: "10px", borderRadius: 9, border: `1.5px solid ${audience === "specific" ? COLORS.gold : COLORS.line}`, background: audience === "specific" ? COLORS.gold : COLORS.panel2, color: audience === "specific" ? COLORS.darkText : COLORS.ink, fontSize: 13, fontWeight: 600, cursor: "pointer" }}>Specific people</button>
+        </div>
+      </Field>
+
+      {audience === "specific" && (
+        <Field label={`Recipients${selectedIds.length ? ` (${selectedIds.length} selected)` : ""}`}>
+          <div style={{ display: "flex", flexWrap: "wrap", gap: 6 }}>
+            {team.map((m) => (
+              <button key={m.id} onClick={() => toggleId(m.id)} className="mrcap-press" style={{ padding: "7px 11px", borderRadius: 999, border: `1.5px solid ${selectedIds.includes(m.id) ? COLORS.gold : COLORS.line}`, background: selectedIds.includes(m.id) ? "rgba(201,162,39,0.15)" : COLORS.panel2, color: selectedIds.includes(m.id) ? COLORS.gold : COLORS.muted, fontSize: 12, fontWeight: 600, cursor: "pointer" }}>
+                {m.name}
+              </button>
+            ))}
+          </div>
+        </Field>
+      )}
+
+      <Field label="Title"><input style={inputStyle} value={title} onChange={(e) => setTitle(e.target.value)} placeholder="e.g. Shop closing early Thursday" maxLength={120} /></Field>
+      <Field label="Message"><textarea style={textareaStyle} value={body} onChange={(e) => setBody(e.target.value)} placeholder="What do they need to know?" maxLength={500} /></Field>
+
+      <button onClick={send} disabled={!canSend} className="mrcap-press" style={{ ...primaryBtnStyle, width: "100%", opacity: canSend ? 1 : 0.5, marginTop: 6 }}>
+        {sending ? "Sending…" : audience === "everyone" ? "Send to everyone" : `Send to ${selectedIds.length || 0}`}
+      </button>
+
+      {result && (
+        <div style={{ marginTop: 14, padding: "11px 12px", borderRadius: 10, border: `1px solid ${result.ok ? COLORS.green : COLORS.red}`, background: result.ok ? "rgba(74,122,87,0.12)" : "rgba(168,64,47,0.12)" }}>
+          {result.ok ? (
+            <div style={{ fontSize: 12.5, color: "#7BC494" }}>
+              Sent to {result.sent} device{result.sent === 1 ? "" : "s"}{result.failed ? `, ${result.failed} failed` : ""}.
+              {result.note ? ` ${result.note}` : ""}
+            </div>
+          ) : (
+            <div style={{ fontSize: 12.5, color: "#E08A78" }}>{result.error || "Something went wrong sending it."}</div>
+          )}
+        </div>
+      )}
     </div>
   );
 }
