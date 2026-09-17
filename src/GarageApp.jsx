@@ -2262,7 +2262,7 @@ function Pill({ children, tone = "default", bg, fg }) {
   };
   const t = bg ? { bg, fg } : (tones[tone] || tones.default);
   return (
-    <span style={{ background: t.bg, color: t.fg, fontFamily: "Inter, sans-serif", fontWeight: 600, fontSize: 11, letterSpacing: 0.3, padding: "4px 9px", borderRadius: 999, textTransform: "uppercase", whiteSpace: "nowrap", display: "inline-block" }}>
+    <span style={{ background: t.bg, color: t.fg, fontFamily: "-apple-system, BlinkMacSystemFont, Inter, sans-serif", fontWeight: 600, fontSize: 11, letterSpacing: 0.3, padding: "4px 9px", borderRadius: 999, textTransform: "uppercase", whiteSpace: "nowrap", display: "inline-block" }}>
       {children}
     </span>
   );
@@ -2317,7 +2317,7 @@ function ServiceStepPills({ steps, currentKey, onSelect, disabled, size = "norma
 }
 
 const labelStyle = { fontSize: 12, fontWeight: 600, color: COLORS.muted, textTransform: "uppercase", letterSpacing: 0.4 };
-const inputStyle = { width: "100%", marginTop: 8, padding: "11px 12px", borderRadius: 10, border: `1.5px solid ${COLORS.line}`, background: COLORS.panel2, fontSize: 15, fontFamily: "Inter, sans-serif", boxSizing: "border-box", color: COLORS.ink };
+const inputStyle = { width: "100%", marginTop: 8, padding: "11px 12px", borderRadius: 10, border: `1.5px solid ${COLORS.line}`, background: COLORS.panel2, fontSize: 15, fontFamily: "-apple-system, BlinkMacSystemFont, Inter, sans-serif", boxSizing: "border-box", color: COLORS.ink };
 const textareaStyle = { ...inputStyle, minHeight: 72, resize: "vertical" };
 const primaryBtnStyle = { padding: "13px", borderRadius: 10, border: "none", background: COLORS.gold, color: COLORS.darkText, fontWeight: 700, fontSize: 14.5, cursor: "pointer" };
 const secondaryBtnStyle = { padding: "13px", borderRadius: 10, border: `1.5px solid ${COLORS.line}`, background: COLORS.panel2, color: COLORS.ink, fontWeight: 600, fontSize: 14.5, cursor: "pointer" };
@@ -2329,6 +2329,15 @@ ${FONT_IMPORT}
 @keyframes mrcapFadeUp {
   from { opacity: 0; transform: translateY(10px); }
   to { opacity: 1; transform: translateY(0); }
+}
+/* Every screen root already uses .mrcap-view, and each one is a real
+   mount (React swaps the whole branch on a view change, it doesn't
+   morph one in place) — so giving this animation a horizontal
+   component instead of a vertical one is enough to read as an iOS-style
+   "push" without building an actual layered navigation stack. */
+@keyframes mrcapSlideIn {
+  from { opacity: 0; transform: translateX(26px); }
+  to { opacity: 1; transform: translateX(0); }
 }
 @keyframes mrcapFadeIn {
   from { opacity: 0; }
@@ -2351,8 +2360,12 @@ ${FONT_IMPORT}
   40% { background: rgba(201,162,39,0.28); }
   100% { background: ${COLORS.panel2}; }
 }
-.mrcap-view { animation: mrcapFadeUp 0.32s cubic-bezier(0.22,0.61,0.36,1) both; }
+.mrcap-view { animation: mrcapSlideIn 0.32s cubic-bezier(0.22,0.61,0.36,1) both; }
 .mrcap-fade { animation: mrcapFadeIn 0.4s ease both; }
+@media (prefers-reduced-motion: reduce) {
+  .mrcap-view, .mrcap-fade, .mrcap-sweep { animation: none !important; }
+  .mrcap-press, .mrcap-card { transition: none !important; }
+}
 .mrcap-skeleton {
   background: linear-gradient(90deg, ${COLORS.panel} 25%, ${COLORS.panel2} 50%, ${COLORS.panel} 75%);
   background-size: 200% 100%;
@@ -2378,7 +2391,7 @@ ${FONT_IMPORT}
 
 function Shell({ children }) {
   return (
-    <div style={{ fontFamily: "Inter, sans-serif", background: COLORS.paper, minHeight: "100vh", maxWidth: 480, margin: "0 auto", position: "relative", paddingTop: "env(safe-area-inset-top)", paddingBottom: 24 }}>
+    <div style={{ fontFamily: "-apple-system, BlinkMacSystemFont, Inter, sans-serif", background: COLORS.paper, minHeight: "100vh", maxWidth: 480, margin: "0 auto", position: "relative", paddingTop: "env(safe-area-inset-top)", paddingBottom: 24 }}>
       <style>{GLOBAL_STYLES}</style>
       {children}
     </div>
@@ -2415,7 +2428,7 @@ function DesktopShell({ session, team, view, setView, onLogout, canArchive, chil
   };
 
   return (
-    <div style={{ fontFamily: "Inter, sans-serif", background: COLORS.paper, minHeight: "100vh", display: "flex" }}>
+    <div style={{ fontFamily: "-apple-system, BlinkMacSystemFont, Inter, sans-serif", background: COLORS.paper, minHeight: "100vh", display: "flex" }}>
       <style>{GLOBAL_STYLES}</style>
       <div style={{ width: 232, flexShrink: 0, background: "#15181C", minHeight: "100vh", display: "flex", flexDirection: "column", padding: "20px 12px", position: "sticky", top: 0, alignSelf: "flex-start" }}>
         <div style={{ padding: "6px 10px 22px" }}>
@@ -3311,7 +3324,7 @@ export default function GarageApp() {
       {view === "list" && (
         isSimplifiedRole(session)
           ? <SimplifiedDashboard index={index} session={session} onOpen={openJob} onRefresh={refreshIndex} syncState={syncState} lastSyncedAt={lastSyncedAt} />
-          : <Dashboard index={index} session={session} onOpen={openJob} canArchive={canArchive} onRefresh={refreshIndex} syncState={syncState} lastSyncedAt={lastSyncedAt} />
+          : <Dashboard index={index} session={session} team={team} onOpen={openJob} onJobDeleted={removeFromIndex} canArchive={canArchive} onRefresh={refreshIndex} syncState={syncState} lastSyncedAt={lastSyncedAt} />
       )}
       {view === "list" && hasPermission(session, team, "newJob") && (
         <FloatingNewJobButton onClick={() => setView("quickintake")} />
@@ -3624,7 +3637,14 @@ function TopBar({ session, team, onLogout, onNew, view, onBack, onTeam, onArchiv
     moreItems.push({ label: "Issue Reports", icon: <AlertCircle size={15} color={COLORS.ink} />, onClick: onIssues });
   }
   return (
-    <div className="mrcap-view">
+    <div
+      className="mrcap-view"
+      style={{
+        position: "sticky", top: "env(safe-area-inset-top)", zIndex: 60,
+        background: "rgba(10,10,9,0.68)",
+        backdropFilter: "blur(14px) saturate(140%)", WebkitBackdropFilter: "blur(14px) saturate(140%)",
+      }}
+    >
       <div style={{ height: 2, background: `linear-gradient(90deg, transparent, ${COLORS.gold}, transparent)` }} />
       <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", padding: "16px 18px 10px" }}>
         <div style={{ display: "flex", alignItems: "center", gap: 10 }}>
@@ -3847,7 +3867,128 @@ function SimplifiedDashboard({ index, session, onOpen, onRefresh, syncState, las
   );
 }
 
-function Dashboard({ index, session, onOpen, canArchive, onRefresh, syncState, lastSyncedAt }) {
+// Swipe-left-to-reveal Delete on a job card, iOS Mail-style — but the
+// swipe only ever REVEALS the action, never performs it. Tapping the
+// revealed button opens the exact same type-DELETE-to-confirm gate
+// already used on the Delete Job Card button inside JobDetail (same
+// copy, same deleteJob() call, same audit trail via deletion_log) — this
+// is a second entry point onto an unchanged, already-safety-gated
+// action, not a new way to lose a job. touch-action: pan-y tells the
+// browser this element handles its own horizontal gestures, so it
+// doesn't fight the page's vertical scroll the way relying on
+// preventDefault() inside onTouchMove unreliably would.
+function SwipeableJobCard({ job, session, team, onDeleted, children }) {
+  const REVEAL_WIDTH = 84;
+  const canDelete = hasPermission(session, team, "delete");
+  const [dragX, setDragX] = useState(0);
+  const [revealed, setRevealed] = useState(false);
+  const [dragging, setDragging] = useState(false);
+  const [confirming, setConfirming] = useState(false);
+  const [confirmText, setConfirmText] = useState("");
+  const [deleting, setDeleting] = useState(false);
+  const startRef = useRef({ x: 0, y: 0 });
+  const axisRef = useRef(null); // 'x' | 'y' | null — locked in on first real movement
+
+  const closeReveal = () => { setRevealed(false); setDragX(0); };
+
+  const onTouchStart = (e) => {
+    if (!canDelete) return;
+    const t = e.touches[0];
+    startRef.current = { x: t.clientX, y: t.clientY };
+    axisRef.current = null;
+    setDragging(true);
+  };
+  const onTouchMove = (e) => {
+    if (!canDelete || !dragging) return;
+    const t = e.touches[0];
+    const dx = t.clientX - startRef.current.x;
+    const dy = t.clientY - startRef.current.y;
+    if (!axisRef.current) {
+      if (Math.abs(dx) < 6 && Math.abs(dy) < 6) return;
+      axisRef.current = Math.abs(dx) > Math.abs(dy) ? "x" : "y";
+    }
+    if (axisRef.current !== "x") return; // vertical intent — leave it to page scroll
+    const base = revealed ? -REVEAL_WIDTH : 0;
+    setDragX(Math.min(0, Math.max(-REVEAL_WIDTH - 24, base + dx)));
+  };
+  const onTouchEnd = () => {
+    if (axisRef.current === "x") {
+      const shouldReveal = dragX < -REVEAL_WIDTH / 2;
+      setRevealed(shouldReveal);
+      setDragX(shouldReveal ? -REVEAL_WIDTH : 0);
+    }
+    setDragging(false);
+    axisRef.current = null;
+  };
+
+  const handleDelete = async () => {
+    if (confirmText !== "DELETE") return;
+    setDeleting(true);
+    const ok = await deleteJob(job, session);
+    setDeleting(false);
+    if (ok) onDeleted?.(job.id);
+  };
+
+  return (
+    <div style={{ position: "relative", borderRadius: 10, overflow: "hidden" }}>
+      {canDelete && (
+        <div
+          onClick={() => { setConfirming(true); setConfirmText(""); }}
+          style={{
+            position: "absolute", inset: 0, display: "flex", justifyContent: "flex-end",
+            background: COLORS.red, cursor: "pointer",
+          }}
+        >
+          <div style={{ width: REVEAL_WIDTH, display: "flex", flexDirection: "column", alignItems: "center", justifyContent: "center", gap: 4 }}>
+            <Trash2 size={16} color="#fff" />
+            <span style={{ fontSize: 10.5, fontWeight: 700, color: "#fff" }}>Delete</span>
+          </div>
+        </div>
+      )}
+      <div
+        onTouchStart={onTouchStart}
+        onTouchMove={onTouchMove}
+        onTouchEnd={onTouchEnd}
+        style={{ touchAction: "pan-y", transform: `translateX(${dragX}px)`, transition: dragging ? "none" : "transform 0.2s cubic-bezier(0.22,0.61,0.36,1)" }}
+      >
+        {children}
+      </div>
+      {revealed && <div onClick={closeReveal} style={{ position: "absolute", inset: 0, zIndex: 5 }} />}
+
+      {confirming && createPortal(
+        <div onClick={() => !deleting && setConfirming(false)} style={{ position: "fixed", inset: 0, background: "rgba(0,0,0,0.6)", zIndex: 1000, display: "flex", alignItems: "flex-end", justifyContent: "center" }}>
+          <div onClick={(e) => e.stopPropagation()} style={{ width: "100%", maxWidth: 480, background: COLORS.panel, borderTop: `2px solid ${COLORS.red}`, borderRadius: "16px 16px 0 0", padding: 20, boxSizing: "border-box", paddingBottom: "max(20px, calc(env(safe-area-inset-bottom) + 20px))" }}>
+            <div style={{ width: 36, height: 4, borderRadius: 3, background: COLORS.line, margin: "0 auto 14px" }} />
+            <div style={{ display: "flex", alignItems: "center", gap: 8, marginBottom: 10 }}>
+              <ShieldAlert size={20} color={COLORS.red} />
+              <div style={{ fontFamily: DISPLAY_FONT, fontWeight: 700, fontSize: 15, color: "#FF8A73" }}>This cannot be undone</div>
+            </div>
+            <div style={{ fontSize: 12.5, color: "#F0C4BA", marginBottom: 12, lineHeight: 1.5 }}>
+              Deleting <b>{job.plate}</b> permanently removes this job card, its photos, and its full history. It will NOT appear in Archive. The deletion itself will be logged with your name and the time, but the job's contents are gone for good.
+            </div>
+            <div style={{ fontSize: 11.5, color: "#F0C4BA", marginBottom: 8 }}>Type <b>DELETE</b> to confirm:</div>
+            <input
+              value={confirmText}
+              onChange={(e) => setConfirmText(e.target.value)}
+              placeholder="DELETE"
+              autoFocus
+              style={{ width: "100%", boxSizing: "border-box", background: "#2A100D", border: `1.5px solid ${COLORS.red}`, borderRadius: 8, padding: "10px 12px", fontSize: 14, color: "#fff", fontFamily: MONO_FONT, marginBottom: 12, letterSpacing: 1 }}
+            />
+            <div style={{ display: "flex", gap: 8 }}>
+              <button onClick={() => { setConfirming(false); closeReveal(); }} className="mrcap-press" style={{ ...secondaryBtnStyle, flex: 1, padding: "10px", fontSize: 12.5 }}>Cancel</button>
+              <button onClick={handleDelete} disabled={confirmText !== "DELETE" || deleting} className="mrcap-press" style={{ flex: 1, padding: "10px", borderRadius: 9, border: "none", background: COLORS.red, color: "#fff", fontWeight: 700, fontSize: 12.5, cursor: confirmText === "DELETE" ? "pointer" : "not-allowed", opacity: confirmText === "DELETE" ? 1 : 0.5 }}>
+                {deleting ? "Deleting…" : "Permanently Delete"}
+              </button>
+            </div>
+          </div>
+        </div>,
+        document.body
+      )}
+    </div>
+  );
+}
+
+function Dashboard({ index, session, team, onOpen, onJobDeleted, canArchive, onRefresh, syncState, lastSyncedAt }) {
   const [filter, setFilter] = useState("open");
   const [search, setSearch] = useState("");
   // Tapping a stat card toggles this: null (no extra filter), "high"
@@ -4157,35 +4298,37 @@ function Dashboard({ index, session, onOpen, canArchive, onRefresh, syncState, l
           </div>
           <div style={{ display: "flex", flexDirection: "column", gap: 10 }}>
             {jobs.map((j) => (
-              <button key={j.id} onClick={() => onOpen(j.id)} className="mrcap-press mrcap-card" style={{ textAlign: "left", background: COLORS.panel, borderTop: `1px solid ${COLORS.line}`, borderRight: `1px solid ${COLORS.line}`, borderBottom: `1px solid ${COLORS.line}`, borderLeft: `3px solid ${COLORS.gold}`, borderRadius: "4px 10px 10px 4px", padding: "13px 14px", cursor: "pointer", display: "flex", flexDirection: "column", gap: 6, width: "100%", boxSizing: "border-box", boxShadow: "0 6px 16px -10px rgba(0,0,0,0.6)" }}>
-                <div style={{ display: "flex", justifyContent: "space-between", alignItems: "flex-start" }}>
-                  <div>
-                    <div style={{ fontFamily: MONO_FONT, fontWeight: 700, fontSize: 16, color: COLORS.ink, letterSpacing: 1.1 }}>{j.plate || "—"}</div>
-                    <div style={{ fontSize: 12.5, color: COLORS.muted, marginTop: 1 }}>{j.makeModel} · {j.customerName}</div>
-                  </div>
-                  <Pill tone={priorityTone(j.priority)}>{j.priority}</Pill>
-                </div>
-                {(() => {
-                  const { primary, rest } = splitPrimaryService(j.serviceTypes);
-                  if (!primary) return null;
-                  return (
-                    <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
-                      <div style={{ fontSize: 13, fontWeight: 600, color: COLORS.ink }}>{primary.label}</div>
-                      {rest.length > 0 && (
-                        <div style={{ display: "flex", gap: 5 }}>
-                          {rest.map((s) => {
-                            const Icon = SERVICE_ICONS[s.key];
-                            return Icon ? <Icon key={s.key} size={13} color={COLORS.muted} /> : null;
-                          })}
-                        </div>
-                      )}
+              <SwipeableJobCard key={j.id} job={j} session={session} team={team} onDeleted={onJobDeleted}>
+                <button onClick={() => onOpen(j.id)} className="mrcap-press mrcap-card" style={{ textAlign: "left", background: COLORS.panel, borderTop: `1px solid ${COLORS.line}`, borderRight: `1px solid ${COLORS.line}`, borderBottom: `1px solid ${COLORS.line}`, borderLeft: `3px solid ${COLORS.gold}`, borderRadius: "4px 10px 10px 4px", padding: "13px 14px", cursor: "pointer", display: "flex", flexDirection: "column", gap: 6, width: "100%", boxSizing: "border-box", boxShadow: "0 6px 16px -10px rgba(0,0,0,0.6)" }}>
+                  <div style={{ display: "flex", justifyContent: "space-between", alignItems: "flex-start" }}>
+                    <div>
+                      <div style={{ fontFamily: MONO_FONT, fontWeight: 700, fontSize: 16, color: COLORS.ink, letterSpacing: 1.1 }}>{j.plate || "—"}</div>
+                      <div style={{ fontSize: 12.5, color: COLORS.muted, marginTop: 1 }}>{j.makeModel} · {j.customerName}</div>
                     </div>
-                  );
-                })()}
-                <div style={{ fontSize: 11, color: COLORS.muted, display: "flex", alignItems: "center", gap: 5 }}>
-                  <Clock size={11} /> {fmtTime(j.updatedAt)} · <Building2 size={11} /> {j.location}
-                </div>
-              </button>
+                    <Pill tone={priorityTone(j.priority)}>{j.priority}</Pill>
+                  </div>
+                  {(() => {
+                    const { primary, rest } = splitPrimaryService(j.serviceTypes);
+                    if (!primary) return null;
+                    return (
+                      <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
+                        <div style={{ fontSize: 13, fontWeight: 600, color: COLORS.ink }}>{primary.label}</div>
+                        {rest.length > 0 && (
+                          <div style={{ display: "flex", gap: 5 }}>
+                            {rest.map((s) => {
+                              const Icon = SERVICE_ICONS[s.key];
+                              return Icon ? <Icon key={s.key} size={13} color={COLORS.muted} /> : null;
+                            })}
+                          </div>
+                        )}
+                      </div>
+                    );
+                  })()}
+                  <div style={{ fontSize: 11, color: COLORS.muted, display: "flex", alignItems: "center", gap: 5 }}>
+                    <Clock size={11} /> {fmtTime(j.updatedAt)} · <Building2 size={11} /> {j.location}
+                  </div>
+                </button>
+              </SwipeableJobCard>
             ))}
           </div>
         </div>
@@ -5857,7 +6000,7 @@ function JobDetail({ id, initialJob, session, team, onChanged, onBack, canArchiv
                   defaultValue={(job.serviceNotes || {})[s.key] || ""}
                   onBlur={(e) => { if (e.target.value !== ((job.serviceNotes || {})[s.key] || "")) setServiceNote(s.key, e.target.value); }}
                   placeholder="Add a note (optional)"
-                  style={{ width: "100%", boxSizing: "border-box", background: COLORS.panel2, border: `1px solid ${COLORS.line}`, borderRadius: 10, padding: "12px 14px", fontSize: 14, color: COLORS.ink, fontFamily: "Inter, sans-serif" }}
+                  style={{ width: "100%", boxSizing: "border-box", background: COLORS.panel2, border: `1px solid ${COLORS.line}`, borderRadius: 10, padding: "12px 14px", fontSize: 14, color: COLORS.ink, fontFamily: "-apple-system, BlinkMacSystemFont, Inter, sans-serif" }}
                 />
               </div>
 
@@ -6376,7 +6519,7 @@ function JobDetail({ id, initialJob, session, team, onChanged, onBack, canArchiv
                       defaultValue={(job.serviceNotes || {})[s.key] || ""}
                       onBlur={(e) => { if (e.target.value !== ((job.serviceNotes || {})[s.key] || "")) setServiceNote(s.key, e.target.value); }}
                       placeholder="Note for this service (optional)"
-                      style={{ width: "100%", boxSizing: "border-box", background: COLORS.panel2, border: `1px solid ${COLORS.line}`, borderRadius: 7, padding: "6px 9px", fontSize: 11.5, color: COLORS.ink, fontFamily: "Inter, sans-serif" }}
+                      style={{ width: "100%", boxSizing: "border-box", background: COLORS.panel2, border: `1px solid ${COLORS.line}`, borderRadius: 7, padding: "6px 9px", fontSize: 11.5, color: COLORS.ink, fontFamily: "-apple-system, BlinkMacSystemFont, Inter, sans-serif" }}
                     />
                   </div>
 
@@ -6805,23 +6948,11 @@ function ReportsScreen({ onBack }) {
       {!loading && !error && (
         <>
           <ReportSection title="Jobs completed, by person" icon={<CheckCircle2 size={14} color={COLORS.gold} />}>
-            <div style={{ display: "flex", gap: 6, marginBottom: 14 }}>
-              {[["7d", "7 days"], ["30d", "30 days"], ["all", "All time"]].map(([key, label]) => (
-                <button
-                  key={key}
-                  onClick={() => setCompletionsRange(key)}
-                  className="mrcap-press"
-                  style={{
-                    padding: "5px 12px", borderRadius: 999, fontSize: 11.5, fontWeight: 700, cursor: "pointer",
-                    border: `1px solid ${completionsRange === key ? COLORS.gold : COLORS.line}`,
-                    background: completionsRange === key ? COLORS.gold : "transparent",
-                    color: completionsRange === key ? COLORS.darkText : COLORS.muted,
-                  }}
-                >
-                  {label}
-                </button>
-              ))}
-            </div>
+            <SegmentedControl
+              options={[{ key: "7d", label: "7 days" }, { key: "30d", label: "30 days" }, { key: "all", label: "All time" }]}
+              value={completionsRange}
+              onChange={setCompletionsRange}
+            />
             {completionsLoading ? (
               <SkeletonRows count={3} height={32} />
             ) : completionsByStaff.length === 0 ? (
@@ -6953,6 +7084,56 @@ function ReportRow({ label, value, sub }) {
 }
 function ReportEmpty() {
   return <div style={{ padding: "16px 13px", fontSize: 12.5, color: COLORS.muted, textAlign: "center" }}>No data yet.</div>;
+}
+
+// True iOS-style segmented control: one pill-shaped track, a single
+// highlight that slides to the active option's actual measured width
+// (not an equal-width assumption, so it works whether there are 3
+// options or 7) and scrolls horizontally if the options don't fit
+// instead of wrapping to a second row or clipping.
+function SegmentedControl({ options, value, onChange }) {
+  const btnRefs = useRef({});
+  const [thumb, setThumb] = useState(null);
+
+  useEffect(() => {
+    const el = btnRefs.current[value];
+    if (!el) return;
+    setThumb({ left: el.offsetLeft, width: el.offsetWidth });
+  }, [value, options]);
+
+  return (
+    <div
+      style={{
+        position: "relative", display: "flex", gap: 2, background: COLORS.panel2,
+        borderRadius: 9, padding: 3, marginBottom: 14, overflowX: "auto", WebkitOverflowScrolling: "touch",
+      }}
+    >
+      {thumb && (
+        <div
+          style={{
+            position: "absolute", top: 3, bottom: 3, left: thumb.left, width: thumb.width,
+            background: COLORS.gold, borderRadius: 7, boxShadow: "0 2px 6px rgba(0,0,0,0.35)",
+            transition: "left 0.22s cubic-bezier(0.22,0.61,0.36,1), width 0.22s cubic-bezier(0.22,0.61,0.36,1)",
+          }}
+        />
+      )}
+      {options.map((opt) => (
+        <button
+          key={opt.key}
+          ref={(el) => { btnRefs.current[opt.key] = el; }}
+          onClick={() => onChange(opt.key)}
+          className="mrcap-press"
+          style={{
+            position: "relative", zIndex: 1, flexShrink: 0, padding: "6px 14px", borderRadius: 7,
+            fontSize: 11.5, fontWeight: 700, whiteSpace: "nowrap", cursor: "pointer", border: "none", background: "none",
+            color: value === opt.key ? COLORS.darkText : COLORS.muted,
+          }}
+        >
+          {opt.label}
+        </button>
+      ))}
+    </div>
+  );
 }
 
 /* ---------------- WhatsApp message templates (Suhail-only) ---------------- */
@@ -7948,18 +8129,11 @@ function AdminStatsScreen({ team, onBack }) {
 
       {!loading && !error && (
         <>
-          <div style={{ display: "flex", flexWrap: "wrap", gap: 7, marginBottom: 16 }}>
-            {RANGE_PRESETS.map((r) => (
-              <button
-                key={r.key}
-                onClick={() => setRangeKey(r.key)}
-                className="mrcap-press"
-                style={{ padding: "6px 12px", borderRadius: 999, border: `1.5px solid ${rangeKey === r.key ? COLORS.gold : COLORS.line}`, background: rangeKey === r.key ? COLORS.gold : COLORS.panel2, color: rangeKey === r.key ? COLORS.darkText : COLORS.muted, fontSize: 11.5, fontWeight: 600, cursor: "pointer" }}
-              >
-                {r.label}
-              </button>
-            ))}
-          </div>
+          <SegmentedControl
+            options={RANGE_PRESETS.map((r) => ({ key: r.key, label: r.label }))}
+            value={rangeKey}
+            onChange={setRangeKey}
+          />
 
           <div style={{ display: "flex", flexWrap: "wrap", gap: 10, marginBottom: 22 }}>
             <AdminStatCard icon={<TrendingUp size={13} color={COLORS.gold} />} label="Total Revenue" value={fmtAED(totalRevenue)} sub="All-time, invoiced jobs" />
