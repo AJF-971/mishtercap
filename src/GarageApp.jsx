@@ -7,7 +7,7 @@ import {
   Users, BarChart3, Phone, Download, Upload, FileText, Send, PauseCircle,
   MessageSquare, TrendingUp, RotateCcw, ExternalLink, Star, AlertCircle,
   Sparkles, Hammer, Armchair, ChevronUp, ChevronDown, GripVertical,
-  XCircle, Trash2
+  XCircle, Trash2, MoreVertical
 } from "lucide-react";
 import { jsPDF } from "jspdf";
 import { Capacitor } from "@capacitor/core";
@@ -2623,13 +2623,22 @@ function PhotoViewer({ photos, index, onClose, onNavigate }) {
 
   return (
     <div className="mrcap-fade" style={{ position: "fixed", inset: 0, background: "rgba(6,6,5,0.96)", zIndex: 1000, display: "flex", flexDirection: "column" }} onClick={onClose}>
-      <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", padding: "16px 18px", paddingTop: "max(16px, env(safe-area-inset-top))" }} onClick={(e) => e.stopPropagation()}>
+      {/* Extra clearance beyond the raw safe-area inset, and the close
+          button pulled in from the literal top-right corner — on iPhones
+          with the Dynamic Island, that exact corner doubles as the
+          Control Center swipe-down zone, which can intermittently eat a
+          tap meant for a button sitting right on it. Close is placed
+          before Download (closer to center, Download takes the exact
+          corner instead) since Close is the one that needs to land
+          reliably; either way, tapping anywhere on the dimmed
+          background below this bar still closes the viewer. */}
+      <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", padding: "16px 12px 16px 18px", paddingTop: "max(24px, calc(env(safe-area-inset-top) + 14px))" }} onClick={(e) => e.stopPropagation()}>
         <div style={{ color: COLORS.muted, fontSize: 12.5 }}>{photo.label} · {index + 1} of {photos.length}</div>
-        <div style={{ display: "flex", gap: 8 }}>
+        <div style={{ display: "flex", gap: 10 }}>
+          <button onClick={onClose} className="mrcap-press" style={iconBtnStyle}><X size={18} color={COLORS.ink} /></button>
           <button onClick={download} className="mrcap-press" style={{ ...iconBtnStyle, background: COLORS.gold, border: "none" }} title="Save to device">
             <Download size={17} color={COLORS.darkText} />
           </button>
-          <button onClick={onClose} className="mrcap-press" style={iconBtnStyle}><X size={18} color={COLORS.ink} /></button>
         </div>
       </div>
       <div style={{ flex: 1, display: "flex", alignItems: "center", justifyContent: "center", padding: "0 12px", position: "relative" }} onClick={(e) => e.stopPropagation()}>
@@ -3291,18 +3300,8 @@ export default function GarageApp() {
   const isDesktop = session.viewMode === "pc" && isFullDashboardRole(session);
   const ActiveShell = isDesktop ? DesktopShell : Shell;
 
-  // Same "attention needed" definition as the Follow-ups Due banner and
-  // Warranty Expiring Soon banner on the dashboard itself — the egg's
-  // badge is just a glanceable preview of those two counts from
-  // anywhere in the app, not a separate source of truth.
-  const eggTodayStr = new Date().toISOString().slice(0, 10);
-  const eggIn30DaysStr = new Date(Date.now() + 30 * 24 * 60 * 60 * 1000).toISOString().slice(0, 10);
-  const eggAttentionCount = index.filter((j) => j.followupDate && j.followupDate <= eggTodayStr).length
-    + index.filter((j) => j.warrantyExpiry && j.warrantyExpiry >= eggTodayStr && j.warrantyExpiry <= eggIn30DaysStr).length;
-
   return (
     <ActiveShell session={session} team={team} view={view} setView={setView} onLogout={onLogout} canArchive={canArchive}>
-      {isSuperAdmin(session) && <DraggablePorscheEgg badgeCount={eggAttentionCount} onTap={() => setView("admindash")} />}
       <ReportIssueButton session={session} view={view} />
       <TopBar session={session} team={team} onLogout={onLogout} onNew={() => setView("new")} view={view} onBack={() => window.history.back()} onTeam={() => setView("team")} onArchive={() => setView("archive")} onCustomers={() => setView("customers")} onReports={() => setView("reports")} onQuotes={() => setView("quotes")} canArchive={canArchive} onAdminDash={() => setView("admindash")} onMsgTemplates={() => setView("msgtemplates")} onIssues={() => setView("issues")} onDispatch={() => setView("dispatch")} onLiveUpdates={() => setView("liveupdates")} onAnnouncements={() => setView("announcements")} />
       {showMorningReminder && <MorningReminderBanner onDismiss={() => { setShowMorningReminder(false); dismissMorningReminder("mrcap"); }} />}
@@ -3575,8 +3574,55 @@ const keyBtnStyle = { height: 54, borderRadius: 12, border: `1px solid ${COLORS.
 
 /* ---------------- Top bar ---------------- */
 
+// Overflow menu for the TopBar's less-frequently-used icons — dropped
+// down from the row itself (not a portal), so it naturally sits inside
+// the Shell's own safe-area-padded container instead of needing its own
+// top-inset handling. Keeps the main row down to a handful of icons
+// even on Suhail's login, which used to carry up to 11 across one row
+// and get clipped/crowded on a narrow phone.
+function TopBarMoreMenu({ items }) {
+  const [open, setOpen] = useState(false);
+  if (!items.length) return null;
+  return (
+    <div style={{ position: "relative" }}>
+      <button onClick={() => setOpen((o) => !o)} style={iconBtnStyle} className="mrcap-press" title="More">
+        <MoreVertical size={16} color={COLORS.ink} />
+      </button>
+      {open && (
+        <>
+          <div onClick={() => setOpen(false)} style={{ position: "fixed", inset: 0, zIndex: 400 }} />
+          <div style={{ position: "absolute", top: "calc(100% + 6px)", right: 0, background: COLORS.panel, border: `1px solid ${COLORS.line}`, borderRadius: 10, boxShadow: "0 10px 26px rgba(0,0,0,0.4)", minWidth: 200, zIndex: 401, overflow: "hidden" }}>
+            {items.map((it, i) => (
+              <button
+                key={it.label}
+                onClick={() => { setOpen(false); it.onClick(); }}
+                className="mrcap-press"
+                style={{ display: "flex", alignItems: "center", gap: 10, width: "100%", padding: "12px 14px", background: "none", border: "none", borderBottom: i < items.length - 1 ? `1px solid ${COLORS.line}` : "none", color: COLORS.ink, fontSize: 13, fontWeight: 500, cursor: "pointer", textAlign: "left", boxSizing: "border-box" }}
+              >
+                {it.icon} {it.label}
+              </button>
+            ))}
+          </div>
+        </>
+      )}
+    </div>
+  );
+}
+
 function TopBar({ session, team, onLogout, onNew, view, onBack, onTeam, onArchive, onCustomers, onReports, onQuotes, canArchive, onAdminDash, onMsgTemplates, onIssues, onDispatch, onLiveUpdates, onAnnouncements }) {
   const isSimplified = isSimplifiedRole(session);
+  // Only the handful of icons everyone in that role actually reaches for
+  // daily stay as direct taps; the rest (all Suhail-only, or occasional)
+  // fold into the "More" menu so the row can't flood past ~6-7 icons no
+  // matter how many permissions/roles stack up on one login.
+  const moreItems = [];
+  if (view === "list" && canSeeLiveUpdates(session)) moreItems.push({ label: "Live Updates", icon: <MessageSquare size={15} color={COLORS.ink} />, onClick: onLiveUpdates });
+  if (view === "list" && isSuperAdmin(session)) {
+    moreItems.push({ label: "Admin Dashboard", icon: <LayoutDashboard size={15} color={COLORS.ink} />, onClick: onAdminDash });
+    moreItems.push({ label: "WhatsApp Messages", icon: <MessageSquare size={15} color={COLORS.ink} />, onClick: onMsgTemplates });
+    moreItems.push({ label: "Post Announcement", icon: <Send size={15} color={COLORS.ink} />, onClick: onAnnouncements });
+    moreItems.push({ label: "Issue Reports", icon: <AlertCircle size={15} color={COLORS.ink} />, onClick: onIssues });
+  }
   return (
     <div className="mrcap-view">
       <div style={{ height: 2, background: `linear-gradient(90deg, transparent, ${COLORS.gold}, transparent)` }} />
@@ -3596,7 +3642,7 @@ function TopBar({ session, team, onLogout, onNew, view, onBack, onTeam, onArchiv
             </div>
           )}
         </div>
-        <div style={{ display: "flex", gap: 6 }}>
+        <div style={{ display: "flex", flexWrap: "wrap", justifyContent: "flex-end", gap: 6, rowGap: 8 }}>
           {view === "list" && hasPermission(session, team, "customers") && (
             <button onClick={onCustomers} style={iconBtnStyle} className="mrcap-press" title="Customers"><Users size={16} color={COLORS.ink} /></button>
           )}
@@ -3615,21 +3661,7 @@ function TopBar({ session, team, onLogout, onNew, view, onBack, onTeam, onArchiv
           {view === "list" && (
             <button onClick={onDispatch} style={iconBtnStyle} className="mrcap-press" title="Dispatch Board"><ListChecks size={16} color={COLORS.ink} /></button>
           )}
-          {view === "list" && isSuperAdmin(session) && (
-            <button onClick={onAdminDash} style={iconBtnStyle} className="mrcap-press" title="Admin Dashboard"><LayoutDashboard size={16} color={COLORS.ink} /></button>
-          )}
-          {view === "list" && canSeeLiveUpdates(session) && (
-            <button onClick={onLiveUpdates} style={iconBtnStyle} className="mrcap-press" title="Live Updates"><MessageSquare size={16} color={COLORS.ink} /></button>
-          )}
-          {view === "list" && isSuperAdmin(session) && (
-            <button onClick={onMsgTemplates} style={iconBtnStyle} className="mrcap-press" title="WhatsApp Messages"><MessageSquare size={16} color={COLORS.ink} /></button>
-          )}
-          {view === "list" && isSuperAdmin(session) && (
-            <button onClick={onAnnouncements} style={iconBtnStyle} className="mrcap-press" title="Post Announcement"><Send size={16} color={COLORS.ink} /></button>
-          )}
-          {view === "list" && isSuperAdmin(session) && (
-            <button onClick={onIssues} style={iconBtnStyle} className="mrcap-press" title="Issue Reports"><AlertCircle size={16} color={COLORS.ink} /></button>
-          )}
+          {view === "list" && <TopBarMoreMenu items={moreItems} />}
         </div>
       </div>
       {view === "list" && (
@@ -7707,15 +7739,6 @@ function exportAdminStatsPDF({ rangeLabel, totalRevenue, revenueInRange, activeJ
   doc.save(`MrCAP-Dashboard-${new Date().toISOString().slice(0, 10)}.pdf`);
 }
 
-// Started as a pure easter egg; now doubles as a real shortcut — tap it
-// (don't drag) to jump straight to the Admin Dashboard from anywhere in
-// the app, and it carries a small red badge mirroring the combined
-// Follow-ups Due + Warranty Expiring Soon count so there's something to
-// glance at even before tapping. A green, wide-winged sports-coupe
-// silhouette (big rear wing, front splitter, wide stance) — original
-// artwork, not a real photo or badge — that can still be dragged
-// anywhere on screen and remembers where you left it via localStorage.
-//
 // Rendered through a portal straight into document.body — NOT as a
 // normal child. .mrcap-view (its would-be parent) has a CSS animation
 // that includes a transform, and per spec any ancestor with a transform
@@ -7725,8 +7748,7 @@ function exportAdminStatsPDF({ rangeLabel, totalRevenue, revenueInRange, activeJ
 // trapped inside that div's box — which is exactly what happened; it
 // was never actually invisible, just positioned against the wrong box.
 // A lightweight bug-report tool, available to everyone (not just
-// Suhail) — floats bottom-left so it never collides with the egg's
-// default bottom-right spot. Deliberately no screenshot capture: a
+// Suhail) — floats bottom-left. Deliberately no screenshot capture: a
 // real screen-grab library adds real fragility (cross-origin content,
 // dynamic layouts) for a 3-month pilot feature that mainly needs to be
 // reliable. Context (which screen, who, device) plus a note is enough
@@ -7810,122 +7832,6 @@ function ReportIssueButton({ session, view }) {
         </div>
       )}
     </>,
-    document.body
-  );
-}
-
-function DraggablePorscheEgg({ badgeCount, onTap }) {
-  const [pos, setPos] = useState(() => {
-    const size = 60;
-    try {
-      const saved = JSON.parse(window.localStorage.getItem("mrcap_egg_pos"));
-      if (saved && typeof saved.x === "number" && typeof saved.y === "number") {
-        // Clamp against the CURRENT viewport — a position saved before the
-        // portal fix (or on a different-sized screen) could otherwise sit
-        // off-screen forever with no way to find it again.
-        return {
-          x: Math.min(Math.max(8, saved.x), window.innerWidth - size - 8),
-          y: Math.min(Math.max(8, saved.y), window.innerHeight - size - 8),
-        };
-      }
-    } catch { /* fall through to default spot */ }
-    return { x: window.innerWidth - 80, y: 140 };
-  });
-  const draggingRef = useRef(false);
-  const offsetRef = useRef({ x: 0, y: 0 });
-  const posRef = useRef(pos);
-  posRef.current = pos;
-  const startPointRef = useRef({ x: 0, y: 0 });
-  const movedRef = useRef(false);
-
-  const clamp = (x, y) => {
-    const size = 60;
-    return {
-      x: Math.min(Math.max(8, x), window.innerWidth - size - 8),
-      y: Math.min(Math.max(8, y), window.innerHeight - size - 8),
-    };
-  };
-
-  const start = (e) => {
-    draggingRef.current = true;
-    movedRef.current = false;
-    const p = e.touches ? e.touches[0] : e;
-    startPointRef.current = { x: p.clientX, y: p.clientY };
-    offsetRef.current = { x: p.clientX - posRef.current.x, y: p.clientY - posRef.current.y };
-  };
-  const move = (e) => {
-    if (!draggingRef.current) return;
-    if (e.touches) e.preventDefault();
-    const p = e.touches ? e.touches[0] : e;
-    // A few px of wobble shouldn't count as a drag — otherwise a plain
-    // tap (to jump to the dashboard) almost never registers cleanly.
-    if (Math.abs(p.clientX - startPointRef.current.x) > 5 || Math.abs(p.clientY - startPointRef.current.y) > 5) {
-      movedRef.current = true;
-    }
-    setPos(clamp(p.clientX - offsetRef.current.x, p.clientY - offsetRef.current.y));
-  };
-  const end = () => {
-    if (!draggingRef.current) return;
-    draggingRef.current = false;
-    if (movedRef.current) {
-      try { window.localStorage.setItem("mrcap_egg_pos", JSON.stringify(posRef.current)); } catch { /* not worth blocking over */ }
-    } else {
-      onTap?.();
-    }
-  };
-
-  useEffect(() => {
-    window.addEventListener("mousemove", move);
-    window.addEventListener("mouseup", end);
-    window.addEventListener("touchmove", move, { passive: false });
-    window.addEventListener("touchend", end);
-    return () => {
-      window.removeEventListener("mousemove", move);
-      window.removeEventListener("mouseup", end);
-      window.removeEventListener("touchmove", move);
-      window.removeEventListener("touchend", end);
-    };
-  });
-
-  return createPortal(
-    <div
-      onMouseDown={start}
-      onTouchStart={start}
-      title={badgeCount > 0 ? `${badgeCount} need attention — tap for the dashboard` : "Tap for the dashboard"}
-      style={{
-        position: "fixed", left: pos.x, top: pos.y, width: 60, height: 60, borderRadius: "50%",
-        background: `radial-gradient(circle at 34% 28%, ${COLORS.panel2}, ${COLORS.panel})`,
-        border: `1.5px solid ${COLORS.gold}`,
-        boxShadow: "0 10px 26px -8px rgba(0,0,0,0.65), 0 0 0 1px rgba(201,162,39,0.15)",
-        display: "flex", alignItems: "center", justifyContent: "center",
-        cursor: "grab", zIndex: 999, touchAction: "none", userSelect: "none",
-      }}
-    >
-      {badgeCount > 0 && (
-        <div style={{
-          position: "absolute", top: -4, right: -4, minWidth: 18, height: 18, borderRadius: 9, padding: "0 4px",
-          background: COLORS.red, border: `1.5px solid ${COLORS.panel}`, color: "#fff",
-          fontSize: 10.5, fontWeight: 700, display: "flex", alignItems: "center", justifyContent: "center",
-          fontFamily: MONO_FONT, pointerEvents: "none",
-        }}>
-          {badgeCount > 9 ? "9+" : badgeCount}
-        </div>
-      )}
-      <svg width="39" height="39" viewBox="0 0 64 64" fill="none">
-        <g transform="translate(31 35) scale(1.08 0.8) translate(-31 -35)">
-          <rect x="44" y="19" width="2.2" height="8" fill="#161512" />
-          <rect x="53" y="19" width="2.2" height="8" fill="#161512" />
-          <rect x="41.5" y="16" width="16" height="3.6" rx="1" fill="#161512" />
-          <path d="M6 40c0-3 2-5 5-6l6-8c4-5 10-8 17-8h2c7 0 13 3 17 8l6 8c3 1 5 3 5 6v5c0 2-2 4-4 4h-3a6 6 0 1 1-12 0H24a6 6 0 1 1-12 0H8c-2 0-4-2-4-4v-5z" fill="#39B54A" stroke="#161512" strokeWidth="1.4" />
-          <rect x="2" y="37" width="7" height="3" rx="1" fill="#161512" />
-          <path d="M21 25c2-3 6-5 10-5h2c4 0 8 2 10 5l2 5H19l2-5z" fill="#1a1918" />
-          <circle cx="18" cy="45" r="6" fill="#161512" />
-          <circle cx="46" cy="45" r="6" fill="#161512" />
-          <circle cx="18" cy="45" r="2.4" fill="#39B54A" />
-          <circle cx="46" cy="45" r="2.4" fill="#39B54A" />
-        </g>
-      </svg>
-    </div>,
     document.body
   );
 }
