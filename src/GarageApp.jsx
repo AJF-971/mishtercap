@@ -536,6 +536,44 @@ function writeCache(path, data) {
 // Whether the server then accepts or rejects a replayed write, the
 // round-trip happened, so it's removed either way — a rejected write
 // was never going to succeed by itself retrying again unattended.
+//
+// The server's answer is checked, not assumed: a queued write the server
+// then REJECTS (validation failure, a table/PIN guard, an expired
+// deployment) used to be dropped from the queue with nothing shown, while
+// the person who made the change had already been told it saved. Those
+// are now kept in a "rejected" list that the dashboard surfaces until
+// someone dismisses it. A server hiccup (5xx / timeout / rate limit) is
+// retried a few times before it's treated the same way, so one bad
+// request can never block every change queued behind it forever.
+const REJECTED_KEY = "mrcap_rejected_writes";
+const MAX_QUEUE_ATTEMPTS = 5;
+function getRejectedWrites() {
+  try { return JSON.parse(window.localStorage.getItem(REJECTED_KEY) || "[]"); } catch { return []; }
+}
+function setRejectedWrites(list) {
+  try { window.localStorage.setItem(REJECTED_KEY, JSON.stringify(list.slice(-20))); } catch { /* ignore */ }
+  try { window.dispatchEvent(new CustomEvent("mrcap-rejected-changed")); } catch { /* ignore */ }
+}
+const WRITE_TABLE_LABELS = { jobs: "Job update", quotes: "Quote update", customers: "Customer update", vehicles: "Vehicle update", announcements: "Announcement", issue_reports: "Issue report", app_settings: "Settings change", team_members: "Team change" };
+const WRITE_FIELD_LABELS = { stage_index: "stage", service_done: "service done", service_step: "service step", assigned_to: "assignee", assigned_team: "assignees", history: "notes", on_hold: "hold", photos: "photos", invoice_amount: "invoice", parts: "parts", service_notes: "service note", customer_notify: "customer message", followup_date: "follow-up" };
+// A readable one-liner for "which change was it" — the raw path/method
+// ("PATCH jobs") tells nobody anything.
+function describeQueuedWrite(env) {
+  const table = String(env.path || "").split("?")[0];
+  const base = env.summary || WRITE_TABLE_LABELS[table] || `${env.method || "Change"} to ${table || "the server"}`;
+  const body = Array.isArray(env.body) ? env.body[0] : env.body;
+  const fields = body && typeof body === "object" ? Object.keys(body).filter((k) => k !== "updated_at" && k !== "id").map((k) => WRITE_FIELD_LABELS[k]).filter(Boolean) : [];
+  const who = env.actor?.name ? ` by ${env.actor.name}` : "";
+  return `${base}${fields.length ? ` (${[...new Set(fields)].slice(0, 3).join(", ")})` : ""}${who}`;
+}
+function recordRejectedWrite(item, status, detail) {
+  const env = item.envelope || {};
+  setRejectedWrites([...getRejectedWrites(), {
+    id: item.id, at: Date.now(), status,
+    what: describeQueuedWrite(env),
+    detail: String(detail || "").slice(0, 160),
+  }]);
+}
 let flushingOfflineQueue = false;
 async function flushOfflineQueue() {
   if (flushingOfflineQueue) return;
@@ -544,14 +582,26 @@ async function flushOfflineQueue() {
     let q = getOfflineQueue();
     while (q.length) {
       const item = q[0];
+      let res;
       try {
-        await fetch(GATEKEEPER_URL, {
+        res = await fetch(GATEKEEPER_URL, {
           method: "POST",
           headers: { apikey: SUPABASE_KEY, Authorization: `Bearer ${SUPABASE_KEY}`, "Content-Type": "application/json" },
           body: JSON.stringify(item.envelope),
         });
       } catch {
         break; // still offline — leave this and everything after it queued
+      }
+      if (!res.ok) {
+        const transient = res.status >= 500 || res.status === 408 || res.status === 429;
+        const attempts = (item.attempts || 0) + 1;
+        if (transient && attempts < MAX_QUEUE_ATTEMPTS) {
+          q = [{ ...item, attempts }, ...q.slice(1)];
+          setOfflineQueue(q);
+          break; // try again on the next poll, keep order
+        }
+        const detail = await res.text().catch(() => "");
+        recordRejectedWrite(item, res.status, detail);
       }
       q = q.slice(1);
       setOfflineQueue(q);
@@ -702,19 +752,19 @@ async function loadTeam() {
     });
     return DEFAULT_TEAM;
   }
-  // Table already has real data (PINs already set, etc.) — only add
-  // brand-new default members that don't exist yet (e.g. Fakher, added
-  // after go-live), never overwrite or duplicate existing ones.
-  const existingIds = new Set(data.map((m) => m.id));
-  const missing = DEFAULT_TEAM.filter((m) => !existingIds.has(m.id));
-  if (missing.length) {
-    await sbFetch("team_members", {
-      method: "POST",
-      headers: { Prefer: "resolution=merge-duplicates,return=minimal" },
-      body: JSON.stringify(missing.map((m) => ({ id: m.id, name: m.name, role: m.role, pin: m.pin, permissions: m.permissions }))),
-    });
-    return [...data.map((m) => ({ id: m.id, name: m.name, role: m.role, hasPin: !!m.has_pin, locked: !!m.pin_locked_at, failedAttempts: m.failed_pin_attempts || 0, specialty: m.specialty || null, permissions: m.permissions || {}, dashboardMode: m.dashboard_mode || "auto" })), ...missing];
-  }
+  // The table has real data: it IS the roster. (This used to re-insert any
+  // built-in default person missing from the table on every app start — fine
+  // for adding a late default like Fakher, but it meant nobody in that
+  // built-in list could ever actually be removed: they came straight back,
+  // with no PIN, the next time the app opened.)
+  return data.map((m) => ({ id: m.id, name: m.name, role: m.role, hasPin: !!m.has_pin, locked: !!m.pin_locked_at, failedAttempts: m.failed_pin_attempts || 0, specialty: m.specialty || null, permissions: m.permissions || {}, dashboardMode: m.dashboard_mode || "auto" }));
+}
+// Fresh roster from the server, or null if it can't be read — unlike
+// loadTeam, a failure never falls back to the built-in default list (which
+// would hide anyone added since).
+async function refreshTeam() {
+  const { ok, data } = await sbFetch("team_members?select=id,name,role,specialty,permissions,has_pin,failed_pin_attempts,pin_locked_at,dashboard_mode,created_at,updated_at&order=created_at.asc");
+  if (!ok || !data || !data.length) return null;
   return data.map((m) => ({ id: m.id, name: m.name, role: m.role, hasPin: !!m.has_pin, locked: !!m.pin_locked_at, failedAttempts: m.failed_pin_attempts || 0, specialty: m.specialty || null, permissions: m.permissions || {}, dashboardMode: m.dashboard_mode || "auto" }));
 }
 async function saveTeam(team) {
@@ -1263,7 +1313,7 @@ async function loadCustomerHistory(customerId) {
 // Converts a Supabase row (snake_case, flat) into the app's job shape
 // (camelCase, nested photos/history) so the rest of the app is unchanged.
 function rowToJob(r) {
-  return {
+  const job = {
     id: r.id, customerId: r.customer_id, vehicleId: r.vehicle_id,
     plate: r.plate, makeModel: r.make_model, customerName: r.customer_name, customerPhone: r.customer_phone,
     description: r.description, damageNotes: r.damage_notes, priority: r.priority, location: r.location,
@@ -1286,6 +1336,17 @@ function rowToJob(r) {
     customerNotify: r.customer_notify || {},
     createdBy: r.created_by, createdAt: new Date(r.created_at).getTime(), updatedAt: new Date(r.updated_at).getTime(),
   };
+  // Snapshot of what the server held when this job was loaded — saveJob
+  // diffs against it so a save only writes the fields actually changed
+  // (see saveJob). Enumerable on purpose: every screen updates a job by
+  // spreading it into a new object, and the snapshot has to ride along.
+  job._base = rowSnapshot(job);
+  return job;
+}
+function rowSnapshot(job) {
+  const row = jobToRow(job);
+  delete row.updated_at;
+  return row;
 }
 function jobToRow(job) {
   return {
@@ -2211,13 +2272,65 @@ async function createJob(job, { reassignVehicle = false, customerType = null } =
   }
   return { ok: false, job: withLinks };
 }
+function sameValue(a, b) {
+  if (a === b) return true;
+  if (a == null || b == null || typeof a !== "object" || typeof b !== "object") return false;
+  return JSON.stringify(a) === JSON.stringify(b);
+}
+const historyKey = (h) => `${h?.at}|${h?.by}|${h?.stage}|${h?.label || ""}|${h?.note || ""}`;
+
 // Updates an existing job in place (stage advances, reassignment, etc).
+//
+// Only the fields this screen actually changed are written — not the whole
+// row rebuilt from whatever copy of the job this device happened to have
+// in memory. Two people on the same job (shop floor + dispatch + intake is
+// the normal case) used to silently overwrite each other: the second save
+// re-sent the first person's stale service_done/assigned_to/etc. along with
+// its own change. It also stops every tap re-uploading the job's photos
+// (base64, often megabytes) when only a status flag changed.
+//
+// history is the one exception to "send what changed": it's an audit trail
+// that must never lose entries, so it's merged — the server's current
+// entries plus the ones added locally — instead of replaced.
+//
+// Jobs with no snapshot (built by hand rather than loaded) fall back to the
+// old whole-row write, exactly as before.
 async function saveJob(job) {
+  const full = jobToRow(job);
+  const base = job._base;
+  let body = full;
+  let mergedHistory = null;
+
+  if (base) {
+    body = { updated_at: full.updated_at };
+    for (const k of Object.keys(full)) {
+      if (k === "updated_at" || k === "id") continue;
+      if (!sameValue(full[k], base[k])) body[k] = full[k];
+    }
+    if (body.history) {
+      const baseKeys = new Set((base.history || []).map(historyKey));
+      const mine = (full.history || []).filter((h) => !baseKeys.has(historyKey(h)));
+      const res = await sbFetch(`jobs?id=eq.${job.id}&select=history`);
+      if (res.ok && !res.stale && res.data && res.data[0]) {
+        const server = res.data[0].history || [];
+        const have = new Set(server.map(historyKey));
+        mergedHistory = [...server, ...mine.filter((h) => !have.has(historyKey(h)))];
+        body.history = mergedHistory;
+      }
+    }
+  }
+
   const { ok } = await sbFetch(`jobs?id=eq.${job.id}`, {
     method: "PATCH",
     headers: { Prefer: "return=minimal" },
-    body: JSON.stringify(jobToRow(job)),
+    body: JSON.stringify(body),
   });
+  if (ok && base) {
+    if (mergedHistory) job.history = mergedHistory;
+    const snap = { ...full, history: mergedHistory || full.history };
+    delete snap.updated_at;
+    job._base = snap;
+  }
   return ok;
 }
 
@@ -2393,6 +2506,12 @@ function Shell({ children }) {
   return (
     <div style={{ fontFamily: "-apple-system, BlinkMacSystemFont, Inter, sans-serif", background: COLORS.paper, minHeight: "100vh", maxWidth: 480, margin: "0 auto", position: "relative", paddingTop: "env(safe-area-inset-top)", paddingBottom: 24 }}>
       <style>{GLOBAL_STYLES}</style>
+      {/* Solid strip over the status-bar / Dynamic Island area. The app runs
+          edge-to-edge (viewport-fit=cover, translucent status bar), so
+          without this, pinned headers stop below the inset but scrolled
+          content still slides underneath the clock and the island. Zero
+          height on anything without a notch. */}
+      <div aria-hidden="true" style={{ position: "fixed", top: 0, left: 0, right: 0, height: "env(safe-area-inset-top)", background: COLORS.paper, zIndex: 70, pointerEvents: "none" }} />
       {children}
     </div>
   );
@@ -2470,8 +2589,12 @@ function DesktopShell({ session, team, view, setView, onLogout, canArchive, chil
 // Fixed, thumb-reachable "New Job" button — replaces the old small
 // top-corner icon. Sits above the safe-area on mobile, large enough to
 // hit reliably on a work-floor phone.
+// Portaled to document.body: the Quotes screen renders this inside its own
+// animated container, and a transformed ancestor turns position:fixed into
+// "fixed to that container" — the New Quote button ended up parked at the
+// bottom of the list instead of floating over it.
 function FloatingNewJobButton({ onClick, label = "New Job" }) {
-  return (
+  return createPortal(
     <button
       onClick={onClick}
       className="mrcap-press"
@@ -2486,9 +2609,9 @@ function FloatingNewJobButton({ onClick, label = "New Job" }) {
       }}
     >
       <Plus size={22} strokeWidth={2.6} /> {label}
-    </button>
+    </button>,
+    document.body
   );
-
 }
 function SectionTitle({ children }) {
   return <div style={{ fontFamily: DISPLAY_FONT, fontWeight: 600, fontSize: 19, color: COLORS.ink, margin: "12px 0 16px" }}>{children}</div>;
@@ -2634,17 +2757,19 @@ function PhotoViewer({ photos, index, onClose, onNavigate }) {
     document.body.removeChild(a);
   };
 
-  return (
+  // Rendered through a portal into document.body, like every other overlay
+  // in the app. It used to render inline inside the job screen, whose
+  // entrance animation leaves a transform on it — and a transformed
+  // ancestor becomes the containing block for position:fixed, so the
+  // "full-screen" viewer was really sized to the whole (scrolled) job
+  // page: its header, and the Close button in it, sat at the top of that
+  // page, off-screen whenever you'd scrolled down to the photos. That's
+  // the "can't reach the X sometimes" on iPhone.
+  return createPortal(
     <div className="mrcap-fade" style={{ position: "fixed", inset: 0, background: "rgba(6,6,5,0.96)", zIndex: 1000, display: "flex", flexDirection: "column" }} onClick={onClose}>
-      {/* Extra clearance beyond the raw safe-area inset, and the close
-          button pulled in from the literal top-right corner — on iPhones
-          with the Dynamic Island, that exact corner doubles as the
-          Control Center swipe-down zone, which can intermittently eat a
-          tap meant for a button sitting right on it. Close is placed
-          before Download (closer to center, Download takes the exact
-          corner instead) since Close is the one that needs to land
-          reliably; either way, tapping anywhere on the dimmed
-          background below this bar still closes the viewer. */}
+      {/* Clearance below the status bar / Dynamic Island, and Close sits
+          before Download so it isn't the button jammed into the far
+          corner. Tapping anywhere on the dimmed area below also closes. */}
       <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", padding: "16px 12px 16px 18px", paddingTop: "max(24px, calc(env(safe-area-inset-top) + 14px))" }} onClick={(e) => e.stopPropagation()}>
         <div style={{ color: COLORS.muted, fontSize: 12.5 }}>{photo.label} · {index + 1} of {photos.length}</div>
         <div style={{ display: "flex", gap: 10 }}>
@@ -2663,7 +2788,8 @@ function PhotoViewer({ photos, index, onClose, onNavigate }) {
           <button onClick={() => onNavigate(index + 1)} className="mrcap-press" style={{ ...iconBtnStyle, position: "absolute", right: 10 }}><ChevronLeft size={20} color={COLORS.ink} style={{ transform: "rotate(180deg)" }} /></button>
         )}
       </div>
-    </div>
+    </div>,
+    document.body
   );
 }
 
@@ -3441,6 +3567,24 @@ function LoginScreen({ team, setTeam, onLogin }) {
   // shop phone and the office computer on different days.
   const [viewMode, setViewMode] = useState("phone");
 
+  // The roster on this screen was loaded once when the app opened, so a
+  // phone or tablet that had been open since before a new person was added
+  // never showed them — they simply weren't in the list until someone
+  // force-quit the app. Re-read it whenever this screen appears and whenever
+  // the app comes back to the foreground.
+  useEffect(() => {
+    let alive = true;
+    const refresh = async () => {
+      const fresh = await refreshTeam();
+      if (alive && fresh) setTeam(fresh);
+    };
+    refresh();
+    const onVisible = () => { if (document.visibilityState === "visible") refresh(); };
+    document.addEventListener("visibilitychange", onVisible);
+    return () => { alive = false; document.removeEventListener("visibilitychange", onVisible); };
+    // eslint-disable-next-line
+  }, []);
+
   const pick = (member) => {
     setPicked(member);
     setPin("");
@@ -3458,8 +3602,17 @@ function LoginScreen({ team, setTeam, onLogin }) {
     (async () => {
       if (mode === "set") {
         const next = team.map((m) => (m.id === picked.id ? { ...m, pin } : m));
+        // Log in only once the PIN is actually saved. This used to show
+        // "Access granted" whether or not the save worked, so a new hire whose
+        // PIN never reached the server was let in once, then found their PIN
+        // "didn't work" the next morning.
+        const saved = await saveTeam(next);
+        if (!saved) {
+          setError("Couldn't save your PIN — check the connection");
+          setTimeout(() => setPin(""), 260);
+          return;
+        }
         setTeam(next);
-        await saveTeam(next);
         setFlash(true);
         setTimeout(() => onLogin({ ...picked, hasPin: true }, viewMode), 420);
       } else {
@@ -3587,48 +3740,87 @@ const keyBtnStyle = { height: 54, borderRadius: 12, border: `1px solid ${COLORS.
 
 /* ---------------- Top bar ---------------- */
 
-// Overflow menu for the TopBar's less-frequently-used icons — dropped
-// down from the row itself (not a portal), so it naturally sits inside
-// the Shell's own safe-area-padded container instead of needing its own
-// top-inset handling. Keeps the main row down to a handful of icons
-// even on Suhail's login, which used to carry up to 11 across one row
-// and get clipped/crowded on a narrow phone.
+// Overflow menu for the TopBar's less-frequently-used destinations.
+// The dropdown is absolutely positioned inside the bar (no portal), and
+// "tap outside to close" is a document-level listener rather than a
+// full-screen fixed backdrop: the bar carries an animation transform and
+// a backdrop-filter, and per spec either one makes it the containing
+// block for position:fixed descendants — so a fixed backdrop in here
+// would only cover the bar itself, not the screen, and taps elsewhere
+// would never close the menu.
 function TopBarMoreMenu({ items }) {
   const [open, setOpen] = useState(false);
+  const wrapRef = useRef(null);
+  useEffect(() => {
+    if (!open) return undefined;
+    const onDown = (e) => { if (wrapRef.current && !wrapRef.current.contains(e.target)) setOpen(false); };
+    const onKey = (e) => { if (e.key === "Escape") setOpen(false); };
+    document.addEventListener("pointerdown", onDown);
+    document.addEventListener("keydown", onKey);
+    return () => { document.removeEventListener("pointerdown", onDown); document.removeEventListener("keydown", onKey); };
+  }, [open]);
   if (!items.length) return null;
   return (
-    <div style={{ position: "relative" }}>
-      <button onClick={() => setOpen((o) => !o)} style={iconBtnStyle} className="mrcap-press" title="More">
+    <div ref={wrapRef} style={{ position: "relative" }}>
+      <button onClick={() => setOpen((o) => !o)} style={iconBtnStyle} className="mrcap-press" title="More" aria-haspopup="menu" aria-expanded={open}>
         <MoreVertical size={16} color={COLORS.ink} />
       </button>
       {open && (
-        <>
-          <div onClick={() => setOpen(false)} style={{ position: "fixed", inset: 0, zIndex: 400 }} />
-          <div style={{ position: "absolute", top: "calc(100% + 6px)", right: 0, background: COLORS.panel, border: `1px solid ${COLORS.line}`, borderRadius: 10, boxShadow: "0 10px 26px rgba(0,0,0,0.4)", minWidth: 200, zIndex: 401, overflow: "hidden" }}>
-            {items.map((it, i) => (
-              <button
-                key={it.label}
-                onClick={() => { setOpen(false); it.onClick(); }}
-                className="mrcap-press"
-                style={{ display: "flex", alignItems: "center", gap: 10, width: "100%", padding: "12px 14px", background: "none", border: "none", borderBottom: i < items.length - 1 ? `1px solid ${COLORS.line}` : "none", color: COLORS.ink, fontSize: 13, fontWeight: 500, cursor: "pointer", textAlign: "left", boxSizing: "border-box" }}
-              >
-                {it.icon} {it.label}
-              </button>
-            ))}
-          </div>
-        </>
+        <div role="menu" style={{ position: "absolute", top: "calc(100% + 6px)", right: 0, background: COLORS.panel, border: `1px solid ${COLORS.line}`, borderRadius: 10, boxShadow: "0 10px 26px rgba(0,0,0,0.4)", minWidth: 200, zIndex: 401, overflow: "hidden" }}>
+          {items.map((it, i) => (
+            <button
+              key={it.label}
+              role="menuitem"
+              onClick={() => { setOpen(false); it.onClick(); }}
+              className="mrcap-press"
+              style={{ display: "flex", alignItems: "center", gap: 10, width: "100%", padding: "12px 14px", background: "none", border: "none", borderBottom: i < items.length - 1 ? `1px solid ${COLORS.line}` : "none", color: COLORS.ink, fontSize: 13, fontWeight: 500, cursor: "pointer", textAlign: "left", boxSizing: "border-box" }}
+            >
+              {it.icon} {it.label}
+            </button>
+          ))}
+        </div>
       )}
     </div>
   );
 }
 
+// Window width, tracked so the header can decide how many icons fit in
+// one row instead of letting them wrap into a second line.
+function useViewportWidth() {
+  const [w, setW] = useState(() => (typeof window !== "undefined" ? window.innerWidth : 390));
+  useEffect(() => {
+    const onResize = () => setW(window.innerWidth);
+    window.addEventListener("resize", onResize);
+    return () => window.removeEventListener("resize", onResize);
+  }, []);
+  return w;
+}
+
 function TopBar({ session, team, onLogout, onNew, view, onBack, onTeam, onArchive, onCustomers, onReports, onQuotes, canArchive, onAdminDash, onMsgTemplates, onIssues, onDispatch, onLiveUpdates, onAnnouncements }) {
   const isSimplified = isSimplifiedRole(session);
-  // Only the handful of icons everyone in that role actually reaches for
-  // daily stay as direct taps; the rest (all Suhail-only, or occasional)
-  // fold into the "More" menu so the row can't flood past ~6-7 icons no
-  // matter how many permissions/roles stack up on one login.
-  const moreItems = [];
+  const viewportW = useViewportWidth();
+  // Every destination this login can reach, in the order they've always
+  // appeared. Only as many as physically fit beside the logo stay as
+  // direct taps (4 on a normal phone, 3 on a very narrow one) — measured
+  // so the row never wraps into a second line. Whatever doesn't fit
+  // folds into "More", lowest-traffic first (Team, then Archive, then
+  // Reports), so the daily ones stay one tap away.
+  const navAll = view === "list" ? [
+    { key: "customers", title: "Customers", Icon: Users, onClick: onCustomers, allowed: hasPermission(session, team, "customers") },
+    { key: "quotes", title: "Quotations", Icon: FileText, onClick: onQuotes, allowed: hasPermission(session, team, "quotations") },
+    { key: "archive", title: "Archive", Icon: Archive, onClick: onArchive, allowed: hasPermission(session, team, "archive") },
+    { key: "reports", title: "Reports", Icon: BarChart3, onClick: onReports, allowed: hasPermission(session, team, "reports") },
+    { key: "team", title: "Team", Icon: ShieldCheck, onClick: onTeam, allowed: hasPermission(session, team, "team") },
+    { key: "dispatch", title: "Dispatch Board", Icon: ListChecks, onClick: onDispatch, allowed: true },
+  ].filter((n) => n.allowed) : [];
+  const maxDirect = viewportW >= 370 ? 4 : 3;
+  const demoteOrder = ["team", "archive", "reports", "customers", "quotes"];
+  const directKeys = new Set(navAll.map((n) => n.key));
+  for (const k of demoteOrder) { if (directKeys.size <= maxDirect) break; directKeys.delete(k); }
+  const directNav = navAll.filter((n) => directKeys.has(n.key));
+  const moreItems = navAll
+    .filter((n) => !directKeys.has(n.key))
+    .map((n) => ({ label: n.key === "dispatch" ? "Dispatch Board" : n.title, icon: <n.Icon size={15} color={COLORS.ink} />, onClick: n.onClick }));
   if (view === "list" && canSeeLiveUpdates(session)) moreItems.push({ label: "Live Updates", icon: <MessageSquare size={15} color={COLORS.ink} />, onClick: onLiveUpdates });
   if (view === "list" && isSuperAdmin(session)) {
     moreItems.push({ label: "Admin Dashboard", icon: <LayoutDashboard size={15} color={COLORS.ink} />, onClick: onAdminDash });
@@ -3637,10 +3829,14 @@ function TopBar({ session, team, onLogout, onNew, view, onBack, onTeam, onArchiv
     moreItems.push({ label: "Issue Reports", icon: <AlertCircle size={15} color={COLORS.ink} />, onClick: onIssues });
   }
   return (
+    <>
     <div
       className="mrcap-view"
       style={{
-        position: "sticky", top: "env(safe-area-inset-top)", zIndex: 60,
+        // Pinned only on the board itself. Detail screens (Job Detail,
+        // Quote Detail…) carry their own pinned strip with the plate and
+        // stage, and two things stuck to the top would stack and hide it.
+        position: view === "list" ? "sticky" : "static", top: "env(safe-area-inset-top)", zIndex: 60,
         background: "rgba(10,10,9,0.68)",
         backdropFilter: "blur(14px) saturate(140%)", WebkitBackdropFilter: "blur(14px) saturate(140%)",
       }}
@@ -3651,46 +3847,37 @@ function TopBar({ session, team, onLogout, onNew, view, onBack, onTeam, onArchiv
           {view !== "list" ? (
             <button onClick={onBack} style={iconBtnStyle} className="mrcap-press"><ChevronLeft size={20} color={COLORS.ink} /></button>
           ) : (
-            <div style={{ display: "flex", alignItems: "center", gap: 10 }}>
+            <div style={{ display: "flex", alignItems: "center", gap: 10, flexShrink: 0 }}>
               <div style={{ width: 28, height: 28, borderRadius: 7, background: "#fff", display: "flex", alignItems: "center", justifyContent: "center", padding: 3, boxSizing: "border-box", flexShrink: 0, border: `1px solid ${COLORS.line}` }}>
                 <img src={LOGO_SRC} alt="" style={{ width: "100%", height: "100%", objectFit: "contain" }} />
               </div>
-              <div>
+              <div style={{ whiteSpace: "nowrap" }}>
                 <div style={{ fontFamily: DISPLAY_FONT, fontWeight: 700, fontSize: 16, color: COLORS.ink, lineHeight: 1.1 }}>Mr.CAP.</div>
-                <div style={{ fontSize: 9.5, color: COLORS.gold, letterSpacing: 2, textTransform: "uppercase", lineHeight: 1.3 }}>Job Tracker</div>
+                <div style={{ fontSize: 9.5, color: COLORS.gold, letterSpacing: 1.5, textTransform: "uppercase", lineHeight: 1.3 }}>Job Tracker</div>
               </div>
             </div>
           )}
         </div>
-        <div style={{ display: "flex", flexWrap: "wrap", justifyContent: "flex-end", gap: 6, rowGap: 8 }}>
-          {view === "list" && hasPermission(session, team, "customers") && (
-            <button onClick={onCustomers} style={iconBtnStyle} className="mrcap-press" title="Customers"><Users size={16} color={COLORS.ink} /></button>
-          )}
-          {view === "list" && hasPermission(session, team, "quotations") && (
-            <button onClick={onQuotes} style={iconBtnStyle} className="mrcap-press" title="Quotations"><FileText size={16} color={COLORS.ink} /></button>
-          )}
-          {view === "list" && hasPermission(session, team, "archive") && (
-            <button onClick={onArchive} style={iconBtnStyle} className="mrcap-press" title="Archive"><Archive size={16} color={COLORS.ink} /></button>
-          )}
-          {view === "list" && hasPermission(session, team, "reports") && (
-            <button onClick={onReports} style={iconBtnStyle} className="mrcap-press" title="Reports"><BarChart3 size={16} color={COLORS.ink} /></button>
-          )}
-          {view === "list" && hasPermission(session, team, "team") && (
-            <button onClick={onTeam} style={iconBtnStyle} className="mrcap-press" title="Team"><ShieldCheck size={16} color={COLORS.ink} /></button>
-          )}
-          {view === "list" && (
-            <button onClick={onDispatch} style={iconBtnStyle} className="mrcap-press" title="Dispatch Board"><ListChecks size={16} color={COLORS.ink} /></button>
-          )}
+        <div style={{ display: "flex", flexWrap: "wrap", justifyContent: "flex-end", gap: 5, rowGap: 8 }}>
+          {directNav.map((n) => (
+            <button key={n.key} onClick={n.onClick} style={iconBtnStyle} className="mrcap-press" title={n.title} aria-label={n.title}>
+              <n.Icon size={16} color={COLORS.ink} />
+            </button>
+          ))}
           {view === "list" && <TopBarMoreMenu items={moreItems} />}
         </div>
       </div>
-      {view === "list" && (
-        <button onClick={onLogout} style={{ margin: "0 18px 10px", display: "flex", alignItems: "center", gap: 6, background: "none", border: "none", padding: 0, cursor: "pointer" }}>
-          <User size={13} color={COLORS.muted} />
-          <span style={{ fontSize: 12.5, color: COLORS.muted }}>{session.name} · {ROLE_DEFS[session.role].label} · tap to switch</span>
-        </button>
-      )}
     </div>
+    {/* Outside the sticky bar on purpose: only the icon row stays pinned
+        while scrolling — the "tap to switch" line scrolls away instead of
+        permanently costing another ~28px of a small phone's height. */}
+    {view === "list" && (
+      <button onClick={onLogout} style={{ margin: "0 18px 10px", display: "flex", alignItems: "center", gap: 6, background: "none", border: "none", padding: 0, cursor: "pointer" }}>
+        <User size={13} color={COLORS.muted} />
+        <span style={{ fontSize: 12.5, color: COLORS.muted }}>{session.name} · {ROLE_DEFS[session.role].label} · tap to switch</span>
+      </button>
+    )}
+    </>
   );
 }
 
@@ -3740,7 +3927,44 @@ function OfflineBadge() {
   );
 }
 
-function SyncBar({ syncState, lastSyncedAt, onRefresh }) {
+// Changes made offline that the server refused once they finally sent —
+// shown on the board until dismissed, so "it saved" is never quietly false.
+function RejectedWritesBanner() {
+  const [items, setItems] = useState(() => getRejectedWrites());
+  useEffect(() => {
+    const on = () => setItems(getRejectedWrites());
+    window.addEventListener("mrcap-rejected-changed", on);
+    return () => window.removeEventListener("mrcap-rejected-changed", on);
+  }, []);
+  if (!items.length) return null;
+  return (
+    <div role="alert" style={{ background: "#3A2420", border: `1px solid ${COLORS.red}`, borderRadius: 10, padding: "10px 12px", marginBottom: 12 }}>
+      <div style={{ display: "flex", alignItems: "flex-start", justifyContent: "space-between", gap: 10 }}>
+        <div>
+          <div style={{ fontSize: 12.5, color: "#F0C4BA", fontWeight: 700 }}>
+            {items.length} change{items.length === 1 ? "" : "s"} made offline couldn't be saved
+          </div>
+          <div style={{ fontSize: 11, color: "#E8A99B", marginTop: 3, lineHeight: 1.45 }}>
+            The server refused {items.length === 1 ? "it" : "them"} when the connection came back — redo {items.length === 1 ? "it" : "them"} on the job:
+            {" "}{items.slice(-3).map((r) => r.what).join(" · ")}
+          </div>
+        </div>
+        <button onClick={() => setRejectedWrites([])} className="mrcap-press" style={{ fontSize: 11.5, color: "#fff", background: COLORS.red, border: "none", borderRadius: 7, padding: "6px 10px", cursor: "pointer", fontWeight: 700, flexShrink: 0 }}>Dismiss</button>
+      </div>
+    </div>
+  );
+}
+
+function SyncBar(props) {
+  return (
+    <>
+      <RejectedWritesBanner />
+      <SyncBarCore {...props} />
+    </>
+  );
+}
+
+function SyncBarCore({ syncState, lastSyncedAt, onRefresh }) {
   const [refreshing, setRefreshing] = useState(false);
   const doRefresh = async () => { setRefreshing(true); await onRefresh(); setRefreshing(false); };
   const online = useOnlineStatus();
@@ -3953,7 +4177,7 @@ function SwipeableJobCard({ job, session, team, onDeleted, children }) {
       >
         {children}
       </div>
-      {revealed && <div onClick={closeReveal} style={{ position: "absolute", inset: 0, zIndex: 5 }} />}
+      {revealed && <div onClick={closeReveal} style={{ position: "absolute", top: 0, bottom: 0, left: 0, right: REVEAL_WIDTH, zIndex: 5 }} />}
 
       {confirming && createPortal(
         <div onClick={() => !deleting && setConfirming(false)} style={{ position: "fixed", inset: 0, background: "rgba(0,0,0,0.6)", zIndex: 1000, display: "flex", alignItems: "flex-end", justifyContent: "center" }}>
@@ -5469,7 +5693,7 @@ function JobDetail({ id, initialJob, session, team, onChanged, onBack, canArchiv
     const saved = await saveJob(updated);
     setJob(updated);
     setUploadingCompletion(false);
-    onChanged(updated, saved);
+    notifyChanged(updated, saved);
   };
   const [pickerFor, setPickerFor] = useState(null); // service key currently showing the reassign list
   const [finalizingInvoice, setFinalizingInvoice] = useState(false);
@@ -5523,6 +5747,23 @@ function JobDetail({ id, initialJob, session, team, onChanged, onBack, canArchiv
   const [showDeleteConfirm, setShowDeleteConfirm] = useState(false); // first tap
   const [deleteConfirmText, setDeleteConfirmText] = useState(""); // must type DELETE to actually confirm
   const [deleting, setDeleting] = useState(false);
+  // Every quick action on this screen saves through notifyChanged. A save
+  // the server actually refused (not "offline" — that's queued and shown by
+  // the offline badge) used to look identical to a successful one: the tap
+  // updated the screen and nothing said it hadn't stuck. Now it raises a
+  // banner with a Retry, same as the job form screens already did.
+  const [saveFailed, setSaveFailed] = useState(false);
+  const [retrying, setRetrying] = useState(false);
+  const notifyChanged = (updatedJob, savedOk) => {
+    setSaveFailed(!savedOk);
+    onChanged(updatedJob, savedOk);
+  };
+  const retrySave = async () => {
+    setRetrying(true);
+    const savedOk = await saveJob(job);
+    setRetrying(false);
+    notifyChanged(job, savedOk);
+  };
 
   const load = useCallback(async () => {
     setLoadError(false);
@@ -5602,7 +5843,7 @@ function JobDetail({ id, initialJob, session, team, onChanged, onBack, canArchiv
     };
     const saved = await saveJob(updated);
     setJob(updated);
-    onChanged(updated, saved);
+    notifyChanged(updated, saved);
   };
 
   // Moves a service module to a specific step in its category's real,
@@ -5633,14 +5874,14 @@ function JobDetail({ id, initialJob, session, team, onChanged, onBack, canArchiv
     };
     const saved = await saveJob(updated);
     setJob(updated);
-    onChanged(updated, saved);
+    notifyChanged(updated, saved);
   };
 
   const setServiceNote = async (key, text) => {
     const updated = { ...job, serviceNotes: { ...(job.serviceNotes || {}), [key]: text }, updatedAt: Date.now() };
     const saved = await saveJob(updated);
     setJob(updated);
-    onChanged(updated, saved);
+    notifyChanged(updated, saved);
   };
 
   // Passed as onSave to CustomerNotifyControl — it hands back the whole
@@ -5649,7 +5890,7 @@ function JobDetail({ id, initialJob, session, team, onChanged, onBack, canArchiv
   const saveJobRecord = async (updated) => {
     const saved = await saveJob(updated);
     setJob(updated);
-    onChanged(updated, saved);
+    notifyChanged(updated, saved);
   };
 
   // Markup calculator — cost + % in, charge price out, saved as a line
@@ -5675,7 +5916,7 @@ function JobDetail({ id, initialJob, session, team, onChanged, onBack, canArchiv
     setJob(updated);
     setMarkupDesc(""); setMarkupCost(""); setMarkupPercent(""); setMarkupPhotos([]);
     setSavingMarkup(false);
-    onChanged(updated, saved);
+    notifyChanged(updated, saved);
   };
 
   // Photos for the entry currently being composed (bill/receipt shots,
@@ -5694,7 +5935,7 @@ function JobDetail({ id, initialJob, session, team, onChanged, onBack, canArchiv
     const updated = { ...job, markupEntries: (job.markupEntries || []).filter((e) => e.id !== entryId), updatedAt: Date.now() };
     const saved = await saveJob(updated);
     setJob(updated);
-    onChanged(updated, saved);
+    notifyChanged(updated, saved);
   };
 
   // Parts & fees, editable straight from the main job card now instead
@@ -5705,7 +5946,7 @@ function JobDetail({ id, initialJob, session, team, onChanged, onBack, canArchiv
     const updated = { ...job, parts: newParts, updatedAt: Date.now() };
     const saved = await saveJob(updated);
     setJob(updated);
-    onChanged(updated, saved);
+    notifyChanged(updated, saved);
   };
 
   // Used to be the customer-facing status line. Repurposed per request:
@@ -5740,7 +5981,7 @@ function JobDetail({ id, initialJob, session, team, onChanged, onBack, canArchiv
     setJob(updated);
     setSavingStatusNote(false);
     setCustomStatusNote("");
-    onChanged(updated, saved);
+    notifyChanged(updated, saved);
   };
 
   const reviewService = async (key) => {
@@ -5752,7 +5993,7 @@ function JobDetail({ id, initialJob, session, team, onChanged, onBack, canArchiv
     };
     const saved = await saveJob(updated);
     setJob(updated);
-    onChanged(updated, saved);
+    notifyChanged(updated, saved);
   };
 
   const assignService = async (key, memberId) => {
@@ -5782,7 +6023,7 @@ function JobDetail({ id, initialJob, session, team, onChanged, onBack, canArchiv
     const saved = await saveJob(updated);
     setJob(updated);
     setPickerFor(null);
-    onChanged(updated, saved);
+    notifyChanged(updated, saved);
   };
 
   const advance = async () => {
@@ -5808,7 +6049,7 @@ function JobDetail({ id, initialJob, session, team, onChanged, onBack, canArchiv
     const saved = await saveJob(updated);
     setJob(updated);
     setNote(""); setPendingPhotos([]); setBusy(false);
-    onChanged(updated, saved);
+    notifyChanged(updated, saved);
   };
 
   // Admin-only: send a job back a stage, from ANY stage including
@@ -5834,7 +6075,7 @@ function JobDetail({ id, initialJob, session, team, onChanged, onBack, canArchiv
     setBusy(false);
     setShowReverseConfirm(false);
     setClearReviewsOnReverse(false);
-    onChanged(updated, saved);
+    notifyChanged(updated, saved);
   };
 
   // Admin/Intake only. A car can be put on hold from wherever it currently
@@ -5859,7 +6100,7 @@ function JobDetail({ id, initialJob, session, team, onChanged, onBack, canArchiv
     setBusy(false);
     setShowHoldPrompt(false);
     setHoldNoteInput("");
-    onChanged(updated, saved);
+    notifyChanged(updated, saved);
   };
 
   const takeOffHold = async () => {
@@ -5876,7 +6117,7 @@ function JobDetail({ id, initialJob, session, team, onChanged, onBack, canArchiv
     const saved = await saveJob(updated);
     setJob(updated);
     setBusy(false);
-    onChanged(updated, saved);
+    notifyChanged(updated, saved);
   };
 
   const handleDelete = async () => {
@@ -6020,12 +6261,12 @@ function JobDetail({ id, initialJob, session, team, onChanged, onBack, canArchiv
   }
 
   if (editing) {
-    return <EditJobScreen job={job} session={session} onSaved={(updated, saved) => { setJob(updated); window.history.back(); onChanged(updated, saved); }} onCancel={() => window.history.back()} />;
+    return <EditJobScreen job={job} session={session} onSaved={(updated, saved) => { setJob(updated); window.history.back(); notifyChanged(updated, saved); }} onCancel={() => window.history.back()} />;
   }
 
   return (
     <div className="mrcap-view" style={{ padding: "0 18px 34px" }}>
-      <div style={{ position: "sticky", top: 0, zIndex: 20, background: COLORS.paper, margin: "0 -18px", padding: "10px 18px", borderBottom: `1px solid ${COLORS.line}`, display: "flex", alignItems: "center", justifyContent: "space-between", gap: 10 }}>
+      <div style={{ position: "sticky", top: "env(safe-area-inset-top)", zIndex: 20, background: COLORS.paper, margin: "0 -18px", padding: "10px 18px", borderBottom: `1px solid ${COLORS.line}`, display: "flex", alignItems: "center", justifyContent: "space-between", gap: 10 }}>
         <div style={{ display: "flex", alignItems: "center", gap: 8, minWidth: 0 }}>
           <span style={{ fontFamily: MONO_FONT, fontWeight: 700, fontSize: 13, color: COLORS.ink, flexShrink: 0 }}>{job.plate}</span>
           <span style={{ fontSize: 11.5, color: COLORS.muted, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{job.makeModel}</span>
@@ -6035,6 +6276,15 @@ function JobDetail({ id, initialJob, session, team, onChanged, onBack, canArchiv
           <Pill tone={stageTone(stage.key)}>{stage.label}</Pill>
         </div>
       </div>
+      {saveFailed && (
+        <div className="mrcap-fade" role="alert" style={{ background: "#3A2420", border: `1px solid ${COLORS.red}`, borderRadius: 10, padding: "10px 12px", margin: "12px 0" }}>
+          <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", gap: 8 }}>
+            <span style={{ fontSize: 12.5, color: "#F0C4BA", fontWeight: 600 }}>Your last change didn't save to the server.</span>
+            <button onClick={retrySave} disabled={retrying} className="mrcap-press" style={{ fontSize: 11.5, color: "#fff", background: COLORS.red, border: "none", borderRadius: 7, padding: "6px 11px", cursor: "pointer", fontWeight: 700, flexShrink: 0, opacity: retrying ? 0.6 : 1 }}>{retrying ? "Retrying…" : "Retry"}</button>
+          </div>
+          {lastStorageError && <div style={{ fontSize: 10.5, color: "#E8A99B", marginTop: 6, fontFamily: "monospace", wordBreak: "break-word" }}>{lastStorageError}</div>}
+        </div>
+      )}
       {stage.key === "ready" && job.customerPhone && (
         <>
           <WhatsAppSendButton
@@ -7801,7 +8051,19 @@ function exportAdminStatsCSV({ rangeLabel, totalRevenue, revenueInRange, activeJ
 // 2x pixel density (crisp when placed into a PDF) with the bar's value
 // printed above each bar and its label below, so the image is legible
 // on its own without needing the text table next to it.
-function renderBarChartPNG(rows, { width = 700, height = 260, color = "#D4AF37", formatValue } = {}) {
+// Rounds the axis top up to a clean 1 / 2 / 2.5 / 5 x 10^n so the four
+// gridlines land on readable numbers (0, 2,500, 5,000 ...) instead of
+// whatever the tallest bar happens to be.
+function niceCeil(v) {
+  if (!(v > 0)) return 1;
+  const pow = Math.pow(10, Math.floor(Math.log10(v)));
+  const n = v / pow;
+  return (n <= 1 ? 1 : n <= 2 ? 2 : n <= 2.5 ? 2.5 : n <= 5 ? 5 : 10) * pow;
+}
+// `highlightLast` draws the final bar in the deeper gold and the rest
+// lighter — for a month-by-month series the current month is the one
+// being read against the others.
+function renderBarChartPNG(rows, { width = 700, height = 260, color = "#C9A227", accent = "#8F6F12", formatValue, highlightLast = false } = {}) {
   if (!rows || !rows.length) return null;
   const dpr = 2;
   const canvas = document.createElement("canvas");
@@ -7810,35 +8072,64 @@ function renderBarChartPNG(rows, { width = 700, height = 260, color = "#D4AF37",
   if (!ctx) return null;
   ctx.scale(dpr, dpr);
   ctx.fillStyle = "#ffffff"; ctx.fillRect(0, 0, width, height);
+  const FONT = "Helvetica, Arial, sans-serif";
+  const fmt = (v) => (formatValue ? formatValue(v) : Math.round(v).toLocaleString());
 
-  const max = Math.max(1, ...rows.map((r) => r.value || 0));
-  const padL = 8, padR = 8, padTop = 22, padBottom = 32;
+  // Money axes round up to a clean 1/2/2.5/5 x 10^n; count axes (jobs per
+  // category) step in whole numbers so no gridline reads "0.25 jobs".
+  const maxVal = Math.max(1, ...rows.map((r) => r.value || 0));
+  const countStep = [1, 2, 5, 10, 20, 25, 50, 100, 200, 250, 500, 1000].find((s) => s * 4 >= maxVal) || Math.ceil(maxVal / 4);
+  const top = formatValue ? niceCeil(maxVal) : countStep * 4;
+  const padL = formatValue ? 78 : 40, padR = 14, padTop = 26, padBottom = 34;
   const chartW = width - padL - padR;
   const chartH = height - padTop - padBottom;
 
-  ctx.strokeStyle = "#e8e8e8"; ctx.lineWidth = 1;
+  // gridlines, each labelled with the value it stands for
+  ctx.lineWidth = 1;
+  ctx.font = `10px ${FONT}`;
+  ctx.textAlign = "right";
   for (let i = 0; i <= 4; i++) {
-    const gy = padTop + chartH - (chartH * i) / 4;
+    const gy = Math.round(padTop + chartH - (chartH * i) / 4) + 0.5;
+    ctx.strokeStyle = i === 0 ? "#bdbdbd" : "#ececec";
     ctx.beginPath(); ctx.moveTo(padL, gy); ctx.lineTo(width - padR, gy); ctx.stroke();
+    ctx.fillStyle = "#8a8a8a";
+    ctx.fillText(fmt((top * i) / 4), padL - 8, gy + 3.5);
   }
 
-  const gap = 14;
-  const barW = Math.max(4, (chartW - gap * (rows.length - 1)) / rows.length);
+  const slot = chartW / rows.length;
+  const barW = Math.min(72, slot * 0.62);
+  const maxChars = Math.max(5, Math.floor(slot / 6.4));
   rows.forEach((r, i) => {
-    const barH = ((r.value || 0) / max) * chartH;
-    const x = padL + i * (barW + gap);
+    const v = r.value || 0;
+    const barH = (v / top) * chartH;
+    const x = padL + i * slot + (slot - barW) / 2;
     const y = padTop + chartH - barH;
-    ctx.fillStyle = color;
-    ctx.fillRect(x, y, barW, Math.max(1, barH));
+    const isLast = highlightLast && i === rows.length - 1;
 
-    ctx.fillStyle = "#1a1a1a";
-    ctx.font = "bold 11px Helvetica, Arial, sans-serif";
+    if (v > 0) {
+      ctx.fillStyle = highlightLast ? (isLast ? accent : color) : color;
+      const rad = Math.min(4, barW / 2, barH);
+      ctx.beginPath();
+      ctx.moveTo(x, y + barH);
+      ctx.lineTo(x, y + rad);
+      ctx.quadraticCurveTo(x, y, x + rad, y);
+      ctx.lineTo(x + barW - rad, y);
+      ctx.quadraticCurveTo(x + barW, y, x + barW, y + rad);
+      ctx.lineTo(x + barW, y + barH);
+      ctx.closePath();
+      ctx.fill();
+
+      ctx.fillStyle = "#1a1a1a";
+      ctx.font = `${isLast ? "bold " : "600 "}11px ${FONT}`;
+      ctx.textAlign = "center";
+      ctx.fillText(fmt(v), x + barW / 2, Math.max(12, y - 7));
+    }
+
+    const label = String(r.label);
+    ctx.fillStyle = isLast ? "#1a1a1a" : "#777";
+    ctx.font = `${isLast ? "bold " : ""}10px ${FONT}`;
     ctx.textAlign = "center";
-    ctx.fillText(formatValue ? formatValue(r.value) : String(r.value), x + barW / 2, Math.max(12, y - 6));
-
-    ctx.fillStyle = "#777";
-    ctx.font = "10px Helvetica, Arial, sans-serif";
-    ctx.fillText(String(r.label).slice(0, 12), x + barW / 2, height - padBottom + 15);
+    ctx.fillText(label.length > maxChars ? `${label.slice(0, maxChars - 1)}…` : label, x + barW / 2, height - padBottom + 16);
   });
   return canvas.toDataURL("image/png");
 }
@@ -7877,8 +8168,8 @@ function exportAdminStatsPDF({ rangeLabel, totalRevenue, revenueInRange, activeJ
   statLine("Collected in range", collectedInRange);
   statLine("Avg turnaround", avgTurnaroundDays != null ? `${avgTurnaroundDays.toFixed(1)} days` : "Not enough data");
 
-  const chart = (title, rows, formatValue) => {
-    const png = renderBarChartPNG(rows, { formatValue });
+  const chart = (title, rows, formatValue, opts = {}) => {
+    const png = renderBarChartPNG(rows, { formatValue, ...opts });
     if (!png) return;
     const imgW = pageW - margin * 2;
     const imgH = imgW * (260 / 700);
@@ -7892,10 +8183,13 @@ function exportAdminStatsPDF({ rangeLabel, totalRevenue, revenueInRange, activeJ
     doc.addImage(png, "PNG", margin, y, imgW, imgH);
     y += imgH + 4;
   };
-  chart("Revenue by month", revenueByMonth, fmtAED);
+  chart("Revenue by month", revenueByMonth, fmtAED, { highlightLast: true });
   chart("Jobs by service category (in range)", byCategory);
 
   const table = (title, rows, formatValue) => {
+    // Never leave a table's heading stranded at the foot of a page with its
+    // rows on the next one — start a fresh page unless heading + a few rows fit.
+    if (y + 12 + 20 + 16 + Math.min(rows.length, 3) * 15 > 780) { doc.addPage(); y = 50; }
     y += 12;
     doc.setDrawColor(210); doc.line(margin, y, pageW - margin, y);
     y += 20;
@@ -9532,26 +9826,46 @@ function TeamScreen({ team, setTeam, session, onBack, onImport, onServices, canS
   // old PIN until they set a new one) and confirms after, same as every
   // other destructive action in this app already does.
   const [confirmResetId, setConfirmResetId] = useState(null);
+  const [confirmRemoveId, setConfirmRemoveId] = useState(null);
   const [busyMemberId, setBusyMemberId] = useState(null);
   const [pinActionDone, setPinActionDone] = useState(null); // { id, label } — brief success flash
   const [dashboardMode, setDashboardMode] = useState("auto"); // for the Add member form
+
+  // Every Team change goes through here. It used to update the screen and
+  // fire the save without looking at the answer, so a save the server
+  // refused (a new hire was the classic case) left the person sitting in the
+  // list until the next reload, when they quietly vanished. Now a failed
+  // save puts the list back and says so.
+  const [teamError, setTeamError] = useState("");
+  const persistTeam = async (next, what) => {
+    const before = team;
+    setTeamError("");
+    setTeam(next);
+    const ok = await saveTeam(next);
+    if (!ok) {
+      setTeam(before);
+      setTeamError(`Couldn't save — ${what} was not saved. Check the connection and try again.`);
+    }
+    return ok;
+  };
 
   const addMember = async () => {
     if (!name.trim()) return;
     const blankPerms = Object.fromEntries(PERMISSIONS.map((p) => [p.key, false]));
     const next = [...team, { id: uid("member"), name: name.trim(), role, pin: null, permissions: { ...blankPerms, newJob: true }, dashboardMode }];
-    setTeam(next);
-    await saveTeam(next);
-    setName("");
-    setDashboardMode("auto");
+    const ok = await persistTeam(next, `${name.trim()}`);
+    if (ok) {
+      setName("");
+      setDashboardMode("auto");
+    }
   };
   const resetPin = async (id) => {
     // Full reset: forces a fresh PIN pick next login, and clears any
     // lockout at the same time so a reset always leaves the account usable.
     setBusyMemberId(id);
     const next = team.map((m) => (m.id === id ? { ...m, pin: null, failed_pin_attempts: 0, pin_locked_at: null, hasPin: false, locked: false, failedAttempts: 0 } : m));
-    setTeam(next);
-    await saveTeam(next);
+    const resetOk = await persistTeam(next, "the PIN reset");
+    if (!resetOk) { setBusyMemberId(null); setConfirmResetId(null); return; }
     setBusyMemberId(null);
     setConfirmResetId(null);
     setPinActionDone({ id, label: "PIN reset — they'll set a new one at next login" });
@@ -9562,40 +9876,64 @@ function TeamScreen({ team, setTeam, session, onBack, onImport, onServices, canS
     // but keeps their existing PIN, so they don't have to re-set it.
     setBusyMemberId(id);
     const next = team.map((m) => (m.id === id ? { ...m, failed_pin_attempts: 0, pin_locked_at: null, locked: false, failedAttempts: 0 } : m));
-    setTeam(next);
-    await saveTeam(next);
+    const unlockOk = await persistTeam(next, "the unlock");
     setBusyMemberId(null);
+    if (!unlockOk) return;
     setPinActionDone({ id, label: "Unlocked — same PIN still works" });
     setTimeout(() => setPinActionDone((cur) => (cur && cur.id === id ? null : cur)), 3000);
   };
   const changeDashboardMode = async (id, mode) => {
     const next = team.map((m) => (m.id === id ? { ...m, dashboardMode: mode } : m));
-    setTeam(next);
-    await saveTeam(next);
+    await persistTeam(next, "the dashboard change");
   };
   const togglePermission = async (id, key) => {
     const next = team.map((m) => (m.id === id ? { ...m, permissions: { ...m.permissions, [key]: !m.permissions?.[key] } } : m));
-    setTeam(next);
-    await saveTeam(next);
+    await persistTeam(next, "the permission change");
   };
   const removeMember = async (id) => {
     if (id === session.id) return;
-    const next = team.filter((m) => m.id !== id);
-    setTeam(next);
-    await saveTeam(next);
+    const target = team.find((m) => m.id === id);
+    if (!target) return;
+    // Never remove the only administrator — nobody would be left who can
+    // manage the team.
+    if (target.role === "admin" && team.filter((m) => m.role === "admin").length <= 1) {
+      setConfirmRemoveId(null);
+      setTeamError("Can't remove the only administrator — make someone else an admin first.");
+      return;
+    }
+    setBusyMemberId(id);
+    setTeamError("");
+    // This used to only hide the person on this screen and re-save everyone
+    // else — the database row was never deleted, so "removed" people came
+    // back on the next reload and could still log in. Now it deletes them.
+    // Their push-notification tokens are removed with them by the database
+    // (cascade); their name stays on old jobs and history.
+    withActivitySummary(`Removed team member ${target.name}`);
+    const removed = await sbFetch(`team_members?id=eq.${encodeURIComponent(id)}`, { method: "DELETE" });
+    setBusyMemberId(null);
+    setConfirmRemoveId(null);
+    if (!removed.ok) {
+      setTeamError(`Couldn't remove ${target.name} — they're still on the team. Check the connection and try again.`);
+      return;
+    }
+    setTeam(team.filter((m) => m.id !== id));
   };
   const startEdit = (m) => { setEditingId(m.id); setEditName(m.name); };
   const saveEdit = async (id) => {
     if (!editName.trim()) return;
     const next = team.map((m) => (m.id === id ? { ...m, name: editName.trim() } : m));
-    setTeam(next);
-    await saveTeam(next);
-    setEditingId(null);
+    const ok = await persistTeam(next, "the new name");
+    if (ok) setEditingId(null);
   };
 
   return (
     <div className="mrcap-view" style={{ padding: "0 18px 30px" }}>
       <SectionTitle>Team</SectionTitle>
+      {teamError && (
+        <div role="alert" className="mrcap-fade" style={{ background: "#3A2420", border: `1px solid ${COLORS.red}`, borderRadius: 10, padding: "10px 12px", marginBottom: 14, fontSize: 12.5, color: "#F0C4BA", fontWeight: 600 }}>
+          {teamError}
+        </div>
+      )}
 
       {canServices && (
         <button onClick={onServices} className="mrcap-press" style={{ display: "flex", alignItems: "center", justifyContent: "center", gap: 8, width: "100%", padding: "11px", borderRadius: 10, border: `1.5px dashed ${COLORS.gold}`, background: "rgba(201,162,39,0.1)", color: COLORS.gold, fontWeight: 600, fontSize: 13, cursor: "pointer", marginBottom: 10 }}>
@@ -9648,7 +9986,7 @@ function TeamScreen({ team, setTeam, session, onBack, onImport, onServices, canS
                       )}
                       <button onClick={() => setConfirmResetId(m.id)} disabled={busyMemberId === m.id} className="mrcap-press" style={{ fontSize: 11, color: COLORS.muted, background: "none", border: `1px solid ${COLORS.line}`, borderRadius: 7, padding: "5px 7px", cursor: busyMemberId === m.id ? "default" : "pointer", opacity: busyMemberId === m.id ? 0.6 : 1 }}>Reset PIN</button>
                       {m.id !== session.id && (
-                        <button onClick={() => removeMember(m.id)} className="mrcap-press" style={{ fontSize: 11, color: COLORS.red, background: "none", border: `1px solid ${COLORS.line}`, borderRadius: 7, padding: "5px 7px", cursor: "pointer" }}>Remove</button>
+                        <button onClick={() => setConfirmRemoveId(m.id)} disabled={busyMemberId === m.id} className="mrcap-press" style={{ fontSize: 11, color: COLORS.red, background: "none", border: `1px solid ${COLORS.line}`, borderRadius: 7, padding: "5px 7px", cursor: "pointer" }}>Remove</button>
                       )}
                     </div>
                   </>
@@ -9658,6 +9996,17 @@ function TeamScreen({ team, setTeam, session, onBack, onImport, onServices, canS
               {/* Reset PIN is disruptive — they can't log in with their old
                   PIN again until they set a new one — so it asks first
                   instead of firing silently on a single tap. */}
+              {confirmRemoveId === m.id && (
+                <div style={{ padding: "10px 12px", borderBottom: `1px solid ${COLORS.line}`, background: "rgba(168,64,47,0.12)" }}>
+                  <div style={{ fontSize: 12, color: COLORS.ink, marginBottom: 8, lineHeight: 1.45 }}>Remove {m.name}? They won't be able to log in any more. Their name stays on past jobs and history.</div>
+                  <div style={{ display: "flex", gap: 8 }}>
+                    <button onClick={() => removeMember(m.id)} disabled={busyMemberId === m.id} className="mrcap-press" style={{ fontSize: 11.5, color: "#fff", background: COLORS.red, border: "none", borderRadius: 7, padding: "7px 11px", cursor: "pointer", fontWeight: 600 }}>
+                      {busyMemberId === m.id ? "Removing…" : "Yes, remove"}
+                    </button>
+                    <button onClick={() => setConfirmRemoveId(null)} disabled={busyMemberId === m.id} className="mrcap-press" style={{ fontSize: 11.5, color: COLORS.muted, background: "none", border: `1px solid ${COLORS.line}`, borderRadius: 7, padding: "7px 11px", cursor: "pointer" }}>Cancel</button>
+                  </div>
+                </div>
+              )}
               {confirmResetId === m.id && (
                 <div style={{ padding: "10px 12px", borderBottom: `1px solid ${COLORS.line}`, background: "rgba(168,64,47,0.08)" }}>
                   <div style={{ fontSize: 12, color: COLORS.ink, marginBottom: 8 }}>Reset {m.name}'s PIN? They'll pick a new one the next time they log in.</div>
@@ -11707,6 +12056,15 @@ export function DispatchKiosk() {
       setTeam(await loadTeam());
       setReady(true);
     })();
+    // This tablet stays open all day — pick up anyone added since it loaded
+    // whenever the screen wakes, instead of only after a manual reload.
+    const onVisible = async () => {
+      if (document.visibilityState !== "visible") return;
+      const fresh = await refreshTeam();
+      if (fresh) setTeam(fresh);
+    };
+    document.addEventListener("visibilitychange", onVisible);
+    return () => document.removeEventListener("visibilitychange", onVisible);
   }, []);
 
   // Auto-logout around 9pm (shop closes at 7) — checked on mount and
