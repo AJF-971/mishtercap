@@ -13,6 +13,11 @@ import { jsPDF } from "jspdf";
 import { Capacitor } from "@capacitor/core";
 import { PushNotifications } from "@capacitor/push-notifications";
 import { Bell } from "lucide-react";
+import { Receipt, Banknote } from "lucide-react";
+import {
+  VAT_RATE_DEFAULT, r2, computeTotals, fmtMoney, fmtPct, amountInWords, proformaNumber, receiptNumber, proformaCounterKey,
+  PAYMENT_METHODS, CHEQUE_STATUSES, paymentSummary, linesFromInvoiceRows, blankLine, issueProblems, reconcileCsv, formatLongDate,
+} from "./billing.js";
 
 /* ---------------------------------------------------------------
    Mr.CAP — Vehicle Workflow Tracker
@@ -32,6 +37,7 @@ let ROLE_DEFS = {
   dentrepair: { label: "Dent Repair",       color: "#B37A2E", simplified: true },
   bodyshop:   { label: "Body Work (Smartech)", color: "#B3402B", simplified: true },
   upholstery: { label: "Upholstery (Beneloom)", color: "#A6752C", simplified: true },
+  accountant: { label: "Accountant",        color: "#5B6B7A", simplified: false },
 };
 
 // Every real, individually-toggleable capability in the app. Admins
@@ -48,6 +54,7 @@ const PERMISSIONS = [
   { key: "archive",    label: "Archive" },
   { key: "customers",  label: "Customers" },
   { key: "quotations", label: "Quotations" },
+  { key: "billing",    label: "Billing (proformas & payments)" },
   { key: "reports",    label: "Reports" },
   { key: "team",       label: "Team" },
   { key: "import",     label: "Import" },
@@ -93,6 +100,9 @@ const DEFAULT_TEAM = [
 function hasPermission(session, team, key) {
   if (!session) return false;
   if (session.role === "admin") return true;
+  // Accountants always have Billing (they are there for it); everything else
+  // an accountant can reach is still switched on per person like anyone else.
+  if (key === "billing" && session.role === "accountant") return true;
   const member = team.find((m) => m.id === session.id);
   return !!member?.permissions?.[key];
 }
@@ -2351,6 +2361,501 @@ async function deleteJob(job, deletedBy) {
   return ok;
 }
 
+/* ---------------- Billing: proformas, payments, First Bit reconciliation ----------------
+   Proformas are issued from here, with their own number series (ZBPI26-…),
+   and paid in cash, cheque or bank transfer. After a handful of jobs the
+   accountant enters them into First Bit and marks them reconciled.
+
+   Billing data lives in three tables that the public key cannot read
+   (proformas, proforma_payments, billing_reconciliation), so — unlike every
+   other screen — it reads AND writes through the db-gatekeeper. It also never
+   uses the offline queue: a number that is issued must be issued right now,
+   not replayed later, so billing needs a live connection and says so. */
+
+const PROFORMA_ISSUERS = {
+  ZB: { label: "Branch · Al Quoz 1", name: "Z Cars Technologies", trn: INVOICE_ISSUER.trn, address: "Shed No#4, MrCap, 24 A Street, PO Box:390822, Behind Grand Supermarket, Al Quoz 1, UAE", tel: "+971 (04) 3469559", email: "" },
+  ZH: { label: "Head Office · Nad Al Hamar", name: "Z Cars Technologies", trn: INVOICE_ISSUER.trn, address: INVOICE_ISSUER.address, tel: INVOICE_ISSUER.tel, email: "" },
+};
+const PAYMENT_TERMS_PRESETS = ["Cash on delivery", "Cheque on delivery", "Bank transfer before release", "50% advance, balance on delivery"];
+const RECONCILE_NUDGE_AT = 5; // "reconcile after 5-6 jobs"
+
+// Billing access: admins always, accountants always, everyone else only when
+// "Billing" is switched on for them (Team screen, or Billing → Access).
+function canUseBilling(session, team) {
+  return hasPermission(session, team, "billing");
+}
+
+// Every billing call goes straight to the gatekeeper and is never queued.
+async function gkCall(envelope) {
+  try {
+    const res = await fetch(GATEKEEPER_URL, {
+      method: "POST",
+      headers: { apikey: SUPABASE_KEY, Authorization: `Bearer ${SUPABASE_KEY}`, "Content-Type": "application/json" },
+      body: JSON.stringify({ headers: {}, actor: currentActor, ...envelope }),
+    });
+    const text = await res.text();
+    if (!res.ok) return { ok: false, status: res.status, error: text.slice(0, 200) || `Failed (${res.status})` };
+    return { ok: true, data: text ? JSON.parse(text) : null };
+  } catch {
+    return { ok: false, offline: true, error: "You're offline. Billing needs a connection so numbers and payments are never duplicated." };
+  }
+}
+async function gkGet(path) {
+  const res = await gkCall({ path, method: "GET" });
+  if (res.ok) { writeCache(`gk:${path}`, res.data); return res; }
+  if (res.offline) {
+    const cached = readCache(`gk:${path}`);
+    if (cached) return { ok: true, data: cached.data, stale: true, cachedAt: cached.at };
+  }
+  return res;
+}
+const nowIso = () => new Date().toISOString();
+
+// Totals for a document: the snapshot taken at issue time when there is one,
+// otherwise worked out live from the lines.
+function docTotals(p) {
+  const live = computeTotals(p.lines, Number(p.vat_rate));
+  if (p.status !== "draft" && p.totals && typeof p.totals.totalIncl === "number") return { ...live, ...p.totals };
+  return live;
+}
+const totalsSnapshot = (t) => ({ subtotalExcl: t.subtotalExcl, totalVat: t.totalVat, totalIncl: t.totalIncl, totalDiscount: t.totalDiscount, hasDiscount: t.hasDiscount });
+
+function blankProforma() {
+  const d = new Date(); d.setDate(d.getDate() + 7);
+  return {
+    id: null, number: null, entity: "ZB", status: "draft", job_id: null, quote_id: null, customer_id: null,
+    bill_to: { name: "", phone: "", trn: "", address: "", email: "" },
+    car: { makeModel: "", color: "", plate: "", vin: "" },
+    lines: [blankLine()], vat_rate: VAT_RATE, payment_terms: "Cash on delivery", delivery_terms: "", notes: "",
+    valid_until: localDateKey(d), supersedes: null,
+  };
+}
+// Starting point for a proforma raised from a job: the same line items the
+// tax invoice would print, the customer's details, and the vehicle.
+function proformaSeedFromJob(job) {
+  const { rows } = buildInvoiceLineItems(job);
+  return {
+    ...blankProforma(),
+    job_id: job.id, customer_id: job.customerId || null,
+    entity: job.commissionEntity === "head_office" ? "ZH" : "ZB",
+    bill_to: { name: job.customerName || "", phone: job.customerPhone || "", trn: "", address: "", email: "" },
+    car: { makeModel: job.makeModel || "", color: "", plate: job.plate || "", vin: "" },
+    lines: rows.length ? linesFromInvoiceRows(rows) : [blankLine()],
+  };
+}
+// A revision is a new draft that will replace (void) the issued original.
+function proformaRevisionSeed(p) {
+  return { ...blankProforma(), ...p, id: null, number: null, status: "draft", totals: null, supersedes: p.id, issued_at: null, issued_by: null, voided_at: null, voided_by: null, void_reason: null, valid_until: blankProforma().valid_until };
+}
+
+async function loadProformaList() {
+  const [pr, pay] = await Promise.all([
+    gkGet("proformas?select=id,number,entity,status,bill_to,car,lines,vat_rate,totals,issued_at,created_at,updated_at,job_id,supersedes,valid_until,void_reason,created_by&order=created_at.desc&limit=500"),
+    gkGet("proforma_payments?select=id,proforma_id,method,amount,cheque_status,cheque_no,cheque_date,paid_on&limit=3000"),
+  ]);
+  if (!pr.ok) return { ok: false, error: pr.error, proformas: [], payments: [] };
+  return { ok: true, stale: !!pr.stale, proformas: pr.data || [], payments: pay.ok ? pay.data || [] : [] };
+}
+async function loadProformaFull(id) {
+  const [pr, pay, rec] = await Promise.all([
+    gkGet(`proformas?id=eq.${encodeURIComponent(id)}&select=*&limit=1`),
+    gkGet(`proforma_payments?proforma_id=eq.${encodeURIComponent(id)}&select=*&order=created_at.asc`),
+    gkGet(`billing_reconciliation?doc_type=eq.proforma&doc_id=eq.${encodeURIComponent(id)}&select=*&limit=1`),
+  ]);
+  if (!pr.ok) return { ok: false, error: pr.error };
+  const proforma = (pr.data || [])[0] || null;
+  return { ok: true, stale: !!pr.stale, proforma, payments: pay.ok ? pay.data || [] : [], reconciliation: rec.ok ? (rec.data || [])[0] || null : null };
+}
+
+function proformaBody(p) {
+  return {
+    entity: p.entity, job_id: p.job_id || null, quote_id: p.quote_id || null, customer_id: p.customer_id || null,
+    bill_to: p.bill_to, car: p.car, lines: p.lines, vat_rate: Number(p.vat_rate),
+    payment_terms: p.payment_terms || null, delivery_terms: p.delivery_terms || null, notes: p.notes || null,
+    valid_until: p.valid_until || null, supersedes: p.supersedes || null, updated_at: nowIso(),
+  };
+}
+async function saveProformaDraft(p, session) {
+  if (p.id) {
+    const res = await gkCall({ path: `proformas?id=eq.${p.id}&status=eq.draft`, method: "PATCH", body: proformaBody(p), headers: { Prefer: "return=representation" }, summary: "Saved a proforma draft" });
+    if (!res.ok) return { ok: false, error: res.error };
+    if (!Array.isArray(res.data) || !res.data.length) return { ok: false, error: "This proforma has already been issued, so it can't be edited. Use Revise to make a new version." };
+    return { ok: true, row: res.data[0] };
+  }
+  const res = await gkCall({ path: "proformas", method: "POST", body: [{ ...proformaBody(p), status: "draft", created_by: session.name }], headers: { Prefer: "return=representation" }, summary: "Started a proforma draft" });
+  if (!res.ok) return { ok: false, error: res.error };
+  if (!Array.isArray(res.data) || !res.data.length) return { ok: false, error: "Couldn't save the proforma." };
+  return { ok: true, row: res.data[0] };
+}
+// Saves, takes the next number, and locks the document. If the number was
+// reserved but the lock failed, `reserved` lets the caller retry with the SAME
+// number instead of burning another one.
+async function issueProforma(p, session, reserved) {
+  const problems = issueProblems(p);
+  if (problems.length) return { ok: false, error: problems.join(" ") };
+  const saved = await saveProformaDraft(p, session);
+  if (!saved.ok) return { ok: false, error: saved.error };
+  const id = saved.row.id;
+  let seq = reserved && reserved.seq;
+  let year = reserved && reserved.year;
+  if (!seq) {
+    year = new Date().getFullYear();
+    const r = await gkCall({ path: "rpc/next_invoice_number", method: "POST", body: { p_entity: proformaCounterKey(p.entity), p_year: year }, summary: "Reserved a proforma number" });
+    if (!r.ok || typeof r.data !== "number") return { ok: false, error: r.offline ? r.error : "Couldn't get the next proforma number. Try again.", id };
+    seq = r.data;
+  }
+  const number = proformaNumber(p.entity, year, seq);
+  const totals = totalsSnapshot(computeTotals(p.lines, Number(p.vat_rate)));
+  const issued = await gkCall({
+    path: `proformas?id=eq.${id}&status=eq.draft`, method: "PATCH",
+    body: { number, status: "issued", totals, issued_at: nowIso(), issued_by: session.name, updated_at: nowIso() },
+    headers: { Prefer: "return=representation" }, summary: `Issued proforma ${number}`,
+  });
+  let row = issued.ok && Array.isArray(issued.data) ? issued.data[0] : null;
+  if (!row) {
+    // The lock may have gone through even though the answer never made it back.
+    const check = await gkCall({ path: `proformas?id=eq.${id}&select=*&limit=1`, method: "GET" });
+    const found = check.ok && Array.isArray(check.data) ? check.data[0] : null;
+    if (found && found.status === "issued" && found.number === number) row = found;
+  }
+  if (!row) return { ok: false, id, reserved: { seq, year }, error: `Number ${number} is reserved but couldn't be saved. Tap Issue again to retry with the same number.` };
+  if (p.supersedes) {
+    await gkCall({ path: `proformas?id=eq.${p.supersedes}&status=eq.issued`, method: "PATCH", body: { status: "void", voided_at: nowIso(), voided_by: session.name, void_reason: `Replaced by ${number}`, updated_at: nowIso() }, headers: { Prefer: "return=minimal" }, summary: `Voided proforma replaced by ${number}` });
+  }
+  return { ok: true, row };
+}
+async function voidProforma(p, reason, session) {
+  const res = await gkCall({ path: `proformas?id=eq.${p.id}&status=eq.issued`, method: "PATCH", body: { status: "void", voided_at: nowIso(), voided_by: session.name, void_reason: reason, updated_at: nowIso() }, headers: { Prefer: "return=representation" }, summary: `Voided proforma ${p.number}` });
+  if (!res.ok) return { ok: false, error: res.error };
+  return Array.isArray(res.data) && res.data.length ? { ok: true, row: res.data[0] } : { ok: false, error: "That proforma can't be voided (it may already be void)." };
+}
+async function deleteProformaDraft(p) {
+  const res = await gkCall({ path: `proformas?id=eq.${p.id}&status=eq.draft`, method: "DELETE", summary: "Deleted a proforma draft" });
+  return res.ok;
+}
+
+async function nextReceiptNumber() {
+  const year = new Date().getFullYear();
+  const r = await gkCall({ path: "rpc/next_invoice_number", method: "POST", body: { p_entity: "RC", p_year: year }, summary: "Reserved a receipt number" });
+  if (!r.ok || typeof r.data !== "number") return { ok: false, error: r.error || "Couldn't get a receipt number." };
+  return { ok: true, number: receiptNumber(year, r.data) };
+}
+async function recordPayment(p, pay, session) {
+  let receipt_no = null;
+  if (pay.method !== "cheque") {
+    const r = await nextReceiptNumber();
+    if (!r.ok) return { ok: false, error: r.error };
+    receipt_no = r.number;
+  }
+  const res = await gkCall({
+    path: "proforma_payments", method: "POST", headers: { Prefer: "return=representation" },
+    body: [{
+      proforma_id: p.id, method: pay.method, amount: Number(pay.amount), paid_on: pay.paid_on || localDateKey(),
+      cheque_no: pay.method === "cheque" ? pay.cheque_no || null : null,
+      cheque_bank: pay.method === "cheque" ? pay.cheque_bank || null : null,
+      cheque_date: pay.method === "cheque" ? pay.cheque_date || null : null,
+      cheque_status: pay.method === "cheque" ? "received" : null,
+      receipt_no, note: pay.note || null, recorded_by: session.name,
+    }],
+    summary: `Recorded ${pay.method} payment of AED ${fmtMoney(pay.amount)} on ${p.number}`,
+  });
+  if (!res.ok) return { ok: false, error: res.error };
+  return { ok: true, row: (res.data || [])[0] };
+}
+async function setChequeStatus(payment, status, p) {
+  let receipt_no = payment.receipt_no || null;
+  if (status === "cleared" && !receipt_no) {
+    const r = await nextReceiptNumber();
+    if (!r.ok) return { ok: false, error: r.error };
+    receipt_no = r.number;
+  }
+  const res = await gkCall({ path: `proforma_payments?id=eq.${payment.id}`, method: "PATCH", body: { cheque_status: status, receipt_no, updated_at: nowIso() }, headers: { Prefer: "return=representation" }, summary: `Cheque ${payment.cheque_no || ""} marked ${status} on ${p.number}` });
+  if (!res.ok) return { ok: false, error: res.error };
+  return { ok: true, row: (res.data || [])[0] };
+}
+async function deletePayment(payment, p) {
+  const res = await gkCall({ path: `proforma_payments?id=eq.${payment.id}`, method: "DELETE", summary: `Removed a payment of AED ${fmtMoney(payment.amount)} from ${p.number}` });
+  return res.ok;
+}
+// Remembers TRN / address / email for next time. Quietly does nothing if the
+// customers table hasn't been given those columns yet.
+async function rememberCustomerDetails(customerId, billTo) {
+  if (!customerId) return;
+  await gkCall({ path: `customers?id=eq.${customerId}`, method: "PATCH", body: { trn: billTo.trn || null, address: billTo.address || null, email: billTo.email || null, updated_at: nowIso() }, headers: { Prefer: "return=minimal" }, summary: "Saved customer billing details" });
+}
+
+// Everything that has been issued but not yet entered in First Bit: issued
+// proformas, plus tax invoices finalised from jobs.
+async function loadReconciliationData() {
+  const [pf, rec, jobs, pay] = await Promise.all([
+    gkGet("proformas?status=eq.issued&select=id,number,entity,bill_to,car,lines,vat_rate,totals,issued_at,job_id&order=issued_at.asc&limit=1000"),
+    gkGet("billing_reconciliation?select=*&order=entered_at.desc&limit=1000"),
+    sbFetch("jobs?invoice_no=not.is.null&select=id,plate,customer_name,invoice_no,invoice_amount,invoice_finalized_at,commission_entity&order=invoice_finalized_at.asc&limit=1000"),
+    gkGet("proforma_payments?select=proforma_id,method,amount,cheque_status&limit=3000"),
+  ]);
+  if (!pf.ok || !rec.ok) return { ok: false, error: (pf.ok ? rec.error : pf.error) || "Couldn't load billing records.", items: [], entered: [] };
+  const paysBy = {};
+  for (const x of pay.ok ? pay.data || [] : []) (paysBy[x.proforma_id] ||= []).push(x);
+  const done = new Set((rec.data || []).map((r) => `${r.doc_type}:${r.doc_id}`));
+  const items = [];
+  for (const p of pf.data || []) {
+    const t = docTotals({ ...p, status: "issued" });
+    const s = paymentSummary(t.totalIncl, paysBy[p.id]);
+    const methods = [...new Set((paysBy[p.id] || []).map((x) => (PAYMENT_METHODS.find((m) => m.key === x.method) || {}).label))].join(" + ");
+    items.push({
+      key: `proforma:${p.id}`, docType: "proforma", docId: p.id, type: "Proforma", number: p.number, date: (p.issued_at || "").slice(0, 10),
+      client: p.bill_to?.name || "", trn: p.bill_to?.trn || "", plate: p.car?.plate || p.car?.vin || "",
+      excl: fmtMoney(t.subtotalExcl), vat: fmtMoney(t.totalVat), incl: fmtMoney(t.totalIncl), inclNum: t.totalIncl,
+      collected: fmtMoney(s.collected), payment: methods || "Unpaid", ref: p.job_id ? `Job ${String(p.job_id).slice(0, 8).toUpperCase()}` : "",
+    });
+  }
+  for (const j of jobs.ok ? jobs.data || [] : []) {
+    if (!j.invoice_finalized_at) continue;
+    const incl = Number(j.invoice_amount) || 0;
+    const excl = r2(incl / (1 + VAT_RATE));
+    items.push({
+      key: `tax_invoice:${j.id}`, docType: "tax_invoice", docId: j.id, type: "Tax invoice", number: j.invoice_no, date: (j.invoice_finalized_at || "").slice(0, 10),
+      client: j.customer_name || "", trn: "", plate: j.plate || "",
+      excl: fmtMoney(excl), vat: fmtMoney(r2(incl - excl)), incl: fmtMoney(incl), inclNum: incl,
+      collected: "", payment: "", ref: `Job ${String(j.id).slice(0, 8).toUpperCase()}`,
+    });
+  }
+  items.sort((a, b) => String(a.date).localeCompare(String(b.date)));
+  const recByKey = new Map((rec.data || []).map((r) => [`${r.doc_type}:${r.doc_id}`, r]));
+  return {
+    ok: true,
+    items: items.filter((i) => !done.has(i.key)),
+    entered: (rec.data || []).slice(0, 30).map((r) => ({ ...r, key: `${r.doc_type}:${r.doc_id}` })),
+    recByKey,
+  };
+}
+async function markReconciled(items, ref, session) {
+  const res = await gkCall({
+    path: "billing_reconciliation?on_conflict=doc_type,doc_id", method: "POST", headers: { Prefer: "resolution=ignore-duplicates,return=minimal" },
+    body: items.map((i) => ({ doc_type: i.docType, doc_id: i.docId, doc_number: i.number, amount: i.inclNum, first_bit_ref: ref || null, entered_by: session.name })),
+    summary: `Marked ${items.length} document${items.length === 1 ? "" : "s"} as entered in First Bit`,
+  });
+  return res.ok ? { ok: true } : { ok: false, error: res.error };
+}
+async function unmarkReconciled(row) {
+  const res = await gkCall({ path: `billing_reconciliation?id=eq.${row.id}`, method: "DELETE", summary: `Un-marked ${row.doc_number || "a document"} as entered in First Bit` });
+  return res.ok;
+}
+function downloadTextFile(name, text, mime = "text/csv;charset=utf-8") {
+  const url = URL.createObjectURL(new Blob([text], { type: mime }));
+  const a = document.createElement("a");
+  a.href = url; a.download = name;
+  document.body.appendChild(a); a.click(); a.remove();
+  setTimeout(() => URL.revokeObjectURL(url), 4000); // revoking straight away cancels the download in Safari and WebViews
+}
+
+// ---- PDFs -----------------------------------------------------------------
+// Laid out like the proformas the shop already issues from First Bit
+// (ZBPI26-…): Issued By / Bill To, bank details, terms, a VAT line table that
+// only shows the Discount column when a line has one, totals, amount in
+// words, notes and a "Released By" line.
+function generateProformaPDF(p) {
+  const doc = new jsPDF({ unit: "pt", format: "a4" });
+  const pageW = doc.internal.pageSize.getWidth();
+  const margin = 36;
+  const right = pageW - margin;
+  const DARK = [20, 20, 20], GREY = [110, 110, 110], LINE = [175, 175, 175];
+  const issuer = PROFORMA_ISSUERS[p.entity] || PROFORMA_ISSUERS.ZB;
+  const bill = p.bill_to || {};
+  const car = p.car || {};
+  const totals = docTotals(p);
+  const disc = totals.hasDiscount;
+
+  const watermark = () => {
+    if (p.status !== "void" && p.status !== "draft") return;
+    doc.setFont("helvetica", "bold"); doc.setFontSize(96); doc.setTextColor(232, 232, 232);
+    doc.text(p.status === "void" ? "VOID" : "DRAFT", pageW / 2, 470, { align: "center", angle: 35 });
+  };
+  watermark();
+
+  const label = (t, x, y) => { doc.setFont("helvetica", "bold"); doc.setFontSize(8); doc.setTextColor(...GREY); doc.text(t, x, y); };
+  const value = (t, x, y, size = 8.5, bold = false) => { doc.setFont("helvetica", bold ? "bold" : "normal"); doc.setFontSize(size); doc.setTextColor(...DARK); doc.text(String(t || ""), x, y); };
+
+  doc.setFont("helvetica", "bold"); doc.setFontSize(15); doc.setTextColor(...DARK);
+  doc.text("PROFORMA INVOICE", margin, 52);
+  doc.setFont("helvetica", "normal"); doc.setFontSize(9.5);
+  doc.text(`# ${p.number || "DRAFT (not yet issued)"}`, margin, 68);
+  doc.text(formatLongDate(p.issued_at || new Date()), margin, 82);
+
+  // Issued By | Bill To
+  let y = 96;
+  const midX = margin + (right - margin) / 2;
+  const boxH = 92;
+  doc.setDrawColor(...LINE); doc.rect(margin, y, right - margin, boxH); doc.line(midX, y, midX, y + boxH);
+  doc.setFont("helvetica", "bold"); doc.setFontSize(9); doc.setTextColor(...DARK);
+  doc.text("Issued By:", (margin + midX) / 2, y + 14, { align: "center" });
+  doc.text("Bill To:", (midX + right) / 2, y + 14, { align: "center" });
+  const block = (x0, rows, nameText) => {
+    let ty = y + 30;
+    value(nameText, x0, ty, 9, true); ty += 13;
+    rows.forEach(([k, v]) => {
+      label(k, x0, ty);
+      const lines = doc.splitTextToSize(String(v || ""), midX - margin - 74);
+      doc.setFont("helvetica", "normal"); doc.setFontSize(8); doc.setTextColor(...DARK);
+      doc.text(lines.length ? lines : [""], x0 + 46, ty);
+      ty += Math.max(lines.length, 1) * 10 + 2;
+    });
+  };
+  block(margin + 8, [["TRN:", issuer.trn], ["Address:", issuer.address], ["Tel.:", issuer.tel], ["E-mail:", issuer.email]], issuer.name);
+  block(midX + 8, [["TRN:", bill.trn], ["Address:", bill.address], ["Tel.:", bill.phone], ["E-mail:", bill.email]], bill.name || "");
+
+  // Bank Details | Terms
+  y += boxH + 6;
+  const box2H = 62;
+  doc.setDrawColor(...LINE); doc.rect(margin, y, right - margin, box2H); doc.line(midX, y, midX, y + box2H);
+  doc.setFont("helvetica", "bold"); doc.setFontSize(9); doc.setTextColor(...DARK);
+  doc.text("Bank Details:", (margin + midX) / 2, y + 13, { align: "center" });
+  doc.text("Terms and Conditions", (midX + right) / 2, y + 13, { align: "center" });
+  value(INVOICE_ISSUER.bankName, margin + 8, y + 26, 8.5, true);
+  label("IBAN:", margin + 8, y + 37); value(INVOICE_ISSUER.iban, margin + 46, y + 37, 8);
+  label("SWIFT:", margin + 8, y + 47); value(INVOICE_ISSUER.swift, margin + 46, y + 47, 8);
+  label("Beneficiary:", margin + 8, y + 57); value(INVOICE_ISSUER.beneficiary, margin + 62, y + 57, 8);
+  label("Payment Terms:", midX + 8, y + 26); value(p.payment_terms, midX + 78, y + 26, 8);
+  label("Delivery Terms:", midX + 8, y + 37); value(p.delivery_terms, midX + 78, y + 37, 8);
+  if (p.valid_until) { label("Valid Until:", midX + 8, y + 48); value(formatLongDate(`${p.valid_until}T12:00:00`), midX + 78, y + 48, 8); }
+
+  // Line table
+  y += box2H + 12;
+  const C = disc
+    ? { idx: margin + 5, desc: margin + 22, descW: 150, qtyR: margin + 218, uom: margin + 226, priceR: margin + 296, discR: margin + 338, vatPctR: margin + 372, vatAmtR: margin + 432, amtR: right - 4 }
+    : { idx: margin + 5, desc: margin + 22, descW: 210, qtyR: margin + 268, uom: margin + 278, priceR: margin + 350, discR: 0, vatPctR: margin + 392, vatAmtR: margin + 450, amtR: right - 4 };
+  const drawHead = () => {
+    const h = 36;
+    doc.setFillColor(238, 238, 238); doc.rect(margin, y, right - margin, h, "F");
+    doc.setDrawColor(...LINE); doc.rect(margin, y, right - margin, h);
+    doc.setFont("helvetica", "bold"); doc.setFontSize(7); doc.setTextColor(...DARK);
+    doc.text("#", C.idx, y + 12);
+    doc.text("Description", C.desc, y + 12);
+    doc.text("Quantity", C.qtyR, y + 12, { align: "right" });
+    doc.text("UOM", C.uom, y + 12);
+    doc.text(["Price", "(Excl. VAT)", "(AED)"], C.priceR, y + 12, { align: "right" });
+    if (disc) doc.text(["Discount,", "%"], C.discR, y + 12, { align: "right" });
+    doc.text(["VAT,", "%"], C.vatPctR, y + 12, { align: "right" });
+    doc.text(["VAT Amount", "(AED)"], C.vatAmtR, y + 12, { align: "right" });
+    doc.text(["Amount,", "(AED)"], C.amtR, y + 12, { align: "right" });
+    y += h;
+  };
+  drawHead();
+  doc.setFont("helvetica", "normal"); doc.setFontSize(8.5);
+  totals.rows.forEach((r, i) => {
+    const descLines = doc.splitTextToSize(String(r.desc || ""), C.descW);
+    const rowH = Math.max(18, descLines.length * 10 + 8);
+    if (y + rowH > 760) { doc.addPage(); watermark(); y = 40; drawHead(); doc.setFont("helvetica", "normal"); doc.setFontSize(8.5); }
+    doc.setDrawColor(...LINE); doc.rect(margin, y, right - margin, rowH);
+    doc.setTextColor(...DARK); doc.setFont("helvetica", "normal"); doc.setFontSize(8.5);
+    const ty = y + 12;
+    doc.text(String(i + 1), C.idx, ty);
+    doc.text(descLines, C.desc, ty);
+    doc.text(Number(r.qty).toFixed(3), C.qtyR, ty, { align: "right" });
+    doc.text(String(r.uom || "Pcs"), C.uom, ty);
+    doc.text(fmtMoney(r.price), C.priceR, ty, { align: "right" });
+    if (disc) doc.text(fmtPct(r.discountPct), C.discR, ty, { align: "right" });
+    doc.text(String(Math.round(Number(p.vat_rate) * 100 * 100) / 100), C.vatPctR, ty, { align: "right" });
+    doc.text(fmtMoney(r.vat), C.vatAmtR, ty, { align: "right" });
+    doc.text(fmtMoney(r.incl), C.amtR, ty, { align: "right" });
+    y += rowH;
+  });
+
+  // Amount in words + totals
+  y += 16;
+  if (y > 700) { doc.addPage(); watermark(); y = 50; }
+  doc.setFont("helvetica", "bold"); doc.setFontSize(8.5); doc.setTextColor(...DARK);
+  doc.text("Amount in Words:", margin, y);
+  doc.setFont("helvetica", "normal");
+  const words = doc.splitTextToSize(amountInWords(totals.totalIncl), 250);
+  doc.text(words, margin + 82, y);
+  const totalsLabelX = right - 190;
+  let ty = y;
+  const totalLine = (lbl, val, bold) => {
+    doc.setFont("helvetica", bold ? "bold" : "normal"); doc.setFontSize(bold ? 9.5 : 9); doc.setTextColor(...DARK);
+    doc.text(lbl, totalsLabelX, ty);
+    doc.text(val, right - 4, ty, { align: "right" });
+    ty += 16;
+  };
+  if (disc) totalLine("Total Discount, (AED):", fmtMoney(totals.totalDiscount));
+  totalLine("Total (Excl. VAT), (AED):", fmtMoney(totals.subtotalExcl));
+  totalLine("Total VAT, (AED):", fmtMoney(totals.totalVat));
+  totalLine("Total (Incl. VAT), (AED):", fmtMoney(totals.totalIncl), true);
+  y = Math.max(ty, y + words.length * 11) + 14;
+
+  // Notes
+  doc.setFont("helvetica", "bold"); doc.setFontSize(9); doc.setTextColor(...DARK);
+  doc.text("Terms and Conditions:", margin - 6, y);
+  y += 16;
+  doc.setFont("helvetica", "normal"); doc.setFontSize(8.5);
+  const noteLines = [];
+  if (car.makeModel) noteLines.push(`MAKE/MODEL: ${car.makeModel}`);
+  if (car.color) noteLines.push(`COLOR: ${car.color}`);
+  if (car.plate) noteLines.push(`PLATE NO: ${car.plate}`);
+  if (car.vin) noteLines.push(`VIN: ${car.vin}`);
+  if (p.notes) doc.splitTextToSize(p.notes, right - margin).forEach((l) => noteLines.push(l));
+  noteLines.forEach((l) => { if (y > 790) { doc.addPage(); watermark(); y = 50; } doc.text(l, margin - 6, y); y += 10.5; });
+
+  y = Math.max(y + 50, 470);
+  if (y > 780) { doc.addPage(); watermark(); y = 120; }
+  doc.setDrawColor(...LINE); doc.line(margin + 20, y, margin + 150, y);
+  doc.setFont("helvetica", "bold"); doc.setFontSize(8.5); doc.setTextColor(...DARK);
+  doc.text("Released By", margin + 52, y + 13);
+  if (p.status === "void") {
+    doc.setFont("helvetica", "bold"); doc.setFontSize(9); doc.setTextColor(168, 64, 47);
+    doc.text(`VOID${p.void_reason ? `: ${p.void_reason}` : ""}`, margin + 20, y + 40);
+  }
+  return doc;
+}
+
+function generateReceiptPDF(p, payment, summary) {
+  const doc = new jsPDF({ unit: "pt", format: "a5" });
+  const pageW = doc.internal.pageSize.getWidth();
+  const margin = 32;
+  const right = pageW - margin;
+  const DARK = [20, 20, 20], GREY = [110, 110, 110], LINE = [175, 175, 175];
+  const issuer = PROFORMA_ISSUERS[p.entity] || PROFORMA_ISSUERS.ZB;
+  const method = (PAYMENT_METHODS.find((m) => m.key === payment.method) || {}).label || payment.method;
+  doc.setFont("helvetica", "bold"); doc.setFontSize(15); doc.setTextColor(...DARK);
+  doc.text("PAYMENT RECEIPT", margin, 48);
+  doc.setFont("helvetica", "normal"); doc.setFontSize(9.5);
+  doc.text(`# ${payment.receipt_no || "-"}`, margin, 63);
+  doc.text(formatLongDate(`${payment.paid_on || localDateKey()}T12:00:00`), margin, 76);
+  doc.setFontSize(8.5); doc.setTextColor(...GREY);
+  doc.text([issuer.name, `TRN: ${issuer.trn}`, issuer.address, `Tel.: ${issuer.tel}`], right, 48, { align: "right" });
+  doc.setDrawColor(...LINE); doc.line(margin, 100, right, 100);
+
+  let y = 124;
+  const row = (k, v) => {
+    doc.setFont("helvetica", "bold"); doc.setFontSize(8.5); doc.setTextColor(...GREY); doc.text(k, margin, y);
+    doc.setFont("helvetica", "normal"); doc.setFontSize(10); doc.setTextColor(...DARK);
+    const lines = doc.splitTextToSize(String(v || "-"), right - margin - 110);
+    doc.text(lines, margin + 110, y);
+    y += Math.max(lines.length, 1) * 13 + 5;
+  };
+  row("Received from", p.bill_to?.name);
+  row("Amount", `AED ${fmtMoney(payment.amount)}`);
+  row("In words", amountInWords(payment.amount));
+  row("Payment method", method);
+  if (payment.method === "cheque") {
+    row("Cheque no.", payment.cheque_no);
+    row("Bank", payment.cheque_bank);
+    row("Cheque date", payment.cheque_date ? formatLongDate(`${payment.cheque_date}T12:00:00`) : "");
+  }
+  row("Against", `Proforma ${p.number}${p.car?.plate ? ` · ${p.car.plate}` : ""}`);
+  if (summary) {
+    row("Proforma total", `AED ${fmtMoney(docTotals(p).totalIncl)}`);
+    row("Balance after this", `AED ${fmtMoney(summary.balance)}`);
+  }
+  y = Math.max(y + 40, 380);
+  doc.setDrawColor(...LINE); doc.line(margin, y, margin + 150, y); doc.line(right - 150, y, right, y);
+  doc.setFont("helvetica", "bold"); doc.setFontSize(8.5); doc.setTextColor(...DARK);
+  doc.text("Received By (Mr.CAP)", margin, y + 13);
+  doc.text("Paid By", right - 150, y + 13);
+  if (payment.recorded_by) { doc.setFont("helvetica", "normal"); doc.setFontSize(8); doc.setTextColor(...GREY); doc.text(`Recorded by ${payment.recorded_by}`, margin, y + 26); }
+  return doc;
+}
+
 /* ---------------- UI atoms ---------------- */
 // A handful of pulsing placeholder rows, shaped like the real list item
 // they'll be replaced by — used wherever a screen used to just say
@@ -2558,6 +3063,7 @@ function DesktopShell({ session, team, view, setView, onLogout, canArchive, chil
           {navItem("list", "Dashboard", LayoutDashboard, () => setView("list"))}
           {navItem("customers", "Customers", Users, () => setView("customers"), hasPermission(session, team, "customers"))}
           {navItem("quotes", "Quotations", FileText, () => setView("quotes"), hasPermission(session, team, "quotations"))}
+          {navItem("billing", "Billing", Receipt, () => setView("billing"), canUseBilling(session, team))}
           {navItem("reports", "Reports", BarChart3, () => setView("reports"), hasPermission(session, team, "reports"))}
           {navItem("archive", "Archive", Archive, () => setView("archive"), canArchive)}
           {navItem("team", "Team", ShieldCheck, () => setView("team"), hasPermission(session, team, "team"))}
@@ -3312,6 +3818,9 @@ export default function GarageApp() {
       if (state.mrcapView === "quotedetail" && state.activeQuoteId) {
         setActiveQuoteId(state.activeQuoteId);
       }
+      if (state.mrcapView === "proformadetail" && state.activeProformaId) {
+        setActiveProformaId(state.activeProformaId);
+      }
     };
     window.addEventListener("popstate", onPopState);
     // Seed the initial entry once, so the very first back-press has a
@@ -3425,6 +3934,19 @@ export default function GarageApp() {
   const openJob = (id, job) => { setActiveId(id); setActiveJob(job || null); setView("detail", { activeId: id }); logEvent("view", `Viewed job${job?.plate ? ` ${job.plate}` : ""} (${id.slice(0, 8)})`); };
   const [activeQuoteId, setActiveQuoteId] = useState(null);
   const openQuote = (id) => { setActiveQuoteId(id); setView("quotedetail", { activeQuoteId: id }); logEvent("view", `Viewed quote (${id.slice(0, 8)})`); };
+  // Billing. The editor is a screen of its own; when it finishes it REPLACES
+  // its history entry with the proforma's page, so Back from there goes to the
+  // list rather than back into an editor whose draft has just been issued.
+  const [activeProformaId, setActiveProformaId] = useState(null);
+  const [proformaSeed, setProformaSeed] = useState(null);
+  const openProforma = (id) => { setActiveProformaId(id); setView("proformadetail", { activeProformaId: id }); };
+  const newProforma = (seed) => { setProformaSeed(seed || null); setView("proformaedit"); };
+  const finishProformaEdit = (row) => {
+    setActiveProformaId(row.id);
+    setViewRaw("proformadetail");
+    window.history.replaceState({ mrcapView: "proformadetail", activeProformaId: row.id }, "");
+  };
+  const canBilling = canUseBilling(session, team);
   const canArchive = hasPermission(session, team, "archive");
 
   if (!ready) return <Shell><div style={{ padding: 40, textAlign: "center", color: COLORS.muted }}>Loading…</div></Shell>;
@@ -3442,7 +3964,7 @@ export default function GarageApp() {
   return (
     <ActiveShell session={session} team={team} view={view} setView={setView} onLogout={onLogout} canArchive={canArchive}>
       <ReportIssueButton session={session} view={view} />
-      <TopBar session={session} team={team} onLogout={onLogout} onNew={() => setView("new")} view={view} onBack={() => window.history.back()} onTeam={() => setView("team")} onArchive={() => setView("archive")} onCustomers={() => setView("customers")} onReports={() => setView("reports")} onQuotes={() => setView("quotes")} canArchive={canArchive} onAdminDash={() => setView("admindash")} onMsgTemplates={() => setView("msgtemplates")} onIssues={() => setView("issues")} onDispatch={() => setView("dispatch")} onLiveUpdates={() => setView("liveupdates")} onAnnouncements={() => setView("announcements")} />
+      <TopBar session={session} team={team} onLogout={onLogout} onNew={() => setView("new")} view={view} onBack={() => window.history.back()} onTeam={() => setView("team")} onArchive={() => setView("archive")} onCustomers={() => setView("customers")} onReports={() => setView("reports")} onQuotes={() => setView("quotes")} canArchive={canArchive} onAdminDash={() => setView("admindash")} onMsgTemplates={() => setView("msgtemplates")} onIssues={() => setView("issues")} onDispatch={() => setView("dispatch")} onLiveUpdates={() => setView("liveupdates")} onAnnouncements={() => setView("announcements")} onBilling={() => setView("billing")} />
       {showMorningReminder && <MorningReminderBanner onDismiss={() => { setShowMorningReminder(false); dismissMorningReminder("mrcap"); }} />}
       <AnnouncementBanner session={session} />
       <LiveUpdateBroadcaster onOpenJob={(id) => openJob(id)} />
@@ -3485,7 +4007,7 @@ export default function GarageApp() {
       )}
       {view === "park" && !isFullDashboardRole(session) && <AccessDenied onBack={() => window.history.back()} />}
       {view === "detail" && activeId && (
-        <JobDetail id={activeId} initialJob={activeJob} session={session} team={team} onChanged={(job, saved) => { upsertIndex(job); setActiveJob(job); setSyncState(saved ? "ok" : "failed"); if (saved) setLastSyncedAt(Date.now()); }} onBack={() => window.history.back()} canArchive={canArchive} onDeleted={(jobId) => { removeFromIndex(jobId); window.history.back(); }} />
+        <JobDetail id={activeId} initialJob={activeJob} session={session} team={team} onChanged={(job, saved) => { upsertIndex(job); setActiveJob(job); setSyncState(saved ? "ok" : "failed"); if (saved) setLastSyncedAt(Date.now()); }} onBack={() => window.history.back()} canArchive={canArchive} onDeleted={(jobId) => { removeFromIndex(jobId); window.history.back(); }} onCreateProforma={(job) => newProforma(proformaSeedFromJob(job))} />
       )}
       {view === "team" && hasPermission(session, team, "team") && (
         <TeamScreen team={team} setTeam={setTeam} session={session} onBack={() => window.history.back()} onImport={() => setView("import")} onServices={() => setView("services")} canServices={hasPermission(session, team, "services")} onActivityLog={() => setView("activitylog")} onNotify={() => setView("notify")} />
@@ -3549,6 +4071,16 @@ export default function GarageApp() {
         <QuoteDetail id={activeQuoteId} session={session} team={team} onBack={() => window.history.back()} onConverted={(job) => { upsertIndex(job); openJob(job.id, job); }} />
       )}
       {view === "quotedetail" && !hasPermission(session, team, "quotations") && <AccessDenied onBack={() => window.history.back()} />}
+      {view === "billing" && canBilling && (
+        <BillingScreen session={session} team={team} setTeam={setTeam} onBack={() => window.history.back()} onOpen={openProforma} onNew={() => newProforma(null)} />
+      )}
+      {view === "proformaedit" && canBilling && (
+        <ProformaEditor key={(proformaSeed && (proformaSeed.id || proformaSeed.supersedes || proformaSeed.job_id)) || "new"} seed={proformaSeed} session={session} onCancel={() => window.history.back()} onDone={finishProformaEdit} />
+      )}
+      {view === "proformadetail" && activeProformaId && canBilling && (
+        <ProformaDetail id={activeProformaId} session={session} team={team} onBack={() => window.history.back()} onEditDraft={(p) => newProforma(p)} onRevise={(seed) => newProforma(seed)} onOpenJob={(jobId) => openJob(jobId)} onDeleted={() => window.history.back()} />
+      )}
+      {(view === "billing" || view === "proformaedit" || view === "proformadetail") && !canBilling && <AccessDenied onBack={() => window.history.back()} />}
     </ActiveShell>
   );
 }
@@ -3796,7 +4328,7 @@ function useViewportWidth() {
   return w;
 }
 
-function TopBar({ session, team, onLogout, onNew, view, onBack, onTeam, onArchive, onCustomers, onReports, onQuotes, canArchive, onAdminDash, onMsgTemplates, onIssues, onDispatch, onLiveUpdates, onAnnouncements }) {
+function TopBar({ session, team, onLogout, onNew, view, onBack, onTeam, onArchive, onCustomers, onReports, onQuotes, canArchive, onAdminDash, onMsgTemplates, onIssues, onDispatch, onLiveUpdates, onAnnouncements, onBilling }) {
   const isSimplified = isSimplifiedRole(session);
   const viewportW = useViewportWidth();
   // Every destination this login can reach, in the order they've always
@@ -3812,9 +4344,10 @@ function TopBar({ session, team, onLogout, onNew, view, onBack, onTeam, onArchiv
     { key: "reports", title: "Reports", Icon: BarChart3, onClick: onReports, allowed: hasPermission(session, team, "reports") },
     { key: "team", title: "Team", Icon: ShieldCheck, onClick: onTeam, allowed: hasPermission(session, team, "team") },
     { key: "dispatch", title: "Dispatch Board", Icon: ListChecks, onClick: onDispatch, allowed: true },
+    { key: "billing", title: "Billing", Icon: Receipt, onClick: onBilling, allowed: canUseBilling(session, team) },
   ].filter((n) => n.allowed) : [];
   const maxDirect = viewportW >= 370 ? 4 : 3;
-  const demoteOrder = ["team", "archive", "reports", "customers", "quotes"];
+  const demoteOrder = ["team", "archive", "billing", "reports", "customers", "quotes"];
   const directKeys = new Set(navAll.map((n) => n.key));
   for (const k of demoteOrder) { if (directKeys.size <= maxDirect) break; directKeys.delete(k); }
   const directNav = navAll.filter((n) => directKeys.has(n.key));
@@ -5662,7 +6195,7 @@ function EditJobScreen({ job, session, onSaved, onCancel }) {
   );
 }
 
-function JobDetail({ id, initialJob, session, team, onChanged, onBack, canArchive, onDeleted }) {
+function JobDetail({ id, initialJob, session, team, onChanged, onBack, canArchive, onDeleted, onCreateProforma }) {
   const [job, setJob] = useState(initialJob || null);
   const [loadError, setLoadError] = useState(false);
   const [note, setNote] = useState("");
@@ -6420,6 +6953,12 @@ function JobDetail({ id, initialJob, session, team, onChanged, onBack, canArchiv
             <FileText size={15} /> {finalizingInvoice ? "Finalizing..." : job.invoiceNo ? "Reprint Invoice" : "Finalize & Generate Invoice"}
           </button>
         </div>
+      )}
+
+      {onCreateProforma && canUseBilling(session, team) && (
+        <button onClick={() => onCreateProforma(job)} className="mrcap-press" style={{ display: "flex", alignItems: "center", justifyContent: "center", gap: 8, width: "100%", padding: "11px", borderRadius: 10, border: `1.5px solid ${COLORS.gold}`, background: "transparent", color: COLORS.gold, fontWeight: 700, fontSize: 13, cursor: "pointer", marginBottom: 12 }}>
+          <Receipt size={15} /> Create Proforma for this job
+        </button>
       )}
 
       {(hasPermission(session, team, "editJob") || hasPermission(session, team, "sendBack")) && (
@@ -9092,6 +9631,696 @@ function QuoteDetail({ id, session, team, onBack, onConverted }) {
 // "ceramic_coating"), used for new category/role/treatment ids. Falls
 // back to a short random suffix if the slug is empty (e.g. label was
 // all punctuation) so we never write a blank key.
+/* ---------------- Billing screens ---------------- */
+const billCard = { background: COLORS.panel, border: `1px solid ${COLORS.line}`, borderRadius: 12, padding: 14, marginBottom: 12 };
+const chipBtn = (active, tone = COLORS.gold) => ({
+  padding: "8px 12px", borderRadius: 999, fontSize: 12.5, fontWeight: 600, cursor: "pointer",
+  border: `1.5px solid ${active ? tone : COLORS.line}`, background: active ? tone : COLORS.panel2,
+  color: active ? COLORS.darkText : COLORS.ink,
+});
+const smallLabel = { fontSize: 11, fontWeight: 600, color: COLORS.muted, textTransform: "uppercase", letterSpacing: 0.4 };
+const moneyText = (n) => `AED ${fmtMoney(n)}`;
+
+function BillingStat({ label, value, sub, tone }) {
+  return (
+    <div style={{ flex: 1, minWidth: 0, background: COLORS.panel, border: `1px solid ${COLORS.line}`, borderRadius: 12, padding: "11px 12px" }}>
+      <div style={{ fontSize: 10.5, fontWeight: 600, color: COLORS.muted, textTransform: "uppercase", letterSpacing: 0.4 }}>{label}</div>
+      <div style={{ fontFamily: MONO_FONT, fontWeight: 700, fontSize: 15, color: tone || COLORS.ink, marginTop: 4, overflow: "hidden", textOverflow: "ellipsis" }}>{value}</div>
+      {sub ? <div style={{ fontSize: 10.5, color: COLORS.muted, marginTop: 2 }}>{sub}</div> : null}
+    </div>
+  );
+}
+
+// A proforma's payment state, worked out from its payments.
+function proformaState(p, payments) {
+  const t = docTotals(p);
+  const s = paymentSummary(t.totalIncl, payments);
+  if (p.status === "draft") return { label: "Draft", tone: "default", t, s };
+  if (p.status === "void") return { label: "Void", tone: "red", t, s };
+  if (s.status === "paid") return { label: "Paid", tone: "green", t, s };
+  if (s.status === "part") return { label: "Part paid", tone: "yellow", t, s };
+  return { label: "Unpaid", tone: "blue", t, s };
+}
+
+function BillingScreen({ session, team, setTeam, onBack, onOpen, onNew }) {
+  const [tab, setTab] = useState("proformas");
+  const [list, setList] = useState({ loading: true, proformas: [], payments: [] });
+  const [recon, setRecon] = useState({ loading: true, items: [], entered: [] });
+  const [search, setSearch] = useState("");
+  const [filter, setFilter] = useState("all");
+
+  const reload = useCallback(async () => {
+    const [a, b] = await Promise.all([loadProformaList(), loadReconciliationData()]);
+    setList({ loading: false, ...a });
+    setRecon({ loading: false, ...b });
+  }, []);
+  useEffect(() => { reload(); }, [reload]);
+
+  const paysBy = {};
+  for (const x of list.payments || []) (paysBy[x.proforma_id] ||= []).push(x);
+  const rows = (list.proformas || []).map((p) => ({ p, st: proformaState(p, paysBy[p.id]) }));
+
+  let outstanding = 0; let chequesN = 0; let chequesAmt = 0; let returnedN = 0;
+  for (const r of rows) {
+    if (r.p.status !== "issued") continue;
+    outstanding += r.st.s.balance;
+    if (r.st.s.pendingCheques > 0) { chequesN += 1; chequesAmt += r.st.s.pendingCheques; }
+    if (r.st.s.returnedCheques > 0) returnedN += 1;
+  }
+
+  const q = search.trim().toLowerCase();
+  const shown = rows.filter(({ p, st }) => {
+    if (filter === "draft" && p.status !== "draft") return false;
+    if (filter === "void" && p.status !== "void") return false;
+    if (filter === "unpaid" && !(p.status === "issued" && st.s.status !== "paid")) return false;
+    if (filter === "paid" && !(p.status === "issued" && st.s.status === "paid")) return false;
+    if (!q) return true;
+    return [p.number, p.bill_to?.name, p.bill_to?.phone, p.car?.plate, p.car?.makeModel].some((v) => String(v || "").toLowerCase().includes(q));
+  });
+
+  const pending = (recon.items || []).length;
+  const tabBtn = (key, label, badge) => (
+    <button key={key} onClick={() => setTab(key)} className="mrcap-press" style={{ flex: 1, padding: "9px 6px", borderRadius: 8, border: "none", cursor: "pointer", fontSize: 12.5, fontWeight: 700, background: tab === key ? COLORS.gold : "transparent", color: tab === key ? COLORS.darkText : COLORS.muted }}>
+      {label}{badge ? ` · ${badge}` : ""}
+    </button>
+  );
+
+  return (
+    <div className="mrcap-view" style={{ padding: "0 18px 96px" }}>
+      <SectionTitle>Billing</SectionTitle>
+      <div style={{ display: "flex", gap: 6, background: COLORS.panel2, borderRadius: 10, padding: 3, marginBottom: 14 }}>
+        {tabBtn("proformas", "Proformas")}
+        {tabBtn("reconcile", "First Bit", pending || "")}
+        {session.role === "admin" && tabBtn("access", "Access")}
+      </div>
+
+      {list.stale && <div style={{ fontSize: 11.5, color: COLORS.gold, marginBottom: 10 }}>Offline: showing what was last loaded.</div>}
+      {!list.loading && list.ok === false && (
+        <div style={{ ...billCard, borderColor: COLORS.red, color: "#E08A78", fontSize: 12.5 }}>
+          Couldn't load billing records. {list.error || ""} <button onClick={reload} className="mrcap-press" style={{ marginLeft: 6, color: COLORS.gold, background: "none", border: "none", fontWeight: 700, cursor: "pointer" }}>Try again</button>
+        </div>
+      )}
+
+      {tab === "proformas" && (
+        <>
+          <div style={{ display: "flex", gap: 8, marginBottom: 12 }}>
+            <BillingStat label="Outstanding" value={moneyText(outstanding)} />
+            <BillingStat label="Cheques pending" value={String(chequesN)} sub={chequesN ? moneyText(chequesAmt) : "none"} tone={chequesN ? COLORS.gold : undefined} />
+            <BillingStat label="Returned" value={String(returnedN)} tone={returnedN ? "#E08A78" : undefined} />
+          </div>
+          {pending >= RECONCILE_NUDGE_AT && (
+            <button onClick={() => setTab("reconcile")} className="mrcap-press" style={{ ...billCard, width: "100%", textAlign: "left", cursor: "pointer", borderColor: COLORS.gold, background: "rgba(201,162,39,0.1)", color: COLORS.gold, fontSize: 12.5, fontWeight: 700 }}>
+              {pending} documents are waiting to be entered in First Bit. Tap to reconcile.
+            </button>
+          )}
+          <div style={{ position: "relative", marginBottom: 10 }}>
+            <Search size={15} color={COLORS.muted} style={{ position: "absolute", left: 12, top: 12 }} />
+            <input value={search} onChange={(e) => setSearch(e.target.value)} placeholder="Search number, client or plate…" style={{ ...inputStyle, marginTop: 0, paddingLeft: 34 }} />
+          </div>
+          <div style={{ display: "flex", gap: 6, overflowX: "auto", marginBottom: 12, paddingBottom: 2 }}>
+            {[["all", "All"], ["unpaid", "Unpaid"], ["paid", "Paid"], ["draft", "Drafts"], ["void", "Void"]].map(([k, l]) => (
+              <button key={k} onClick={() => setFilter(k)} className="mrcap-press" style={{ ...chipBtn(filter === k), flexShrink: 0 }}>{l}</button>
+            ))}
+          </div>
+          {list.loading && <SkeletonRows count={3} height={78} />}
+          {!list.loading && list.ok !== false && shown.length === 0 && (
+            <div style={{ textAlign: "center", padding: "40px 10px", color: COLORS.muted }}>
+              <Receipt size={26} style={{ opacity: 0.4, marginBottom: 8 }} />
+              <div style={{ fontSize: 14 }}>{rows.length ? "Nothing matches." : "No proformas yet. Tap New Proforma to raise the first one."}</div>
+            </div>
+          )}
+          <div style={{ display: "flex", flexDirection: "column", gap: 10 }}>
+            {shown.map(({ p, st }) => (
+              <button key={p.id} onClick={() => onOpen(p.id)} className="mrcap-press" style={{ textAlign: "left", width: "100%", boxSizing: "border-box", background: COLORS.panel, border: `1px solid ${COLORS.line}`, borderLeft: `3px solid ${p.status === "void" ? COLORS.red : p.status === "draft" ? COLORS.muted : COLORS.gold}`, borderRadius: "4px 10px 10px 4px", padding: "12px 14px", cursor: "pointer", opacity: p.status === "void" ? 0.6 : 1 }}>
+                <div style={{ display: "flex", justifyContent: "space-between", alignItems: "flex-start", gap: 8 }}>
+                  <div style={{ minWidth: 0 }}>
+                    <div style={{ fontFamily: MONO_FONT, fontWeight: 600, fontSize: 14, color: COLORS.ink }}>{p.number || "Draft"}</div>
+                    <div style={{ fontSize: 12.5, color: COLORS.ink, marginTop: 2, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{p.bill_to?.name || "No client yet"}</div>
+                    <div style={{ fontSize: 11.5, color: COLORS.muted, marginTop: 1 }}>{[p.car?.makeModel, p.car?.plate].filter(Boolean).join(" · ")}</div>
+                  </div>
+                  <div style={{ textAlign: "right", flexShrink: 0 }}>
+                    <div style={{ fontFamily: MONO_FONT, fontWeight: 700, fontSize: 14, color: COLORS.gold }}>{moneyText(st.t.totalIncl)}</div>
+                    <div style={{ marginTop: 5 }}><Pill tone={st.tone}>{st.label}</Pill></div>
+                  </div>
+                </div>
+                <div style={{ display: "flex", gap: 6, alignItems: "center", marginTop: 7, flexWrap: "wrap" }}>
+                  <span style={{ fontSize: 11, color: COLORS.muted }}>{fmtTime(new Date(p.issued_at || p.created_at).getTime())}</span>
+                  {p.status === "issued" && st.s.status === "part" && <span style={{ fontSize: 11, color: COLORS.muted }}>· balance {moneyText(st.s.balance)}</span>}
+                  {st.s.pendingCheques > 0 && <Pill tone="yellow">Cheque pending</Pill>}
+                  {st.s.returnedCheques > 0 && <Pill tone="red">Cheque returned</Pill>}
+                </div>
+              </button>
+            ))}
+          </div>
+          <FloatingNewJobButton onClick={onNew} label="New Proforma" />
+        </>
+      )}
+
+      {tab === "reconcile" && <ReconcileTab session={session} recon={recon} onChanged={reload} />}
+      {tab === "access" && session.role === "admin" && <BillingAccessPanel team={team} setTeam={setTeam} />}
+    </div>
+  );
+}
+
+/* ---- Reconcile with First Bit ---- */
+function ReconcileTab({ session, recon, onChanged }) {
+  const [selected, setSelected] = useState(() => new Set());
+  const [ref, setRef] = useState("");
+  const [confirming, setConfirming] = useState(false);
+  const [busy, setBusy] = useState(false);
+  const [msg, setMsg] = useState("");
+  const items = recon.items || [];
+  const picked = items.filter((i) => selected.has(i.key));
+  const exportSet = picked.length ? picked : items;
+
+  const toggle = (key) => setSelected((cur) => { const n = new Set(cur); if (n.has(key)) n.delete(key); else n.add(key); return n; });
+  const allOn = items.length > 0 && picked.length === items.length;
+
+  const download = () => {
+    downloadTextFile(`MrCAP-FirstBit-${localDateKey()}.csv`, reconcileCsv(exportSet));
+  };
+  const mark = async () => {
+    setBusy(true); setMsg("");
+    const res = await markReconciled(picked, ref.trim(), session);
+    setBusy(false);
+    if (!res.ok) { setMsg(res.error || "Couldn't save. Nothing was marked."); return; }
+    setSelected(new Set()); setRef(""); setConfirming(false);
+    onChanged();
+  };
+  const undo = async (row) => { if (await unmarkReconciled(row)) onChanged(); };
+
+  if (recon.loading) return <SkeletonRows count={3} height={70} />;
+  if (recon.ok === false) return <div style={{ ...billCard, color: "#E08A78", fontSize: 12.5 }}>Couldn't load. {recon.error}</div>;
+
+  return (
+    <>
+      <div style={{ ...billCard, borderColor: items.length >= RECONCILE_NUDGE_AT ? COLORS.gold : COLORS.line }}>
+        <div style={{ fontWeight: 700, fontSize: 14, color: COLORS.ink }}>{items.length === 0 ? "Everything is in First Bit." : `${items.length} document${items.length === 1 ? "" : "s"} not yet in First Bit`}</div>
+        <div style={{ fontSize: 12, color: COLORS.muted, marginTop: 4, lineHeight: 1.5 }}>
+          Issued proformas and tax invoices raised here. Download the list, enter them in First Bit, then mark them entered so they drop off this list.
+        </div>
+      </div>
+
+      {items.length > 0 && (
+        <>
+          <div style={{ display: "flex", gap: 8, marginBottom: 10 }}>
+            <button onClick={() => setSelected(allOn ? new Set() : new Set(items.map((i) => i.key)))} className="mrcap-press" style={{ ...chipBtn(false), flexShrink: 0 }}>{allOn ? "Clear" : "Select all"}</button>
+            <button onClick={download} className="mrcap-press" style={{ ...secondaryBtnStyle, flex: 1, padding: "9px", fontSize: 12.5, display: "flex", alignItems: "center", justifyContent: "center", gap: 6 }}>
+              <Download size={14} /> Download CSV ({exportSet.length})
+            </button>
+          </div>
+          <div style={{ display: "flex", flexDirection: "column", gap: 8, marginBottom: 14 }}>
+            {items.map((i) => {
+              const on = selected.has(i.key);
+              return (
+                <button key={i.key} onClick={() => toggle(i.key)} className="mrcap-press" style={{ textAlign: "left", width: "100%", boxSizing: "border-box", display: "flex", gap: 10, alignItems: "center", background: COLORS.panel, border: `1.5px solid ${on ? COLORS.gold : COLORS.line}`, borderRadius: 10, padding: "10px 12px", cursor: "pointer" }}>
+                  <span style={{ width: 18, height: 18, borderRadius: 5, border: `2px solid ${on ? COLORS.gold : COLORS.muted}`, background: on ? COLORS.gold : "transparent", display: "flex", alignItems: "center", justifyContent: "center", flexShrink: 0 }}>{on && <Check size={12} color={COLORS.darkText} />}</span>
+                  <span style={{ flex: 1, minWidth: 0 }}>
+                    <span style={{ display: "flex", justifyContent: "space-between", gap: 8 }}>
+                      <span style={{ fontFamily: MONO_FONT, fontWeight: 600, fontSize: 12.5, color: COLORS.ink }}>{i.number}</span>
+                      <span style={{ fontFamily: MONO_FONT, fontWeight: 700, fontSize: 12.5, color: COLORS.gold }}>AED {i.incl}</span>
+                    </span>
+                    <span style={{ display: "block", fontSize: 11.5, color: COLORS.muted, marginTop: 2, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{i.type} · {i.client}{i.plate ? ` · ${i.plate}` : ""}{i.payment ? ` · ${i.payment}` : ""}</span>
+                  </span>
+                </button>
+              );
+            })}
+          </div>
+
+          <div style={billCard}>
+            <label style={smallLabel}>First Bit reference (optional)</label>
+            <input value={ref} onChange={(e) => setRef(e.target.value)} placeholder="e.g. batch date or First Bit entry number" style={inputStyle} />
+            {msg && <div style={{ color: "#E08A78", fontSize: 12, marginTop: 8 }}>{msg}</div>}
+            {!confirming ? (
+              <button onClick={() => setConfirming(true)} disabled={!picked.length} className="mrcap-press" style={{ ...primaryBtnStyle, width: "100%", marginTop: 12, opacity: picked.length ? 1 : 0.45 }}>
+                Mark {picked.length || ""} as entered in First Bit
+              </button>
+            ) : (
+              <div style={{ marginTop: 12 }}>
+                <div style={{ fontSize: 12.5, color: COLORS.ink, marginBottom: 8 }}>Mark {picked.length} document{picked.length === 1 ? "" : "s"} as entered? They will leave this list.</div>
+                <div style={{ display: "flex", gap: 8 }}>
+                  <button onClick={() => setConfirming(false)} className="mrcap-press" style={{ ...secondaryBtnStyle, flex: 1 }}>Not yet</button>
+                  <button onClick={mark} disabled={busy} className="mrcap-press" style={{ ...primaryBtnStyle, flex: 2, opacity: busy ? 0.6 : 1 }}>{busy ? "Saving…" : "Yes, mark entered"}</button>
+                </div>
+              </div>
+            )}
+          </div>
+        </>
+      )}
+
+      {(recon.entered || []).length > 0 && (
+        <>
+          <div style={{ ...smallLabel, margin: "6px 2px 8px" }}>Recently entered</div>
+          <div style={{ display: "flex", flexDirection: "column", gap: 6 }}>
+            {recon.entered.slice(0, 15).map((r) => (
+              <div key={r.id} style={{ display: "flex", justifyContent: "space-between", alignItems: "center", gap: 8, background: COLORS.panel, border: `1px solid ${COLORS.line}`, borderRadius: 9, padding: "8px 11px" }}>
+                <div style={{ minWidth: 0 }}>
+                  <div style={{ fontFamily: MONO_FONT, fontSize: 12, color: COLORS.ink }}>{r.doc_number}</div>
+                  <div style={{ fontSize: 10.5, color: COLORS.muted }}>{r.first_bit_ref ? `${r.first_bit_ref} · ` : ""}{r.entered_by} · {fmtTime(new Date(r.entered_at).getTime())}</div>
+                </div>
+                {session.role === "admin" && <button onClick={() => undo(r)} className="mrcap-press" style={{ background: "none", border: `1px solid ${COLORS.line}`, borderRadius: 7, padding: "4px 9px", fontSize: 11, color: COLORS.muted, cursor: "pointer" }}>Undo</button>}
+              </div>
+            ))}
+          </div>
+        </>
+      )}
+    </>
+  );
+}
+
+/* ---- Who can use Billing ---- */
+function BillingAccessPanel({ team, setTeam }) {
+  const [busyId, setBusyId] = useState(null);
+  const [error, setError] = useState("");
+  const toggle = async (m) => {
+    setBusyId(m.id); setError("");
+    const next = { ...(m.permissions || {}), billing: !m.permissions?.billing };
+    const res = await gkCall({ path: `team_members?id=eq.${encodeURIComponent(m.id)}`, method: "PATCH", body: { permissions: next, updated_at: nowIso() }, headers: { Prefer: "return=minimal" }, summary: `${next.billing ? "Gave" : "Removed"} Billing access ${next.billing ? "to" : "from"} ${m.name}` });
+    setBusyId(null);
+    if (!res.ok) { setError(res.error); return; }
+    setTeam((cur) => cur.map((x) => (x.id === m.id ? { ...x, permissions: next } : x)));
+  };
+  const always = team.filter((m) => m.role === "admin" || m.role === "accountant");
+  const others = team.filter((m) => m.role !== "admin" && m.role !== "accountant");
+  return (
+    <>
+      <div style={{ ...billCard, fontSize: 12.5, color: COLORS.muted, lineHeight: 1.55 }}>
+        Admins and accountants always have Billing. Switch it on for anyone else below. To add an accountant, use Team, add a member, and choose the Accountant role.
+      </div>
+      {error && <div style={{ color: "#E08A78", fontSize: 12.5, marginBottom: 10 }}>{error}</div>}
+      {always.length > 0 && <div style={{ ...smallLabel, margin: "2px 2px 8px" }}>Always have access</div>}
+      <div style={{ display: "flex", flexDirection: "column", gap: 6, marginBottom: 14 }}>
+        {always.map((m) => (
+          <div key={m.id} style={{ display: "flex", justifyContent: "space-between", alignItems: "center", background: COLORS.panel, border: `1px solid ${COLORS.line}`, borderRadius: 9, padding: "10px 12px" }}>
+            <span style={{ fontSize: 13.5, color: COLORS.ink }}>{m.name}</span>
+            <Pill tone="green">{ROLE_DEFS[m.role]?.label || m.role}</Pill>
+          </div>
+        ))}
+      </div>
+      <div style={{ ...smallLabel, margin: "2px 2px 8px" }}>Everyone else</div>
+      <div style={{ display: "flex", flexDirection: "column", gap: 6 }}>
+        {others.map((m) => {
+          const on = !!m.permissions?.billing;
+          return (
+            <div key={m.id} style={{ display: "flex", justifyContent: "space-between", alignItems: "center", background: COLORS.panel, border: `1px solid ${COLORS.line}`, borderRadius: 9, padding: "8px 12px" }}>
+              <div>
+                <div style={{ fontSize: 13.5, color: COLORS.ink }}>{m.name}</div>
+                <div style={{ fontSize: 11, color: COLORS.muted }}>{ROLE_DEFS[m.role]?.label || m.role}</div>
+              </div>
+              <button onClick={() => toggle(m)} disabled={busyId === m.id} className="mrcap-press" aria-pressed={on} style={{ ...chipBtn(on, COLORS.green), minWidth: 84, opacity: busyId === m.id ? 0.6 : 1 }}>
+                {busyId === m.id ? "…" : on ? "Has access" : "No access"}
+              </button>
+            </div>
+          );
+        })}
+      </div>
+    </>
+  );
+}
+
+/* ---- Create / edit a proforma ---- */
+function ProformaEditor({ seed, session, onCancel, onDone }) {
+  const base = blankProforma();
+  const [p, setP] = useState(() => ({
+    ...base, ...(seed || {}),
+    bill_to: { ...base.bill_to, ...((seed && seed.bill_to) || {}) },
+    car: { ...base.car, ...((seed && seed.car) || {}) },
+    lines: seed && seed.lines && seed.lines.length ? seed.lines : [blankLine()],
+    vat_rate: seed && seed.vat_rate != null ? Number(seed.vat_rate) : VAT_RATE,
+  }));
+  const [saving, setSaving] = useState(false);
+  const [error, setError] = useState("");
+  const [reserved, setReserved] = useState(null);
+  const [confirming, setConfirming] = useState(false);
+  const [remember, setRemember] = useState(true);
+
+  // Pre-fill TRN / address / email that were saved on the customer earlier.
+  useEffect(() => {
+    if (!seed || !seed.customer_id) return;
+    (async () => {
+      const { ok, data } = await sbFetch(`customers?id=eq.${seed.customer_id}&select=*&limit=1`);
+      const c = ok && data && data[0];
+      if (!c) return;
+      setP((cur) => ({ ...cur, bill_to: { ...cur.bill_to, trn: cur.bill_to.trn || c.trn || "", address: cur.bill_to.address || c.address || "", email: cur.bill_to.email || c.email || "" } }));
+    })();
+    // eslint-disable-next-line
+  }, []);
+
+  const setBill = (k, v) => setP((cur) => ({ ...cur, bill_to: { ...cur.bill_to, [k]: v } }));
+  const setCar = (k, v) => setP((cur) => ({ ...cur, car: { ...cur.car, [k]: v } }));
+  const setLine = (i, patch) => setP((cur) => ({ ...cur, lines: cur.lines.map((l, idx) => (idx === i ? { ...l, ...patch } : l)) }));
+  const addLine = () => setP((cur) => ({ ...cur, lines: [...cur.lines, blankLine()] }));
+  const removeLine = (i) => setP((cur) => ({ ...cur, lines: cur.lines.length > 1 ? cur.lines.filter((_, idx) => idx !== i) : [blankLine()] }));
+
+  const totals = computeTotals(p.lines, Number(p.vat_rate));
+  const problems = issueProblems(p);
+  const isRevision = !!p.supersedes;
+
+  const finish = (row) => onDone(row);
+  const saveDraft = async () => {
+    setSaving(true); setError("");
+    const res = await saveProformaDraft(p, session);
+    setSaving(false);
+    if (!res.ok) { setError(res.error); return; }
+    finish(res.row);
+  };
+  const issue = async () => {
+    setSaving(true); setError("");
+    const res = await issueProforma(p, session, reserved);
+    setSaving(false);
+    if (res.id && !p.id) setP((cur) => ({ ...cur, id: res.id }));
+    if (!res.ok) { setError(res.error); if (res.reserved) setReserved(res.reserved); setConfirming(false); return; }
+    if (remember && p.customer_id) rememberCustomerDetails(p.customer_id, p.bill_to);
+    finish(res.row);
+  };
+
+  const inp = { ...inputStyle, marginTop: 0 };
+  return (
+    <div className="mrcap-view" style={{ padding: "0 18px 40px" }}>
+      <SectionTitle>{p.id ? "Edit Proforma Draft" : isRevision ? "Revise Proforma" : "New Proforma"}</SectionTitle>
+      {isRevision && <div style={{ ...billCard, fontSize: 12.5, color: COLORS.gold }}>This is a new version. When you issue it, the original is voided and marked as replaced.</div>}
+
+      <Field label="Issued from">
+        <div style={{ display: "flex", gap: 8 }}>
+          {Object.entries(PROFORMA_ISSUERS).map(([k, v]) => (
+            <button key={k} onClick={() => setP((cur) => ({ ...cur, entity: k }))} className="mrcap-press" style={{ ...chipBtn(p.entity === k), flex: 1, borderRadius: 10 }}>{v.label}</button>
+          ))}
+        </div>
+      </Field>
+
+      <div style={billCard}>
+        <div style={{ ...smallLabel, marginBottom: 10 }}>Bill to</div>
+        <Field label="Client name"><input style={inp} value={p.bill_to.name} onChange={(e) => setBill("name", e.target.value)} placeholder="Company or person" /></Field>
+        <Field label="Client TRN (optional)"><input style={{ ...inp, fontFamily: MONO_FONT }} inputMode="numeric" value={p.bill_to.trn} onChange={(e) => setBill("trn", e.target.value.replace(/[^0-9]/g, ""))} placeholder="15-digit TRN, if they have one" /></Field>
+        <Field label="Phone"><input style={inp} type="tel" value={p.bill_to.phone} onChange={(e) => setBill("phone", e.target.value)} /></Field>
+        <Field label="Address (optional)"><input style={inp} value={p.bill_to.address} onChange={(e) => setBill("address", e.target.value)} /></Field>
+        <Field label="Email (optional)"><input style={inp} type="email" value={p.bill_to.email} onChange={(e) => setBill("email", e.target.value)} /></Field>
+        {p.customer_id && (
+          <label style={{ display: "flex", alignItems: "center", gap: 8, fontSize: 12.5, color: COLORS.muted }}>
+            <input type="checkbox" checked={remember} onChange={(e) => setRemember(e.target.checked)} /> Remember these details for this customer
+          </label>
+        )}
+      </div>
+
+      <div style={billCard}>
+        <div style={{ ...smallLabel, marginBottom: 10 }}>Vehicle</div>
+        <Field label="Make / model"><input style={inp} value={p.car.makeModel} onChange={(e) => setCar("makeModel", e.target.value)} /></Field>
+        <div style={{ display: "flex", gap: 8 }}>
+          <div style={{ flex: 1 }}><Field label="Colour"><input style={inp} value={p.car.color} onChange={(e) => setCar("color", e.target.value)} /></Field></div>
+          <div style={{ flex: 1 }}><Field label="Plate no."><input style={{ ...inp, fontFamily: MONO_FONT }} value={p.car.plate} onChange={(e) => setCar("plate", e.target.value.toUpperCase())} /></Field></div>
+        </div>
+        <Field label="VIN (optional)"><input style={{ ...inp, fontFamily: MONO_FONT }} value={p.car.vin} onChange={(e) => setCar("vin", e.target.value.toUpperCase())} /></Field>
+      </div>
+
+      <div style={{ ...smallLabel, margin: "4px 2px 8px" }}>Lines</div>
+      {p.lines.map((l, i) => {
+        const c = totals.rows[i];
+        return (
+          <div key={i} style={billCard}>
+            <div style={{ display: "flex", gap: 8, alignItems: "flex-start" }}>
+              <textarea value={l.desc} onChange={(e) => setLine(i, { desc: e.target.value })} placeholder="Description, e.g. SM BodyRepair/ Front Bumper" rows={2} style={{ ...textareaStyle, marginTop: 0, minHeight: 48, flex: 1 }} />
+              <button onClick={() => removeLine(i)} className="mrcap-press" aria-label="Remove line" style={{ ...iconBtnStyle, flexShrink: 0 }}><Trash2 size={15} color={COLORS.muted} /></button>
+            </div>
+            <div style={{ display: "flex", gap: 8, marginTop: 10 }}>
+              <div style={{ width: 64 }}><label style={smallLabel}>Qty</label><input style={{ ...inp, marginTop: 4 }} type="number" inputMode="decimal" min="0" step="any" value={l.qty} onChange={(e) => setLine(i, { qty: e.target.value })} /></div>
+              <div style={{ width: 74 }}><label style={smallLabel}>Unit</label><input style={{ ...inp, marginTop: 4 }} value={l.uom} onChange={(e) => setLine(i, { uom: e.target.value })} /></div>
+              <div style={{ flex: 1 }}><label style={smallLabel}>Price (excl. VAT)</label><input style={{ ...inp, marginTop: 4, fontFamily: MONO_FONT }} type="number" inputMode="decimal" min="0" step="0.01" value={l.price} onChange={(e) => setLine(i, { price: e.target.value })} /></div>
+            </div>
+            <div style={{ display: "flex", gap: 8, marginTop: 10, alignItems: "flex-end" }}>
+              <div style={{ flex: 1 }}><label style={smallLabel}>Discount</label><input style={{ ...inp, marginTop: 4, fontFamily: MONO_FONT }} type="number" inputMode="decimal" min="0" step="0.01" value={l.discValue} onChange={(e) => setLine(i, { discValue: e.target.value })} placeholder="0" /></div>
+              <div style={{ display: "flex", gap: 4 }}>
+                {[["aed", "AED"], ["pct", "%"]].map(([k, lab]) => <button key={k} onClick={() => setLine(i, { discType: k })} className="mrcap-press" style={{ ...chipBtn((l.discType || "aed") === k), padding: "11px 12px", borderRadius: 10 }}>{lab}</button>)}
+              </div>
+            </div>
+            <div style={{ display: "flex", justifyContent: "space-between", marginTop: 10, fontSize: 12, color: COLORS.muted }}>
+              <span>{c.discount > 0 ? `Discount AED ${fmtMoney(c.discount)} (${fmtPct(c.discountPct)}%)` : "No discount"}</span>
+              <span style={{ fontFamily: MONO_FONT, color: COLORS.ink }}>Line total AED {fmtMoney(c.incl)}</span>
+            </div>
+          </div>
+        );
+      })}
+      <button onClick={addLine} className="mrcap-press" style={{ ...secondaryBtnStyle, width: "100%", marginBottom: 14, display: "flex", alignItems: "center", justifyContent: "center", gap: 6 }}><Plus size={15} /> Add a line</button>
+
+      <Field label="VAT">
+        <div style={{ display: "flex", gap: 8 }}>
+          <button onClick={() => setP((cur) => ({ ...cur, vat_rate: VAT_RATE }))} className="mrcap-press" style={{ ...chipBtn(Number(p.vat_rate) === VAT_RATE), flex: 1, borderRadius: 10 }}>5% VAT</button>
+          <button onClick={() => setP((cur) => ({ ...cur, vat_rate: 0 }))} className="mrcap-press" style={{ ...chipBtn(Number(p.vat_rate) === 0), flex: 1, borderRadius: 10 }}>No VAT</button>
+        </div>
+      </Field>
+
+      <div style={{ ...billCard, borderTop: `2px solid ${COLORS.gold}` }}>
+        {totals.hasDiscount && <TotalRow label="Total discount" value={totals.totalDiscount} />}
+        <TotalRow label="Total (excl. VAT)" value={totals.subtotalExcl} />
+        <TotalRow label={`VAT (${Math.round(Number(p.vat_rate) * 10000) / 100}%)`} value={totals.totalVat} />
+        <div style={{ display: "flex", justifyContent: "space-between", marginTop: 8, paddingTop: 8, borderTop: `1px dashed ${COLORS.line}` }}>
+          <span style={{ fontWeight: 700, color: COLORS.ink }}>Total (incl. VAT)</span>
+          <span style={{ fontFamily: MONO_FONT, fontWeight: 700, fontSize: 17, color: COLORS.gold }}>{moneyText(totals.totalIncl)}</span>
+        </div>
+        <div style={{ fontSize: 11.5, color: COLORS.muted, marginTop: 6 }}>{amountInWords(totals.totalIncl)}</div>
+      </div>
+
+      <Field label="Payment terms">
+        <div style={{ display: "flex", gap: 6, flexWrap: "wrap", marginBottom: 8 }}>
+          {PAYMENT_TERMS_PRESETS.map((t) => <button key={t} onClick={() => setP((cur) => ({ ...cur, payment_terms: t }))} className="mrcap-press" style={chipBtn(p.payment_terms === t)}>{t}</button>)}
+        </div>
+        <input style={inp} value={p.payment_terms || ""} onChange={(e) => setP((cur) => ({ ...cur, payment_terms: e.target.value }))} placeholder="or type your own" />
+      </Field>
+      <Field label="Delivery terms (optional)"><input style={inp} value={p.delivery_terms || ""} onChange={(e) => setP((cur) => ({ ...cur, delivery_terms: e.target.value }))} /></Field>
+      <Field label="Valid until"><input style={inp} type="date" value={p.valid_until || ""} onChange={(e) => setP((cur) => ({ ...cur, valid_until: e.target.value }))} /></Field>
+      <Field label="Notes (printed on the proforma)"><textarea style={textareaStyle} value={p.notes || ""} onChange={(e) => setP((cur) => ({ ...cur, notes: e.target.value }))} /></Field>
+
+      {error && <div style={{ ...billCard, borderColor: COLORS.red, color: "#E08A78", fontSize: 12.5 }}>{error}</div>}
+      {problems.length > 0 && <div style={{ fontSize: 12, color: COLORS.muted, marginBottom: 10 }}>To issue: {problems.join(" ")}</div>}
+
+      {!confirming ? (
+        <div style={{ display: "flex", gap: 8 }}>
+          <button onClick={onCancel} className="mrcap-press" style={{ ...secondaryBtnStyle, flex: 1 }}>Cancel</button>
+          <button onClick={saveDraft} disabled={saving || !String(p.bill_to.name || "").trim()} className="mrcap-press" style={{ ...secondaryBtnStyle, flex: 1, opacity: saving || !String(p.bill_to.name || "").trim() ? 0.5 : 1 }}>Save draft</button>
+          <button onClick={() => { setError(""); setConfirming(true); }} disabled={saving || problems.length > 0} className="mrcap-press" style={{ ...primaryBtnStyle, flex: 1.4, opacity: saving || problems.length ? 0.5 : 1 }}>{reserved ? "Retry issue" : "Issue"}</button>
+        </div>
+      ) : (
+        <div style={billCard}>
+          <div style={{ fontWeight: 700, color: COLORS.ink, marginBottom: 6 }}>Issue this proforma?</div>
+          <div style={{ fontSize: 12.5, color: COLORS.muted, lineHeight: 1.5, marginBottom: 12 }}>
+            It takes the next number and is locked, so it can't be edited afterwards. If something changes you can revise it into a new version.
+          </div>
+          <div style={{ display: "flex", gap: 8 }}>
+            <button onClick={() => setConfirming(false)} disabled={saving} className="mrcap-press" style={{ ...secondaryBtnStyle, flex: 1 }}>Go back</button>
+            <button onClick={issue} disabled={saving} className="mrcap-press" style={{ ...primaryBtnStyle, flex: 2, opacity: saving ? 0.6 : 1 }}>{saving ? "Issuing…" : "Yes, issue it"}</button>
+          </div>
+        </div>
+      )}
+    </div>
+  );
+}
+function TotalRow({ label, value }) {
+  return (
+    <div style={{ display: "flex", justifyContent: "space-between", fontSize: 12.5, color: COLORS.muted, marginBottom: 5 }}>
+      <span>{label}</span><span style={{ fontFamily: MONO_FONT, color: COLORS.ink }}>{moneyText(value)}</span>
+    </div>
+  );
+}
+
+/* ---- One proforma: PDF, payments, revise, void ---- */
+function ProformaDetail({ id, session, team, onBack, onEditDraft, onRevise, onOpenJob, onDeleted }) {
+  const [state, setState] = useState({ loading: true });
+  const [payOpen, setPayOpen] = useState(false);
+  const [pay, setPay] = useState({ method: "cash", amount: "", paid_on: localDateKey(), cheque_no: "", cheque_bank: "", cheque_date: "", note: "" });
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState("");
+  const [voiding, setVoiding] = useState(false);
+  const [voidReason, setVoidReason] = useState("");
+  const [confirmDelete, setConfirmDelete] = useState(false);
+
+  const load = useCallback(async () => {
+    const r = await loadProformaFull(id);
+    setState({ loading: false, ...r });
+  }, [id]);
+  useEffect(() => { load(); }, [load]);
+
+  if (state.loading) return <div style={{ padding: 30, color: COLORS.muted, textAlign: "center" }}>Loading proforma…</div>;
+  if (!state.ok || !state.proforma) return <div style={{ padding: 30, color: COLORS.muted, textAlign: "center" }}>{state.error || "Proforma not found."}</div>;
+
+  const p = state.proforma;
+  const payments = state.payments || [];
+  const st = proformaState(p, payments);
+  const { t, s } = st;
+  const isAdmin = session.role === "admin";
+  const method = (k) => (PAYMENT_METHODS.find((m) => m.key === k) || {}).label || k;
+
+  const openPay = () => { setPay((cur) => ({ ...cur, amount: s.balance > 0 ? String(s.balance) : "" })); setError(""); setPayOpen(true); };
+  const payProblem = !(Number(pay.amount) > 0) ? "Enter an amount." : pay.method === "cheque" && !pay.cheque_no.trim() ? "Enter the cheque number." : "";
+  const savePayment = async () => {
+    setBusy(true); setError("");
+    const res = await recordPayment(p, pay, session);
+    setBusy(false);
+    if (!res.ok) { setError(res.error); return; }
+    setPayOpen(false); setPay({ method: "cash", amount: "", paid_on: localDateKey(), cheque_no: "", cheque_bank: "", cheque_date: "", note: "" });
+    load();
+  };
+  const changeCheque = async (payment, status) => {
+    setBusy(true); setError("");
+    const res = await setChequeStatus(payment, status, p);
+    setBusy(false);
+    if (!res.ok) { setError(res.error); return; }
+    load();
+  };
+  const removePayment = async (payment) => {
+    if (!window.confirm(`Remove this ${method(payment.method)} payment of AED ${fmtMoney(payment.amount)}? This is logged.`)) return;
+    setBusy(true);
+    const ok = await deletePayment(payment, p);
+    setBusy(false);
+    if (!ok) { setError("Couldn't remove the payment."); return; }
+    load();
+  };
+  const doVoid = async () => {
+    setBusy(true); setError("");
+    const res = await voidProforma(p, voidReason.trim(), session);
+    setBusy(false);
+    if (!res.ok) { setError(res.error); return; }
+    setVoiding(false); setVoidReason("");
+    load();
+  };
+  const doDelete = async () => {
+    setBusy(true);
+    const ok = await deleteProformaDraft(p);
+    setBusy(false);
+    if (!ok) { setError("Couldn't delete the draft."); return; }
+    onDeleted();
+  };
+
+  const pdf = () => { const doc = generateProformaPDF(p); doc.save(`MrCAP-Proforma-${p.number || "DRAFT"}.pdf`); };
+  const waText = `Hello ${p.bill_to?.name || ""}, here is proforma ${p.number} for ${[p.car?.makeModel, p.car?.plate].filter(Boolean).join(" ") || "your vehicle"}: AED ${fmtMoney(t.totalIncl)}${p.payment_terms ? ` (${p.payment_terms})` : ""}. Thank you, Mr.CAP.`;
+  const rec = state.reconciliation;
+
+  return (
+    <div className="mrcap-view" style={{ padding: "0 18px 40px" }}>
+      <div style={{ background: `linear-gradient(160deg, ${COLORS.panel2}, ${COLORS.panel})`, border: `1px solid ${COLORS.line}`, borderTop: `2px solid ${p.status === "void" ? COLORS.red : COLORS.gold}`, borderRadius: 12, padding: "16px 16px 14px", marginBottom: 14 }}>
+        <div style={{ display: "flex", justifyContent: "space-between", alignItems: "flex-start", gap: 8 }}>
+          <div style={{ minWidth: 0 }}>
+            <div style={{ fontFamily: MONO_FONT, fontWeight: 700, fontSize: 17, color: COLORS.ink, letterSpacing: 0.3 }}>{p.number || "Draft (not issued)"}</div>
+            <div style={{ fontSize: 13, color: COLORS.ink, marginTop: 4 }}>{p.bill_to?.name}</div>
+            <div style={{ fontSize: 12, color: COLORS.muted, marginTop: 2 }}>{[p.car?.makeModel, p.car?.color, p.car?.plate || p.car?.vin].filter(Boolean).join(" · ")}</div>
+          </div>
+          <Pill tone={st.tone}>{st.label}</Pill>
+        </div>
+        <div style={{ marginTop: 12, fontFamily: MONO_FONT, fontWeight: 700, fontSize: 20, color: COLORS.gold }}>{moneyText(t.totalIncl)}</div>
+        <div style={{ fontSize: 11.5, color: COLORS.muted, marginTop: 3 }}>
+          {t.totalVat > 0 ? `${moneyText(t.subtotalExcl)} + ${moneyText(t.totalVat)} VAT` : "No VAT"}{p.valid_until ? ` · valid until ${formatLongDate(`${p.valid_until}T12:00:00`)}` : ""}
+        </div>
+        {p.status === "void" && <div style={{ marginTop: 10, fontSize: 12.5, color: "#E08A78" }}>Void{p.void_reason ? `: ${p.void_reason}` : ""}</div>}
+      </div>
+
+      {error && <div style={{ ...billCard, borderColor: COLORS.red, color: "#E08A78", fontSize: 12.5 }}>{error}</div>}
+
+      <button onClick={pdf} className="mrcap-press" style={{ display: "flex", alignItems: "center", justifyContent: "center", gap: 8, width: "100%", padding: "12px", borderRadius: 10, border: "none", background: COLORS.gold, color: COLORS.darkText, fontWeight: 700, fontSize: 13, cursor: "pointer", marginBottom: 10 }}>
+        <FileText size={15} /> {p.status === "draft" ? "Preview PDF (draft)" : "Download PDF"}
+      </button>
+      {p.status === "issued" && p.bill_to?.phone && (
+        <a href={`https://wa.me/${toWhatsAppNumber(p.bill_to.phone)}?text=${encodeURIComponent(waText)}`} target="_blank" rel="noopener noreferrer" className="mrcap-press" style={{ display: "flex", alignItems: "center", justifyContent: "center", gap: 8, width: "100%", padding: "12px", borderRadius: 10, background: "#25D366", color: "#0D2A17", fontWeight: 700, fontSize: 13, textDecoration: "none", marginBottom: 10, boxSizing: "border-box" }}>
+          <Send size={15} /> Send on WhatsApp
+        </a>
+      )}
+      {p.job_id && onOpenJob && (
+        <button onClick={() => onOpenJob(p.job_id)} className="mrcap-press" style={{ ...secondaryBtnStyle, width: "100%", marginBottom: 10 }}>Open the job card</button>
+      )}
+
+      {p.status === "draft" && (
+        <div style={{ display: "flex", gap: 8, marginBottom: 12 }}>
+          <button onClick={() => onEditDraft(p)} className="mrcap-press" style={{ ...primaryBtnStyle, flex: 2 }}>Edit and issue</button>
+          {!confirmDelete
+            ? <button onClick={() => setConfirmDelete(true)} className="mrcap-press" style={{ ...secondaryBtnStyle, flex: 1 }}>Delete</button>
+            : <button onClick={doDelete} disabled={busy} className="mrcap-press" style={{ ...secondaryBtnStyle, flex: 1, color: "#E08A78", borderColor: COLORS.red }}>Yes, delete</button>}
+        </div>
+      )}
+
+      {p.status === "issued" && (
+        <>
+          <div style={billCard}>
+            <div style={{ display: "flex", gap: 8 }}>
+              <BillingStat label="Collected" value={moneyText(s.collected)} tone="#7BC494" />
+              <BillingStat label="Balance" value={moneyText(s.balance)} tone={s.balance > 0 ? COLORS.gold : "#7BC494"} />
+              {s.pendingCheques > 0 && <BillingStat label="Cheques due" value={moneyText(s.pendingCheques)} />}
+            </div>
+            {s.returnedCheques > 0 && <div style={{ marginTop: 10, fontSize: 12.5, color: "#E08A78" }}>A cheque of {moneyText(s.returnedCheques)} was returned. It is not counted as paid.</div>}
+          </div>
+
+          <div style={{ ...smallLabel, margin: "4px 2px 8px" }}>Payments</div>
+          {payments.length === 0 && <div style={{ fontSize: 12.5, color: COLORS.muted, marginBottom: 10 }}>No payments yet.</div>}
+          {payments.map((x) => (
+            <div key={x.id} style={billCard}>
+              <div style={{ display: "flex", justifyContent: "space-between", alignItems: "flex-start", gap: 8 }}>
+                <div>
+                  <div style={{ fontSize: 13.5, fontWeight: 600, color: COLORS.ink }}>{method(x.method)} · {moneyText(x.amount)}</div>
+                  <div style={{ fontSize: 11.5, color: COLORS.muted, marginTop: 2 }}>
+                    {formatLongDate(`${x.paid_on}T12:00:00`)}{x.receipt_no ? ` · receipt ${x.receipt_no}` : ""}{x.recorded_by ? ` · ${x.recorded_by}` : ""}
+                  </div>
+                  {x.method === "cheque" && <div style={{ fontSize: 11.5, color: COLORS.muted, marginTop: 2 }}>Cheque {x.cheque_no}{x.cheque_bank ? ` · ${x.cheque_bank}` : ""}{x.cheque_date ? ` · dated ${formatLongDate(`${x.cheque_date}T12:00:00`)}` : ""}</div>}
+                  {x.note && <div style={{ fontSize: 11.5, color: COLORS.muted, marginTop: 2 }}>{x.note}</div>}
+                </div>
+                {x.method === "cheque" && <Pill tone={x.cheque_status === "cleared" ? "green" : x.cheque_status === "returned" ? "red" : "yellow"}>{(CHEQUE_STATUSES.find((c) => c.key === x.cheque_status) || {}).label || x.cheque_status}</Pill>}
+              </div>
+              <div style={{ display: "flex", gap: 6, flexWrap: "wrap", marginTop: 10 }}>
+                {x.method === "cheque" && x.cheque_status === "received" && <button onClick={() => changeCheque(x, "deposited")} disabled={busy} className="mrcap-press" style={chipBtn(false)}>Deposited</button>}
+                {x.method === "cheque" && (x.cheque_status === "received" || x.cheque_status === "deposited") && <button onClick={() => changeCheque(x, "cleared")} disabled={busy} className="mrcap-press" style={chipBtn(false, COLORS.green)}>Cleared</button>}
+                {x.method === "cheque" && (x.cheque_status === "received" || x.cheque_status === "deposited") && <button onClick={() => changeCheque(x, "returned")} disabled={busy} className="mrcap-press" style={{ ...chipBtn(false), color: "#E08A78" }}>Returned</button>}
+                {x.receipt_no && <button onClick={() => generateReceiptPDF(p, x, s).save(`MrCAP-Receipt-${x.receipt_no}.pdf`)} className="mrcap-press" style={chipBtn(false)}>Receipt PDF</button>}
+                {isAdmin && <button onClick={() => removePayment(x)} disabled={busy} className="mrcap-press" style={{ ...chipBtn(false), color: COLORS.muted }}>Remove</button>}
+              </div>
+            </div>
+          ))}
+
+          {!payOpen ? (
+            <button onClick={openPay} className="mrcap-press" style={{ ...secondaryBtnStyle, width: "100%", marginBottom: 12, display: "flex", alignItems: "center", justifyContent: "center", gap: 6 }}><Banknote size={15} /> Record a payment</button>
+          ) : (
+            <div style={billCard}>
+              <div style={{ ...smallLabel, marginBottom: 10 }}>Record a payment</div>
+              <div style={{ display: "flex", gap: 6, marginBottom: 12 }}>
+                {PAYMENT_METHODS.map((m) => <button key={m.key} onClick={() => setPay((cur) => ({ ...cur, method: m.key }))} className="mrcap-press" style={{ ...chipBtn(pay.method === m.key), flex: 1, borderRadius: 10 }}>{m.label}</button>)}
+              </div>
+              <Field label="Amount (AED)"><input style={{ ...inputStyle, marginTop: 0, fontFamily: MONO_FONT }} type="number" inputMode="decimal" min="0" step="0.01" value={pay.amount} onChange={(e) => setPay((cur) => ({ ...cur, amount: e.target.value }))} /></Field>
+              <Field label="Date received"><input style={{ ...inputStyle, marginTop: 0 }} type="date" value={pay.paid_on} onChange={(e) => setPay((cur) => ({ ...cur, paid_on: e.target.value }))} /></Field>
+              {pay.method === "cheque" && (
+                <>
+                  <Field label="Cheque number"><input style={{ ...inputStyle, marginTop: 0, fontFamily: MONO_FONT }} value={pay.cheque_no} onChange={(e) => setPay((cur) => ({ ...cur, cheque_no: e.target.value }))} /></Field>
+                  <Field label="Bank"><input style={{ ...inputStyle, marginTop: 0 }} value={pay.cheque_bank} onChange={(e) => setPay((cur) => ({ ...cur, cheque_bank: e.target.value }))} /></Field>
+                  <Field label="Date on the cheque (if post-dated)"><input style={{ ...inputStyle, marginTop: 0 }} type="date" value={pay.cheque_date} onChange={(e) => setPay((cur) => ({ ...cur, cheque_date: e.target.value }))} /></Field>
+                  <div style={{ fontSize: 11.5, color: COLORS.muted, marginBottom: 10 }}>A cheque only counts as paid once you mark it Cleared.</div>
+                </>
+              )}
+              <Field label="Note (optional)"><input style={{ ...inputStyle, marginTop: 0 }} value={pay.note} onChange={(e) => setPay((cur) => ({ ...cur, note: e.target.value }))} /></Field>
+              {payProblem && <div style={{ fontSize: 12, color: COLORS.muted, marginBottom: 8 }}>{payProblem}</div>}
+              <div style={{ display: "flex", gap: 8 }}>
+                <button onClick={() => setPayOpen(false)} className="mrcap-press" style={{ ...secondaryBtnStyle, flex: 1 }}>Cancel</button>
+                <button onClick={savePayment} disabled={busy || !!payProblem} className="mrcap-press" style={{ ...primaryBtnStyle, flex: 2, opacity: busy || payProblem ? 0.5 : 1 }}>{busy ? "Saving…" : "Save payment"}</button>
+              </div>
+            </div>
+          )}
+
+          <div style={{ ...billCard, fontSize: 12.5, color: rec ? "#7BC494" : COLORS.muted }}>
+            {rec ? `Entered in First Bit${rec.first_bit_ref ? ` (${rec.first_bit_ref})` : ""} by ${rec.entered_by}.` : "Not yet entered in First Bit."}
+          </div>
+
+          <div style={{ display: "flex", gap: 8, marginBottom: 10 }}>
+            <button onClick={() => onRevise(proformaRevisionSeed(p))} className="mrcap-press" style={{ ...secondaryBtnStyle, flex: 1 }}>Revise (new version)</button>
+            {!voiding && <button onClick={() => setVoiding(true)} className="mrcap-press" style={{ ...secondaryBtnStyle, flex: 1, color: "#E08A78" }}>Void</button>}
+          </div>
+          {voiding && (
+            <div style={billCard}>
+              <div style={{ fontSize: 12.5, color: COLORS.ink, marginBottom: 8 }}>Voiding keeps the number on record and stamps the PDF VOID. Why is it being voided?</div>
+              <input style={{ ...inputStyle, marginTop: 0 }} value={voidReason} onChange={(e) => setVoidReason(e.target.value)} placeholder="Reason" />
+              <div style={{ display: "flex", gap: 8, marginTop: 10 }}>
+                <button onClick={() => { setVoiding(false); setVoidReason(""); }} className="mrcap-press" style={{ ...secondaryBtnStyle, flex: 1 }}>Cancel</button>
+                <button onClick={doVoid} disabled={busy || voidReason.trim().length < 3} className="mrcap-press" style={{ ...primaryBtnStyle, flex: 2, background: COLORS.red, color: "#fff", opacity: busy || voidReason.trim().length < 3 ? 0.5 : 1 }}>Void proforma</button>
+              </div>
+            </div>
+          )}
+        </>
+      )}
+    </div>
+  );
+}
+
 function slugify(label) {
   const base = (label || "").trim().toLowerCase().replace(/[^a-z0-9]+/g, "_").replace(/^_+|_+$/g, "");
   return base || `item_${Math.random().toString(36).slice(2, 7)}`;
