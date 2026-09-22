@@ -7112,7 +7112,16 @@ function JobDetail({ id, initialJob, session, team, onChanged, onBack, canArchiv
           {lastStorageError && <div style={{ fontSize: 10.5, color: "#E8A99B", marginTop: 6, fontFamily: "monospace", wordBreak: "break-word" }}>{lastStorageError}</div>}
         </div>
       )}
-      {stage.key === "ready" && job.customerPhone && (
+      {/* WhatsAppSendButton already no-ops (returns null) when there's no
+          phone on file — but CustomerNotifyControl must NOT be gated on
+          phone too: "Customer informed" (or "not needed") is a plain
+          acknowledgment staff can tick regardless of how they told the
+          customer (call, in person, WhatsApp from a personal phone,
+          etc). Nesting it inside `job.customerPhone &&` used to hide the
+          checkbox entirely for any job with no phone on file (e.g. every
+          Quick Intake job) — leaving no way to ever clear the dashboard's
+          "Customer Not Yet Informed" flag for that car. */}
+      {stage.key === "ready" && (
         <>
           <WhatsAppSendButton
             phone={job.customerPhone}
@@ -7120,10 +7129,11 @@ function JobDetail({ id, initialJob, session, team, onChanged, onBack, canArchiv
             vars={{ customerName: job.customerName || "", makeModel: job.makeModel || "vehicle", plate: job.plate || "" }}
             label="Notify Customer on WhatsApp"
           />
+          {!job.customerPhone && <div style={{ fontSize: 11, color: COLORS.muted, marginBottom: 8, fontStyle: "italic" }}>No phone on file — add one via Edit Job to WhatsApp them, or just tick below once you've told them another way.</div>}
           <CustomerNotifyControl record={job} templateKey="ready_for_collection" session={session} onSave={saveJobRecord} skippable={false} />
         </>
       )}
-      {stage.key === "intake" && job.customerPhone && (
+      {stage.key === "intake" && (
         <>
           <WhatsAppSendButton
             phone={job.customerPhone}
@@ -7135,7 +7145,7 @@ function JobDetail({ id, initialJob, session, team, onChanged, onBack, canArchiv
         </>
       )}
 
-      {stage.key === "collected" && job.customerPhone && hasPermission(session, team, "googleReview") && (
+      {stage.key === "collected" && hasPermission(session, team, "googleReview") && (
         <div style={{ background: "linear-gradient(160deg, rgba(201,162,39,0.14), rgba(201,162,39,0.04))", border: `1.5px solid ${COLORS.gold}`, borderRadius: 12, padding: "14px 15px", marginBottom: 12 }}>
           <div style={{ display: "flex", alignItems: "center", gap: 7, marginBottom: 6 }}>
             <Star size={15} color={COLORS.gold} fill={COLORS.gold} />
@@ -9857,17 +9867,18 @@ function QuoteDetail({ id, session, team, onBack, onConverted }) {
         <FileText size={15} /> Generate E-Quote (PDF)
       </button>
 
-      {quote.customerPhone && (
-        <>
-          <WhatsAppSendButton
-            phone={quote.customerPhone}
-            templateKey="quote_sent"
-            vars={{ customerName: quote.customerName || "", makeModel: quote.makeModel || "vehicle", plate: quote.plate || "", total: total > 0 ? Math.round(total).toLocaleString() : "0", quoteLink: `${window.location.origin}/?quote=${quote.id}` }}
-            label="Send Quote on WhatsApp"
-          />
-          <CustomerNotifyControl record={quote} templateKey="quote_sent" session={session} onSave={saveQuoteRecord} skippable={false} />
-        </>
-      )}
+      {/* Same fix as JobDetail: CustomerNotifyControl isn't gated on
+          phone — a quote with no number on file should still let staff
+          tick "Customer informed" once it's been sent another way. */}
+      <>
+        <WhatsAppSendButton
+          phone={quote.customerPhone}
+          templateKey="quote_sent"
+          vars={{ customerName: quote.customerName || "", makeModel: quote.makeModel || "vehicle", plate: quote.plate || "", total: total > 0 ? Math.round(total).toLocaleString() : "0", quoteLink: `${window.location.origin}/?quote=${quote.id}` }}
+          label="Send Quote on WhatsApp"
+        />
+        <CustomerNotifyControl record={quote} templateKey="quote_sent" session={session} onSave={saveQuoteRecord} skippable={false} />
+      </>
 
       {canEditQuote && quote.status !== "converted" && (
         <button onClick={() => setEditing(true)} className="mrcap-press" style={{ display: "flex", alignItems: "center", justifyContent: "center", gap: 7, width: "100%", padding: "10px", borderRadius: 10, border: `1.5px dashed ${COLORS.gold}`, background: "rgba(201,162,39,0.08)", color: COLORS.gold, fontWeight: 600, fontSize: 12.5, cursor: "pointer", marginBottom: 12 }}>
