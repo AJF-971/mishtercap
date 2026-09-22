@@ -1,0 +1,21 @@
+[build]
+  command = "npm run build"
+  publish = "dist"
+
+  # Pinned so every build uses the same Node. One of the dependencies
+  # (@capacitor/cli, for the Android app) needs Node 22 or newer, and a
+  # build that fails for a version reason still spends credits.
+  [build.environment]
+    NODE_VERSION = "22"
+
+[functions]
+  directory = "netlify/functions"
+  node_bundler = "esbuild"
+
+# Single-page app: any route falls back to index.html so React Router-less
+# client-side view switching (our app uses simple state, not URL routes)
+# still loads correctly on a hard refresh or direct link.
+[[redirects]]
+  from = "/*"
+  to = "/index.html"
+  status = 200
