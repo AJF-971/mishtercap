@@ -1895,7 +1895,12 @@ function generateJobCardPDF(job) {
     doc.text("5", margin + 452, y + 12);
     doc.text(r.amountIncl.toFixed(2), margin + 470, y + 12);
     subtotal += r.amountExcl;
-    totalDiscount += r.price - r.amountExcl;
+    // r.price is the UNIT price (qty lives separately in r.qty since
+    // per-piece treatments were added) — the pre-discount extended
+    // amount is price x qty, not price alone, or this goes negative for
+    // any qty > 1 line (was already subtly wrong for multi-qty parts
+    // rows too, before per-piece treatments existed).
+    totalDiscount += r.price * (r.qty || 1) - r.amountExcl;
     totalVat += r.vatAmount;
     y += rowH;
   });
@@ -5406,11 +5411,14 @@ function NewQuoteForm({ session, onCreated, onCancel }) {
                         </button>
                         {picked && (
                           <div style={{ padding: "5px 9px 0 30px" }}>
-                            <div style={{ display: "flex", alignItems: "center", gap: 6 }}>
+                            <div style={{ display: "flex", alignItems: "center", gap: 6, flexWrap: "wrap" }}>
                               <span style={{ fontSize: 10.5, color: COLORS.muted }}>AED</span>
                               <input type="number" value={treatmentPrices[priceKey] ?? ""} onChange={(e) => setTreatmentPrices((p) => ({ ...p, [priceKey]: e.target.value }))} style={{ width: 90, background: COLORS.panel2, border: `1px solid ${COLORS.line}`, borderRadius: 6, padding: "4px 7px", fontSize: 11.5, color: COLORS.gold, fontFamily: MONO_FONT }} />
                               {t.retail != null && Number(treatmentPrices[priceKey]) !== t.retail && (
                                 <span style={{ fontSize: 10, color: COLORS.muted, textDecoration: "line-through", fontFamily: MONO_FONT }}>AED {t.retail.toLocaleString()}</span>
+                              )}
+                              {isPerPieceTreatment(s.key, t.name) && (
+                                <span style={{ fontSize: 10, color: COLORS.gold }}>per piece — enter the unit price, not the total (quotes don't have a pieces picker yet)</span>
                               )}
                             </div>
                           </div>
@@ -9682,11 +9690,14 @@ function EditQuoteScreen({ quote, session, onSaved, onCancel }) {
                         </button>
                         {picked && (
                           <div style={{ padding: "5px 9px 0 30px" }}>
-                            <div style={{ display: "flex", alignItems: "center", gap: 6 }}>
+                            <div style={{ display: "flex", alignItems: "center", gap: 6, flexWrap: "wrap" }}>
                               <span style={{ fontSize: 10.5, color: COLORS.muted }}>AED</span>
                               <input type="number" value={treatmentPrices[priceKey] ?? ""} onChange={(e) => setTreatmentPrices((p) => ({ ...p, [priceKey]: e.target.value }))} style={{ width: 90, background: COLORS.panel2, border: `1px solid ${COLORS.line}`, borderRadius: 6, padding: "4px 7px", fontSize: 11.5, color: COLORS.gold, fontFamily: MONO_FONT }} />
                               {t.retail != null && Number(treatmentPrices[priceKey]) !== t.retail && (
                                 <span style={{ fontSize: 10, color: COLORS.muted, textDecoration: "line-through", fontFamily: MONO_FONT }}>AED {t.retail.toLocaleString()}</span>
+                              )}
+                              {isPerPieceTreatment(s.key, t.name) && (
+                                <span style={{ fontSize: 10, color: COLORS.gold }}>per piece — enter the unit price, not the total (quotes don't have a pieces picker yet)</span>
                               )}
                             </div>
                           </div>
@@ -11180,9 +11191,13 @@ function SmartechJobDetail({ session, jobRow, onBack, onUpdated }) {
         {jobRow.smartech_description && <div style={{ fontSize: 12.5, color: COLORS.ink, marginTop: 10, fontWeight: 600 }}>{jobRow.smartech_description}</div>}
         {jobRow.description && <div style={{ fontSize: 12, color: COLORS.muted, marginTop: 6 }}>{jobRow.description}</div>}
         {jobRow.damage_notes && <div style={{ fontSize: 12, color: COLORS.muted, marginTop: 6 }}>{jobRow.damage_notes}</div>}
-        {/* Piece/panel counts only — never a price. Keyed "serviceKey::name",
-            same as treatmentPrices, but this field is informational-only
-            and never read by billing. */}
+        {/* Piece/panel counts only — never a price (Smartech never sees
+            price). Keyed "serviceKey::name", same as treatmentPrices.
+            This IS the real quantity used in billing (price x qty) for
+            treatments flagged "per piece" from Services & Pricing — see
+            isPerPieceTreatment/treatmentLineTotal — but shows here for
+            whatever's on this job regardless of category, not just
+            body-work ones. */}
         {Object.entries(jobRow.smartech_pieces || {}).filter(([, n]) => Number(n) > 0).length > 0 && (
           <div style={{ marginTop: 8, display: "flex", flexWrap: "wrap", gap: 6 }}>
             {Object.entries(jobRow.smartech_pieces || {}).filter(([, n]) => Number(n) > 0).map(([key, n]) => (
@@ -11499,7 +11514,13 @@ function SmartechChatBroadcaster({ session }) {
   useEffect(() => {
     const check = async () => {
       const updates = await loadRecentSmartechMessages(lastSeenRef.current);
-      lastSeenRef.current = Date.now();
+      if (!updates.length) return;
+      // Advance from the messages' own server timestamps, not the
+      // device clock (same reasoning as LiveUpdateBroadcaster) — a
+      // phone whose clock lags the server would otherwise re-chime the
+      // same message repeatedly, and one running ahead could miss
+      // messages silently.
+      lastSeenRef.current = Math.max(...updates.map((m) => new Date(m.created_at).getTime()));
       const incoming = updates.filter((m) => m.sender_id !== session.id);
       if (!incoming.length) return;
       playUpdateChime();
