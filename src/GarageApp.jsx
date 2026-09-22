@@ -10560,6 +10560,10 @@ async function fetchJobishJobs(memberId) {
   );
   if (!ok || !data) return [];
   return data.filter((j) => {
+    // Same "collected" exclusion every other staff member's job list
+    // already applies (SimplifiedDashboard) — without it, every job ever
+    // assigned to this person stays in the list forever.
+    if ((STAGES[j.stage_index] || STAGES[0]).key === "collected") return false;
     const singleAssignee = (j.assigned_to || {}).bodyshop;
     const teamAssignees = (j.assigned_team || {}).bodyshop || [];
     return singleAssignee === memberId || teamAssignees.includes(memberId);
