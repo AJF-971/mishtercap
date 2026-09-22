@@ -162,6 +162,14 @@ function isSubcontractorPortal(member) {
   return !!member && member.dashboardMode === "subcontractor";
 }
 
+// Who can review/approve Jobish's submitted bills & purchases: every
+// admin, plus Ahmed and Laani by name (a deliberate exception outside
+// the role system, same pattern as isSuperAdmin below — they're not
+// role "admin", but the shop wants them here specifically).
+function canApproveJobish(session) {
+  return !!session && (session.role === "admin" || session.id === "ahmed" || session.id === "laani");
+}
+
 // Who can hide/show a car on the Dispatch Board entirely (e.g. it's
 // actually sitting at Smartech, not on-site) — a named list by request,
 // not a toggleable permission flag.
@@ -1613,8 +1621,10 @@ const COMMISSION_ENTITIES = [
 // are never confused with each other, until a real integration exists.
 async function finalizeInvoiceNumber(job, session) {
   if (job.invoiceNo) return { ok: true, invoiceNo: job.invoiceNo, alreadyFinalized: true };
-  const entity = COMMISSION_ENTITIES.find((e) => e.key === job.commissionEntity);
-  if (!entity) return { ok: false, error: "This job has no commission entity set — contact an admin before finalizing." };
+  // Single-branch operation now (see COMMISSION_ENTITIES) — fall back to
+  // the only entity that exists rather than hard-failing if some future
+  // job ever ends up with an unset/stale commissionEntity value.
+  const entity = COMMISSION_ENTITIES.find((e) => e.key === job.commissionEntity) || COMMISSION_ENTITIES[0];
 
   const year = new Date().getFullYear();
   const { ok, data } = await sbFetch("rpc/next_invoice_number", {
@@ -3084,7 +3094,7 @@ function DesktopShell({ session, team, view, setView, onLogout, canArchive, chil
           {navItem("msgtemplates", "WhatsApp Messages", MessageSquare, () => setView("msgtemplates"), isSuperAdmin(session))}
           {navItem("announcements", "Post Announcement", Send, () => setView("announcements"), isSuperAdmin(session))}
           {navItem("issues", "Issue Reports", AlertCircle, () => setView("issues"), isSuperAdmin(session))}
-          {navItem("jobishapprovals", "Jobish Approvals", Receipt, () => setView("jobishapprovals"), session.role === "admin")}
+          {navItem("jobishapprovals", "Jobish Approvals", Receipt, () => setView("jobishapprovals"), canApproveJobish(session))}
         </div>
         <div style={{ borderTop: "1px solid #262A30", paddingTop: 12, marginTop: 12 }}>
           <div style={{ padding: "0 10px 10px", fontSize: 11.5, color: "#8A919B" }}>{session.name} · {ROLE_DEFS[session.role]?.label || session.role}</div>
@@ -3879,11 +3889,19 @@ export default function GarageApp() {
       let restoredSession = null;
       if (raw) {
         const s = raw;
-        if (t.find((m) => m.id === s.id)) {
-          setSession(s); setCurrentActor(s);
-          restoredSession = s;
+        const fresh = t.find((m) => m.id === s.id);
+        if (fresh) {
+          // Merge in whatever an admin may have changed since this device
+          // last logged in (role, dashboardMode) — a session restored from
+          // localStorage used to keep whatever it was stamped with at
+          // login until the next logout, so a mode change (e.g. someone
+          // switched to Subcontractor Portal) silently didn't take effect
+          // on a device that was already signed in.
+          const s2 = { ...s, role: fresh.role, dashboardMode: fresh.dashboardMode || "auto" };
+          setSession(s2); setCurrentActor(s2);
+          restoredSession = s2;
           if (shouldShowMorningReminder("mrcap")) setShowMorningReminder(true);
-          registerForPush(s.id);
+          registerForPush(s2.id);
         }
       }
       // A subcontractor portal session (Jobish etc.) never needs the
@@ -4125,10 +4143,10 @@ export default function GarageApp() {
         <ProformaDetail id={activeProformaId} session={session} team={team} onBack={() => window.history.back()} onEditDraft={(p) => newProforma(p)} onRevise={(seed) => newProforma(seed)} onOpenJob={(jobId) => openJob(jobId)} onDeleted={() => window.history.back()} />
       )}
       {(view === "billing" || view === "proformaedit" || view === "proformadetail") && !canBilling && <AccessDenied onBack={() => window.history.back()} />}
-      {view === "jobishapprovals" && session.role === "admin" && (
+      {view === "jobishapprovals" && canApproveJobish(session) && (
         <JobishApprovalQueue session={session} onBack={() => window.history.back()} />
       )}
-      {view === "jobishapprovals" && session.role !== "admin" && <AccessDenied onBack={() => window.history.back()} />}
+      {view === "jobishapprovals" && !canApproveJobish(session) && <AccessDenied onBack={() => window.history.back()} />}
     </ActiveShell>
   );
 }
@@ -4409,7 +4427,7 @@ function TopBar({ session, team, onLogout, onNew, view, onBack, onTeam, onArchiv
     moreItems.push({ label: "Post Announcement", icon: <Send size={15} color={COLORS.ink} />, onClick: onAnnouncements });
     moreItems.push({ label: "Issue Reports", icon: <AlertCircle size={15} color={COLORS.ink} />, onClick: onIssues });
   }
-  if (view === "list" && session.role === "admin") {
+  if (view === "list" && canApproveJobish(session)) {
     moreItems.push({ label: "Jobish Approvals", icon: <Receipt size={15} color={COLORS.ink} />, onClick: onJobishApprovals });
   }
   return (
@@ -7151,6 +7169,21 @@ function JobDetail({ id, initialJob, session, team, onChanged, onBack, canArchiv
               Post
             </button>
           </div>
+        </div>
+      )}
+
+      {canApproveJobish(session) && ((job.jobishBills || []).length > 0 || (job.jobishPurchases || []).length > 0) && (
+        <div style={{ background: COLORS.panel, border: `1px solid ${COLORS.line}`, borderRadius: 12, padding: 16, marginBottom: 16 }}>
+          <div style={{ display: "flex", alignItems: "center", gap: 7, marginBottom: 3 }}>
+            <Receipt size={14} color={COLORS.gold} />
+            <div style={{ fontFamily: DISPLAY_FONT, fontWeight: 600, fontSize: 14.5, color: COLORS.ink }}>Jobish Bills & Purchases</div>
+            <Lock size={11} color={COLORS.muted} style={{ marginLeft: "auto" }} />
+          </div>
+          <div style={{ fontSize: 10.5, color: COLORS.muted, marginBottom: 12, display: "flex", alignItems: "center", gap: 5, fontStyle: "italic" }}>
+            <Lock size={9} /> Internal reference only — the customer never sees this section or its photos.
+          </div>
+          <JobishEntryList title="Bills" entries={job.jobishBills} />
+          <JobishEntryList title="Purchases" entries={job.jobishPurchases} />
         </div>
       )}
 
@@ -10641,6 +10674,7 @@ function JobishEntryForm({ label, onSubmit }) {
   const [photo, setPhoto] = useState(null);
   const [uploading, setUploading] = useState(false);
   const [saving, setSaving] = useState(false);
+  const [error, setError] = useState("");
   const fileRef = useRef(null);
 
   const attach = async (files) => {
@@ -10650,12 +10684,21 @@ function JobishEntryForm({ label, onSubmit }) {
     setUploading(false);
   };
 
+  // onSubmit reports back whether it actually saved (submitBill/
+  // submitPurchase in JobishJobDetail return that) — this used to clear
+  // the form unconditionally, so a rejected/offline write silently wiped
+  // out what Jobish had just typed with no error shown at all.
   const submit = async () => {
     const amt = Number(amount);
     if (!amt || amt <= 0 || !description.trim()) return;
     setSaving(true);
-    await onSubmit({ amount: amt, description: description.trim(), photo });
-    setAmount(""); setDescription(""); setPhoto(null);
+    setError("");
+    const ok = await onSubmit({ amount: amt, description: description.trim(), photo });
+    if (ok) {
+      setAmount(""); setDescription(""); setPhoto(null);
+    } else {
+      setError("Couldn't save — check your connection and try again.");
+    }
     setSaving(false);
   };
 
@@ -10669,6 +10712,7 @@ function JobishEntryForm({ label, onSubmit }) {
       <button onClick={() => fileRef.current?.click()} disabled={uploading} className="mrcap-press" style={{ marginTop: 8, display: "flex", alignItems: "center", gap: 6, padding: "7px 11px", borderRadius: 8, border: `1px dashed ${COLORS.gold}`, background: "rgba(201,162,39,0.08)", color: COLORS.gold, fontSize: 11.5, fontWeight: 600, cursor: "pointer" }}>
         <Camera size={13} /> {uploading ? "Uploading…" : photo ? "Replace Photo" : "Attach Bill / Receipt Photo"}
       </button>
+      {error && <div style={{ fontSize: 11, color: COLORS.red, marginTop: 8 }}>{error}</div>}
       <button onClick={submit} disabled={saving || !amount || !description.trim()} className="mrcap-press" style={{ ...primaryBtnStyle, width: "100%", marginTop: 10, opacity: saving || !amount || !description.trim() ? 0.6 : 1 }}>
         {saving ? "Submitting…" : "Submit for Approval"}
       </button>
@@ -10683,12 +10727,22 @@ function JobishEntryList({ title, entries }) {
     <div style={{ marginBottom: 14 }}>
       <div style={{ fontSize: 11, color: COLORS.muted, textTransform: "uppercase", letterSpacing: 0.5, marginBottom: 6 }}>{title}</div>
       {entries.slice().reverse().map((e) => (
-        <div key={e.id} style={{ background: COLORS.panel2, border: `1px solid ${COLORS.line}`, borderRadius: 8, padding: "9px 11px", marginBottom: 6 }}>
-          <div style={{ display: "flex", justifyContent: "space-between" }}>
-            <div style={{ fontSize: 12.5, fontWeight: 600, color: COLORS.ink }}>{e.description}</div>
-            <div style={{ fontFamily: MONO_FONT, fontSize: 12.5, color: COLORS.gold }}>AED {Math.round(e.amount).toLocaleString()}</div>
+        <div key={e.id} style={{ display: "flex", alignItems: "center", gap: 8, background: COLORS.panel2, border: `1px solid ${COLORS.line}`, borderRadius: 8, padding: "9px 11px", marginBottom: 6 }}>
+          {e.photo && (
+            <img
+              src={e.photo}
+              alt=""
+              onClick={() => window.open(e.photo, "_blank")}
+              style={{ width: 40, height: 40, objectFit: "cover", borderRadius: 6, border: `1px solid ${COLORS.line}`, cursor: "pointer", flexShrink: 0 }}
+            />
+          )}
+          <div style={{ flex: 1, minWidth: 0 }}>
+            <div style={{ display: "flex", justifyContent: "space-between" }}>
+              <div style={{ fontSize: 12.5, fontWeight: 600, color: COLORS.ink }}>{e.description}</div>
+              <div style={{ fontFamily: MONO_FONT, fontSize: 12.5, color: COLORS.gold, whiteSpace: "nowrap" }}>AED {Math.round(e.amount).toLocaleString()}</div>
+            </div>
+            <div style={{ fontSize: 10.5, color: toneFor(e.status), marginTop: 3, textTransform: "capitalize" }}>{e.status}{e.status === "rejected" && e.rejectionReason ? ` — ${e.rejectionReason}` : ""}{e.createdBy ? ` · ${e.createdBy}` : ""}</div>
           </div>
-          <div style={{ fontSize: 10.5, color: toneFor(e.status), marginTop: 3, textTransform: "capitalize" }}>{e.status}{e.status === "rejected" && e.rejectionReason ? ` — ${e.rejectionReason}` : ""}</div>
         </div>
       ))}
     </div>
@@ -10702,11 +10756,13 @@ function JobishJobDetail({ session, jobRow, onBack, onUpdated }) {
     const entry = { id: uid("jbill"), amount, description, photo: photo || null, status: "pending", createdAt: Date.now(), createdBy: session.name, createdById: session.id, reviewedAt: null, reviewedBy: null, rejectionReason: null };
     const next = await submitJobishEntry(jobRow, "bill", entry);
     if (next) onUpdated({ ...jobRow, jobish_bills: next });
+    return !!next;
   };
   const submitPurchase = async ({ amount, description, photo }) => {
     const entry = { id: uid("jpurch"), amount, description, photo: photo || null, status: "pending", createdAt: Date.now(), createdBy: session.name, createdById: session.id, reviewedAt: null, reviewedBy: null, rejectionReason: null };
     const next = await submitJobishEntry(jobRow, "purchase", entry);
     if (next) onUpdated({ ...jobRow, jobish_purchases: next });
+    return !!next;
   };
 
   return (
@@ -13726,7 +13782,12 @@ export function DispatchKiosk() {
         <div style={{ fontSize: 12.5, color: COLORS.muted, marginTop: 6 }}>Tap your name — no PIN needed</div>
       </div>
       <div style={{ display: "flex", flexDirection: "column", gap: 8, maxWidth: 420, margin: "0 auto" }}>
-        {team.map((m) => (
+        {/* Subcontractor-portal members (Jobish etc.) are deliberately
+            never offered here — this kiosk's whole login is "tap your
+            name, no PIN" for non-admins, which would otherwise let anyone
+            standing at this tablet open the full shop-wide board as them,
+            defeating the point of their locked-down portal entirely. */}
+        {team.filter((m) => !isSubcontractorPortal(m)).map((m) => (
           <button
             key={m.id}
             onClick={() => pick(m)}
