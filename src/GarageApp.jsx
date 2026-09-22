@@ -299,15 +299,15 @@ let SERVICES = [
     // paint work Smartech does, not Mr.CAP.
     treatments: [
       { name: "Paintless Dent Removal", retail: null, b2b: null },
-      { name: "Dent & Paint", retail: null, b2b: null },
+      { name: "Dent & Paint", retail: null, b2b: null, perPiece: true },
     ] },
   { key: "bodyshop",   label: "Body Work (Smartech)", role: "bodyshop",
     treatments: [
       { name: "BodyWorks (Smart Paint)", retail: 1000, b2b: 700 },
       { name: "BodyWorks (min charge)", retail: 800, b2b: 600 },
-      { name: "RimRepair - Painted", retail: 500, b2b: 250 },
-      { name: "RimRepair - Diamond cut", retail: 600, b2b: 300 },
-      { name: "Panels", retail: null, b2b: null },
+      { name: "RimRepair - Painted", retail: 500, b2b: 250, perPiece: true },
+      { name: "RimRepair - Diamond cut", retail: 600, b2b: 300, perPiece: true },
+      { name: "Panels", retail: null, b2b: null, perPiece: true },
     ] },
   { key: "upholstery", label: "Upholstery (Beneloom)", role: "upholstery",
     // No prices were given for any Beneloom treatment — all manual-entry.
@@ -324,6 +324,37 @@ let SERVICES = [
 function jobRoutesToSmartech(serviceTypes, treatments) {
   if ((serviceTypes || []).includes("bodyshop")) return true;
   return ((treatments && treatments.dentrepair) || []).includes("Dent & Paint");
+}
+
+// Per-piece pricing: a treatment (any category — rim repair, body panels,
+// etc.) can be flagged `perPiece` from the Services & Pricing screen. When
+// it is, the number stored in treatmentPrices is the PRICE PER PIECE, and
+// the real line amount used everywhere (subtotals, invoices, proformas) is
+// price x quantity. Quantity lives in job.smartechPieces (same
+// "serviceKey::name" keys as treatmentPrices) — the same field the
+// Smartech dashboard already displays piece counts from, since in
+// practice the per-piece treatments are exactly the Smartech-routed ones
+// (rims, panels, dent & paint). When a treatment is NOT flagged per-piece,
+// nothing changes from before: the stored price already IS the line total.
+function isPerPieceTreatment(serviceKey, name) {
+  const svc = SERVICES.find((s) => s.key === serviceKey);
+  return !!svc?.treatments?.find((t) => t.name === name)?.perPiece;
+}
+function treatmentLineTotal(serviceKey, name, price, qty) {
+  const amt = Number(price) || 0;
+  if (!isPerPieceTreatment(serviceKey, name)) return amt;
+  return amt * Math.max(1, Number(qty) || 1);
+}
+// treatmentPrices/treatmentQty are both keyed "serviceKey::name" — this is
+// the one place "what's the real subtotal" gets computed, used by every
+// job form so a per-piece treatment's price x qty is never missed.
+function treatmentPricesSubtotal(treatmentPrices, treatmentQty) {
+  return Object.entries(treatmentPrices || {}).reduce((sum, [key, price]) => {
+    const sep = key.indexOf("::");
+    const serviceKey = key.slice(0, sep);
+    const name = key.slice(sep + 2);
+    return sum + treatmentLineTotal(serviceKey, name, price, (treatmentQty || {})[key]);
+  }, 0);
 }
 
 // One small icon per service category, purely for the dashboard job card's
@@ -929,7 +960,7 @@ async function loadDynamicServicesAndRoles() {
 
   const treatsByCategory = {};
   for (const t of treatsRes.data || []) {
-    (treatsByCategory[t.category_key] ||= []).push({ name: t.name, retail: t.retail, b2b: t.b2b, active: t.active !== false, id: t.id });
+    (treatsByCategory[t.category_key] ||= []).push({ name: t.name, retail: t.retail, b2b: t.b2b, active: t.active !== false, id: t.id, perPiece: !!t.per_piece });
   }
 
   const nextServices = catsRes.data.map((c) => ({
@@ -1222,14 +1253,14 @@ async function setServiceCategoryActive(id, active) {
 }
 
 async function saveServiceTreatment(treatment) {
-  // treatment: { id?, category_key, name, retail, b2b, sort_order, active }
+  // treatment: { id?, category_key, name, retail, b2b, sort_order, active, perPiece }
   const isNew = !treatment.id;
   const { ok } = await sbFetch(isNew ? "service_treatments" : `service_treatments?id=eq.${encodeURIComponent(treatment.id)}`, {
     method: isNew ? "POST" : "PATCH",
     headers: { Prefer: "return=minimal" },
     body: JSON.stringify(isNew
-      ? [{ category_key: treatment.category_key, name: treatment.name, retail: treatment.retail, b2b: treatment.b2b, sort_order: treatment.sort_order ?? 0, active: true }]
-      : { name: treatment.name, retail: treatment.retail, b2b: treatment.b2b, updated_at: new Date().toISOString() }),
+      ? [{ category_key: treatment.category_key, name: treatment.name, retail: treatment.retail, b2b: treatment.b2b, sort_order: treatment.sort_order ?? 0, active: true, per_piece: !!treatment.perPiece }]
+      : { name: treatment.name, retail: treatment.retail, b2b: treatment.b2b, per_piece: !!treatment.perPiece, updated_at: new Date().toISOString() }),
   });
   if (ok) await loadDynamicServicesAndRoles();
   return ok;
@@ -1735,12 +1766,13 @@ function buildInvoiceLineItems(job) {
     const picks = (job.treatments || {})[s.key] || [];
     picks.forEach((name) => {
       const priceKey = `${s.key}::${name}`;
-      const price = Number((job.treatmentPrices || {})[priceKey]) || 0;
+      const unitPrice = Number((job.treatmentPrices || {})[priceKey]) || 0;
+      const qty = isPerPieceTreatment(s.key, name) ? Math.max(1, Number((job.smartechPieces || {})[priceKey]) || 1) : 1;
       const discountPct = job.discountPercent || 0;
-      const excl = price;
+      const excl = unitPrice * qty;
       const amountExcl = excl * (1 - discountPct / 100);
       const vatAmount = amountExcl * VAT_RATE;
-      rows.push({ desc: name, qty: 1, price: excl, discount: discountPct, amountExcl, vatAmount, amountIncl: amountExcl + vatAmount });
+      rows.push({ desc: name, qty, price: unitPrice, discount: discountPct, amountExcl, vatAmount, amountIncl: amountExcl + vatAmount });
     });
   });
   (job.parts || []).forEach((p) => {
@@ -4088,6 +4120,7 @@ export default function GarageApp() {
       {showMorningReminder && <MorningReminderBanner onDismiss={() => { setShowMorningReminder(false); dismissMorningReminder("mrcap"); }} />}
       <AnnouncementBanner session={session} />
       <LiveUpdateBroadcaster onOpenJob={(id) => openJob(id)} />
+      {canUseSmartechChat(session) && <SmartechChatBroadcaster session={session} />}
       {canSeeLiveUpdates(session) && <InternalUpdatesWidget team={team} session={session} index={index} onOpenJob={(id) => openJob(id)} />}
       {view === "list" && (
         isSimplifiedRole(session)
@@ -5816,7 +5849,10 @@ function NewJobForm({ session, team, onCreated, onCancel }) {
       smartechFlag: routesToSmartech,
       smartechDescription: routesToSmartech ? smartechDescription.trim() : "",
       smartechPhotos: routesToSmartech ? smartechPhotos : [],
-      smartechPieces: routesToSmartech ? smartechPieces : {},
+      // Piece quantities are independent of Smartech routing — any
+      // treatment can be flagged per-piece from Services & Pricing — so
+      // always saved, not gated on routesToSmartech.
+      smartechPieces,
       history: [{ stage: "intake", label: "Intake", by: session.name, role: session.role, note: "Job card opened — customer signed", at: now }],
       createdAt: now, updatedAt: now, createdBy: session.name,
     };
@@ -5961,17 +5997,20 @@ function NewJobForm({ session, team, onCreated, onCancel }) {
                                   placeholder={hasListPrice ? "" : "type price"}
                                   style={{ width: 90, background: COLORS.panel2, border: `1px solid ${COLORS.line}`, borderRadius: 6, padding: "4px 7px", fontSize: 11.5, color: COLORS.gold, fontFamily: MONO_FONT }}
                                 />
-                                {!hasListPrice && jobRoutesToSmartech([s.key], { [s.key]: [t.name] }) && (
+                                {isPerPieceTreatment(s.key, t.name) && (
                                   <>
-                                    <span style={{ fontSize: 10.5, color: COLORS.muted, marginLeft: 4 }}>Pieces</span>
+                                    <span style={{ fontSize: 10.5, color: COLORS.muted, marginLeft: 4 }}>x Pcs</span>
                                     <input
                                       type="number"
-                                      min="0"
+                                      min="1"
                                       value={smartechPieces[priceKey] ?? ""}
                                       onChange={(e) => setSmartechPieces((p) => ({ ...p, [priceKey]: e.target.value }))}
                                       placeholder="1"
                                       style={{ width: 50, background: COLORS.panel2, border: `1px solid ${COLORS.line}`, borderRadius: 6, padding: "4px 7px", fontSize: 11.5, color: COLORS.ink, fontFamily: MONO_FONT }}
                                     />
+                                    <span style={{ fontSize: 10.5, color: COLORS.gold, fontFamily: MONO_FONT }}>
+                                      = AED {Math.round(treatmentLineTotal(s.key, t.name, treatmentPrices[priceKey], smartechPieces[priceKey])).toLocaleString()}
+                                    </span>
                                   </>
                                 )}
                               </div>
@@ -5993,15 +6032,15 @@ function NewJobForm({ session, team, onCreated, onCancel }) {
         <div style={{ background: COLORS.panel, border: `1px solid ${COLORS.line}`, borderRadius: 10, padding: 14, marginBottom: 14 }}>
           <div style={{ display: "flex", justifyContent: "space-between", fontSize: 12.5, color: COLORS.muted, marginBottom: 8 }}>
             <span>Subtotal</span>
-            <span style={{ fontFamily: MONO_FONT, color: COLORS.ink }}>AED {Object.values(treatmentPrices).reduce((sum, v) => sum + (Number(v) || 0), 0).toLocaleString()}</span>
+            <span style={{ fontFamily: MONO_FONT, color: COLORS.ink }}>AED {treatmentPricesSubtotal(treatmentPrices, smartechPieces).toLocaleString()}</span>
           </div>
           <div style={{ marginBottom: 4 }}>
-            <DiscountPicker value={discountPercent} onChange={setDiscountPercent} subtotal={Object.values(treatmentPrices).reduce((sum, v) => sum + (Number(v) || 0), 0)} />
+            <DiscountPicker value={discountPercent} onChange={setDiscountPercent} subtotal={treatmentPricesSubtotal(treatmentPrices, smartechPieces)} />
           </div>
           <div style={{ display: "flex", justifyContent: "space-between", marginTop: 10, paddingTop: 10, borderTop: `1px dashed ${COLORS.line}` }}>
             <span style={{ fontSize: 13.5, fontWeight: 700, color: COLORS.ink }}>Total</span>
             <span style={{ fontFamily: MONO_FONT, fontWeight: 700, fontSize: 16, color: COLORS.gold }}>
-              AED {Math.round(Object.values(treatmentPrices).reduce((sum, v) => sum + (Number(v) || 0), 0) * (1 - discountPercent / 100)).toLocaleString()}
+              AED {Math.round(treatmentPricesSubtotal(treatmentPrices, smartechPieces) * (1 - discountPercent / 100)).toLocaleString()}
             </span>
           </div>
         </div>
@@ -6167,6 +6206,10 @@ function EditJobScreen({ job, session, onSaved, onCancel }) {
   const [serviceTypes, setServiceTypes] = useState(job.serviceTypes || []);
   const [treatments, setTreatments] = useState(job.treatments || {});
   const [treatmentPrices, setTreatmentPrices] = useState(job.treatmentPrices || {});
+  // Piece/panel quantities for treatments flagged "per piece" from
+  // Services & Pricing (see isPerPieceTreatment) — same "serviceKey::name"
+  // keys as treatmentPrices, same field the Smartech dashboard reads.
+  const [smartechPieces, setSmartechPieces] = useState(job.smartechPieces || {});
   const [discountPercent, setDiscountPercent] = useState(job.discountPercent || 0);
   const [parts, setParts] = useState(job.parts || []);
   const [warrantyExpiry, setWarrantyExpiry] = useState(job.warrantyExpiry || "");
@@ -6198,11 +6241,14 @@ function EditJobScreen({ job, session, onSaved, onCancel }) {
       return { ...cur, [serviceKey]: next };
     });
     const priceKey = `${serviceKey}::${name}`;
+    const already = (treatments[serviceKey] || []).includes(name);
     setTreatmentPrices((p) => {
-      const already = (treatments[serviceKey] || []).includes(name);
       if (already) { const next = { ...p }; delete next[priceKey]; return next; }
       return { ...p, [priceKey]: t.retail != null ? t.retail : "" };
     });
+    if (already) {
+      setSmartechPieces((p) => { const next = { ...p }; delete next[priceKey]; return next; });
+    }
   };
 
 
@@ -6235,6 +6281,17 @@ function EditJobScreen({ job, session, onSaved, onCancel }) {
       if (String(before ?? "") !== String(after ?? "")) {
         const treatmentName = priceKey.split("::")[1] || priceKey;
         changes.push(`Price — ${treatmentName}: AED ${before || "0"} → AED ${after || "0"}`);
+      }
+    });
+    // Piece-quantity changes get the same per-line logging as price
+    // changes — only meaningful for per-piece treatments, but cheap to
+    // check unconditionally.
+    Object.keys(smartechPieces).forEach((priceKey) => {
+      const before = (job.smartechPieces || {})[priceKey];
+      const after = smartechPieces[priceKey];
+      if (String(before ?? "") !== String(after ?? "")) {
+        const treatmentName = priceKey.split("::")[1] || priceKey;
+        changes.push(`Pieces — ${treatmentName}: ${before || "1"} → ${after || "1"}`);
       }
     });
     const addedServices = serviceTypes.filter((k) => !(job.serviceTypes || []).includes(k));
@@ -6270,7 +6327,7 @@ function EditJobScreen({ job, session, onSaved, onCancel }) {
       plate: plate.trim().toUpperCase(), makeModel: makeModel.trim(),
       customerName: customerName.trim(), customerPhone: customerPhone.trim(),
       description: description.trim(), damageNotes: damageNotes.trim(),
-      priority, location, serviceTypes, treatments, treatmentPrices, discountPercent, parts,
+      priority, location, serviceTypes, treatments, treatmentPrices, smartechPieces, discountPercent, parts,
       // Body Work or "Dent & Paint" added here (not just at intake) should
       // also route the job to Smartech's dashboard — only ever turns this
       // ON, never off, so removing a service later can't silently hide
@@ -6338,6 +6395,22 @@ function EditJobScreen({ job, session, onSaved, onCancel }) {
                           <div style={{ display: "flex", alignItems: "center", gap: 6, padding: "5px 9px 0 30px" }}>
                             <span style={{ fontSize: 10.5, color: COLORS.muted }}>AED</span>
                             <input type="number" value={treatmentPrices[priceKey] ?? ""} onChange={(e) => setTreatmentPrices((p) => ({ ...p, [priceKey]: e.target.value }))} style={{ width: 90, background: COLORS.panel2, border: `1px solid ${COLORS.line}`, borderRadius: 6, padding: "4px 7px", fontSize: 11.5, color: COLORS.gold, fontFamily: MONO_FONT }} />
+                            {isPerPieceTreatment(s.key, t.name) && (
+                              <>
+                                <span style={{ fontSize: 10.5, color: COLORS.muted, marginLeft: 4 }}>x Pcs</span>
+                                <input
+                                  type="number"
+                                  min="1"
+                                  value={smartechPieces[priceKey] ?? ""}
+                                  onChange={(e) => setSmartechPieces((p) => ({ ...p, [priceKey]: e.target.value }))}
+                                  placeholder="1"
+                                  style={{ width: 50, background: COLORS.panel2, border: `1px solid ${COLORS.line}`, borderRadius: 6, padding: "4px 7px", fontSize: 11.5, color: COLORS.ink, fontFamily: MONO_FONT }}
+                                />
+                                <span style={{ fontSize: 10.5, color: COLORS.gold, fontFamily: MONO_FONT }}>
+                                  = AED {Math.round(treatmentLineTotal(s.key, t.name, treatmentPrices[priceKey], smartechPieces[priceKey])).toLocaleString()}
+                                </span>
+                              </>
+                            )}
                           </div>
                         )}
                       </div>
@@ -6354,10 +6427,10 @@ function EditJobScreen({ job, session, onSaved, onCancel }) {
       <div style={{ background: COLORS.panel, border: `1px solid ${COLORS.line}`, borderRadius: 10, padding: 14, marginBottom: 14 }}>
         <div style={{ display: "flex", justifyContent: "space-between", fontSize: 12.5, color: COLORS.muted, marginBottom: 8 }}>
           <span>Services subtotal</span>
-          <span style={{ fontFamily: MONO_FONT, color: COLORS.ink }}>AED {Object.values(treatmentPrices).reduce((sum, v) => sum + (Number(v) || 0), 0).toLocaleString()}</span>
+          <span style={{ fontFamily: MONO_FONT, color: COLORS.ink }}>AED {treatmentPricesSubtotal(treatmentPrices, smartechPieces).toLocaleString()}</span>
         </div>
         <div style={{ marginBottom: 4 }}>
-          <DiscountPicker value={discountPercent} onChange={setDiscountPercent} subtotal={Object.values(treatmentPrices).reduce((sum, v) => sum + (Number(v) || 0), 0)} />
+          <DiscountPicker value={discountPercent} onChange={setDiscountPercent} subtotal={treatmentPricesSubtotal(treatmentPrices, smartechPieces)} />
         </div>
         {parts.length > 0 && (
           <div style={{ display: "flex", justifyContent: "space-between", fontSize: 12.5, color: COLORS.muted, marginTop: 10, paddingTop: 10, borderTop: `1px dashed ${COLORS.line}` }}>
@@ -6371,7 +6444,7 @@ function EditJobScreen({ job, session, onSaved, onCancel }) {
           <span style={{ fontSize: 13.5, fontWeight: 700, color: COLORS.ink }}>Total</span>
           <span style={{ fontFamily: MONO_FONT, fontWeight: 700, fontSize: 16, color: COLORS.gold }}>
             AED {Math.round(
-              Object.values(treatmentPrices).reduce((sum, v) => sum + (Number(v) || 0), 0) * (1 - discountPercent / 100)
+              treatmentPricesSubtotal(treatmentPrices, smartechPieces) * (1 - discountPercent / 100)
               + parts.reduce((sum, p) => sum + (Number(p.price) || 0) * (Number(p.qty) || 1) * (1 - (Number(p.discountPercent) || 0) / 100), 0)
             ).toLocaleString()}
           </span>
@@ -10887,17 +10960,21 @@ function SmartechPortal({ session, onLogout }) {
 
   if (activeJob) {
     return (
-      <SmartechJobDetail
-        session={session}
-        jobRow={activeJob}
-        onBack={() => { setActiveJob(null); refresh(); }}
-        onUpdated={(row) => setActiveJob(row)}
-      />
+      <>
+        <SmartechChatBroadcaster session={session} />
+        <SmartechJobDetail
+          session={session}
+          jobRow={activeJob}
+          onBack={() => { setActiveJob(null); refresh(); }}
+          onUpdated={(row) => setActiveJob(row)}
+        />
+      </>
     );
   }
 
   return (
     <div style={{ minHeight: "100vh", background: COLORS.paper, padding: "20px 16px 60px" }}>
+      <SmartechChatBroadcaster session={session} />
       <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", marginBottom: 18 }}>
         <div>
           <div style={{ fontFamily: DISPLAY_FONT, fontWeight: 700, fontSize: 18, color: COLORS.ink }}>My Jobs</div>
@@ -11322,6 +11399,9 @@ function SmartechChatScreen({ session, onBack }) {
   const [sending, setSending] = useState(false);
   const [sendError, setSendError] = useState(false);
   const fileRef = useRef(null);
+  // Just displays/refreshes the thread here — the notification chime is
+  // owned exclusively by SmartechChatBroadcaster (mounted app-wide, not
+  // just on this screen) so a new message never chimes twice.
 
   const refresh = useCallback(async () => {
     const res = await loadSmartechMessages();
@@ -11394,6 +11474,55 @@ function SmartechChatScreen({ session, onBack }) {
         <button onClick={send} disabled={sending || (!text.trim() && !photo)} className="mrcap-press" style={{ padding: "0 16px", height: 38, borderRadius: 8, border: "none", background: COLORS.gold, color: COLORS.darkText, fontWeight: 700, fontSize: 12.5, cursor: "pointer", opacity: sending || (!text.trim() && !photo) ? 0.6 : 1 }}>Send</button>
       </div>
     </div>
+  );
+}
+
+// Fetches messages newer than sinceMs — deliberately lightweight (just
+// the last 50), same "poll every ~12-15s" pattern as loadRecentUpdates.
+async function loadRecentSmartechMessages(sinceMs) {
+  const res = await gkGet("messages?select=*&order=created_at.desc&limit=50");
+  if (!res.ok) return [];
+  return (res.data || []).filter((m) => new Date(m.created_at).getTime() > sinceMs);
+}
+
+// Mounted once at the root — inside the main Shell for admin/Ahmed/Laani
+// (gated by canUseSmartechChat), and inside SmartechPortal for Smartech —
+// so a chat message chimes and toasts on WHATEVER screen someone is on,
+// not just while SmartechChatScreen itself happens to be open. Exactly
+// the same pattern as LiveUpdateBroadcaster for job progress updates;
+// reuses the same playUpdateChime() sound on purpose, so it reads as
+// "something happened" the same way everywhere in the app.
+function SmartechChatBroadcaster({ session }) {
+  const [toasts, setToasts] = useState([]);
+  const lastSeenRef = useRef(Date.now());
+
+  useEffect(() => {
+    const check = async () => {
+      const updates = await loadRecentSmartechMessages(lastSeenRef.current);
+      lastSeenRef.current = Date.now();
+      const incoming = updates.filter((m) => m.sender_id !== session.id);
+      if (!incoming.length) return;
+      playUpdateChime();
+      setToasts((prev) => [...prev, ...incoming.map((m) => ({ ...m, key: m.id }))]);
+      incoming.forEach((m) => {
+        setTimeout(() => setToasts((prev) => prev.filter((t) => t.key !== m.id)), 7000);
+      });
+    };
+    const interval = setInterval(check, 12000);
+    return () => clearInterval(interval);
+  }, [session.id]);
+
+  if (!toasts.length) return null;
+  return createPortal(
+    <div style={{ position: "fixed", bottom: 18, right: 18, left: 18, zIndex: 9999, display: "flex", flexDirection: "column", alignItems: "flex-end", gap: 8, pointerEvents: "none" }}>
+      {toasts.map((t) => (
+        <div key={t.key} className="mrcap-fade" style={{ pointerEvents: "auto", maxWidth: 340, width: "100%", background: COLORS.panel, border: `1px solid ${COLORS.gold}`, borderRadius: 12, padding: "12px 14px", boxShadow: "0 10px 26px rgba(0,0,0,0.5)" }}>
+          <div style={{ fontSize: 12.5, fontWeight: 700, color: COLORS.gold }}>{t.sender_name} · Smartech Chat</div>
+          <div style={{ fontSize: 13, color: COLORS.ink, marginTop: 3, lineHeight: 1.35 }}>{t.body || "Sent a photo"}</div>
+        </div>
+      ))}
+    </div>,
+    document.body
   );
 }
 
@@ -11661,6 +11790,11 @@ function TreatmentEditInline({ treatment, onSaved, onToggleActive, busy }) {
   const [name, setName] = useState(treatment.name);
   const [retail, setRetail] = useState(treatment.retail ?? "");
   const [b2b, setB2b] = useState(treatment.b2b ?? "");
+  // treatment here is a raw Supabase row (snake_case) from
+  // ServicesManagementScreen's loadAllServiceData, not the camelCase
+  // shape loadDynamicServicesAndRoles produces for the app's SERVICES
+  // global — read per_piece, not perPiece.
+  const [perPiece, setPerPiece] = useState(!!treatment.per_piece);
   const [saving, setSaving] = useState(false);
 
   const save = async () => {
@@ -11672,6 +11806,7 @@ function TreatmentEditInline({ treatment, onSaved, onToggleActive, busy }) {
       name: name.trim(),
       retail: retail === "" ? null : Number(retail),
       b2b: b2b === "" ? null : Number(b2b),
+      perPiece,
     });
     setSaving(false);
     setEditing(false);
@@ -11686,9 +11821,15 @@ function TreatmentEditInline({ treatment, onSaved, onToggleActive, busy }) {
           <input value={retail} onChange={(e) => setRetail(e.target.value)} type="number" style={{ ...inputStyle, marginTop: 0, padding: "7px 9px", fontSize: 13 }} placeholder="Retail AED" />
           <input value={b2b} onChange={(e) => setB2b(e.target.value)} type="number" style={{ ...inputStyle, marginTop: 0, padding: "7px 9px", fontSize: 13 }} placeholder="B2B AED" />
         </div>
+        <button onClick={() => setPerPiece((v) => !v)} className="mrcap-press" type="button" style={{ display: "flex", alignItems: "center", gap: 7, padding: "7px 9px", borderRadius: 7, border: `1px solid ${perPiece ? COLORS.gold : COLORS.line}`, background: perPiece ? "rgba(201,162,39,0.12)" : "transparent", cursor: "pointer", width: "100%", boxSizing: "border-box" }}>
+          <div style={{ width: 14, height: 14, borderRadius: 4, border: `2px solid ${perPiece ? COLORS.gold : COLORS.muted}`, background: perPiece ? COLORS.gold : "transparent", display: "flex", alignItems: "center", justifyContent: "center", flexShrink: 0 }}>
+            {perPiece && <Check size={9} color={COLORS.darkText} />}
+          </div>
+          <span style={{ fontSize: 11.5, color: COLORS.ink }}>Sold per piece (shows a qty picker; price x qty = line total)</span>
+        </button>
         <div style={{ display: "flex", gap: 6 }}>
           <button onClick={save} disabled={saving || !name.trim()} className="mrcap-press" style={{ fontSize: 11.5, color: "#fff", background: COLORS.green, border: "none", borderRadius: 8, padding: "7px 10px", cursor: "pointer", fontWeight: 600, opacity: saving ? 0.6 : 1 }}>{saving ? "Saving…" : "Save"}</button>
-          <button onClick={() => { setEditing(false); setName(treatment.name); setRetail(treatment.retail ?? ""); setB2b(treatment.b2b ?? ""); }} className="mrcap-press" style={{ fontSize: 11.5, color: COLORS.muted, background: "none", border: `1px solid ${COLORS.line}`, borderRadius: 8, padding: "7px 10px", cursor: "pointer" }}>Cancel</button>
+          <button onClick={() => { setEditing(false); setName(treatment.name); setRetail(treatment.retail ?? ""); setB2b(treatment.b2b ?? ""); setPerPiece(!!treatment.per_piece); }} className="mrcap-press" style={{ fontSize: 11.5, color: COLORS.muted, background: "none", border: `1px solid ${COLORS.line}`, borderRadius: 8, padding: "7px 10px", cursor: "pointer" }}>Cancel</button>
         </div>
       </div>
     );
@@ -11697,7 +11838,7 @@ function TreatmentEditInline({ treatment, onSaved, onToggleActive, busy }) {
   return (
     <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", padding: "7px 9px", borderRadius: 8, background: COLORS.panel2, opacity: treatment.active ? 1 : 0.55 }}>
       <div>
-        <div style={{ fontSize: 13, color: COLORS.ink }}>{treatment.name}{!treatment.active && <span style={{ color: COLORS.muted }}> · Retired</span>}</div>
+        <div style={{ fontSize: 13, color: COLORS.ink }}>{treatment.name}{!treatment.active && <span style={{ color: COLORS.muted }}> · Retired</span>}{treatment.per_piece && <span style={{ color: COLORS.gold }}> · Per piece</span>}</div>
         <div style={{ fontSize: 11, color: COLORS.muted, fontFamily: MONO_FONT }}>
           {treatment.retail != null ? `Retail ${treatment.retail}` : "Retail —"} · {treatment.b2b != null ? `B2B ${treatment.b2b}` : "B2B —"}
         </div>
@@ -11715,6 +11856,7 @@ function NewTreatmentInline({ categoryKey, nextSort, onCreated }) {
   const [name, setName] = useState("");
   const [retail, setRetail] = useState("");
   const [b2b, setB2b] = useState("");
+  const [perPiece, setPerPiece] = useState(false);
   const [saving, setSaving] = useState(false);
 
   const create = async () => {
@@ -11725,10 +11867,11 @@ function NewTreatmentInline({ categoryKey, nextSort, onCreated }) {
       name: name.trim(),
       retail: retail === "" ? null : Number(retail),
       b2b: b2b === "" ? null : Number(b2b),
+      perPiece,
       sort_order: nextSort,
     });
     setSaving(false);
-    setName(""); setRetail(""); setB2b(""); setOpen(false);
+    setName(""); setRetail(""); setB2b(""); setPerPiece(false); setOpen(false);
     onCreated && onCreated();
   };
 
@@ -11746,9 +11889,15 @@ function NewTreatmentInline({ categoryKey, nextSort, onCreated }) {
         <input value={retail} onChange={(e) => setRetail(e.target.value)} type="number" style={{ ...inputStyle, marginTop: 0, padding: "7px 9px", fontSize: 13 }} placeholder="Retail AED (optional)" />
         <input value={b2b} onChange={(e) => setB2b(e.target.value)} type="number" style={{ ...inputStyle, marginTop: 0, padding: "7px 9px", fontSize: 13 }} placeholder="B2B AED (optional)" />
       </div>
+      <button onClick={() => setPerPiece((v) => !v)} className="mrcap-press" type="button" style={{ display: "flex", alignItems: "center", gap: 7, padding: "7px 9px", borderRadius: 7, border: `1px solid ${perPiece ? COLORS.gold : COLORS.line}`, background: perPiece ? "rgba(201,162,39,0.12)" : "transparent", cursor: "pointer", width: "100%", boxSizing: "border-box" }}>
+        <div style={{ width: 14, height: 14, borderRadius: 4, border: `2px solid ${perPiece ? COLORS.gold : COLORS.muted}`, background: perPiece ? COLORS.gold : "transparent", display: "flex", alignItems: "center", justifyContent: "center", flexShrink: 0 }}>
+          {perPiece && <Check size={9} color={COLORS.darkText} />}
+        </div>
+        <span style={{ fontSize: 11.5, color: COLORS.ink }}>Sold per piece (shows a qty picker; price x qty = line total)</span>
+      </button>
       <div style={{ display: "flex", gap: 6 }}>
         <button onClick={create} disabled={saving || !name.trim()} className="mrcap-press" style={{ fontSize: 11.5, color: "#fff", background: COLORS.green, border: "none", borderRadius: 8, padding: "7px 10px", cursor: "pointer", fontWeight: 600, opacity: saving ? 0.6 : 1 }}>{saving ? "Adding…" : "Add"}</button>
-        <button onClick={() => { setOpen(false); setName(""); setRetail(""); setB2b(""); }} className="mrcap-press" style={{ fontSize: 11.5, color: COLORS.muted, background: "none", border: `1px solid ${COLORS.line}`, borderRadius: 8, padding: "7px 10px", cursor: "pointer" }}>Cancel</button>
+        <button onClick={() => { setOpen(false); setName(""); setRetail(""); setB2b(""); setPerPiece(false); }} className="mrcap-press" style={{ fontSize: 11.5, color: COLORS.muted, background: "none", border: `1px solid ${COLORS.line}`, borderRadius: 8, padding: "7px 10px", cursor: "pointer" }}>Cancel</button>
       </div>
     </div>
   );
