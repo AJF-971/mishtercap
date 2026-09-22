@@ -2268,6 +2268,7 @@ function rowToQuote(r) {
     serviceTypes: r.service_types || [], treatments: r.treatments || {}, treatmentPrices: r.treatment_prices || {},
     discountPercent: r.discount_percent || 0, parts: r.parts || [],
     status: r.status || "draft", convertedJobId: r.converted_job_id,
+    customerNotify: r.customer_notify || {},
     acceptedAt: r.accepted_at ? new Date(r.accepted_at).getTime() : null,
     createdBy: r.created_by, createdAt: new Date(r.created_at).getTime(), updatedAt: new Date(r.updated_at).getTime(),
   };
@@ -2280,6 +2281,7 @@ function quoteToRow(q) {
     service_types: q.serviceTypes || [], treatments: q.treatments || {}, treatment_prices: q.treatmentPrices || {},
     discount_percent: q.discountPercent || 0, parts: q.parts || [],
     status: q.status || "draft", converted_job_id: q.convertedJobId || null,
+    customer_notify: q.customerNotify || {},
     accepted_at: q.acceptedAt ? new Date(q.acceptedAt).toISOString() : null,
     created_by: q.createdBy, updated_at: new Date().toISOString(),
   };
@@ -7141,6 +7143,7 @@ function JobDetail({ id, initialJob, session, team, onChanged, onBack, canArchiv
             vars={{ customerName: job.customerName || "", makeModel: job.makeModel || "vehicle", plate: job.plate || "" }}
             label="Send Intake Confirmation"
           />
+          {!job.customerPhone && <div style={{ fontSize: 11, color: COLORS.muted, marginBottom: 8, fontStyle: "italic" }}>No phone on file — add one via Edit Job to WhatsApp them, or just tick below once you've told them another way.</div>}
           <CustomerNotifyControl record={job} templateKey="job_started" session={session} onSave={saveJobRecord} skippable={true} />
         </>
       )}
@@ -9870,15 +9873,13 @@ function QuoteDetail({ id, session, team, onBack, onConverted }) {
       {/* Same fix as JobDetail: CustomerNotifyControl isn't gated on
           phone — a quote with no number on file should still let staff
           tick "Customer informed" once it's been sent another way. */}
-      <>
-        <WhatsAppSendButton
-          phone={quote.customerPhone}
-          templateKey="quote_sent"
-          vars={{ customerName: quote.customerName || "", makeModel: quote.makeModel || "vehicle", plate: quote.plate || "", total: total > 0 ? Math.round(total).toLocaleString() : "0", quoteLink: `${window.location.origin}/?quote=${quote.id}` }}
-          label="Send Quote on WhatsApp"
-        />
-        <CustomerNotifyControl record={quote} templateKey="quote_sent" session={session} onSave={saveQuoteRecord} skippable={false} />
-      </>
+      <WhatsAppSendButton
+        phone={quote.customerPhone}
+        templateKey="quote_sent"
+        vars={{ customerName: quote.customerName || "", makeModel: quote.makeModel || "vehicle", plate: quote.plate || "", total: total > 0 ? Math.round(total).toLocaleString() : "0", quoteLink: `${window.location.origin}/?quote=${quote.id}` }}
+        label="Send Quote on WhatsApp"
+      />
+      <CustomerNotifyControl record={quote} templateKey="quote_sent" session={session} onSave={saveQuoteRecord} skippable={false} />
 
       {canEditQuote && quote.status !== "converted" && (
         <button onClick={() => setEditing(true)} className="mrcap-press" style={{ display: "flex", alignItems: "center", justifyContent: "center", gap: 7, width: "100%", padding: "10px", borderRadius: 10, border: `1.5px dashed ${COLORS.gold}`, background: "rgba(201,162,39,0.08)", color: COLORS.gold, fontWeight: 600, fontSize: 12.5, cursor: "pointer", marginBottom: 12 }}>
