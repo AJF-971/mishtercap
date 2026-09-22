@@ -90,7 +90,7 @@ const DEFAULT_TEAM = [
     permissions: { newJob: true, editJob: false, sendBack: false, delete: false, archive: false, customers: false, quotations: false, reports: false, team: false, import: false, googleReview: false, markupCalc: false, statusUpdate: false } },
   { id: "fakher", name: "Fakher", role: "dentrepair", pin: null,
     permissions: { newJob: true, editJob: false, sendBack: false, delete: false, archive: false, customers: false, quotations: false, reports: false, team: false, import: false, googleReview: false, markupCalc: false, statusUpdate: false } },
-  { id: "jobish", name: "Jobish", role: "bodyshop", pin: null,
+  { id: "jobish", name: "Smartech", role: "bodyshop", pin: null,
     permissions: { newJob: true, editJob: false, sendBack: false, delete: false, archive: false, customers: false, quotations: false, reports: false, team: false, import: false, googleReview: false, markupCalc: false, statusUpdate: false } },
 ];
 
@@ -154,20 +154,34 @@ function isSimplifiedRole(session) {
   return !!ROLE_DEFS[session.role]?.simplified;
 }
 // A 4th dashboardMode value, distinct from 'auto'/'full'/'workshop' above:
-// routes straight into a scoped, job-only portal (see JobishPortal) before
-// the normal Shell/nav/dashboard ever renders. For team members who are
-// really a separate licensed sub-entity (e.g. Jobish) rather than shop
-// staff — they should see only their own assigned jobs, nothing else.
-function isSubcontractorPortal(member) {
-  return !!member && member.dashboardMode === "subcontractor";
+// routes straight into a scoped, job-only portal (see SmartechPortal)
+// before the normal Shell/nav/dashboard ever renders. Smartech is a
+// separately-licensed body-shop vendor, not shop staff — they should see
+// only their own assigned jobs, nothing else. Accepts both "smartech"
+// (current) and "subcontractor" (the old value this was renamed from) so
+// an older cached client/APK build that still writes "subcontractor"
+// keeps working until every device is confirmed on the new bundle.
+function isSmartechPortal(member) {
+  return !!member && (member.dashboardMode === "smartech" || member.dashboardMode === "subcontractor");
 }
 
-// Who can review/approve Jobish's submitted bills & purchases: every
-// admin, plus Ahmed and Laani by name (a deliberate exception outside
-// the role system, same pattern as isSuperAdmin below — they're not
-// role "admin", but the shop wants them here specifically).
-function canApproveJobish(session) {
+// Who can review/approve Smartech's submitted purchases: every admin,
+// plus Ahmed and Laani by name (a deliberate exception outside the role
+// system, same pattern as isSuperAdmin below — they're not role "admin",
+// but the shop wants them here specifically).
+function canApproveSmartech(session) {
   return !!session && (session.role === "admin" || session.id === "ahmed" || session.id === "laani");
+}
+
+// Who's on the Smartech <-> admin group chat: every admin, Ahmed and Laani
+// by name (same "named intake staff" exception as canApproveSmartech
+// above, kept as its own function since the two audiences could diverge
+// later), and Smartech itself. Used to gate the normal Shell/TopBar's nav
+// entry (admin/Ahmed/Laani side) — SmartechPortal renders its own Chat
+// button directly rather than going through this, since a Smartech
+// session never mounts the normal nav at all (see isSmartechPortal).
+function canUseSmartechChat(session) {
+  return !!session && (session.role === "admin" || session.id === "ahmed" || session.id === "laani" || isSmartechPortal(session));
 }
 
 // Who can hide/show a car on the Dispatch Board entirely (e.g. it's
@@ -228,8 +242,8 @@ Amount to be paid by the Customer upon vehicle delivery: AED + 5% VAT
 CUSTOMER SIGNS BY THIS AGREES WITH THE ABOVE MENTIONED TERMS AND CONDITIONS AS WRITTEN ON THE BACK SIDE OF THIS VEHICLE RECEIPT.`;
 
 // The 13 standard car panels for Body Work damage marking — a fixed
-// checklist so every job uses the same real terms Jobish/Smartech
-// recognize, rather than free text.
+// checklist so every job uses the same real terms Smartech recognizes,
+// rather than free text.
 const CAR_PANELS = [
   "Bonnet", "Roof", "Front Bumper", "Rear Bumper",
   "Front-Left Door", "Front-Right Door", "Rear-Left Door", "Rear-Right Door",
@@ -279,8 +293,14 @@ let SERVICES = [
       { name: "Window Tinting - Windshield", retail: 700, b2b: 500 },
     ] },
   { key: "dentrepair", label: "Dent Repair",      role: "dentrepair",
-    // Genuinely size-dependent per the shop — no auto-fill for this one at all.
-    treatments: [{ name: "Dent Removal", retail: null, b2b: null }] },
+    // Genuinely size-dependent per the shop — no auto-fill for either at all.
+    // "Paintless Dent Removal" stays in-house (Fakher); "Dent & Paint" is
+    // routed to Smartech (see SMARTECH_TREATMENT_NAMES) since it needs
+    // paint work Smartech does, not Mr.CAP.
+    treatments: [
+      { name: "Paintless Dent Removal", retail: null, b2b: null },
+      { name: "Dent & Paint", retail: null, b2b: null },
+    ] },
   { key: "bodyshop",   label: "Body Work (Smartech)", role: "bodyshop",
     treatments: [
       { name: "BodyWorks (Smart Paint)", retail: 1000, b2b: 700 },
@@ -294,6 +314,17 @@ let SERVICES = [
     treatments: ["Upholstery", "RoofLifting", "SteerRefresh", "QuietCar", "CarbonFiber", "StarLiner", "DashRenew"]
       .map((name) => ({ name, retail: null, b2b: null })) },
 ];
+
+// A job routes to Smartech (sets smartechFlag, unlocks the intake form's
+// Smartech description/photos section, and shows up in the Smartech
+// dashboard) when the whole "bodyshop" category is selected, OR the
+// specific "Dent & Paint" treatment is picked under Dent Repair —
+// "Paintless Dent Removal" stays in-house with Fakher and never routes
+// to Smartech.
+function jobRoutesToSmartech(serviceTypes, treatments) {
+  if ((serviceTypes || []).includes("bodyshop")) return true;
+  return ((treatments && treatments.dentrepair) || []).includes("Dent & Paint");
+}
 
 // One small icon per service category, purely for the dashboard job card's
 // icon row — keyed off SERVICES[].key so it stays in sync automatically if
@@ -1351,7 +1382,16 @@ function rowToJob(r) {
     serviceNotes: r.service_notes || {}, serviceReviewed: r.service_reviewed || {}, treatments: r.treatments || {},
     treatmentPrices: r.treatment_prices || {}, discountPercent: r.discount_percent || 0, priceHistory: r.price_history || [],
     parts: r.parts || [], markupEntries: r.markup_entries || [],
-    jobishBills: r.jobish_bills || [], jobishPurchases: r.jobish_purchases || [],
+    // Physical DB column is still jobish_purchases (renaming it is real
+    // migration churn for zero benefit — it's an internal detail nobody
+    // sees); the app-facing name is smartechPurchases everywhere else.
+    smartechPurchases: r.jobish_purchases || [],
+    smartechFlag: !!r.smartech_flag, smartechDescription: r.smartech_description || "",
+    smartechPhotos: r.smartech_photos || [], smartechPieces: r.smartech_pieces || {},
+    smartechStatus: r.smartech_status || null,
+    smartechStatusNote: r.smartech_status_note || null,
+    smartechStatusAt: r.smartech_status_at ? new Date(r.smartech_status_at).getTime() : null,
+    smartechStartedAt: r.smartech_started_at ? new Date(r.smartech_started_at).getTime() : null,
     stageIndex: r.stage_index, photos: r.photos || { intake: [], parts_removal: [], service: {} },
     startTime: r.start_time ? new Date(r.start_time).getTime() : null,
     stopTime: r.stop_time ? new Date(r.stop_time).getTime() : null,
@@ -1388,7 +1428,13 @@ function jobToRow(job) {
     service_notes: job.serviceNotes || {}, service_reviewed: job.serviceReviewed || {}, treatments: job.treatments || {},
     treatment_prices: job.treatmentPrices || {}, discount_percent: job.discountPercent || 0, price_history: job.priceHistory || [],
     parts: job.parts || [], markup_entries: job.markupEntries || [],
-    jobish_bills: job.jobishBills || [], jobish_purchases: job.jobishPurchases || [],
+    jobish_purchases: job.smartechPurchases || [],
+    smartech_flag: !!job.smartechFlag, smartech_description: job.smartechDescription || null,
+    smartech_photos: job.smartechPhotos || [], smartech_pieces: job.smartechPieces || {},
+    smartech_status: job.smartechStatus || null,
+    smartech_status_note: job.smartechStatusNote || null,
+    smartech_status_at: job.smartechStatusAt ? new Date(job.smartechStatusAt).toISOString() : null,
+    smartech_started_at: job.smartechStartedAt ? new Date(job.smartechStartedAt).toISOString() : null,
     stage_index: job.stageIndex, photos: job.photos,
     start_time: job.startTime ? new Date(job.startTime).toISOString() : null,
     stop_time: job.stopTime ? new Date(job.stopTime).toISOString() : null,
@@ -2060,7 +2106,18 @@ async function loadIndex() {
 async function loadJob(id) {
   const { ok, data } = await sbFetch(`jobs?id=eq.${id}&select=*&limit=1`);
   if (!ok || !data || !data.length) return null;
-  return rowToJob(data[0]);
+  const job = rowToJob(data[0]);
+  // Re-sign Smartech photo URLs — see refreshSmartechPhotoUrls. Signed
+  // URLs always differ from what's in the DB row (a fresh token every
+  // time), so job._base (set inside rowToJob, used by saveJob's diff)
+  // has to be recomputed AFTER this or every save of this job would
+  // spuriously "change" smartechPhotos and overwrite any concurrent
+  // photo Smartech just added from their own portal.
+  if ((job.smartechPhotos || []).length) {
+    job.smartechPhotos = await refreshSmartechPhotoUrls(job.smartechPhotos);
+    job._base = rowSnapshot(job);
+  }
+  return job;
 }
 // Creates a job: links/creates the customer + vehicle records first (this
 // is what powers CRM history), then inserts the job with real foreign
@@ -3094,7 +3151,8 @@ function DesktopShell({ session, team, view, setView, onLogout, canArchive, chil
           {navItem("msgtemplates", "WhatsApp Messages", MessageSquare, () => setView("msgtemplates"), isSuperAdmin(session))}
           {navItem("announcements", "Post Announcement", Send, () => setView("announcements"), isSuperAdmin(session))}
           {navItem("issues", "Issue Reports", AlertCircle, () => setView("issues"), isSuperAdmin(session))}
-          {navItem("jobishapprovals", "Jobish Approvals", Receipt, () => setView("jobishapprovals"), canApproveJobish(session))}
+          {navItem("smartechapprovals", "Smartech Approvals", Receipt, () => setView("smartechapprovals"), canApproveSmartech(session))}
+          {navItem("smartechchat", "Smartech Chat", MessageSquare, () => setView("smartechchat"), canUseSmartechChat(session))}
         </div>
         <div style={{ borderTop: "1px solid #262A30", paddingTop: 12, marginTop: 12 }}>
           <div style={{ padding: "0 10px 10px", fontSize: 11.5, color: "#8A919B" }}>{session.name} · {ROLE_DEFS[session.role]?.label || session.role}</div>
@@ -3895,7 +3953,7 @@ export default function GarageApp() {
           // last logged in (role, dashboardMode) — a session restored from
           // localStorage used to keep whatever it was stamped with at
           // login until the next logout, so a mode change (e.g. someone
-          // switched to Subcontractor Portal) silently didn't take effect
+          // switched to Smartech Portal) silently didn't take effect
           // on a device that was already signed in.
           const s2 = { ...s, role: fresh.role, dashboardMode: fresh.dashboardMode || "auto" };
           setSession(s2); setCurrentActor(s2);
@@ -3904,10 +3962,10 @@ export default function GarageApp() {
           registerForPush(s2.id);
         }
       }
-      // A subcontractor portal session (Jobish etc.) never needs the
-      // shop-wide job index — it fetches its own scoped list instead
-      // (see JobishPortal), so skip the shared fetch entirely for it.
-      if (!isSubcontractorPortal(restoredSession)) await refreshIndex();
+      // A Smartech portal session never needs the shop-wide job index —
+      // it fetches its own scoped list instead (see SmartechPortal), so
+      // skip the shared fetch entirely for it.
+      if (!isSmartechPortal(restoredSession)) await refreshIndex();
       setReady(true);
     })();
   }, [refreshIndex]);
@@ -3936,7 +3994,7 @@ export default function GarageApp() {
   // dashboard list, not whatever job someone might be mid-edit on, so it
   // can't clobber in-progress work.
   useEffect(() => {
-    if (!ready || !session || isSubcontractorPortal(session)) return;
+    if (!ready || !session || isSmartechPortal(session)) return;
     const interval = setInterval(() => { refreshIndex(); }, 45000);
     const onVisible = () => { if (document.visibilityState === "visible") refreshIndex(); };
     const onFocus = () => { refreshIndex(); };
@@ -3990,7 +4048,7 @@ export default function GarageApp() {
   }
 
   // ?track=<jobId> used to be a pre-login public link (see main.jsx); it
-  // now requires a real staff/Jobish session, so it's handled right here,
+  // now requires a real staff/Smartech session, so it's handled right here,
   // right after the login gate, before the normal Shell/TopBar/router.
   const trackJobId = new URLSearchParams(window.location.search).get("track");
   if (trackJobId) {
@@ -4010,11 +4068,11 @@ export default function GarageApp() {
     );
   }
 
-  // Subcontractor portal (Jobish etc.): a job-only view, scoped to this
-  // person's own assignments — never mounts the normal Shell/TopBar/nav
-  // or the shop-wide job index.
-  if (isSubcontractorPortal(session)) {
-    return <Shell><JobishPortal session={session} onLogout={onLogout} /></Shell>;
+  // Smartech portal: a job-only view, scoped to this person's own
+  // assignments — never mounts the normal Shell/TopBar/nav or the
+  // shop-wide job index.
+  if (isSmartechPortal(session)) {
+    return <Shell><SmartechPortal session={session} onLogout={onLogout} /></Shell>;
   }
 
   // Desktop back-office mode: only offered at login to admin/intake (see
@@ -4026,7 +4084,7 @@ export default function GarageApp() {
   return (
     <ActiveShell session={session} team={team} view={view} setView={setView} onLogout={onLogout} canArchive={canArchive}>
       <ReportIssueButton session={session} view={view} />
-      <TopBar session={session} team={team} onLogout={onLogout} onNew={() => setView("new")} view={view} onBack={() => window.history.back()} onTeam={() => setView("team")} onArchive={() => setView("archive")} onCustomers={() => setView("customers")} onReports={() => setView("reports")} onQuotes={() => setView("quotes")} canArchive={canArchive} onAdminDash={() => setView("admindash")} onMsgTemplates={() => setView("msgtemplates")} onIssues={() => setView("issues")} onDispatch={() => setView("dispatch")} onLiveUpdates={() => setView("liveupdates")} onAnnouncements={() => setView("announcements")} onBilling={() => setView("billing")} onJobishApprovals={() => setView("jobishapprovals")} />
+      <TopBar session={session} team={team} onLogout={onLogout} onNew={() => setView("new")} view={view} onBack={() => window.history.back()} onTeam={() => setView("team")} onArchive={() => setView("archive")} onCustomers={() => setView("customers")} onReports={() => setView("reports")} onQuotes={() => setView("quotes")} canArchive={canArchive} onAdminDash={() => setView("admindash")} onMsgTemplates={() => setView("msgtemplates")} onIssues={() => setView("issues")} onDispatch={() => setView("dispatch")} onLiveUpdates={() => setView("liveupdates")} onAnnouncements={() => setView("announcements")} onBilling={() => setView("billing")} onSmartechApprovals={() => setView("smartechapprovals")} onSmartechChat={() => setView("smartechchat")} />
       {showMorningReminder && <MorningReminderBanner onDismiss={() => { setShowMorningReminder(false); dismissMorningReminder("mrcap"); }} />}
       <AnnouncementBanner session={session} />
       <LiveUpdateBroadcaster onOpenJob={(id) => openJob(id)} />
@@ -4143,10 +4201,14 @@ export default function GarageApp() {
         <ProformaDetail id={activeProformaId} session={session} team={team} onBack={() => window.history.back()} onEditDraft={(p) => newProforma(p)} onRevise={(seed) => newProforma(seed)} onOpenJob={(jobId) => openJob(jobId)} onDeleted={() => window.history.back()} />
       )}
       {(view === "billing" || view === "proformaedit" || view === "proformadetail") && !canBilling && <AccessDenied onBack={() => window.history.back()} />}
-      {view === "jobishapprovals" && canApproveJobish(session) && (
-        <JobishApprovalQueue session={session} onBack={() => window.history.back()} />
+      {view === "smartechapprovals" && canApproveSmartech(session) && (
+        <SmartechApprovalQueue session={session} onBack={() => window.history.back()} />
       )}
-      {view === "jobishapprovals" && !canApproveJobish(session) && <AccessDenied onBack={() => window.history.back()} />}
+      {view === "smartechapprovals" && !canApproveSmartech(session) && <AccessDenied onBack={() => window.history.back()} />}
+      {view === "smartechchat" && canUseSmartechChat(session) && (
+        <SmartechChatScreen session={session} onBack={() => window.history.back()} />
+      )}
+      {view === "smartechchat" && !canUseSmartechChat(session) && <AccessDenied onBack={() => window.history.back()} />}
     </ActiveShell>
   );
 }
@@ -4394,7 +4456,7 @@ function useViewportWidth() {
   return w;
 }
 
-function TopBar({ session, team, onLogout, onNew, view, onBack, onTeam, onArchive, onCustomers, onReports, onQuotes, canArchive, onAdminDash, onMsgTemplates, onIssues, onDispatch, onLiveUpdates, onAnnouncements, onBilling, onJobishApprovals }) {
+function TopBar({ session, team, onLogout, onNew, view, onBack, onTeam, onArchive, onCustomers, onReports, onQuotes, canArchive, onAdminDash, onMsgTemplates, onIssues, onDispatch, onLiveUpdates, onAnnouncements, onBilling, onSmartechApprovals, onSmartechChat }) {
   const isSimplified = isSimplifiedRole(session);
   const viewportW = useViewportWidth();
   // Every destination this login can reach, in the order they've always
@@ -4427,8 +4489,11 @@ function TopBar({ session, team, onLogout, onNew, view, onBack, onTeam, onArchiv
     moreItems.push({ label: "Post Announcement", icon: <Send size={15} color={COLORS.ink} />, onClick: onAnnouncements });
     moreItems.push({ label: "Issue Reports", icon: <AlertCircle size={15} color={COLORS.ink} />, onClick: onIssues });
   }
-  if (view === "list" && canApproveJobish(session)) {
-    moreItems.push({ label: "Jobish Approvals", icon: <Receipt size={15} color={COLORS.ink} />, onClick: onJobishApprovals });
+  if (view === "list" && canApproveSmartech(session)) {
+    moreItems.push({ label: "Smartech Approvals", icon: <Receipt size={15} color={COLORS.ink} />, onClick: onSmartechApprovals });
+  }
+  if (view === "list" && canUseSmartechChat(session)) {
+    moreItems.push({ label: "Smartech Chat", icon: <MessageSquare size={15} color={COLORS.ink} />, onClick: onSmartechChat });
   }
   return (
     <>
@@ -5555,6 +5620,22 @@ function NewJobForm({ session, team, onCreated, onCancel }) {
   const [confirmNoSignature, setConfirmNoSignature] = useState(false); // warning shown once, if they try to submit without signing
   const fileRef = useRef(null);
 
+  // Smartech: a second description + photo set, separate from the main
+  // Mr.CAP-facing fields above, that only Smartech's own dashboard shows
+  // (see SmartechJobDetail). Revealed once Body Work or "Dent & Paint" is
+  // selected (see jobRoutesToSmartech) — "Paintless Dent Removal" stays
+  // in-house and never reveals this section.
+  const [smartechDescription, setSmartechDescription] = useState("");
+  const [smartechPhotos, setSmartechPhotos] = useState([]); // [{path,url}]
+  const [uploadingSmartechPhoto, setUploadingSmartechPhoto] = useState(false);
+  const [smartechPhotoError, setSmartechPhotoError] = useState(false);
+  const smartechFileRef = useRef(null);
+  // Piece/panel counts per Smartech-routed treatment ("serviceKey::name" ->
+  // number) — informational only, shown to Smartech instead of price.
+  // Ahmed still sets one aggregate price for the line in the price field
+  // above, same convention as any other null-list-price treatment.
+  const [smartechPieces, setSmartechPieces] = useState({});
+
   // Duplicate-customer detection: as the person types, check for existing
   // customers/vehicles that might be the same one, so intake staff get a
   // visible flag instead of silently creating a second profile for someone
@@ -5664,11 +5745,31 @@ function NewJobForm({ session, team, onCreated, onCancel }) {
       const listPrice = customerType === "b2b" ? treatmentObj.b2b : treatmentObj.retail;
       return { ...p, [priceKey]: listPrice != null ? listPrice : "" };
     });
+    // Un-ticking drops its piece count too — otherwise Smartech would
+    // keep seeing a piece count for a treatment that isn't on the job.
+    const alreadyPicked = (treatments[serviceKey] || []).includes(name);
+    if (alreadyPicked) {
+      setSmartechPieces((p) => {
+        const next = { ...p };
+        delete next[priceKey];
+        return next;
+      });
+    }
   };
   const assign = (key, memberId) => setAssignedTo((a) => ({ ...a, [key]: a[key] === memberId ? undefined : memberId }));
   const addPhotos = async (files) => {
     const compressed = await Promise.all(Array.from(files).map((f) => compressImage(f)));
     setPhotos((p) => [...p, ...compressed]);
+  };
+  const routesToSmartech = jobRoutesToSmartech(serviceTypes, treatments);
+  const addSmartechPhotos = async (files) => {
+    setUploadingSmartechPhoto(true);
+    setSmartechPhotoError(false);
+    const uploaded = await Promise.all(Array.from(files).map((f) => uploadSmartechPhoto(f, "intake")));
+    const succeeded = uploaded.filter(Boolean);
+    setSmartechPhotos((p) => [...p, ...succeeded]);
+    if (succeeded.length < uploaded.length) setSmartechPhotoError(true);
+    setUploadingSmartechPhoto(false);
   };
 
   const hasUnresolvedMismatch = !!(
@@ -5712,6 +5813,10 @@ function NewJobForm({ session, team, onCreated, onCancel }) {
       startTime: null, stopTime: null, invoiceAmount: "",
       signature, signedAt: signature ? now : null,
       damagePanels, damageDiagramImage,
+      smartechFlag: routesToSmartech,
+      smartechDescription: routesToSmartech ? smartechDescription.trim() : "",
+      smartechPhotos: routesToSmartech ? smartechPhotos : [],
+      smartechPieces: routesToSmartech ? smartechPieces : {},
       history: [{ stage: "intake", label: "Intake", by: session.name, role: session.role, note: "Job card opened — customer signed", at: now }],
       createdAt: now, updatedAt: now, createdBy: session.name,
     };
@@ -5856,6 +5961,19 @@ function NewJobForm({ session, team, onCreated, onCancel }) {
                                   placeholder={hasListPrice ? "" : "type price"}
                                   style={{ width: 90, background: COLORS.panel2, border: `1px solid ${COLORS.line}`, borderRadius: 6, padding: "4px 7px", fontSize: 11.5, color: COLORS.gold, fontFamily: MONO_FONT }}
                                 />
+                                {!hasListPrice && jobRoutesToSmartech([s.key], { [s.key]: [t.name] }) && (
+                                  <>
+                                    <span style={{ fontSize: 10.5, color: COLORS.muted, marginLeft: 4 }}>Pieces</span>
+                                    <input
+                                      type="number"
+                                      min="0"
+                                      value={smartechPieces[priceKey] ?? ""}
+                                      onChange={(e) => setSmartechPieces((p) => ({ ...p, [priceKey]: e.target.value }))}
+                                      placeholder="1"
+                                      style={{ width: 50, background: COLORS.panel2, border: `1px solid ${COLORS.line}`, borderRadius: 6, padding: "4px 7px", fontSize: 11.5, color: COLORS.ink, fontFamily: MONO_FONT }}
+                                    />
+                                  </>
+                                )}
                               </div>
                             )}
                           </div>
@@ -5905,6 +6023,26 @@ function NewJobForm({ session, team, onCreated, onCancel }) {
         <Field label="Body damage — which panels & where">
           <PanelDamageMarker selectedPanels={damagePanels} onTogglePanel={toggleDamagePanel} marks={damageMarks} onMarksChange={setDamageMarks} onImageChange={setDamageDiagramImage} />
         </Field>
+      )}
+
+      {/* Smartech: its own description + photos, separate from the main
+          Mr.CAP-facing fields above — only Smartech's dashboard shows
+          these (see SmartechJobDetail). Revealed by Body Work or
+          "Dent & Paint" (see jobRoutesToSmartech); "Paintless Dent
+          Removal" stays in-house and never reveals this. */}
+      {routesToSmartech && (
+        <div style={{ background: "rgba(179,64,43,0.08)", border: `1px solid #B3402B`, borderRadius: 12, padding: 14, marginBottom: 16 }}>
+          <div style={{ fontSize: 12.5, fontWeight: 700, color: "#D97862", marginBottom: 10 }}>For Smartech</div>
+          <Field label="Description for Smartech">
+            <textarea style={textareaStyle} value={smartechDescription} onChange={(e) => setSmartechDescription(e.target.value)} placeholder="What Smartech needs to know — separate from the customer-facing description above" />
+          </Field>
+          <Field label="Photos for Smartech">
+            <PhotoGrid photos={smartechPhotos.map((p) => p.url)} onRemove={(i) => setSmartechPhotos((p) => p.filter((_, idx) => idx !== i))} />
+            <input ref={smartechFileRef} type="file" accept="image/*" multiple style={{ display: "none" }} onChange={(e) => e.target.files.length && addSmartechPhotos(e.target.files)} />
+            <button onClick={() => smartechFileRef.current.click()} disabled={uploadingSmartechPhoto} className="mrcap-press" style={{ ...cameraBtnStyle, opacity: uploadingSmartechPhoto ? 0.6 : 1 }}><Camera size={15} /> {uploadingSmartechPhoto ? "Uploading…" : "Add photo"}</button>
+            {smartechPhotoError && <div style={{ fontSize: 11, color: COLORS.red, marginTop: 6 }}>One or more photos didn't upload — check your connection and try again.</div>}
+          </Field>
+        </div>
       )}
 
       <Field label="Terms & Conditions">
@@ -6133,6 +6271,12 @@ function EditJobScreen({ job, session, onSaved, onCancel }) {
       customerName: customerName.trim(), customerPhone: customerPhone.trim(),
       description: description.trim(), damageNotes: damageNotes.trim(),
       priority, location, serviceTypes, treatments, treatmentPrices, discountPercent, parts,
+      // Body Work or "Dent & Paint" added here (not just at intake) should
+      // also route the job to Smartech's dashboard — only ever turns this
+      // ON, never off, so removing a service later can't silently hide
+      // Smartech's existing description/photos on a job they're mid-way
+      // through.
+      smartechFlag: job.smartechFlag || jobRoutesToSmartech(serviceTypes, treatments),
       warrantyExpiry: warrantyExpiry || null, followupDate: followupDate || null, followupNote: followupNote.trim() || null,
       // Removing a service drops its done/assign/review state too, but the
       // fact it was removed (and by whom) stays in history permanently.
@@ -7172,18 +7316,46 @@ function JobDetail({ id, initialJob, session, team, onChanged, onBack, canArchiv
         </div>
       )}
 
-      {canApproveJobish(session) && ((job.jobishBills || []).length > 0 || (job.jobishPurchases || []).length > 0) && (
+      {/* Smartech's own progress: description, photos, status flag, and
+          comments — visible to any staff viewing this job (not gated to
+          the approval list like the purchases panel below, which is
+          financial data). Photos here are the same ones Smartech
+          uploads from their portal — this IS the "feeds into the main
+          job view" surface for them, see SmartechJobDetail. */}
+      {(job.smartechFlag || job.smartechDescription || (job.smartechPhotos || []).length > 0) && (
+        <div style={{ background: COLORS.panel, border: `1px solid ${COLORS.line}`, borderRadius: 12, padding: 16, marginBottom: 16 }}>
+          <div style={{ display: "flex", alignItems: "center", gap: 7, marginBottom: 8 }}>
+            <Wrench size={14} color={COLORS.gold} />
+            <div style={{ fontFamily: DISPLAY_FONT, fontWeight: 600, fontSize: 14.5, color: COLORS.ink }}>Smartech</div>
+            {job.smartechStatus && (
+              <div style={{ marginLeft: "auto", fontSize: 10.5, fontWeight: 700, color: COLORS.green, textTransform: "uppercase", letterSpacing: 0.5 }}>
+                {job.smartechStatus === "done" ? "Done" : "Ready for Collection"}
+              </div>
+            )}
+          </div>
+          {job.smartechDescription && <div style={{ fontSize: 12.5, color: COLORS.ink, marginBottom: 10 }}>{job.smartechDescription}</div>}
+          {(job.smartechPhotos || []).length > 0 && (
+            <div style={{ marginBottom: 10 }}><PhotoGrid photos={(job.smartechPhotos || []).map((p) => p.url)} /></div>
+          )}
+          {(job.history || []).filter((h) => h.stage === "smartech_comment").slice(-3).reverse().map((c, i) => (
+            <div key={i} style={{ fontSize: 11.5, color: COLORS.muted, marginTop: 4 }}>
+              <span style={{ color: COLORS.ink }}>{c.note}</span> — {c.by}
+            </div>
+          ))}
+        </div>
+      )}
+
+      {canApproveSmartech(session) && (job.smartechPurchases || []).length > 0 && (
         <div style={{ background: COLORS.panel, border: `1px solid ${COLORS.line}`, borderRadius: 12, padding: 16, marginBottom: 16 }}>
           <div style={{ display: "flex", alignItems: "center", gap: 7, marginBottom: 3 }}>
             <Receipt size={14} color={COLORS.gold} />
-            <div style={{ fontFamily: DISPLAY_FONT, fontWeight: 600, fontSize: 14.5, color: COLORS.ink }}>Jobish Bills & Purchases</div>
+            <div style={{ fontFamily: DISPLAY_FONT, fontWeight: 600, fontSize: 14.5, color: COLORS.ink }}>Smartech Purchases</div>
             <Lock size={11} color={COLORS.muted} style={{ marginLeft: "auto" }} />
           </div>
           <div style={{ fontSize: 10.5, color: COLORS.muted, marginBottom: 12, display: "flex", alignItems: "center", gap: 5, fontStyle: "italic" }}>
             <Lock size={9} /> Internal reference only — the customer never sees this section or its photos.
           </div>
-          <JobishEntryList title="Bills" entries={job.jobishBills} />
-          <JobishEntryList title="Purchases" entries={job.jobishPurchases} />
+          <SmartechEntryList title="Purchases" entries={job.smartechPurchases} />
         </div>
       )}
 
@@ -7378,8 +7550,8 @@ function JobDetail({ id, initialJob, session, team, onChanged, onBack, canArchiv
                   </div>
 
                   {/* Damage diagram — shown directly on the Body Work card so
-                      Jobish/Smartech see exactly what to fix without
-                      scrolling back up to the case file. */}
+                      Smartech sees exactly what to fix without scrolling
+                      back up to the case file. */}
                   {s.key === "bodyshop" && job.damageDiagramImage && (
                     <div style={{ padding: "0 12px 11px" }}>
                       {job.damagePanels && job.damagePanels.length > 0 && (
@@ -10398,7 +10570,7 @@ function slugify(label) {
 // unauthenticated visitor can trigger.
 //
 // PublicJobTracker (?track=<jobId>) is NOT reached this way anymore —
-// job tracking now requires a staff/Jobish login, so it's rendered
+// job tracking now requires a staff/Smartech login, so it's rendered
 // from inside GarageApp itself, after the session gate.
 function PublicPageShell({ children }) {
   return (
@@ -10557,7 +10729,7 @@ function PublicQuoteView({ quoteId }) {
 
 // The one thing checked before the real app even mounts — see main.jsx.
 // Only ?quote= takes this pre-login path now; ?track= is handled inside
-// GarageApp itself, behind the staff/Jobish login gate.
+// GarageApp itself, behind the staff/Smartech login gate.
 export function PublicLinkRouter() {
   const params = new URLSearchParams(window.location.search);
   const quoteId = params.get("quote");
@@ -10565,21 +10737,64 @@ export function PublicLinkRouter() {
   return null;
 }
 
-/* ---------------- Jobish / Subcontractor Portal ---------------- */
-// A team member with dashboardMode "subcontractor" (see
-// isSubcontractorPortal) lands here instead of the normal app — see the
-// branch right after the login gate in GarageApp. Deliberately its own
-// scoped fetch, never the shared `index`/refreshIndex every other screen
-// uses: only jobs assigned to THIS person, on a narrow field list that
-// excludes customer phone, pricing, and other staff's work.
+/* ---------------- Smartech: Storage + Chat helpers ---------------- */
+const STORAGE_GATEKEEPER_URL = `${SUPABASE_URL}/functions/v1/storage-gatekeeper`;
+
+async function storageCall(payload) {
+  try {
+    const res = await fetch(STORAGE_GATEKEEPER_URL, {
+      method: "POST",
+      headers: { apikey: SUPABASE_KEY, Authorization: `Bearer ${SUPABASE_KEY}`, "Content-Type": "application/json" },
+      body: JSON.stringify(payload),
+    });
+    const text = await res.text();
+    if (!res.ok) return { ok: false, error: text.slice(0, 200) };
+    return { ok: true, ...(text ? JSON.parse(text) : {}) };
+  } catch {
+    return { ok: false, error: "Offline — try again once connected." };
+  }
+}
+// Uploads a compressed photo to the private smartech-media bucket via
+// storage-gatekeeper (the anon key can't write to it directly — same
+// "one choke point holds the real key" pattern as db-gatekeeper).
+// Returns { path, url } — `path` is what gets stored in the DB
+// permanently, `url` is a signed link valid ~1 week.
+async function uploadSmartechPhoto(file, folder) {
+  const dataUrl = await compressImage(file);
+  const res = await storageCall({ action: "upload", bucket: "smartech-media", folder, filename: file.name, base64: dataUrl, contentType: "image/jpeg" });
+  return res.ok ? { path: res.path, url: res.url } : null;
+}
+// Signed URLs expire after ~1 week (see storage-gatekeeper's
+// SIGNED_URL_TTL_SECONDS) — every read path that displays previously-
+// saved smartech-media photos has to re-sign them first, or the image
+// just goes dead a week after upload. `photos` is an array of
+// {path, url, ...} objects; only `path` is trusted as permanent.
+async function refreshSmartechPhotoUrls(photos) {
+  const paths = (photos || []).map((p) => p && p.path).filter(Boolean);
+  if (!paths.length) return photos || [];
+  const res = await storageCall({ action: "sign", bucket: "smartech-media", paths });
+  if (!res.ok) return photos;
+  return (photos || []).map((p) => (p && p.path ? { ...p, url: res.urls?.[p.path] || p.url } : p));
+}
+
+/* ---------------- Smartech Portal ---------------- */
+// A team member with dashboardMode "smartech" (or the older "subcontractor"
+// value — see isSmartechPortal) lands here instead of the normal app —
+// see the branch right after the login gate in GarageApp. Deliberately
+// its own scoped fetch, never the shared `index`/refreshIndex every
+// other screen uses: only jobs assigned to THIS person, on a narrow
+// field list that excludes customer phone, pricing, and other staff's
+// work.
 //
-// Bills (labor) and purchases (parts/materials) are submitted separately
-// but share the same shape and the same pending -> admin-approved flow
-// (see JobishApprovalQueue). Only an "approved" entry is ever meant to
-// count as a real internal cost — and neither array is ever read by the
-// invoice/proforma PDF generators, so none of this can reach a
-// customer-facing document. This is back-office bookkeeping only.
-async function fetchJobishJobs(memberId) {
+// Purchases (parts/materials Smartech buys on the shop's behalf) go
+// through a pending -> admin-approved flow (see SmartechApprovalQueue).
+// Only an "approved" entry is ever meant to count as a real internal
+// cost — and it's never read by the invoice/proforma PDF generators, so
+// none of this can reach a customer-facing document. Back-office
+// bookkeeping only. (The old "submit a labour bill" side of this
+// feature was removed entirely — Smartech's own labour charge is
+// agreed and invoiced separately, outside the app.)
+async function fetchSmartechJobs(memberId) {
   // Two independent places a person can be assigned to the "bodyshop"
   // service: JobDetail's single-assignee `assigned_to` (also mirrored
   // into `assigned_team` when set there — see assignService), and the
@@ -10587,12 +10802,12 @@ async function fetchJobishJobs(memberId) {
   // set WITHOUT ever touching `assigned_to`. So this can't filter on
   // just one field server-side without silently missing Dispatch-Board-
   // only assignments — filtered client-side against both instead, same
-  // pattern JobishApprovalQueue already uses for its own scoped fetch.
+  // pattern SmartechApprovalQueue already uses for its own scoped fetch.
   const { ok, data } = await sbFetch(
-    `jobs?select=id,plate,make_model,stage_index,service_types,assigned_to,assigned_team,description,damage_notes,jobish_bills,jobish_purchases,updated_at&order=updated_at.desc&limit=500`
+    `jobs?select=id,plate,make_model,stage_index,service_types,treatments,assigned_to,assigned_team,description,damage_notes,jobish_purchases,smartech_description,smartech_photos,smartech_pieces,smartech_status,smartech_status_note,smartech_status_at,smartech_started_at,history,updated_at&order=updated_at.desc&limit=500`
   );
   if (!ok || !data) return [];
-  return data.filter((j) => {
+  const scoped = data.filter((j) => {
     // Same "collected" exclusion every other staff member's job list
     // already applies (SimplifiedDashboard) — without it, every job ever
     // assigned to this person stays in the list forever.
@@ -10601,34 +10816,78 @@ async function fetchJobishJobs(memberId) {
     const teamAssignees = (j.assigned_team || {}).bodyshop || [];
     return singleAssignee === memberId || teamAssignees.includes(memberId);
   });
+  // Re-sign Smartech photo URLs for every job in the scoped list — see
+  // refreshSmartechPhotoUrls.
+  await Promise.all(scoped.map(async (j) => {
+    if ((j.smartech_photos || []).length) j.smartech_photos = await refreshSmartechPhotoUrls(j.smartech_photos);
+  }));
+  return scoped;
 }
-async function submitJobishEntry(jobRow, kind, entry) {
-  const field = kind === "bill" ? "jobish_bills" : "jobish_purchases";
-  const nextEntries = [...(jobRow[field] || []), entry];
+async function submitSmartechPurchase(jobRow, entry) {
+  const nextEntries = [...(jobRow.jobish_purchases || []), entry];
   const { ok } = await sbFetch(`jobs?id=eq.${jobRow.id}`, {
     method: "PATCH",
     headers: { Prefer: "return=minimal" },
-    body: JSON.stringify({ [field]: nextEntries, updated_at: new Date().toISOString() }),
+    body: JSON.stringify({ jobish_purchases: nextEntries, updated_at: new Date().toISOString() }),
   });
   return ok ? nextEntries : null;
 }
+// Every other direct write the Smartech portal makes to a job — photos,
+// status flag, the start timer, comments — shares this one PATCH helper.
+async function patchSmartechJob(jobId, fields) {
+  const { ok } = await sbFetch(`jobs?id=eq.${jobId}`, {
+    method: "PATCH",
+    headers: { Prefer: "return=minimal" },
+    body: JSON.stringify({ ...fields, updated_at: new Date().toISOString() }),
+  });
+  return ok;
+}
+async function addSmartechPhoto(jobRow, session, file) {
+  const uploaded = await uploadSmartechPhoto(file, jobRow.id);
+  if (!uploaded) return null;
+  const entry = { path: uploaded.path, url: uploaded.url, uploadedAt: Date.now(), uploadedBy: session.name };
+  const nextPhotos = [...(jobRow.smartech_photos || []), entry];
+  return (await patchSmartechJob(jobRow.id, { smartech_photos: nextPhotos })) ? nextPhotos : null;
+}
+// Comments reuse the same history-array pattern the internal Live
+// Updates feed already uses (see postProgressUpdateToJob), just with
+// its own "smartech_comment" stage tag so JobDetail can show them
+// separately from staff progress notes.
+async function postSmartechComment(jobRow, session, note) {
+  const entry = { stage: "smartech_comment", label: "Smartech", by: session.name, role: session.role, note, at: Date.now() };
+  const nextHistory = [...(jobRow.history || []), entry];
+  return (await patchSmartechJob(jobRow.id, { history: nextHistory })) ? nextHistory : null;
+}
+// status is null to clear (tapping an already-active status un-marks it —
+// see markStatus in SmartechJobDetail) or "ready_for_collection"/"done".
+async function setSmartechStatus(jobRow, status) {
+  return patchSmartechJob(jobRow.id, { smartech_status: status, smartech_status_at: status ? new Date().toISOString() : null });
+}
+async function startSmartechTimer(jobRow) {
+  return patchSmartechJob(jobRow.id, { smartech_started_at: new Date().toISOString() });
+}
 
-function JobishPortal({ session, onLogout }) {
+function SmartechPortal({ session, onLogout }) {
   const [jobs, setJobs] = useState([]);
   const [loading, setLoading] = useState(true);
   const [activeJob, setActiveJob] = useState(null);
+  const [showChat, setShowChat] = useState(false);
 
   const refresh = useCallback(async () => {
     setLoading(true);
-    setJobs(await fetchJobishJobs(session.id));
+    setJobs(await fetchSmartechJobs(session.id));
     setLoading(false);
   }, [session.id]);
 
   useEffect(() => { refresh(); }, [refresh]);
 
+  if (showChat) {
+    return <SmartechChatScreen session={session} onBack={() => setShowChat(false)} />;
+  }
+
   if (activeJob) {
     return (
-      <JobishJobDetail
+      <SmartechJobDetail
         session={session}
         jobRow={activeJob}
         onBack={() => { setActiveJob(null); refresh(); }}
@@ -10642,9 +10901,14 @@ function JobishPortal({ session, onLogout }) {
       <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", marginBottom: 18 }}>
         <div>
           <div style={{ fontFamily: DISPLAY_FONT, fontWeight: 700, fontSize: 18, color: COLORS.ink }}>My Jobs</div>
-          <div style={{ fontSize: 11.5, color: COLORS.muted, marginTop: 2 }}>{session.name} · Subcontractor Portal</div>
+          <div style={{ fontSize: 11.5, color: COLORS.muted, marginTop: 2 }}>{session.name} · Smartech Portal</div>
         </div>
-        <button onClick={onLogout} className="mrcap-press" style={{ padding: "8px 12px", borderRadius: 8, border: `1px solid ${COLORS.line}`, background: "none", color: COLORS.muted, fontSize: 12, cursor: "pointer" }}>Log out</button>
+        <div style={{ display: "flex", gap: 8 }}>
+          <button onClick={() => setShowChat(true)} className="mrcap-press" style={{ display: "flex", alignItems: "center", gap: 6, padding: "8px 12px", borderRadius: 8, border: `1px solid ${COLORS.gold}`, background: "rgba(201,162,39,0.1)", color: COLORS.gold, fontSize: 12, fontWeight: 600, cursor: "pointer" }}>
+            <MessageSquare size={13} /> Chat
+          </button>
+          <button onClick={onLogout} className="mrcap-press" style={{ padding: "8px 12px", borderRadius: 8, border: `1px solid ${COLORS.line}`, background: "none", color: COLORS.muted, fontSize: 12, cursor: "pointer" }}>Log out</button>
+        </div>
       </div>
 
       {loading ? (
@@ -10654,12 +10918,16 @@ function JobishPortal({ session, onLogout }) {
       ) : (
         jobs.map((j) => {
           const stage = STAGES[j.stage_index] || STAGES[0];
-          const pendingCount = [...(j.jobish_bills || []), ...(j.jobish_purchases || [])].filter((e) => e.status === "pending").length;
+          const pendingCount = (j.jobish_purchases || []).filter((e) => e.status === "pending").length;
           return (
-            <button key={j.id} onClick={() => setActiveJob(j)} className="mrcap-press" style={{ display: "block", width: "100%", textAlign: "left", background: COLORS.panel, border: `1px solid ${COLORS.line}`, borderRadius: 12, padding: 14, marginBottom: 10, cursor: "pointer" }}>
+            <button key={j.id} onClick={() => { setActiveJob(j); logEvent("view", `Viewed job${j.plate ? ` ${j.plate}` : ""} (${j.id.slice(0, 8)})`); }} className="mrcap-press" style={{ display: "block", width: "100%", textAlign: "left", background: COLORS.panel, border: `1px solid ${COLORS.line}`, borderRadius: 12, padding: 14, marginBottom: 10, cursor: "pointer" }}>
               <div style={{ fontFamily: DISPLAY_FONT, fontWeight: 700, fontSize: 15, color: COLORS.ink }}>{j.make_model || "Vehicle"}</div>
               <div style={{ fontFamily: MONO_FONT, fontSize: 12.5, color: COLORS.gold, marginTop: 2 }}>{j.plate || ""}</div>
-              <div style={{ fontSize: 11.5, color: COLORS.muted, marginTop: 6 }}>{stage.label}{pendingCount ? ` · ${pendingCount} pending` : ""}</div>
+              <div style={{ fontSize: 11.5, color: COLORS.muted, marginTop: 6 }}>
+                {stage.label}
+                {j.smartech_status ? ` · ${j.smartech_status === "done" ? "Marked Done" : "Marked Ready for Collection"}` : ""}
+                {pendingCount ? ` · ${pendingCount} pending` : ""}
+              </div>
             </button>
           );
         })
@@ -10668,7 +10936,7 @@ function JobishPortal({ session, onLogout }) {
   );
 }
 
-function JobishEntryForm({ label, onSubmit }) {
+function SmartechEntryForm({ onSubmit }) {
   const [amount, setAmount] = useState("");
   const [description, setDescription] = useState("");
   const [photo, setPhoto] = useState(null);
@@ -10684,10 +10952,9 @@ function JobishEntryForm({ label, onSubmit }) {
     setUploading(false);
   };
 
-  // onSubmit reports back whether it actually saved (submitBill/
-  // submitPurchase in JobishJobDetail return that) — this used to clear
+  // onSubmit reports back whether it actually saved — this used to clear
   // the form unconditionally, so a rejected/offline write silently wiped
-  // out what Jobish had just typed with no error shown at all.
+  // out what Smartech had just typed with no error shown at all.
   const submit = async () => {
     const amt = Number(amount);
     if (!amt || amt <= 0 || !description.trim()) return;
@@ -10704,13 +10971,13 @@ function JobishEntryForm({ label, onSubmit }) {
 
   return (
     <div style={{ background: COLORS.panel2, border: `1px solid ${COLORS.line}`, borderRadius: 10, padding: 12, marginBottom: 12 }}>
-      <div style={{ fontSize: 12, fontWeight: 700, color: COLORS.ink, marginBottom: 8 }}>{label}</div>
+      <div style={{ fontSize: 12, fontWeight: 700, color: COLORS.ink, marginBottom: 8 }}>Submit a Purchase (parts/materials bought)</div>
       <input value={description} onChange={(e) => setDescription(e.target.value)} placeholder="What's this for?" style={{ ...inputStyle, marginTop: 0 }} />
       <input type="number" value={amount} onChange={(e) => setAmount(e.target.value)} placeholder="Amount (AED)" style={{ ...inputStyle, fontFamily: MONO_FONT }} />
       {photo && <div style={{ marginTop: 8 }}><PhotoGrid photos={[photo]} onRemove={() => setPhoto(null)} /></div>}
       <input ref={fileRef} type="file" accept="image/*" capture="environment" style={{ display: "none" }} onChange={(e) => attach(e.target.files)} />
       <button onClick={() => fileRef.current?.click()} disabled={uploading} className="mrcap-press" style={{ marginTop: 8, display: "flex", alignItems: "center", gap: 6, padding: "7px 11px", borderRadius: 8, border: `1px dashed ${COLORS.gold}`, background: "rgba(201,162,39,0.08)", color: COLORS.gold, fontSize: 11.5, fontWeight: 600, cursor: "pointer" }}>
-        <Camera size={13} /> {uploading ? "Uploading…" : photo ? "Replace Photo" : "Attach Bill / Receipt Photo"}
+        <Camera size={13} /> {uploading ? "Uploading…" : photo ? "Replace Photo" : "Attach Receipt Photo"}
       </button>
       {error && <div style={{ fontSize: 11, color: COLORS.red, marginTop: 8 }}>{error}</div>}
       <button onClick={submit} disabled={saving || !amount || !description.trim()} className="mrcap-press" style={{ ...primaryBtnStyle, width: "100%", marginTop: 10, opacity: saving || !amount || !description.trim() ? 0.6 : 1 }}>
@@ -10720,7 +10987,7 @@ function JobishEntryForm({ label, onSubmit }) {
   );
 }
 
-function JobishEntryList({ title, entries }) {
+function SmartechEntryList({ title, entries }) {
   if (!entries || !entries.length) return null;
   const toneFor = (s) => (s === "approved" ? COLORS.green : s === "rejected" ? COLORS.red : COLORS.gold);
   return (
@@ -10749,21 +11016,79 @@ function JobishEntryList({ title, entries }) {
   );
 }
 
-function JobishJobDetail({ session, jobRow, onBack, onUpdated }) {
-  const stage = STAGES[jobRow.stage_index] || STAGES[0];
+// Ticks a live elapsed label off a start timestamp — Smartech's own
+// timer, independent of the job's real start_time/stop_time used
+// elsewhere in the app, but formatted by the exact same function the
+// Dispatch Board uses for every other "how long has this been running"
+// label (see formatDispatchElapsed) — business hours only (9am-7pm,
+// Mon-Sat), so this stays consistent even if that function ever changes.
+function useElapsedLabel(startedAtMs) {
+  const [, forceTick] = useState(0);
+  useEffect(() => {
+    if (!startedAtMs) return;
+    const t = setInterval(() => forceTick((n) => n + 1), 30000);
+    return () => clearInterval(t);
+  }, [startedAtMs]);
+  if (!startedAtMs) return null;
+  return formatDispatchElapsed(startedAtMs, Date.now());
+}
 
-  const submitBill = async ({ amount, description, photo }) => {
-    const entry = { id: uid("jbill"), amount, description, photo: photo || null, status: "pending", createdAt: Date.now(), createdBy: session.name, createdById: session.id, reviewedAt: null, reviewedBy: null, rejectionReason: null };
-    const next = await submitJobishEntry(jobRow, "bill", entry);
-    if (next) onUpdated({ ...jobRow, jobish_bills: next });
-    return !!next;
-  };
+function SmartechJobDetail({ session, jobRow, onBack, onUpdated }) {
+  const stage = STAGES[jobRow.stage_index] || STAGES[0];
+  const [commentText, setCommentText] = useState("");
+  const [posting, setPosting] = useState(false);
+  const [uploadingPhoto, setUploadingPhoto] = useState(false);
+  const [photoError, setPhotoError] = useState(false);
+  const [busyStatus, setBusyStatus] = useState(false);
+  const [busyTimer, setBusyTimer] = useState(false);
+  const photoRef = useRef(null);
+
+  const startedAtMs = jobRow.smartech_started_at ? new Date(jobRow.smartech_started_at).getTime() : null;
+  const elapsed = useElapsedLabel(startedAtMs);
+
   const submitPurchase = async ({ amount, description, photo }) => {
     const entry = { id: uid("jpurch"), amount, description, photo: photo || null, status: "pending", createdAt: Date.now(), createdBy: session.name, createdById: session.id, reviewedAt: null, reviewedBy: null, rejectionReason: null };
-    const next = await submitJobishEntry(jobRow, "purchase", entry);
+    const next = await submitSmartechPurchase(jobRow, entry);
     if (next) onUpdated({ ...jobRow, jobish_purchases: next });
     return !!next;
   };
+
+  const addPhoto = async (files) => {
+    if (!files || !files[0]) return;
+    setUploadingPhoto(true);
+    setPhotoError(false);
+    const next = await addSmartechPhoto(jobRow, session, files[0]);
+    if (next) onUpdated({ ...jobRow, smartech_photos: next }); else setPhotoError(true);
+    setUploadingPhoto(false);
+  };
+
+  const postComment = async () => {
+    const note = commentText.trim();
+    if (!note) return;
+    setPosting(true);
+    const next = await postSmartechComment(jobRow, session, note);
+    if (next) { onUpdated({ ...jobRow, history: next }); setCommentText(""); }
+    setPosting(false);
+  };
+
+  // Tapping the already-active status clears it (un-mark a mis-tap);
+  // tapping the other one switches to it.
+  const markStatus = async (status) => {
+    const next = jobRow.smartech_status === status ? null : status;
+    setBusyStatus(true);
+    const ok = await setSmartechStatus(jobRow, next);
+    if (ok) onUpdated({ ...jobRow, smartech_status: next, smartech_status_at: next ? new Date().toISOString() : null });
+    setBusyStatus(false);
+  };
+
+  const startTimer = async () => {
+    setBusyTimer(true);
+    const ok = await startSmartechTimer(jobRow);
+    if (ok) onUpdated({ ...jobRow, smartech_started_at: new Date().toISOString() });
+    setBusyTimer(false);
+  };
+
+  const comments = (jobRow.history || []).filter((h) => h.stage === "smartech_comment").slice().reverse();
 
   return (
     <div style={{ minHeight: "100vh", background: COLORS.paper, padding: "20px 16px 60px" }}>
@@ -10775,84 +11100,151 @@ function JobishJobDetail({ session, jobRow, onBack, onUpdated }) {
         <div style={{ fontFamily: DISPLAY_FONT, fontWeight: 700, fontSize: 17, color: COLORS.ink }}>{jobRow.make_model || "Vehicle"}</div>
         <div style={{ fontFamily: MONO_FONT, fontSize: 13, color: COLORS.gold, marginTop: 2 }}>{jobRow.plate || ""}</div>
         <div style={{ fontSize: 11.5, color: COLORS.muted, marginTop: 6 }}>{stage.label}</div>
-        {jobRow.description && <div style={{ fontSize: 12.5, color: COLORS.ink, marginTop: 10 }}>{jobRow.description}</div>}
+        {jobRow.smartech_description && <div style={{ fontSize: 12.5, color: COLORS.ink, marginTop: 10, fontWeight: 600 }}>{jobRow.smartech_description}</div>}
+        {jobRow.description && <div style={{ fontSize: 12, color: COLORS.muted, marginTop: 6 }}>{jobRow.description}</div>}
         {jobRow.damage_notes && <div style={{ fontSize: 12, color: COLORS.muted, marginTop: 6 }}>{jobRow.damage_notes}</div>}
+        {/* Piece/panel counts only — never a price. Keyed "serviceKey::name",
+            same as treatmentPrices, but this field is informational-only
+            and never read by billing. */}
+        {Object.entries(jobRow.smartech_pieces || {}).filter(([, n]) => Number(n) > 0).length > 0 && (
+          <div style={{ marginTop: 8, display: "flex", flexWrap: "wrap", gap: 6 }}>
+            {Object.entries(jobRow.smartech_pieces || {}).filter(([, n]) => Number(n) > 0).map(([key, n]) => (
+              <span key={key} style={{ fontSize: 11, fontWeight: 600, color: COLORS.gold, background: "rgba(201,162,39,0.12)", border: `1px solid ${COLORS.gold}`, borderRadius: 999, padding: "3px 9px" }}>
+                {key.split("::")[1] || key} · {n} pcs
+              </span>
+            ))}
+          </div>
+        )}
       </div>
 
-      <JobishEntryList title="Your Bills" entries={jobRow.jobish_bills} />
-      <JobishEntryList title="Your Purchases" entries={jobRow.jobish_purchases} />
+      {/* Smartech-only start timer — never touches the job's real
+          start_time/stop_time used elsewhere in the app. */}
+      <div style={{ background: COLORS.panel2, border: `1px solid ${COLORS.line}`, borderRadius: 10, padding: 12, marginBottom: 12, display: "flex", alignItems: "center", justifyContent: "space-between" }}>
+        <div>
+          <div style={{ fontSize: 11, color: COLORS.muted, textTransform: "uppercase", letterSpacing: 0.5 }}>Your Timer</div>
+          <div style={{ fontSize: 14, fontWeight: 700, color: COLORS.ink, marginTop: 2 }}>{startedAtMs ? `Running · ${elapsed}` : "Not started"}</div>
+        </div>
+        <button onClick={startTimer} disabled={busyTimer || !!startedAtMs} className="mrcap-press" style={{ padding: "8px 14px", borderRadius: 8, border: "none", background: startedAtMs ? COLORS.panel : COLORS.gold, color: startedAtMs ? COLORS.muted : COLORS.darkText, fontWeight: 700, fontSize: 12.5, cursor: startedAtMs ? "default" : "pointer", opacity: busyTimer ? 0.6 : 1 }}>
+          {startedAtMs ? "Started" : "Start Job"}
+        </button>
+      </div>
 
-      <JobishEntryForm label="Submit a Bill (your labor charge)" onSubmit={submitBill} />
-      <JobishEntryForm label="Submit a Purchase (parts/materials bought)" onSubmit={submitPurchase} />
+      {/* Job photos — Smartech's own progress/completion photos. Also
+          shown on the main job screen (see the Smartech panel on
+          JobDetail), so Ahmed/Laani/admin see them without needing to
+          come into this portal. */}
+      <div style={{ background: COLORS.panel2, border: `1px solid ${COLORS.line}`, borderRadius: 10, padding: 12, marginBottom: 12 }}>
+        <div style={{ fontSize: 11, color: COLORS.muted, textTransform: "uppercase", letterSpacing: 0.5, marginBottom: 8 }}>Job Photos</div>
+        {(jobRow.smartech_photos || []).length > 0 && (
+          <div style={{ marginBottom: 8 }}><PhotoGrid photos={(jobRow.smartech_photos || []).map((p) => p.url)} /></div>
+        )}
+        <input ref={photoRef} type="file" accept="image/*" capture="environment" style={{ display: "none" }} onChange={(e) => addPhoto(e.target.files)} />
+        <button onClick={() => photoRef.current?.click()} disabled={uploadingPhoto} className="mrcap-press" style={{ display: "flex", alignItems: "center", gap: 6, padding: "7px 11px", borderRadius: 8, border: `1px dashed ${COLORS.gold}`, background: "rgba(201,162,39,0.08)", color: COLORS.gold, fontSize: 11.5, fontWeight: 600, cursor: "pointer" }}>
+          <Camera size={13} /> {uploadingPhoto ? "Uploading…" : "Add Photo"}
+        </button>
+        {photoError && <div style={{ fontSize: 11, color: COLORS.red, marginTop: 6 }}>Photo didn't upload — check your connection and try again.</div>}
+      </div>
+
+      {/* Comments — short notes Smartech and admin/Laani/Ahmed both see
+          on this job. Separate from the group chat (Smartech Chat),
+          which isn't tied to any one car. */}
+      <div style={{ background: COLORS.panel2, border: `1px solid ${COLORS.line}`, borderRadius: 10, padding: 12, marginBottom: 12 }}>
+        <div style={{ fontSize: 11, color: COLORS.muted, textTransform: "uppercase", letterSpacing: 0.5, marginBottom: 8 }}>Comments</div>
+        {comments.length === 0 && <div style={{ fontSize: 12, color: COLORS.muted, marginBottom: 8 }}>No comments yet.</div>}
+        {comments.slice(0, 5).map((c, i) => (
+          <div key={i} style={{ fontSize: 12.5, color: COLORS.ink, marginBottom: 6, paddingBottom: 6, borderBottom: i < Math.min(comments.length, 5) - 1 ? `1px solid ${COLORS.line}` : "none" }}>
+            {c.note}
+            <div style={{ fontSize: 10, color: COLORS.muted, marginTop: 2 }}>{c.by} · {new Date(c.at).toLocaleString()}</div>
+          </div>
+        ))}
+        <div style={{ display: "flex", gap: 6, marginTop: 8 }}>
+          <input value={commentText} onChange={(e) => setCommentText(e.target.value)} placeholder="Add a comment…" style={{ ...inputStyle, marginTop: 0, flex: 1 }} />
+          <button onClick={postComment} disabled={posting || !commentText.trim()} className="mrcap-press" style={{ padding: "0 14px", borderRadius: 8, border: "none", background: COLORS.gold, color: COLORS.darkText, fontWeight: 700, fontSize: 12.5, cursor: "pointer", opacity: posting || !commentText.trim() ? 0.6 : 1 }}>Post</button>
+        </div>
+      </div>
+
+      {/* Ready for Collection / Done — a flag Ahmed/Laani/admin see and
+          act on; it never moves the job's real pipeline stage itself. */}
+      <div style={{ background: COLORS.panel2, border: `1px solid ${COLORS.line}`, borderRadius: 10, padding: 12, marginBottom: 16 }}>
+        <div style={{ fontSize: 11, color: COLORS.muted, textTransform: "uppercase", letterSpacing: 0.5, marginBottom: 8 }}>Status</div>
+        {jobRow.smartech_status && (
+          <div style={{ fontSize: 12.5, color: COLORS.green, marginBottom: 8, fontWeight: 600 }}>
+            Marked {jobRow.smartech_status === "done" ? "Done" : "Ready for Collection"} — tap again to un-mark
+          </div>
+        )}
+        <div style={{ display: "flex", gap: 8 }}>
+          <button onClick={() => markStatus("ready_for_collection")} disabled={busyStatus} className="mrcap-press" style={{ flex: 1, padding: "9px", borderRadius: 8, border: `1px solid ${COLORS.gold}`, background: jobRow.smartech_status === "ready_for_collection" ? COLORS.gold : "none", color: jobRow.smartech_status === "ready_for_collection" ? COLORS.darkText : COLORS.gold, fontWeight: 700, fontSize: 12, cursor: "pointer", opacity: busyStatus ? 0.6 : 1 }}>Ready for Collection</button>
+          <button onClick={() => markStatus("done")} disabled={busyStatus} className="mrcap-press" style={{ flex: 1, padding: "9px", borderRadius: 8, border: "none", background: COLORS.green, color: COLORS.darkText, fontWeight: 700, fontSize: 12, cursor: "pointer", opacity: busyStatus ? 0.6 : 1 }}>Mark Done</button>
+        </div>
+      </div>
+
+      <SmartechEntryList title="Your Purchases" entries={jobRow.jobish_purchases} />
+      <SmartechEntryForm onSubmit={submitPurchase} />
     </div>
   );
 }
 
-// Admin-only queue of pending Jobish bills/purchases (reachable by any
-// admin, not restricted to Suhail). Fetches only the two jsonb columns
-// plus job identity — cheap even at this shop's scale — and filters to
+// Admin-only queue of pending Smartech purchases (reachable by any
+// admin, not restricted to Suhail). Fetches only the jsonb column plus
+// job identity — cheap even at this shop's scale — and filters to
 // "pending" entries client-side, the same pattern already used for the
 // Ahmed/Laani review queue on the main dashboard. Approving/rejecting
 // here is the ONLY thing that ever moves an entry out of "pending" —
 // only "approved" entries are meant to be summed anywhere as a real
 // internal cost.
-async function fetchJobishPendingQueue() {
-  const { ok, data } = await sbFetch(`jobs?select=id,plate,make_model,jobish_bills,jobish_purchases,updated_at&order=updated_at.desc&limit=500`);
+async function fetchSmartechPendingQueue() {
+  const { ok, data } = await sbFetch(`jobs?select=id,plate,make_model,jobish_purchases,updated_at&order=updated_at.desc&limit=500`);
   if (!ok || !data) return [];
-  return data.filter((j) => [...(j.jobish_bills || []), ...(j.jobish_purchases || [])].some((e) => e.status === "pending"));
+  return data.filter((j) => (j.jobish_purchases || []).some((e) => e.status === "pending"));
 }
-async function reviewJobishEntry(jobRow, kind, entryId, status, session, rejectionReason) {
-  const field = kind === "bill" ? "jobish_bills" : "jobish_purchases";
-  const nextEntries = (jobRow[field] || []).map((e) =>
+async function reviewSmartechPurchase(jobRow, entryId, status, session, rejectionReason) {
+  const nextEntries = (jobRow.jobish_purchases || []).map((e) =>
     e.id === entryId ? { ...e, status, reviewedAt: Date.now(), reviewedBy: session.name, rejectionReason: rejectionReason || null } : e
   );
   const { ok } = await sbFetch(`jobs?id=eq.${jobRow.id}`, {
     method: "PATCH",
     headers: { Prefer: "return=minimal" },
-    body: JSON.stringify({ [field]: nextEntries, updated_at: new Date().toISOString() }),
+    body: JSON.stringify({ jobish_purchases: nextEntries, updated_at: new Date().toISOString() }),
   });
   return ok ? nextEntries : null;
 }
 
-function JobishApprovalQueue({ session, onBack }) {
+function SmartechApprovalQueue({ session, onBack }) {
   const [loading, setLoading] = useState(true);
   const [jobs, setJobs] = useState([]);
   const [busyId, setBusyId] = useState(null);
 
   const load = useCallback(async () => {
     setLoading(true);
-    setJobs(await fetchJobishPendingQueue());
+    setJobs(await fetchSmartechPendingQueue());
     setLoading(false);
   }, []);
 
   useEffect(() => { load(); }, [load]);
 
-  const act = async (jobRow, kind, entryId, status) => {
+  const act = async (jobRow, entryId, status) => {
     let reason = null;
     if (status === "rejected") {
       reason = window.prompt("Reason for rejecting (optional):") || null;
     }
     setBusyId(entryId);
-    const nextEntries = await reviewJobishEntry(jobRow, kind, entryId, status, session, reason);
+    const nextEntries = await reviewSmartechPurchase(jobRow, entryId, status, session, reason);
     if (nextEntries) {
       setJobs((cur) => cur
-        .map((j) => (j.id === jobRow.id ? { ...j, [kind === "bill" ? "jobish_bills" : "jobish_purchases"]: nextEntries } : j))
-        .filter((j) => [...(j.jobish_bills || []), ...(j.jobish_purchases || [])].some((e) => e.status === "pending")));
+        .map((j) => (j.id === jobRow.id ? { ...j, jobish_purchases: nextEntries } : j))
+        .filter((j) => (j.jobish_purchases || []).some((e) => e.status === "pending")));
     }
     setBusyId(null);
   };
 
-  const rows = jobs.flatMap((j) => [
-    ...(j.jobish_bills || []).filter((e) => e.status === "pending").map((e) => ({ job: j, kind: "bill", entry: e })),
-    ...(j.jobish_purchases || []).filter((e) => e.status === "pending").map((e) => ({ job: j, kind: "purchase", entry: e })),
-  ]);
+  const rows = jobs.flatMap((j) => (j.jobish_purchases || []).filter((e) => e.status === "pending").map((e) => ({ job: j, entry: e })));
 
   return (
     <div className="mrcap-view" style={{ padding: "0 18px 34px" }}>
       <button onClick={onBack} className="mrcap-press" style={{ display: "flex", alignItems: "center", gap: 6, padding: "7px 0", background: "none", border: "none", color: COLORS.muted, fontSize: 12.5, cursor: "pointer", marginBottom: 4 }}>
         <ChevronLeft size={16} /> Back
       </button>
-      <SectionTitle>Jobish Approvals</SectionTitle>
+      <SectionTitle>Smartech Approvals</SectionTitle>
       <div style={{ fontSize: 11.5, color: COLORS.muted, marginTop: -10, marginBottom: 16, display: "flex", alignItems: "center", gap: 6 }}>
         <Lock size={12} /> Internal cost tracking only — never shown on a customer invoice or quote
       </div>
@@ -10863,23 +11255,144 @@ function JobishApprovalQueue({ session, onBack }) {
         <div style={{ textAlign: "center", color: COLORS.muted, padding: 40, fontSize: 13 }}>Nothing pending right now.</div>
       )}
 
-      {!loading && rows.map(({ job, kind, entry }) => (
+      {!loading && rows.map(({ job, entry }) => (
         <div key={entry.id} style={{ background: COLORS.panel, border: `1px solid ${COLORS.line}`, borderRadius: 12, padding: 14, marginBottom: 10 }}>
           <div style={{ display: "flex", justifyContent: "space-between", alignItems: "flex-start" }}>
             <div>
-              <div style={{ fontSize: 10.5, color: COLORS.gold, textTransform: "uppercase", letterSpacing: 0.5, fontWeight: 700 }}>{kind === "bill" ? "Bill" : "Purchase"}</div>
+              <div style={{ fontSize: 10.5, color: COLORS.gold, textTransform: "uppercase", letterSpacing: 0.5, fontWeight: 700 }}>Purchase</div>
               <div style={{ fontSize: 13, fontWeight: 600, color: COLORS.ink, marginTop: 3 }}>{entry.description}</div>
-              <div style={{ fontSize: 11.5, color: COLORS.muted, marginTop: 3 }}>{job.make_model || "Vehicle"} · {job.plate || ""} · by {entry.createdBy || "Jobish"}</div>
+              <div style={{ fontSize: 11.5, color: COLORS.muted, marginTop: 3 }}>{job.make_model || "Vehicle"} · {job.plate || ""} · by {entry.createdBy || "Smartech"}</div>
             </div>
             <div style={{ fontFamily: MONO_FONT, fontWeight: 700, fontSize: 15, color: COLORS.gold }}>AED {Math.round(entry.amount).toLocaleString()}</div>
           </div>
           {entry.photo && <div style={{ marginTop: 10 }}><PhotoGrid photos={[entry.photo]} /></div>}
           <div style={{ display: "flex", gap: 8, marginTop: 12 }}>
-            <button onClick={() => act(job, kind, entry.id, "approved")} disabled={busyId === entry.id} className="mrcap-press" style={{ flex: 1, padding: "9px", borderRadius: 8, border: "none", background: COLORS.green, color: COLORS.darkText, fontWeight: 700, fontSize: 12.5, cursor: "pointer", opacity: busyId === entry.id ? 0.6 : 1 }}>Approve</button>
-            <button onClick={() => act(job, kind, entry.id, "rejected")} disabled={busyId === entry.id} className="mrcap-press" style={{ flex: 1, padding: "9px", borderRadius: 8, border: `1px solid ${COLORS.red}`, background: "none", color: COLORS.red, fontWeight: 700, fontSize: 12.5, cursor: "pointer", opacity: busyId === entry.id ? 0.6 : 1 }}>Reject</button>
+            <button onClick={() => act(job, entry.id, "approved")} disabled={busyId === entry.id} className="mrcap-press" style={{ flex: 1, padding: "9px", borderRadius: 8, border: "none", background: COLORS.green, color: COLORS.darkText, fontWeight: 700, fontSize: 12.5, cursor: "pointer", opacity: busyId === entry.id ? 0.6 : 1 }}>Approve</button>
+            <button onClick={() => act(job, entry.id, "rejected")} disabled={busyId === entry.id} className="mrcap-press" style={{ flex: 1, padding: "9px", borderRadius: 8, border: `1px solid ${COLORS.red}`, background: "none", color: COLORS.red, fontWeight: 700, fontSize: 12.5, cursor: "pointer", opacity: busyId === entry.id ? 0.6 : 1 }}>Reject</button>
           </div>
         </div>
       ))}
+    </div>
+  );
+}
+
+/* ---------------- Smartech Chat ----------------
+   One general, ongoing group thread — Smartech + admin/Laani/Ahmed, not
+   tied to any specific job/car. Reads and writes both go through
+   gkGet/gkCall (see the billing section above) since `messages` has no
+   anon-readable policy (same lockdown as proformas) — only reachable
+   through db-gatekeeper. Polls every 12s, matching the existing Live
+   Updates/Announcements pattern; no Supabase Realtime in this codebase,
+   and a realtime subscription with the anon key couldn't read a
+   gatekeeper-only table anyway. */
+async function loadSmartechMessages() {
+  const res = await gkGet("messages?select=*&order=created_at.desc&limit=200");
+  if (!res.ok) return { ok: false, messages: [] };
+  const messages = (res.data || []).slice().reverse();
+  // Re-sign attachment URLs — see refreshSmartechPhotoUrls.
+  await Promise.all(messages.map(async (m) => {
+    if ((m.attachments || []).length) m.attachments = await refreshSmartechPhotoUrls(m.attachments);
+  }));
+  return { ok: true, messages };
+}
+async function sendSmartechMessage(session, body, attachments) {
+  const res = await gkCall({ path: "messages", method: "POST", body: { sender_id: session.id, sender_name: session.name, sender_role: session.role, body, attachments: attachments || [] }, headers: { Prefer: "return=minimal" }, summary: "Smartech chat message" });
+  if (res.ok) {
+    // Same push-notification path every other one-way alert in the app
+    // uses (see sendPushNotification / SendNotificationScreen) — notify
+    // whichever side didn't just send it. Targets Ahmed/Laani by name
+    // rather than every admin, matching the same named-exception
+    // audience canApproveSmartech/canUseSmartechChat already use for
+    // Smartech-related staff. Fire-and-forget: a push failure should
+    // never make the chat message itself look like it didn't send.
+    const targetMemberIds = session.id === "jobish" ? ["ahmed", "laani"] : ["jobish"];
+    sendPushNotification({ senderId: session.id, title: `${session.name} · Smartech Chat`, body: body || "Sent a photo", targetMemberIds }).catch(() => {});
+  }
+  return res.ok;
+}
+
+function SmartechChatScreen({ session, onBack }) {
+  const [messages, setMessages] = useState([]);
+  const [loading, setLoading] = useState(true);
+  const [loadError, setLoadError] = useState(false);
+  const [text, setText] = useState("");
+  const [photo, setPhoto] = useState(null);
+  const [uploading, setUploading] = useState(false);
+  const [uploadError, setUploadError] = useState(false);
+  const [sending, setSending] = useState(false);
+  const [sendError, setSendError] = useState(false);
+  const fileRef = useRef(null);
+
+  const refresh = useCallback(async () => {
+    const res = await loadSmartechMessages();
+    setMessages(res.messages);
+    setLoadError(!res.ok);
+    setLoading(false);
+  }, []);
+
+  useEffect(() => {
+    refresh();
+    const t = setInterval(refresh, 12000);
+    return () => clearInterval(t);
+  }, [refresh]);
+
+  const attach = async (files) => {
+    if (!files || !files[0]) return;
+    setUploading(true);
+    setUploadError(false);
+    const uploaded = await uploadSmartechPhoto(files[0], "chat");
+    if (uploaded) setPhoto(uploaded); else setUploadError(true);
+    setUploading(false);
+  };
+
+  const send = async () => {
+    const body = text.trim();
+    if (!body && !photo) return;
+    setSending(true);
+    setSendError(false);
+    const ok = await sendSmartechMessage(session, body, photo ? [photo] : []);
+    if (ok) { setText(""); setPhoto(null); await refresh(); } else { setSendError(true); }
+    setSending(false);
+  };
+
+  return (
+    <div className="mrcap-view" style={{ padding: "0 18px 34px", display: "flex", flexDirection: "column", minHeight: "70vh" }}>
+      <button onClick={onBack} className="mrcap-press" style={{ display: "flex", alignItems: "center", gap: 6, padding: "7px 0", background: "none", border: "none", color: COLORS.muted, fontSize: 12.5, cursor: "pointer", marginBottom: 4 }}>
+        <ChevronLeft size={16} /> Back
+      </button>
+      <SectionTitle>Smartech Chat</SectionTitle>
+      <div style={{ fontSize: 11.5, color: COLORS.muted, marginTop: -10, marginBottom: 16 }}>Smartech, Ahmed, Laani, and admin — one shared thread, not tied to a specific car.</div>
+
+      <div style={{ flex: 1, display: "flex", flexDirection: "column", gap: 8, marginBottom: 14 }}>
+        {loading && <SkeletonRows count={3} height={50} />}
+        {!loading && loadError && <div style={{ textAlign: "center", color: COLORS.red, padding: 30, fontSize: 13 }}>Couldn't load messages — check your connection and try again.</div>}
+        {!loading && !loadError && messages.length === 0 && <div style={{ textAlign: "center", color: COLORS.muted, padding: 30, fontSize: 13 }}>No messages yet.</div>}
+        {!loading && !loadError && messages.map((m) => {
+          const mine = m.sender_id === session.id;
+          return (
+            <div key={m.id} style={{ alignSelf: mine ? "flex-end" : "flex-start", maxWidth: "80%", background: mine ? COLORS.gold : COLORS.panel2, border: `1px solid ${COLORS.line}`, borderRadius: 10, padding: "8px 11px" }}>
+              <div style={{ fontSize: 10, color: mine ? COLORS.darkText : COLORS.muted, fontWeight: 700, marginBottom: 2 }}>{m.sender_name}</div>
+              {m.body && <div style={{ fontSize: 12.5, color: mine ? COLORS.darkText : COLORS.ink }}>{m.body}</div>}
+              {(m.attachments || []).map((a, i) => (
+                <img key={i} src={a.url} alt="" onClick={() => window.open(a.url, "_blank")} style={{ width: 120, height: 120, objectFit: "cover", borderRadius: 8, marginTop: 6, cursor: "pointer", display: "block" }} />
+              ))}
+              <div style={{ fontSize: 9.5, color: mine ? "rgba(30,26,10,0.6)" : COLORS.muted, marginTop: 4 }}>{new Date(m.created_at).toLocaleString()}</div>
+            </div>
+          );
+        })}
+      </div>
+
+      {uploadError && <div style={{ fontSize: 11.5, color: COLORS.red, marginBottom: 6 }}>Photo didn't upload — check your connection and try again.</div>}
+      {sendError && <div style={{ fontSize: 11.5, color: COLORS.red, marginBottom: 6 }}>Message didn't send — check your connection and try again.</div>}
+      {photo && <div style={{ marginBottom: 8 }}><PhotoGrid photos={[photo.url]} onRemove={() => setPhoto(null)} /></div>}
+      <div style={{ display: "flex", gap: 6, alignItems: "center" }}>
+        <input ref={fileRef} type="file" accept="image/*" style={{ display: "none" }} onChange={(e) => attach(e.target.files)} />
+        <button onClick={() => fileRef.current?.click()} disabled={uploading} className="mrcap-press" style={{ padding: 9, borderRadius: 8, border: `1px solid ${COLORS.line}`, background: "none", color: COLORS.muted, cursor: "pointer" }}>
+          <Camera size={16} />
+        </button>
+        <input value={text} onChange={(e) => setText(e.target.value)} placeholder="Message…" style={{ ...inputStyle, marginTop: 0, flex: 1 }} onKeyDown={(e) => { if (e.key === "Enter") send(); }} />
+        <button onClick={send} disabled={sending || (!text.trim() && !photo)} className="mrcap-press" style={{ padding: "0 16px", height: 38, borderRadius: 8, border: "none", background: COLORS.gold, color: COLORS.darkText, fontWeight: 700, fontSize: 12.5, cursor: "pointer", opacity: sending || (!text.trim() && !photo) ? 0.6 : 1 }}>Send</button>
+      </div>
     </div>
   );
 }
@@ -11677,16 +12190,23 @@ function TeamScreen({ team, setTeam, session, onBack, onImport, onServices, canS
 // shop-floor role — e.g. a senior technician who should see everything),
 // Workshop Floor (the stripped-down view, even for admin/intake — e.g.
 // someone who should only ever see their own assigned jobs), or
-// Subcontractor Portal (a separately-licensed entity like Jobish — sees
-// only their own assigned jobs and can submit bills/purchases for
-// admin approval, nothing else in the app at all).
+// Smartech Portal (the separately-licensed body-shop vendor — sees only
+// their own assigned jobs, submits purchases for admin approval, and
+// nothing else in the app at all). Writes the new "smartech" value going
+// forward; isSmartechPortal still also recognizes the old "subcontractor"
+// value for any device that hasn't picked this up yet.
 function DashboardModePicker({ value, onChange }) {
   const options = [
     { key: "auto", label: "Auto (by role)" },
     { key: "full", label: "Full Dashboard" },
     { key: "workshop", label: "Workshop Floor" },
-    { key: "subcontractor", label: "Subcontractor Portal" },
+    { key: "smartech", label: "Smartech Portal" },
   ];
+  // Cosmetic normalization only — a member row still saved as the old
+  // "subcontractor" value highlights the same as "smartech" here since
+  // isSmartechPortal treats them identically; onChange below always
+  // writes the new value going forward.
+  const normalizedValue = value === "subcontractor" ? "smartech" : value;
   return (
     <div style={{ display: "flex", flexWrap: "wrap", gap: 6 }}>
       {options.map((o) => (
@@ -11697,9 +12217,9 @@ function DashboardModePicker({ value, onChange }) {
           type="button"
           style={{
             padding: "7px 10px", borderRadius: 8, fontSize: 11.5, fontWeight: 600, cursor: "pointer",
-            border: `1.5px solid ${value === o.key ? COLORS.gold : COLORS.line}`,
-            background: value === o.key ? COLORS.gold : COLORS.panel2,
-            color: value === o.key ? COLORS.darkText : COLORS.muted,
+            border: `1.5px solid ${normalizedValue === o.key ? COLORS.gold : COLORS.line}`,
+            background: normalizedValue === o.key ? COLORS.gold : COLORS.panel2,
+            color: normalizedValue === o.key ? COLORS.darkText : COLORS.muted,
           }}
         >
           {o.label}
@@ -13782,12 +14302,12 @@ export function DispatchKiosk() {
         <div style={{ fontSize: 12.5, color: COLORS.muted, marginTop: 6 }}>Tap your name — no PIN needed</div>
       </div>
       <div style={{ display: "flex", flexDirection: "column", gap: 8, maxWidth: 420, margin: "0 auto" }}>
-        {/* Subcontractor-portal members (Jobish etc.) are deliberately
-            never offered here — this kiosk's whole login is "tap your
-            name, no PIN" for non-admins, which would otherwise let anyone
-            standing at this tablet open the full shop-wide board as them,
-            defeating the point of their locked-down portal entirely. */}
-        {team.filter((m) => !isSubcontractorPortal(m)).map((m) => (
+        {/* Smartech-portal members are deliberately never offered here —
+            this kiosk's whole login is "tap your name, no PIN" for
+            non-admins, which would otherwise let anyone standing at this
+            tablet open the full shop-wide board as them, defeating the
+            point of their locked-down portal entirely. */}
+        {team.filter((m) => !isSmartechPortal(m)).map((m) => (
           <button
             key={m.id}
             onClick={() => pick(m)}

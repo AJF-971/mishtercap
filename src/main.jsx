@@ -5,8 +5,8 @@ import GarageApp, { PublicLinkRouter, DispatchKiosk } from "./GarageApp.jsx";
 // Checked before the main app mounts at all — a customer opening a
 // ?quote= link should never see a login screen or pay the cost of
 // loading team/services data meant for staff. ?track= is deliberately
-// NOT included here — job tracking now requires a staff/Jobish login,
-// handled inside GarageApp itself (see the isSubcontractorPortal /
+// NOT included here — job tracking now requires a staff/Smartech login,
+// handled inside GarageApp itself (see the isSmartechPortal /
 // trackJobId check right after the session gate).
 const params = new URLSearchParams(window.location.search);
 const isPublicLink = params.has("quote");
