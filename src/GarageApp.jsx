@@ -153,6 +153,14 @@ function isSimplifiedRole(session) {
   if (hasFullDashboard(session)) return false;
   return !!ROLE_DEFS[session.role]?.simplified;
 }
+// A 4th dashboardMode value, distinct from 'auto'/'full'/'workshop' above:
+// routes straight into a scoped, job-only portal (see JobishPortal) before
+// the normal Shell/nav/dashboard ever renders. For team members who are
+// really a separate licensed sub-entity (e.g. Jobish) rather than shop
+// staff — they should see only their own assigned jobs, nothing else.
+function isSubcontractorPortal(member) {
+  return !!member && member.dashboardMode === "subcontractor";
+}
 
 // Who can hide/show a car on the Dispatch Board entirely (e.g. it's
 // actually sitting at Smartech, not on-site) — a named list by request,
@@ -941,9 +949,9 @@ function stepsForCategory(key) {
 // component (e.g. the wa.me link deep inside JobDetail) can read the
 // current value without prop-drilling it through the whole tree.
 const DEFAULT_WHATSAPP_TEMPLATES = {
-  ready_for_collection: "Hi {customerName}, your {makeModel} ({plate}) is ready for collection at Mr.CAP. Thank you! Track it anytime: {trackingLink}",
-  job_started: "Hi {customerName}, we've received your {makeModel} ({plate}) at Mr.CAP. and work is underway. Track progress here: {trackingLink}",
-  quote_sent: "Hi {customerName}, here's your quote from Mr.CAP. for your {makeModel} ({plate}): AED {total}. View and accept it here: {quoteLink}",
+  ready_for_collection: "Hi {customerName}, your {makeModel} ({plate}) is ready for collection at Mr.CAP. Thank you!",
+  job_started: "Hi {customerName}, we've received your {makeModel} ({plate}) at Mr.CAP. and work is underway.",
+  quote_sent: "Hi {customerName}, here's your quote from Mr.CAP. for your {makeModel} ({plate}): AED {total}. View it here: {quoteLink} — reply here or call us to accept.",
   follow_up: "Hi {customerName}, just checking in on your {makeModel} ({plate}) — {reason}. Let us know if you'd like to book it in with Mr.CAP.",
   warranty_reminder: "Hi {customerName}, a friendly reminder that the warranty on your {makeModel} ({plate}) work with Mr.CAP. expires on {expiryDate}. Reach out if you'd like it looked at before then.",
   google_review: "Hi {customerName}, thank you for trusting Mr.CAP. with your {makeModel}! If you had a great experience, we'd really appreciate a quick Google review: {reviewLink}",
@@ -1335,6 +1343,7 @@ function rowToJob(r) {
     serviceNotes: r.service_notes || {}, serviceReviewed: r.service_reviewed || {}, treatments: r.treatments || {},
     treatmentPrices: r.treatment_prices || {}, discountPercent: r.discount_percent || 0, priceHistory: r.price_history || [],
     parts: r.parts || [], markupEntries: r.markup_entries || [],
+    jobishBills: r.jobish_bills || [], jobishPurchases: r.jobish_purchases || [],
     stageIndex: r.stage_index, photos: r.photos || { intake: [], parts_removal: [], service: {} },
     startTime: r.start_time ? new Date(r.start_time).getTime() : null,
     stopTime: r.stop_time ? new Date(r.stop_time).getTime() : null,
@@ -1371,6 +1380,7 @@ function jobToRow(job) {
     service_notes: job.serviceNotes || {}, service_reviewed: job.serviceReviewed || {}, treatments: job.treatments || {},
     treatment_prices: job.treatmentPrices || {}, discount_percent: job.discountPercent || 0, price_history: job.priceHistory || [],
     parts: job.parts || [], markup_entries: job.markupEntries || [],
+    jobish_bills: job.jobishBills || [], jobish_purchases: job.jobishPurchases || [],
     stage_index: job.stageIndex, photos: job.photos,
     start_time: job.startTime ? new Date(job.startTime).toISOString() : null,
     stop_time: job.stopTime ? new Date(job.stopTime).toISOString() : null,
@@ -1584,16 +1594,13 @@ const INVOICE_ISSUER = {
 };
 const VAT_RATE = 0.05;
 
-// Head Office / Branch / General — which manager (if any) gets commission
-// credit for a job. Separate concept from the job's physical `location`:
-// a car can be sitting at any site and still be a Head Office or Branch
-// job commission-wise. Codes match First Bit's own ZH/ZB/ZG prefixes, so
-// Mr.CAP's invoice numbers stay conceptually aligned with the real
-// accounting system even before any direct integration exists.
+// Single-branch operation now — every job's invoice series runs under
+// "Branch" (code ZB, matching First Bit's own prefix so Mr.CAP's invoice
+// numbers stay conceptually aligned with the real accounting system).
+// Kept as a lookup array (not a bare constant) because
+// finalizeInvoiceNumber below still does a COMMISSION_ENTITIES.find().
 const COMMISSION_ENTITIES = [
-  { code: "ZH", key: "head_office", label: "Head Office" },
   { code: "ZB", key: "branch", label: "Branch" },
-  { code: "ZG", key: "general", label: "General (no commission)" },
 ];
 
 // Builds this job's real, permanent invoice number the first time it's
@@ -1607,7 +1614,7 @@ const COMMISSION_ENTITIES = [
 async function finalizeInvoiceNumber(job, session) {
   if (job.invoiceNo) return { ok: true, invoiceNo: job.invoiceNo, alreadyFinalized: true };
   const entity = COMMISSION_ENTITIES.find((e) => e.key === job.commissionEntity);
-  if (!entity) return { ok: false, error: "Pick a commission entity (Head Office / Branch / General) before finalizing." };
+  if (!entity) return { ok: false, error: "This job has no commission entity set — contact an admin before finalizing." };
 
   const year = new Date().getFullYear();
   const { ok, data } = await sbFetch("rpc/next_invoice_number", {
@@ -2254,6 +2261,7 @@ async function findActiveJobByPlate(plate) {
 }
 
 async function createJob(job, { reassignVehicle = false, customerType = null } = {}) {
+  job = { ...job, commissionEntity: job.commissionEntity || "branch" };
   const dupe = await findActiveJobByPlate(job.plate);
   if (dupe) {
     return {
@@ -2577,11 +2585,13 @@ async function deletePayment(payment, p) {
   const res = await gkCall({ path: `proforma_payments?id=eq.${payment.id}`, method: "DELETE", summary: `Removed a payment of AED ${fmtMoney(payment.amount)} from ${p.number}` });
   return res.ok;
 }
-// Remembers TRN / address / email for next time. Quietly does nothing if the
-// customers table hasn't been given those columns yet.
-async function rememberCustomerDetails(customerId, billTo) {
-  if (!customerId) return;
-  await gkCall({ path: `customers?id=eq.${customerId}`, method: "PATCH", body: { trn: billTo.trn || null, address: billTo.address || null, email: billTo.email || null, updated_at: nowIso() }, headers: { Prefer: "return=minimal" }, summary: "Saved customer billing details" });
+// A client's TRN / address / email are remembered from their most recent
+// issued proforma. They deliberately do NOT live on the customers table,
+// which the public key can read; proformas are not publicly readable.
+async function loadLastBillTo(customerId) {
+  if (!customerId) return null;
+  const res = await gkGet(`proformas?customer_id=eq.${encodeURIComponent(customerId)}&status=neq.draft&select=bill_to&order=created_at.desc&limit=1`);
+  return res.ok && Array.isArray(res.data) && res.data[0] ? res.data[0].bill_to || null : null;
 }
 
 // Everything that has been issued but not yet entered in First Bit: issued
@@ -3074,6 +3084,7 @@ function DesktopShell({ session, team, view, setView, onLogout, canArchive, chil
           {navItem("msgtemplates", "WhatsApp Messages", MessageSquare, () => setView("msgtemplates"), isSuperAdmin(session))}
           {navItem("announcements", "Post Announcement", Send, () => setView("announcements"), isSuperAdmin(session))}
           {navItem("issues", "Issue Reports", AlertCircle, () => setView("issues"), isSuperAdmin(session))}
+          {navItem("jobishapprovals", "Jobish Approvals", Receipt, () => setView("jobishapprovals"), session.role === "admin")}
         </div>
         <div style={{ borderTop: "1px solid #262A30", paddingTop: 12, marginTop: 12 }}>
           <div style={{ padding: "0 10px 10px", fontSize: 11.5, color: "#8A919B" }}>{session.name} · {ROLE_DEFS[session.role]?.label || session.role}</div>
@@ -3865,15 +3876,20 @@ export default function GarageApp() {
       const [t] = await Promise.all([loadTeam(), loadDynamicServicesAndRoles(), loadAppSettings(), loadWorkflowStepsMap()]);
       setTeam(t);
       const raw = loadLocalSession();
+      let restoredSession = null;
       if (raw) {
         const s = raw;
         if (t.find((m) => m.id === s.id)) {
           setSession(s); setCurrentActor(s);
+          restoredSession = s;
           if (shouldShowMorningReminder("mrcap")) setShowMorningReminder(true);
           registerForPush(s.id);
         }
       }
-      await refreshIndex();
+      // A subcontractor portal session (Jobish etc.) never needs the
+      // shop-wide job index — it fetches its own scoped list instead
+      // (see JobishPortal), so skip the shared fetch entirely for it.
+      if (!isSubcontractorPortal(restoredSession)) await refreshIndex();
       setReady(true);
     })();
   }, [refreshIndex]);
@@ -3902,7 +3918,7 @@ export default function GarageApp() {
   // dashboard list, not whatever job someone might be mid-edit on, so it
   // can't clobber in-progress work.
   useEffect(() => {
-    if (!ready || !session) return;
+    if (!ready || !session || isSubcontractorPortal(session)) return;
     const interval = setInterval(() => { refreshIndex(); }, 45000);
     const onVisible = () => { if (document.visibilityState === "visible") refreshIndex(); };
     const onFocus = () => { refreshIndex(); };
@@ -3955,6 +3971,34 @@ export default function GarageApp() {
     return <Shell><LoginScreen team={team} setTeam={setTeam} onLogin={onLogin} /></Shell>;
   }
 
+  // ?track=<jobId> used to be a pre-login public link (see main.jsx); it
+  // now requires a real staff/Jobish session, so it's handled right here,
+  // right after the login gate, before the normal Shell/TopBar/router.
+  const trackJobId = new URLSearchParams(window.location.search).get("track");
+  if (trackJobId) {
+    return (
+      <Shell>
+        <div style={{ maxWidth: 440, margin: "0 auto", padding: "14px 18px 0" }}>
+          <button
+            onClick={() => { window.location.href = window.location.origin + window.location.pathname; }}
+            className="mrcap-press"
+            style={{ display: "flex", alignItems: "center", gap: 6, padding: "7px 0", background: "none", border: "none", color: COLORS.muted, fontSize: 12.5, cursor: "pointer" }}
+          >
+            <ChevronLeft size={16} /> Back to Dashboard
+          </button>
+        </div>
+        <PublicJobTracker jobId={trackJobId} />
+      </Shell>
+    );
+  }
+
+  // Subcontractor portal (Jobish etc.): a job-only view, scoped to this
+  // person's own assignments — never mounts the normal Shell/TopBar/nav
+  // or the shop-wide job index.
+  if (isSubcontractorPortal(session)) {
+    return <Shell><JobishPortal session={session} onLogout={onLogout} /></Shell>;
+  }
+
   // Desktop back-office mode: only offered at login to admin/intake (see
   // LoginScreen), and only takes effect for those roles even if the flag
   // is somehow set — shop-floor roles always get the normal mobile Shell.
@@ -3964,7 +4008,7 @@ export default function GarageApp() {
   return (
     <ActiveShell session={session} team={team} view={view} setView={setView} onLogout={onLogout} canArchive={canArchive}>
       <ReportIssueButton session={session} view={view} />
-      <TopBar session={session} team={team} onLogout={onLogout} onNew={() => setView("new")} view={view} onBack={() => window.history.back()} onTeam={() => setView("team")} onArchive={() => setView("archive")} onCustomers={() => setView("customers")} onReports={() => setView("reports")} onQuotes={() => setView("quotes")} canArchive={canArchive} onAdminDash={() => setView("admindash")} onMsgTemplates={() => setView("msgtemplates")} onIssues={() => setView("issues")} onDispatch={() => setView("dispatch")} onLiveUpdates={() => setView("liveupdates")} onAnnouncements={() => setView("announcements")} onBilling={() => setView("billing")} />
+      <TopBar session={session} team={team} onLogout={onLogout} onNew={() => setView("new")} view={view} onBack={() => window.history.back()} onTeam={() => setView("team")} onArchive={() => setView("archive")} onCustomers={() => setView("customers")} onReports={() => setView("reports")} onQuotes={() => setView("quotes")} canArchive={canArchive} onAdminDash={() => setView("admindash")} onMsgTemplates={() => setView("msgtemplates")} onIssues={() => setView("issues")} onDispatch={() => setView("dispatch")} onLiveUpdates={() => setView("liveupdates")} onAnnouncements={() => setView("announcements")} onBilling={() => setView("billing")} onJobishApprovals={() => setView("jobishapprovals")} />
       {showMorningReminder && <MorningReminderBanner onDismiss={() => { setShowMorningReminder(false); dismissMorningReminder("mrcap"); }} />}
       <AnnouncementBanner session={session} />
       <LiveUpdateBroadcaster onOpenJob={(id) => openJob(id)} />
@@ -4081,6 +4125,10 @@ export default function GarageApp() {
         <ProformaDetail id={activeProformaId} session={session} team={team} onBack={() => window.history.back()} onEditDraft={(p) => newProforma(p)} onRevise={(seed) => newProforma(seed)} onOpenJob={(jobId) => openJob(jobId)} onDeleted={() => window.history.back()} />
       )}
       {(view === "billing" || view === "proformaedit" || view === "proformadetail") && !canBilling && <AccessDenied onBack={() => window.history.back()} />}
+      {view === "jobishapprovals" && session.role === "admin" && (
+        <JobishApprovalQueue session={session} onBack={() => window.history.back()} />
+      )}
+      {view === "jobishapprovals" && session.role !== "admin" && <AccessDenied onBack={() => window.history.back()} />}
     </ActiveShell>
   );
 }
@@ -4328,7 +4376,7 @@ function useViewportWidth() {
   return w;
 }
 
-function TopBar({ session, team, onLogout, onNew, view, onBack, onTeam, onArchive, onCustomers, onReports, onQuotes, canArchive, onAdminDash, onMsgTemplates, onIssues, onDispatch, onLiveUpdates, onAnnouncements, onBilling }) {
+function TopBar({ session, team, onLogout, onNew, view, onBack, onTeam, onArchive, onCustomers, onReports, onQuotes, canArchive, onAdminDash, onMsgTemplates, onIssues, onDispatch, onLiveUpdates, onAnnouncements, onBilling, onJobishApprovals }) {
   const isSimplified = isSimplifiedRole(session);
   const viewportW = useViewportWidth();
   // Every destination this login can reach, in the order they've always
@@ -4360,6 +4408,9 @@ function TopBar({ session, team, onLogout, onNew, view, onBack, onTeam, onArchiv
     moreItems.push({ label: "WhatsApp Messages", icon: <MessageSquare size={15} color={COLORS.ink} />, onClick: onMsgTemplates });
     moreItems.push({ label: "Post Announcement", icon: <Send size={15} color={COLORS.ink} />, onClick: onAnnouncements });
     moreItems.push({ label: "Issue Reports", icon: <AlertCircle size={15} color={COLORS.ink} />, onClick: onIssues });
+  }
+  if (view === "list" && session.role === "admin") {
+    moreItems.push({ label: "Jobish Approvals", icon: <Receipt size={15} color={COLORS.ink} />, onClick: onJobishApprovals });
   }
   return (
     <>
@@ -6823,7 +6874,7 @@ function JobDetail({ id, initialJob, session, team, onChanged, onBack, canArchiv
           <WhatsAppSendButton
             phone={job.customerPhone}
             templateKey="ready_for_collection"
-            vars={{ customerName: job.customerName || "", makeModel: job.makeModel || "vehicle", plate: job.plate || "", trackingLink: `${window.location.origin}/?track=${job.id}` }}
+            vars={{ customerName: job.customerName || "", makeModel: job.makeModel || "vehicle", plate: job.plate || "" }}
             label="Notify Customer on WhatsApp"
           />
           <CustomerNotifyControl record={job} templateKey="ready_for_collection" session={session} onSave={saveJobRecord} skippable={false} />
@@ -6834,7 +6885,7 @@ function JobDetail({ id, initialJob, session, team, onChanged, onBack, canArchiv
           <WhatsAppSendButton
             phone={job.customerPhone}
             templateKey="job_started"
-            vars={{ customerName: job.customerName || "", makeModel: job.makeModel || "vehicle", plate: job.plate || "", trackingLink: `${window.location.origin}/?track=${job.id}` }}
+            vars={{ customerName: job.customerName || "", makeModel: job.makeModel || "vehicle", plate: job.plate || "" }}
             label="Send Intake Confirmation"
           />
           <CustomerNotifyControl record={job} templateKey="job_started" session={session} onSave={saveJobRecord} skippable={true} />
@@ -6903,29 +6954,10 @@ function JobDetail({ id, initialJob, session, team, onChanged, onBack, canArchiv
             <div style={{ fontSize: 11.5, color: COLORS.red, marginBottom: 8 }}>{finalizeError}</div>
           )}
 
-          {job.invoiceNo ? (
+          {job.invoiceNo && (
             <div style={{ fontSize: 11, color: COLORS.muted, marginBottom: 8 }}>
               Invoice <span style={{ fontFamily: MONO_FONT, color: COLORS.gold }}>{job.invoiceNo}</span> — finalized by {job.invoiceFinalizedBy} on {job.invoiceFinalizedAt ? new Date(job.invoiceFinalizedAt).toLocaleDateString() : ""}
             </div>
-          ) : (
-            <>
-              <div style={{ fontSize: 11, color: COLORS.muted, marginBottom: 5 }}>COMMISSION ENTITY</div>
-              <div style={{ display: "flex", gap: 6, marginBottom: 10 }}>
-                {COMMISSION_ENTITIES.map((e) => (
-                  <button
-                    key={e.key}
-                    onClick={() => { setJob({ ...job, commissionEntity: e.key }); setFinalizeError(""); }}
-                    className="mrcap-press"
-                    style={{ flex: 1, padding: "8px 6px", borderRadius: 8, fontSize: 11, fontWeight: 600, cursor: "pointer",
-                      border: `1.5px solid ${job.commissionEntity === e.key ? COLORS.gold : COLORS.line}`,
-                      background: job.commissionEntity === e.key ? COLORS.gold : "transparent",
-                      color: job.commissionEntity === e.key ? COLORS.darkText : COLORS.ink }}
-                  >
-                    {e.label}
-                  </button>
-                ))}
-              </div>
-            </>
           )}
 
           <button
@@ -7939,7 +7971,6 @@ const TEMPLATE_DEFS = [
       { token: "customerName", sample: "Ahmed" },
       { token: "makeModel", sample: "Toyota Land Cruiser" },
       { token: "plate", sample: "A 12345" },
-      { token: "trackingLink", sample: "https://…/?track=…" },
     ],
   },
   {
@@ -7950,7 +7981,6 @@ const TEMPLATE_DEFS = [
       { token: "customerName", sample: "Ahmed" },
       { token: "makeModel", sample: "Toyota Land Cruiser" },
       { token: "plate", sample: "A 12345" },
-      { token: "trackingLink", sample: "https://…/?track=…" },
     ],
   },
   {
@@ -9469,7 +9499,11 @@ function QuoteDetail({ id, session, team, onBack, onConverted }) {
   useEffect(() => { load(); }, [load]);
 
   const setStatus = async (status) => {
-    const updated = { ...quote, status, updatedAt: Date.now() };
+    // Quote acceptance used to be a customer self-service action via the
+    // public link (removed — see PublicQuoteView); now it's staff marking
+    // it here once the customer has confirmed, so this is what stamps
+    // acceptedAt going forward.
+    const updated = { ...quote, status, acceptedAt: status === "accepted" ? Date.now() : null, updatedAt: Date.now() };
     await saveQuote(updated);
     setQuote(updated);
   };
@@ -9522,7 +9556,7 @@ function QuoteDetail({ id, session, team, onBack, onConverted }) {
           <div style={{ marginTop: 12, fontFamily: MONO_FONT, fontWeight: 700, fontSize: 18, color: COLORS.gold }}>AED {Math.round(total).toLocaleString()}</div>
         )}
         {quote.acceptedAt && (
-          <div style={{ fontSize: 11, color: COLORS.muted, marginTop: 4 }}>Accepted by customer {new Date(quote.acceptedAt).toLocaleString()}</div>
+          <div style={{ fontSize: 11, color: COLORS.muted, marginTop: 4 }}>Marked accepted {new Date(quote.acceptedAt).toLocaleString()}</div>
         )}
       </div>
 
@@ -9952,16 +9986,14 @@ function ProformaEditor({ seed, session, onCancel, onDone }) {
   const [error, setError] = useState("");
   const [reserved, setReserved] = useState(null);
   const [confirming, setConfirming] = useState(false);
-  const [remember, setRemember] = useState(true);
 
-  // Pre-fill TRN / address / email that were saved on the customer earlier.
+  // Pre-fill TRN / address / email from this client's last proforma.
   useEffect(() => {
     if (!seed || !seed.customer_id) return;
     (async () => {
-      const { ok, data } = await sbFetch(`customers?id=eq.${seed.customer_id}&select=*&limit=1`);
-      const c = ok && data && data[0];
-      if (!c) return;
-      setP((cur) => ({ ...cur, bill_to: { ...cur.bill_to, trn: cur.bill_to.trn || c.trn || "", address: cur.bill_to.address || c.address || "", email: cur.bill_to.email || c.email || "" } }));
+      const last = await loadLastBillTo(seed.customer_id);
+      if (!last) return;
+      setP((cur) => ({ ...cur, bill_to: { ...cur.bill_to, trn: cur.bill_to.trn || last.trn || "", address: cur.bill_to.address || last.address || "", email: cur.bill_to.email || last.email || "" } }));
     })();
     // eslint-disable-next-line
   }, []);
@@ -9990,7 +10022,6 @@ function ProformaEditor({ seed, session, onCancel, onDone }) {
     setSaving(false);
     if (res.id && !p.id) setP((cur) => ({ ...cur, id: res.id }));
     if (!res.ok) { setError(res.error); if (res.reserved) setReserved(res.reserved); setConfirming(false); return; }
-    if (remember && p.customer_id) rememberCustomerDetails(p.customer_id, p.bill_to);
     finish(res.row);
   };
 
@@ -10015,11 +10046,7 @@ function ProformaEditor({ seed, session, onCancel, onDone }) {
         <Field label="Phone"><input style={inp} type="tel" value={p.bill_to.phone} onChange={(e) => setBill("phone", e.target.value)} /></Field>
         <Field label="Address (optional)"><input style={inp} value={p.bill_to.address} onChange={(e) => setBill("address", e.target.value)} /></Field>
         <Field label="Email (optional)"><input style={inp} type="email" value={p.bill_to.email} onChange={(e) => setBill("email", e.target.value)} /></Field>
-        {p.customer_id && (
-          <label style={{ display: "flex", alignItems: "center", gap: 8, fontSize: 12.5, color: COLORS.muted }}>
-            <input type="checkbox" checked={remember} onChange={(e) => setRemember(e.target.checked)} /> Remember these details for this customer
-          </label>
-        )}
+        {p.customer_id && <div style={{ fontSize: 11.5, color: COLORS.muted }}>TRN, address and email are filled in from this client's last proforma, and remembered for the next one.</div>}
       </div>
 
       <div style={billCard}>
@@ -10326,15 +10353,20 @@ function slugify(label) {
   return base || `item_${Math.random().toString(36).slice(2, 7)}`;
 }
 
-/* ---------------- Public links — no login, scoped to one job/quote ---------------- */
-// Reached via ?track=<jobId> or ?quote=<quoteId> in the URL (see the
-// router in main.jsx, which checks for these BEFORE the main app even
-// mounts, so there's no session/team loading overhead for a customer
-// who's just checking on their car). Deliberately minimal selects —
-// only fields safe to hand to a customer, nothing internal (no cost,
-// no markup, no notes, no other customers' data). Job/quote ids are
-// high-entropy UUIDs (gen_random_uuid()), which is what makes a bare
-// link like this reasonable to share at all instead of requiring login.
+/* ---------------- Public links — scoped to one job/quote ---------------- */
+// PublicQuoteView is reached via ?quote=<quoteId> in the URL (see
+// PublicLinkRouter below and the router in main.jsx, which checks for
+// this BEFORE the main app even mounts, so there's no session/team
+// loading overhead for a customer just viewing a price). Deliberately
+// minimal selects — only fields safe to hand to a customer, nothing
+// internal (no cost, no markup, no notes, no other customers' data).
+// It's view-only: accepting a quote is a staff action now (see the
+// status picker on the internal Quotations screen), not something an
+// unauthenticated visitor can trigger.
+//
+// PublicJobTracker (?track=<jobId>) is NOT reached this way anymore —
+// job tracking now requires a staff/Jobish login, so it's rendered
+// from inside GarageApp itself, after the session gate.
 function PublicPageShell({ children }) {
   return (
     <div style={{ minHeight: "100vh", background: COLORS.paper, display: "flex", flexDirection: "column", alignItems: "center", padding: "40px 18px" }}>
@@ -10415,8 +10447,6 @@ function PublicJobTracker({ jobId }) {
 function PublicQuoteView({ quoteId }) {
   const [status, setStatus] = useState("loading"); // loading | ok | notfound | error
   const [quote, setQuote] = useState(null);
-  const [accepting, setAccepting] = useState(false);
-  const [acceptError, setAcceptError] = useState(false);
 
   const load = useCallback(async () => {
     if (!quoteId) { setStatus("notfound"); return; }
@@ -10427,24 +10457,6 @@ function PublicQuoteView({ quoteId }) {
   }, [quoteId]);
 
   useEffect(() => { load(); }, [load]);
-
-  const accept = async () => {
-    setAccepting(true);
-    setAcceptError(false);
-    // Not a real team member, but sbFetch's activity-log write wants an
-    // actor — this makes it clear in the log that it was the customer
-    // self-accepting via the public link, not a spoofed team action.
-    currentActor = { id: "customer", name: quote.customerName || "Customer", role: "customer" };
-    nextActivitySummary = `Customer accepted quotation via public link (${quote.plate || quote.makeModel || quote.id})`;
-    const { ok } = await sbFetch(`quotes?id=eq.${quoteId}`, {
-      method: "PATCH",
-      headers: { Prefer: "return=minimal" },
-      body: JSON.stringify({ status: "accepted", accepted_at: new Date().toISOString() }),
-    });
-    setAccepting(false);
-    if (ok) { setQuote((q) => ({ ...q, status: "accepted", acceptedAt: Date.now() })); }
-    else setAcceptError(true);
-  };
 
   if (status === "loading") {
     return <PublicPageShell><SkeletonRows count={2} height={56} /></PublicPageShell>;
@@ -10501,17 +10513,9 @@ function PublicQuoteView({ quoteId }) {
             <div style={{ fontSize: 11.5, color: COLORS.muted, marginTop: 5 }}>We'll be in touch to book you in.</div>
           </div>
         ) : (
-          <>
-            {acceptError && <div style={{ fontSize: 11.5, color: "#E08A78", marginBottom: 10, textAlign: "center" }}>Couldn't save that — please try again.</div>}
-            <button
-              onClick={accept}
-              disabled={accepting}
-              className="mrcap-press"
-              style={{ ...primaryBtnStyle, width: "100%", marginTop: 6, opacity: accepting ? 0.6 : 1 }}
-            >
-              {accepting ? "Saving…" : "Accept Quotation"}
-            </button>
-          </>
+          <div style={{ marginTop: 6, textAlign: "center", padding: "14px 16px", borderRadius: 10, background: COLORS.panel2, border: `1px solid ${COLORS.line}` }}>
+            <div style={{ fontSize: 12, color: COLORS.muted }}>To accept this quotation, reply to us on WhatsApp or give us a call — we'll confirm it on our end.</div>
+          </div>
         )}
       </div>
     </PublicPageShell>
@@ -10519,13 +10523,305 @@ function PublicQuoteView({ quoteId }) {
 }
 
 // The one thing checked before the real app even mounts — see main.jsx.
+// Only ?quote= takes this pre-login path now; ?track= is handled inside
+// GarageApp itself, behind the staff/Jobish login gate.
 export function PublicLinkRouter() {
   const params = new URLSearchParams(window.location.search);
-  const jobId = params.get("track");
   const quoteId = params.get("quote");
-  if (jobId) return <PublicJobTracker jobId={jobId} />;
   if (quoteId) return <PublicQuoteView quoteId={quoteId} />;
   return null;
+}
+
+/* ---------------- Jobish / Subcontractor Portal ---------------- */
+// A team member with dashboardMode "subcontractor" (see
+// isSubcontractorPortal) lands here instead of the normal app — see the
+// branch right after the login gate in GarageApp. Deliberately its own
+// scoped fetch, never the shared `index`/refreshIndex every other screen
+// uses: only jobs assigned to THIS person, on a narrow field list that
+// excludes customer phone, pricing, and other staff's work.
+//
+// Bills (labor) and purchases (parts/materials) are submitted separately
+// but share the same shape and the same pending -> admin-approved flow
+// (see JobishApprovalQueue). Only an "approved" entry is ever meant to
+// count as a real internal cost — and neither array is ever read by the
+// invoice/proforma PDF generators, so none of this can reach a
+// customer-facing document. This is back-office bookkeeping only.
+async function fetchJobishJobs(memberId) {
+  // Two independent places a person can be assigned to the "bodyshop"
+  // service: JobDetail's single-assignee `assigned_to` (also mirrored
+  // into `assigned_team` when set there — see assignService), and the
+  // Dispatch Board's own multi-assignee `assigned_team`, which can be
+  // set WITHOUT ever touching `assigned_to`. So this can't filter on
+  // just one field server-side without silently missing Dispatch-Board-
+  // only assignments — filtered client-side against both instead, same
+  // pattern JobishApprovalQueue already uses for its own scoped fetch.
+  const { ok, data } = await sbFetch(
+    `jobs?select=id,plate,make_model,stage_index,service_types,assigned_to,assigned_team,description,damage_notes,jobish_bills,jobish_purchases,updated_at&order=updated_at.desc&limit=500`
+  );
+  if (!ok || !data) return [];
+  return data.filter((j) => {
+    const singleAssignee = (j.assigned_to || {}).bodyshop;
+    const teamAssignees = (j.assigned_team || {}).bodyshop || [];
+    return singleAssignee === memberId || teamAssignees.includes(memberId);
+  });
+}
+async function submitJobishEntry(jobRow, kind, entry) {
+  const field = kind === "bill" ? "jobish_bills" : "jobish_purchases";
+  const nextEntries = [...(jobRow[field] || []), entry];
+  const { ok } = await sbFetch(`jobs?id=eq.${jobRow.id}`, {
+    method: "PATCH",
+    headers: { Prefer: "return=minimal" },
+    body: JSON.stringify({ [field]: nextEntries, updated_at: new Date().toISOString() }),
+  });
+  return ok ? nextEntries : null;
+}
+
+function JobishPortal({ session, onLogout }) {
+  const [jobs, setJobs] = useState([]);
+  const [loading, setLoading] = useState(true);
+  const [activeJob, setActiveJob] = useState(null);
+
+  const refresh = useCallback(async () => {
+    setLoading(true);
+    setJobs(await fetchJobishJobs(session.id));
+    setLoading(false);
+  }, [session.id]);
+
+  useEffect(() => { refresh(); }, [refresh]);
+
+  if (activeJob) {
+    return (
+      <JobishJobDetail
+        session={session}
+        jobRow={activeJob}
+        onBack={() => { setActiveJob(null); refresh(); }}
+        onUpdated={(row) => setActiveJob(row)}
+      />
+    );
+  }
+
+  return (
+    <div style={{ minHeight: "100vh", background: COLORS.paper, padding: "20px 16px 60px" }}>
+      <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", marginBottom: 18 }}>
+        <div>
+          <div style={{ fontFamily: DISPLAY_FONT, fontWeight: 700, fontSize: 18, color: COLORS.ink }}>My Jobs</div>
+          <div style={{ fontSize: 11.5, color: COLORS.muted, marginTop: 2 }}>{session.name} · Subcontractor Portal</div>
+        </div>
+        <button onClick={onLogout} className="mrcap-press" style={{ padding: "8px 12px", borderRadius: 8, border: `1px solid ${COLORS.line}`, background: "none", color: COLORS.muted, fontSize: 12, cursor: "pointer" }}>Log out</button>
+      </div>
+
+      {loading ? (
+        <SkeletonRows count={3} height={70} />
+      ) : jobs.length === 0 ? (
+        <div style={{ textAlign: "center", color: COLORS.muted, padding: "40px 20px" }}>No jobs assigned to you right now.</div>
+      ) : (
+        jobs.map((j) => {
+          const stage = STAGES[j.stage_index] || STAGES[0];
+          const pendingCount = [...(j.jobish_bills || []), ...(j.jobish_purchases || [])].filter((e) => e.status === "pending").length;
+          return (
+            <button key={j.id} onClick={() => setActiveJob(j)} className="mrcap-press" style={{ display: "block", width: "100%", textAlign: "left", background: COLORS.panel, border: `1px solid ${COLORS.line}`, borderRadius: 12, padding: 14, marginBottom: 10, cursor: "pointer" }}>
+              <div style={{ fontFamily: DISPLAY_FONT, fontWeight: 700, fontSize: 15, color: COLORS.ink }}>{j.make_model || "Vehicle"}</div>
+              <div style={{ fontFamily: MONO_FONT, fontSize: 12.5, color: COLORS.gold, marginTop: 2 }}>{j.plate || ""}</div>
+              <div style={{ fontSize: 11.5, color: COLORS.muted, marginTop: 6 }}>{stage.label}{pendingCount ? ` · ${pendingCount} pending` : ""}</div>
+            </button>
+          );
+        })
+      )}
+    </div>
+  );
+}
+
+function JobishEntryForm({ label, onSubmit }) {
+  const [amount, setAmount] = useState("");
+  const [description, setDescription] = useState("");
+  const [photo, setPhoto] = useState(null);
+  const [uploading, setUploading] = useState(false);
+  const [saving, setSaving] = useState(false);
+  const fileRef = useRef(null);
+
+  const attach = async (files) => {
+    if (!files || !files[0]) return;
+    setUploading(true);
+    setPhoto(await compressImage(files[0]));
+    setUploading(false);
+  };
+
+  const submit = async () => {
+    const amt = Number(amount);
+    if (!amt || amt <= 0 || !description.trim()) return;
+    setSaving(true);
+    await onSubmit({ amount: amt, description: description.trim(), photo });
+    setAmount(""); setDescription(""); setPhoto(null);
+    setSaving(false);
+  };
+
+  return (
+    <div style={{ background: COLORS.panel2, border: `1px solid ${COLORS.line}`, borderRadius: 10, padding: 12, marginBottom: 12 }}>
+      <div style={{ fontSize: 12, fontWeight: 700, color: COLORS.ink, marginBottom: 8 }}>{label}</div>
+      <input value={description} onChange={(e) => setDescription(e.target.value)} placeholder="What's this for?" style={{ ...inputStyle, marginTop: 0 }} />
+      <input type="number" value={amount} onChange={(e) => setAmount(e.target.value)} placeholder="Amount (AED)" style={{ ...inputStyle, fontFamily: MONO_FONT }} />
+      {photo && <div style={{ marginTop: 8 }}><PhotoGrid photos={[photo]} onRemove={() => setPhoto(null)} /></div>}
+      <input ref={fileRef} type="file" accept="image/*" capture="environment" style={{ display: "none" }} onChange={(e) => attach(e.target.files)} />
+      <button onClick={() => fileRef.current?.click()} disabled={uploading} className="mrcap-press" style={{ marginTop: 8, display: "flex", alignItems: "center", gap: 6, padding: "7px 11px", borderRadius: 8, border: `1px dashed ${COLORS.gold}`, background: "rgba(201,162,39,0.08)", color: COLORS.gold, fontSize: 11.5, fontWeight: 600, cursor: "pointer" }}>
+        <Camera size={13} /> {uploading ? "Uploading…" : photo ? "Replace Photo" : "Attach Bill / Receipt Photo"}
+      </button>
+      <button onClick={submit} disabled={saving || !amount || !description.trim()} className="mrcap-press" style={{ ...primaryBtnStyle, width: "100%", marginTop: 10, opacity: saving || !amount || !description.trim() ? 0.6 : 1 }}>
+        {saving ? "Submitting…" : "Submit for Approval"}
+      </button>
+    </div>
+  );
+}
+
+function JobishEntryList({ title, entries }) {
+  if (!entries || !entries.length) return null;
+  const toneFor = (s) => (s === "approved" ? COLORS.green : s === "rejected" ? COLORS.red : COLORS.gold);
+  return (
+    <div style={{ marginBottom: 14 }}>
+      <div style={{ fontSize: 11, color: COLORS.muted, textTransform: "uppercase", letterSpacing: 0.5, marginBottom: 6 }}>{title}</div>
+      {entries.slice().reverse().map((e) => (
+        <div key={e.id} style={{ background: COLORS.panel2, border: `1px solid ${COLORS.line}`, borderRadius: 8, padding: "9px 11px", marginBottom: 6 }}>
+          <div style={{ display: "flex", justifyContent: "space-between" }}>
+            <div style={{ fontSize: 12.5, fontWeight: 600, color: COLORS.ink }}>{e.description}</div>
+            <div style={{ fontFamily: MONO_FONT, fontSize: 12.5, color: COLORS.gold }}>AED {Math.round(e.amount).toLocaleString()}</div>
+          </div>
+          <div style={{ fontSize: 10.5, color: toneFor(e.status), marginTop: 3, textTransform: "capitalize" }}>{e.status}{e.status === "rejected" && e.rejectionReason ? ` — ${e.rejectionReason}` : ""}</div>
+        </div>
+      ))}
+    </div>
+  );
+}
+
+function JobishJobDetail({ session, jobRow, onBack, onUpdated }) {
+  const stage = STAGES[jobRow.stage_index] || STAGES[0];
+
+  const submitBill = async ({ amount, description, photo }) => {
+    const entry = { id: uid("jbill"), amount, description, photo: photo || null, status: "pending", createdAt: Date.now(), createdBy: session.name, createdById: session.id, reviewedAt: null, reviewedBy: null, rejectionReason: null };
+    const next = await submitJobishEntry(jobRow, "bill", entry);
+    if (next) onUpdated({ ...jobRow, jobish_bills: next });
+  };
+  const submitPurchase = async ({ amount, description, photo }) => {
+    const entry = { id: uid("jpurch"), amount, description, photo: photo || null, status: "pending", createdAt: Date.now(), createdBy: session.name, createdById: session.id, reviewedAt: null, reviewedBy: null, rejectionReason: null };
+    const next = await submitJobishEntry(jobRow, "purchase", entry);
+    if (next) onUpdated({ ...jobRow, jobish_purchases: next });
+  };
+
+  return (
+    <div style={{ minHeight: "100vh", background: COLORS.paper, padding: "20px 16px 60px" }}>
+      <button onClick={onBack} className="mrcap-press" style={{ display: "flex", alignItems: "center", gap: 6, padding: "7px 0", background: "none", border: "none", color: COLORS.muted, fontSize: 12.5, cursor: "pointer", marginBottom: 12 }}>
+        <ChevronLeft size={16} /> Back to My Jobs
+      </button>
+
+      <div style={{ background: COLORS.panel, border: `1px solid ${COLORS.line}`, borderRadius: 12, padding: 16, marginBottom: 16 }}>
+        <div style={{ fontFamily: DISPLAY_FONT, fontWeight: 700, fontSize: 17, color: COLORS.ink }}>{jobRow.make_model || "Vehicle"}</div>
+        <div style={{ fontFamily: MONO_FONT, fontSize: 13, color: COLORS.gold, marginTop: 2 }}>{jobRow.plate || ""}</div>
+        <div style={{ fontSize: 11.5, color: COLORS.muted, marginTop: 6 }}>{stage.label}</div>
+        {jobRow.description && <div style={{ fontSize: 12.5, color: COLORS.ink, marginTop: 10 }}>{jobRow.description}</div>}
+        {jobRow.damage_notes && <div style={{ fontSize: 12, color: COLORS.muted, marginTop: 6 }}>{jobRow.damage_notes}</div>}
+      </div>
+
+      <JobishEntryList title="Your Bills" entries={jobRow.jobish_bills} />
+      <JobishEntryList title="Your Purchases" entries={jobRow.jobish_purchases} />
+
+      <JobishEntryForm label="Submit a Bill (your labor charge)" onSubmit={submitBill} />
+      <JobishEntryForm label="Submit a Purchase (parts/materials bought)" onSubmit={submitPurchase} />
+    </div>
+  );
+}
+
+// Admin-only queue of pending Jobish bills/purchases (reachable by any
+// admin, not restricted to Suhail). Fetches only the two jsonb columns
+// plus job identity — cheap even at this shop's scale — and filters to
+// "pending" entries client-side, the same pattern already used for the
+// Ahmed/Laani review queue on the main dashboard. Approving/rejecting
+// here is the ONLY thing that ever moves an entry out of "pending" —
+// only "approved" entries are meant to be summed anywhere as a real
+// internal cost.
+async function fetchJobishPendingQueue() {
+  const { ok, data } = await sbFetch(`jobs?select=id,plate,make_model,jobish_bills,jobish_purchases,updated_at&order=updated_at.desc&limit=500`);
+  if (!ok || !data) return [];
+  return data.filter((j) => [...(j.jobish_bills || []), ...(j.jobish_purchases || [])].some((e) => e.status === "pending"));
+}
+async function reviewJobishEntry(jobRow, kind, entryId, status, session, rejectionReason) {
+  const field = kind === "bill" ? "jobish_bills" : "jobish_purchases";
+  const nextEntries = (jobRow[field] || []).map((e) =>
+    e.id === entryId ? { ...e, status, reviewedAt: Date.now(), reviewedBy: session.name, rejectionReason: rejectionReason || null } : e
+  );
+  const { ok } = await sbFetch(`jobs?id=eq.${jobRow.id}`, {
+    method: "PATCH",
+    headers: { Prefer: "return=minimal" },
+    body: JSON.stringify({ [field]: nextEntries, updated_at: new Date().toISOString() }),
+  });
+  return ok ? nextEntries : null;
+}
+
+function JobishApprovalQueue({ session, onBack }) {
+  const [loading, setLoading] = useState(true);
+  const [jobs, setJobs] = useState([]);
+  const [busyId, setBusyId] = useState(null);
+
+  const load = useCallback(async () => {
+    setLoading(true);
+    setJobs(await fetchJobishPendingQueue());
+    setLoading(false);
+  }, []);
+
+  useEffect(() => { load(); }, [load]);
+
+  const act = async (jobRow, kind, entryId, status) => {
+    let reason = null;
+    if (status === "rejected") {
+      reason = window.prompt("Reason for rejecting (optional):") || null;
+    }
+    setBusyId(entryId);
+    const nextEntries = await reviewJobishEntry(jobRow, kind, entryId, status, session, reason);
+    if (nextEntries) {
+      setJobs((cur) => cur
+        .map((j) => (j.id === jobRow.id ? { ...j, [kind === "bill" ? "jobish_bills" : "jobish_purchases"]: nextEntries } : j))
+        .filter((j) => [...(j.jobish_bills || []), ...(j.jobish_purchases || [])].some((e) => e.status === "pending")));
+    }
+    setBusyId(null);
+  };
+
+  const rows = jobs.flatMap((j) => [
+    ...(j.jobish_bills || []).filter((e) => e.status === "pending").map((e) => ({ job: j, kind: "bill", entry: e })),
+    ...(j.jobish_purchases || []).filter((e) => e.status === "pending").map((e) => ({ job: j, kind: "purchase", entry: e })),
+  ]);
+
+  return (
+    <div className="mrcap-view" style={{ padding: "0 18px 34px" }}>
+      <button onClick={onBack} className="mrcap-press" style={{ display: "flex", alignItems: "center", gap: 6, padding: "7px 0", background: "none", border: "none", color: COLORS.muted, fontSize: 12.5, cursor: "pointer", marginBottom: 4 }}>
+        <ChevronLeft size={16} /> Back
+      </button>
+      <SectionTitle>Jobish Approvals</SectionTitle>
+      <div style={{ fontSize: 11.5, color: COLORS.muted, marginTop: -10, marginBottom: 16, display: "flex", alignItems: "center", gap: 6 }}>
+        <Lock size={12} /> Internal cost tracking only — never shown on a customer invoice or quote
+      </div>
+
+      {loading && <SkeletonRows count={3} height={80} />}
+
+      {!loading && rows.length === 0 && (
+        <div style={{ textAlign: "center", color: COLORS.muted, padding: 40, fontSize: 13 }}>Nothing pending right now.</div>
+      )}
+
+      {!loading && rows.map(({ job, kind, entry }) => (
+        <div key={entry.id} style={{ background: COLORS.panel, border: `1px solid ${COLORS.line}`, borderRadius: 12, padding: 14, marginBottom: 10 }}>
+          <div style={{ display: "flex", justifyContent: "space-between", alignItems: "flex-start" }}>
+            <div>
+              <div style={{ fontSize: 10.5, color: COLORS.gold, textTransform: "uppercase", letterSpacing: 0.5, fontWeight: 700 }}>{kind === "bill" ? "Bill" : "Purchase"}</div>
+              <div style={{ fontSize: 13, fontWeight: 600, color: COLORS.ink, marginTop: 3 }}>{entry.description}</div>
+              <div style={{ fontSize: 11.5, color: COLORS.muted, marginTop: 3 }}>{job.make_model || "Vehicle"} · {job.plate || ""} · by {entry.createdBy || "Jobish"}</div>
+            </div>
+            <div style={{ fontFamily: MONO_FONT, fontWeight: 700, fontSize: 15, color: COLORS.gold }}>AED {Math.round(entry.amount).toLocaleString()}</div>
+          </div>
+          {entry.photo && <div style={{ marginTop: 10 }}><PhotoGrid photos={[entry.photo]} /></div>}
+          <div style={{ display: "flex", gap: 8, marginTop: 12 }}>
+            <button onClick={() => act(job, kind, entry.id, "approved")} disabled={busyId === entry.id} className="mrcap-press" style={{ flex: 1, padding: "9px", borderRadius: 8, border: "none", background: COLORS.green, color: COLORS.darkText, fontWeight: 700, fontSize: 12.5, cursor: "pointer", opacity: busyId === entry.id ? 0.6 : 1 }}>Approve</button>
+            <button onClick={() => act(job, kind, entry.id, "rejected")} disabled={busyId === entry.id} className="mrcap-press" style={{ flex: 1, padding: "9px", borderRadius: 8, border: `1px solid ${COLORS.red}`, background: "none", color: COLORS.red, fontWeight: 700, fontSize: 12.5, cursor: "pointer", opacity: busyId === entry.id ? 0.6 : 1 }}>Reject</button>
+          </div>
+        </div>
+      ))}
+    </div>
+  );
 }
 
 /* ---------------- Services & Pricing (admin: add/edit/retire, no redeploy) ---------------- */
@@ -11316,16 +11612,20 @@ function TeamScreen({ team, setTeam, session, onBack, onImport, onServices, canS
   );
 }
 
-// Three-way picker for how much of the app someone sees: Auto (follow
+// Four-way picker for how much of the app someone sees: Auto (follow
 // their role's usual default), Full Dashboard (admin-style, even for a
 // shop-floor role — e.g. a senior technician who should see everything),
-// or Workshop Floor (the stripped-down view, even for admin/intake —
-// e.g. someone who should only ever see their own assigned jobs).
+// Workshop Floor (the stripped-down view, even for admin/intake — e.g.
+// someone who should only ever see their own assigned jobs), or
+// Subcontractor Portal (a separately-licensed entity like Jobish — sees
+// only their own assigned jobs and can submit bills/purchases for
+// admin approval, nothing else in the app at all).
 function DashboardModePicker({ value, onChange }) {
   const options = [
     { key: "auto", label: "Auto (by role)" },
     { key: "full", label: "Full Dashboard" },
     { key: "workshop", label: "Workshop Floor" },
+    { key: "subcontractor", label: "Subcontractor Portal" },
   ];
   return (
     <div style={{ display: "flex", flexWrap: "wrap", gap: 6 }}>
