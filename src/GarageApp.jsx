@@ -7,7 +7,7 @@ import {
   Users, BarChart3, Phone, Download, Upload, FileText, Send, PauseCircle,
   MessageSquare, TrendingUp, RotateCcw, ExternalLink, Star, AlertCircle,
   Sparkles, Hammer, Armchair, ChevronUp, ChevronDown, GripVertical,
-  XCircle, Trash2, MoreVertical, MessageCircle, ArrowRight, Minus
+  XCircle, Trash2, MoreVertical, MessageCircle, ArrowRight, Minus, Palette
 } from "lucide-react";
 import { jsPDF } from "jspdf";
 import { Capacitor } from "@capacitor/core";
@@ -121,7 +121,10 @@ function isSuperAdmin(session) {
 // widget, per Suhail's request. Dashboard/screen access no longer reads
 // from this list (see dashboardMode / hasFullDashboard below) — this is
 // now purely the attendance-tracker roster.
-const CORE_FOUR = ["ahmed", "laani", "regan", "noel"];
+// These are the team_members ids (and the lowercased names they're stored
+// under in staff_out_today). Reagen's live name is "Reagen" — it was
+// misspelt "regan" here, so Reagen never matched and never saw the widget.
+const CORE_FOUR = ["ahmed", "laani", "reagen", "noel"];
 
 // Which screens a team member sees: the full admin-style dashboard/case
 // file, or the stripped-down workshop-floor view. Used to be a hardcoded
@@ -187,7 +190,7 @@ function canUseSmartechChat(session) {
 // actually sitting at Smartech, not on-site) — a named list by request,
 // not a toggleable permission flag.
 function canManageDispatchVisibility(session) {
-  return !!session && ["ajf", "ahmed", "laani", "mr.cap"].includes((session.name || "").toLowerCase());
+  return !!session && ["ahmed", "laani", "suhail", "owner"].includes(session.id);
 }
 
 const BASE_LOCATIONS = ["Mr.CAP. (Main)", "Beneloom (Upholstery)", "Smartech (Body & Paint)"];
@@ -460,7 +463,7 @@ const COLORS = {
   plateEdge: "#D8D2C0",
 };
 
-const FONT_IMPORT = `@import url('https://fonts.googleapis.com/css2?family=Playfair+Display:wght@500;600;700&family=IBM+Plex+Sans:wght@400;500;600;700&family=IBM+Plex+Mono:wght@400;500;600;700&display=swap');`;
+const FONT_IMPORT = `@import url('https://fonts.googleapis.com/css2?family=Playfair+Display:wght@500;600;700&family=IBM+Plex+Sans:wght@400;500;600;700&family=IBM+Plex+Sans+Condensed:wght@600;700&family=IBM+Plex+Mono:wght@400;500;600;700&display=swap');`;
 const DISPLAY_FONT = "'Playfair Display', serif";
 const MONO_FONT = "'IBM Plex Mono', ui-monospace, monospace";
 const BODY_FONT = "'IBM Plex Sans', -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif";
@@ -748,6 +751,11 @@ async function sbFetch(path, options = {}) {
         // the caller it "succeeded" so the existing optimistic-update code
         // in every screen keeps working unchanged; the pending-sync badge
         // is what tells the truth about it not being on the server yet.
+        // Callers that pass noQueue (e.g. Dispatch Board writes that must
+        // re-read fresh state before applying) opt out of this — an
+        // offline/failed write comes back as a plain failure instead of
+        // silently queuing a replay of possibly-stale data.
+        if (options.noQueue) return { ok: false, data: null };
         queueOfflineWrite(envelope);
         return { ok: true, data: null, queued: true };
       }
@@ -1078,9 +1086,9 @@ async function loadAppSettings() {
 }
 
 // Who covers for whom, from the scope-of-work doc — Ahmed/Lani are each
-// other's backup on intake & updates, Noel/Regan are each other's backup
-// on detailing/QC. Lowercased, matching how names are compared elsewhere.
-const BACKUP_MAP = { ahmed: "laani", laani: "ahmed", noel: "regan", regan: "noel" };
+// other's backup on intake & updates, Noel/Reagen are each other's backup
+// on detailing/QC. Lowercased, matching the CORE_FOUR keys.
+const BACKUP_MAP = { ahmed: "laani", laani: "ahmed", noel: "reagen", reagen: "noel" };
 
 // "Who's out today" — persisted to app_settings like the other shop-wide
 // settings above, keyed by today's date so it auto-resets without anyone
@@ -1147,6 +1155,38 @@ async function saveGoogleReviewLink(link, session) {
   return ok;
 }
 
+// Dispatch Board state colours, set by Mr.CAP from the board's Colours
+// pop-up. Stored as { "new": "#3FD37A", ... } with ONLY the states that
+// differ from the defaults (DISPATCH_THEME), so a later change to a
+// default still reaches every state nobody customised. Read on its own
+// (not via loadAppSettings) because the board re-reads it every minute —
+// that's how the shop TV picks up a change without anyone reloading it.
+// Returns null when the read fails, so a dropped request keeps whatever
+// colours the board already has instead of snapping back to defaults.
+async function loadDispatchColors() {
+  const { ok, data } = await sbFetch("app_settings?key=eq.dispatch_colors&select=value");
+  if (!ok || !Array.isArray(data)) return null;
+  if (!data[0]?.value) return {};
+  let parsed;
+  try { parsed = JSON.parse(data[0].value); } catch { return {}; }
+  const out = {};
+  if (parsed && typeof parsed === "object") {
+    for (const t of DISPATCH_THEME) {
+      const v = parsed[t.key];
+      if (typeof v === "string" && DISPATCH_HEX_RE.test(v)) out[t.key] = v.toUpperCase();
+    }
+  }
+  return out;
+}
+async function saveDispatchColors(colors, session) {
+  const { ok } = await sbFetch("app_settings?on_conflict=key", {
+    method: "POST",
+    headers: { Prefer: "resolution=merge-duplicates,return=minimal" },
+    body: JSON.stringify([{ key: "dispatch_colors", value: JSON.stringify(colors), updated_by: session?.id || null, updated_at: new Date().toISOString() }]),
+  });
+  return ok;
+}
+
 // {token} substitution — unknown tokens resolve to empty string rather
 // than being left in the message, so a typo'd token silently disappears
 // instead of getting sent to a real customer verbatim.
@@ -1182,7 +1222,7 @@ function WhatsAppSendButton({ phone, templateKey, vars, label, small }) {
 // the ones that get skipped sometimes) also shows a "not needed for
 // this job" toggle that hides the checkbox once flipped on. Works for
 // both jobs and quotes — caller passes its own save function.
-function CustomerNotifyControl({ record, templateKey, session, onSave, skippable = false }) {
+function CustomerNotifyControl({ record, templateKey, session, onSave, skippable = false, label = "Customer informed" }) {
   const notify = (record.customerNotify || {})[templateKey] || {};
 
   const patch = async (fields) => {
@@ -1215,7 +1255,7 @@ function CustomerNotifyControl({ record, templateKey, session, onSave, skippable
           style={boxStyle}
           onChange={(e) => e.target.checked ? patch({ informedBy: session.name, informedAt: Date.now() }) : patch({ informedBy: null, informedAt: null })}
         />
-        {notify.informedBy ? `Customer informed by ${notify.informedBy} · ${fmtTime(notify.informedAt)}` : "Customer informed"}
+        {notify.informedBy ? `${label} by ${notify.informedBy} · ${fmtTime(notify.informedAt)}` : label}
       </label>
       {skippable && (
         <label style={{ ...rowStyle, marginTop: -6 }}>
@@ -3255,9 +3295,15 @@ a:hover { color: ${COLORS.goldBright}; }
 .mrcap-scroll-x { scrollbar-width: none; }
 .mrcap-scroll-x::-webkit-scrollbar { display: none; }
 input[type=number]::-webkit-inner-spin-button, input[type=number]::-webkit-outer-spin-button { opacity: 0.35; }
-.mrcap-view { animation: mrcapSlideIn 0.32s cubic-bezier(0.22,0.61,0.36,1) both; }
+/* "backwards", not "both": both kept the final transform: translateX(0)
+   applied forever after the slide-in, and ANY transform on an ancestor
+   makes position:fixed children pin to that ancestor instead of the
+   screen (pop-ups and floating buttons ended up in the wrong place).
+   backwards still holds the start frame during the delay/first paint,
+   then leaves no transform behind — the end frame equals the defaults. */
+.mrcap-view { animation: mrcapSlideIn 0.32s cubic-bezier(0.22,0.61,0.36,1) backwards; }
 .mrcap-fade { animation: mrcapFadeIn 0.4s ease both; }
-.mrcap-rise { animation: mrcapRise 0.36s cubic-bezier(0.22,0.61,0.36,1) both; }
+.mrcap-rise { animation: mrcapRise 0.36s cubic-bezier(0.22,0.61,0.36,1) backwards; }
 @media (prefers-reduced-motion: reduce) {
   .mrcap-view, .mrcap-fade, .mrcap-rise, .mrcap-sweep, .mrcap-skeleton { animation: none !important; }
   .mrcap-press, .mrcap-card, input, textarea, select { transition: none !important; }
@@ -4342,6 +4388,14 @@ export default function GarageApp() {
           ? <SimplifiedDashboard index={index} session={session} onOpen={openJob} onRefresh={refreshIndex} syncState={syncState} lastSyncedAt={lastSyncedAt} />
           : <Dashboard index={index} session={session} team={team} onOpen={openJob} onJobDeleted={removeFromIndex} canArchive={canArchive} onRefresh={refreshIndex} syncState={syncState} lastSyncedAt={lastSyncedAt} />
       )}
+      {/* Desktop has no fade (below), so without this the last row of the
+          dashboard sat permanently under the floating New Job / Park a
+          Vehicle buttons (bottom 22px + 56px tall, and 86px + 36px tall).
+          This spacer lets the page scroll far enough for the last card to
+          clear them. The buttons themselves are unchanged. */}
+      {view === "list" && isDesktop && (hasPermission(session, team, "newJob") || isFullDashboardRole(session)) && (
+        <div aria-hidden="true" style={{ height: 110 }} />
+      )}
       {/* Soft fade under the floating buttons so cards slide away beneath them. */}
       {view === "list" && !isDesktop && (
         <div aria-hidden="true" style={{ position: "fixed", left: 0, right: 0, bottom: 0, height: 150, zIndex: 45, pointerEvents: "none", background: "linear-gradient(to bottom, rgba(10,10,9,0), rgba(10,10,9,0.82) 55%, rgba(10,10,9,0.96))" }} />
@@ -5424,7 +5478,7 @@ function Dashboard({ index, session, team, onOpen, onJobDeleted, canArchive, onR
         </div>
       </section>
 
-      {(isAdmin || CORE_FOUR.includes((session.name || "").toLowerCase())) && (
+      {(isAdmin || CORE_FOUR.includes(session.id) || CORE_FOUR.includes((session.name || "").toLowerCase())) && (
         <div style={{ ...cardStyle, padding: "12px 14px", marginBottom: 16 }}>
           <div style={{ ...eyebrowStyle, marginBottom: 10 }}>
             Who's Out Today
@@ -7576,6 +7630,21 @@ function JobDetail({ id, initialJob, session, team, onChanged, onBack, canArchiv
           />
           {!job.customerPhone && <div style={{ fontSize: 11.5, color: COLORS.muted, marginBottom: 8, fontStyle: "italic" }}>No phone on file — add one via Edit Job to WhatsApp them, or just tick below once you've told them another way.</div>}
           <CustomerNotifyControl record={job} templateKey="ready_for_collection" session={session} onSave={saveJobRecord} skippable={false} />
+          {/* Second WhatsApp message at pickup: the Google review thank-you,
+              with its own tick so the shop can see it was sent. Same
+              google_review record as the Collected-stage card, so ticking
+              it here also shows as sent there. */}
+          {GOOGLE_REVIEW_LINK && hasPermission(session, team, "googleReview") && (
+            <>
+              <WhatsAppSendButton
+                phone={job.customerPhone}
+                templateKey="google_review"
+                vars={{ customerName: job.customerName || "", makeModel: job.makeModel || "vehicle", plate: job.plate || "", reviewLink: GOOGLE_REVIEW_LINK }}
+                label="Send Thank-You + Google Review"
+              />
+              <CustomerNotifyControl record={job} templateKey="google_review" session={session} onSave={saveJobRecord} skippable={true} label="Google review sent to customer" />
+            </>
+          )}
         </>
       )}
       {stage.key === "intake" && (
@@ -7608,7 +7677,7 @@ function JobDetail({ id, initialJob, session, team, onChanged, onBack, canArchiv
                 vars={{ customerName: job.customerName || "", makeModel: job.makeModel || "vehicle", plate: job.plate || "", reviewLink: GOOGLE_REVIEW_LINK }}
                 label="Ask for a Review on WhatsApp"
               />
-              <CustomerNotifyControl record={job} templateKey="google_review" session={session} onSave={saveJobRecord} skippable={true} />
+              <CustomerNotifyControl record={job} templateKey="google_review" session={session} onSave={saveJobRecord} skippable={true} label="Google review sent to customer" />
             </>
           ) : (
             <div style={{ fontSize: 11.5, color: COLORS.muted, fontStyle: "italic" }}>Add your Google review link under WhatsApp Messages to enable this.</div>
@@ -13013,11 +13082,20 @@ async function loadDispatchJobs() {
   // photo/diagram indicator icons are gone from the compact view as a
   // result — the actual images still show fine once a job is opened,
   // via the one-off fetch in loadDispatchJobExtras below.
-  const { ok, data } = await sbFetch(
-    "jobs?select=id,plate,make_model,customer_name,description,damage_notes,priority,location,stage_index,service_types,assigned_to,assigned_team,service_done,service_started,treatments,parts,dispatch_hidden,created_at,updated_at&order=created_at.asc&limit=900"
+  //
+  // `history` IS selected now (plain text entries, no images) — the QC
+  // step, the "no update in 3 hours" check and the Started/QC/Finished
+  // sounds are all derived from it. To keep that affordable every 6s,
+  // Collected jobs are filtered out server-side instead of downloading
+  // every job ever and dropping them here (that used to be up to 900
+  // rows per poll). Returns null (not []) when the fetch fails, so one
+  // dropped request doesn't blank the board and then "re-announce"
+  // every car as new when the next poll succeeds.
+  const { ok, data, stale } = await sbFetch(
+    "jobs?select=id,plate,make_model,customer_name,description,damage_notes,priority,location,stage_index,service_types,assigned_to,assigned_team,service_done,service_started,treatments,parts,history,dispatch_hidden,created_at,updated_at&or=(stage_index.neq.5,stage_index.is.null)&order=created_at.asc&limit=900"
   );
-  if (!ok || !data) return [];
-  return data
+  if (!ok || !Array.isArray(data)) return null;
+  const jobs = data
     .filter((r) => r.stage_index !== 5) // 5 = Collected — done, doesn't belong on a live queue
     .map((r) => ({
       id: r.id, plate: r.plate, makeModel: r.make_model, customerName: r.customer_name,
@@ -13026,9 +13104,13 @@ async function loadDispatchJobs() {
       priority: r.priority, location: r.location,
       stageIndex: r.stage_index, serviceTypes: r.service_types || [], assignedTo: r.assigned_to || {}, assignedTeam: r.assigned_team || {},
       serviceDone: r.service_done || {}, serviceStarted: r.service_started || {}, treatments: r.treatments || {},
-      parts: r.parts || [], dispatchHidden: !!r.dispatch_hidden,
+      parts: r.parts || [], history: Array.isArray(r.history) ? r.history : [], dispatchHidden: !!r.dispatch_hidden,
       createdAt: new Date(r.created_at).getTime(), updatedAt: new Date(r.updated_at).getTime(),
     }));
+  // `stale` means this came from the offline-cache fallback in sbFetch,
+  // not a live response — the caller uses it to avoid treating a stale
+  // snapshot as the silent poll baseline (see firstLoadRef in refresh()).
+  return { jobs, stale: !!stale };
 }
 
 // Fetches the heavy fields for exactly one job — called once when its
@@ -13039,50 +13121,134 @@ async function loadDispatchJobExtras(jobId) {
   return { photos: data[0].photos || {}, damageDiagramImage: data[0].damage_diagram_image || null };
 }
 
-function playDispatchBeep() {
-  // New job arrived — a single flat ping, deliberately plain so it's
-  // never confused with the "finished" chime below.
+/* ---------------- Dispatch Board sounds ----------------
+   Sharp and loud on purpose — the board runs on a 60" tablet in a noisy
+   workshop, and the old soft sine pings were easy to miss. Square and
+   sawtooth tones, all routed through one compressor so they can be loud
+   without clipping.
+
+   ONE shared AudioContext for the whole app. The old code created a new
+   context for every single beep; browsers cap how many can exist, so a
+   board left open all day eventually went silent without any error.
+   Sounds are queued back-to-back instead of overlapping, so three things
+   happening in the same poll still read as three separate sounds. */
+let dispatchAudioCtx = null;
+let dispatchAudioInput = null;
+let dispatchAudioNextFree = 0; // AudioContext time the last queued sound finishes
+
+function getDispatchAudio() {
+  if (dispatchAudioCtx) return dispatchAudioCtx;
+  const Ctx = window.AudioContext || window.webkitAudioContext;
+  if (!Ctx) return null;
+  // Before anyone has tapped the page, a new context only starts
+  // "suspended" (plus a console warning) — wait for the first tap.
+  const activation = navigator.userActivation;
+  if (activation && !activation.hasBeenActive) return null;
   try {
-    const Ctx = window.AudioContext || window.webkitAudioContext;
-    if (!Ctx) return;
     const ctx = new Ctx();
-    const osc = ctx.createOscillator();
-    const gain = ctx.createGain();
-    osc.connect(gain);
-    gain.connect(ctx.destination);
-    osc.frequency.value = 780;
-    osc.type = "sine";
-    gain.gain.setValueAtTime(0.001, ctx.currentTime);
-    gain.gain.exponentialRampToValueAtTime(0.28, ctx.currentTime + 0.02);
-    gain.gain.exponentialRampToValueAtTime(0.001, ctx.currentTime + 0.55);
-    osc.start(ctx.currentTime);
-    osc.stop(ctx.currentTime + 0.55);
-  } catch { /* best-effort only — a silent tablet shouldn't block the board */ }
+    const comp = ctx.createDynamicsCompressor();
+    comp.threshold.value = -10;
+    comp.ratio.value = 6;
+    const master = ctx.createGain();
+    master.gain.value = 0.95;
+    comp.connect(master);
+    master.connect(ctx.destination);
+    dispatchAudioCtx = ctx;
+    dispatchAudioInput = comp;
+  } catch { return null; }
+  return dispatchAudioCtx;
 }
 
-// Two soft rising notes — distinct from the flat "new job" beep above
-// and the harsh EOD alarm, so it reads as "someone posted an update"
-// specifically, not confused with either.
+// Called from a tap anywhere on the board: Chrome only lets a page make
+// sound after an interaction, and Android can suspend the context when
+// the screen sleeps.
+function unlockDispatchAudio() {
+  const ctx = getDispatchAudio();
+  if (ctx && ctx.state === "suspended") ctx.resume().catch(() => {});
+}
+
+// Runs fn(ctx) once the shared context is actually running. Skipped
+// outright (not queued) when the browser hasn't allowed sound yet —
+// otherwise the first tap of the morning would play everything missed.
+function withDispatchAudio(fn) {
+  const ctx = getDispatchAudio();
+  if (!ctx) return;
+  const run = () => { try { fn(ctx); } catch { /* best-effort only — a silent tablet shouldn't block the board */ } };
+  if (ctx.state === "running") { run(); return; }
+  ctx.resume().then(() => { if (ctx.state === "running") run(); }).catch(() => {});
+}
+
+function dispatchTone(ctx, start, freq, at, dur, type = "square", vol = 0.5, toFreq = null) {
+  const t = start + at;
+  const osc = ctx.createOscillator();
+  const gain = ctx.createGain();
+  osc.type = type;
+  osc.frequency.setValueAtTime(freq, t);
+  if (toFreq) osc.frequency.linearRampToValueAtTime(toFreq, t + dur);
+  gain.gain.setValueAtTime(0.0001, t);
+  gain.gain.exponentialRampToValueAtTime(vol, t + 0.012);
+  gain.gain.setValueAtTime(vol, t + dur * 0.7);
+  gain.gain.exponentialRampToValueAtTime(0.0001, t + dur);
+  osc.connect(gain);
+  gain.connect(dispatchAudioInput);
+  osc.start(t);
+  osc.stop(t + dur + 0.02);
+  osc.onended = () => { try { osc.disconnect(); gain.disconnect(); } catch { /* already gone */ } };
+}
+
+// Every Dispatch Board sound. `dur` is how long it rings, used to queue
+// the next one after it and to time a spoken line so it doesn't talk
+// over its own chime. Each has a clearly different shape so staff can
+// tell them apart by ear without looking up.
+const DISPATCH_SOUNDS = {
+  newcar:   { dur: 0.6,  play: (c, s) => { [[880, 0], [1175, 0.13], [1568, 0.26]].forEach(([f, a], i) => dispatchTone(c, s, f, a, i === 2 ? 0.32 : 0.11, "square", 0.5)); } },
+  assigned: { dur: 0.42, play: (c, s) => { dispatchTone(c, s, 1320, 0, 0.08, "square", 0.45); dispatchTone(c, s, 1320, 0.12, 0.08, "square", 0.45); dispatchTone(c, s, 1760, 0.24, 0.16, "square", 0.45); } },
+  started:  { dur: 0.25, play: (c, s) => { dispatchTone(c, s, 660, 0, 0.08, "square", 0.4); dispatchTone(c, s, 990, 0.09, 0.14, "square", 0.4); } },
+  late:     { dur: 1.1,  play: (c, s) => { for (let r = 0; r < 2; r++) for (let i = 0; i < 4; i++) dispatchTone(c, s, 1000, r * 0.62 + i * 0.13, 0.07, "square", 0.55); } },
+  stale:    { dur: 1.0,  play: (c, s) => { [0, 0.5].forEach((a) => { dispatchTone(c, s, 740, a, 0.22, "sawtooth", 0.5); dispatchTone(c, s, 494, a + 0.23, 0.24, "sawtooth", 0.5); }); } },
+  qc:       { dur: 0.86, play: (c, s) => { [0, 0.45].forEach((a) => { dispatchTone(c, s, 1046, a, 0.1, "triangle", 0.7); dispatchTone(c, s, 1318, a + 0.1, 0.1, "triangle", 0.7); dispatchTone(c, s, 1568, a + 0.2, 0.2, "triangle", 0.7); }); } },
+  qclate:   { dur: 0.86, play: (c, s) => { [0, 0.34, 0.68].forEach((a) => dispatchTone(c, s, 1568, a, 0.16, "square", 0.45, 1046)); } },
+  fail:     { dur: 0.62, play: (c, s) => { dispatchTone(c, s, 196, 0, 0.6, "sawtooth", 0.6); dispatchTone(c, s, 185, 0, 0.6, "square", 0.35); } },
+  done:     { dur: 0.82, play: (c, s) => { [[784, 0], [988, 0.1], [1175, 0.2]].forEach(([f, a]) => dispatchTone(c, s, f, a, 0.1, "square", 0.5)); dispatchTone(c, s, 1568, 0.3, 0.5, "square", 0.5); dispatchTone(c, s, 2093, 0.3, 0.5, "triangle", 0.3); } },
+  eod:      { dur: 0.92, play: (c, s) => { dispatchTone(c, s, 600, 0, 0.9, "square", 0.55, 1200); dispatchTone(c, s, 1200, 0.45, 0.45, "square", 0.55, 600); } },
+};
+
+// Per-device mute for the board (the header's Sound on/off pill). Stored
+// locally, not shared: muting a phone shouldn't silence the shop TV.
+const DISPATCH_SOUND_KEY = "mrcap_dispatch_sound";
+function isDispatchSoundOn() {
+  try { return window.localStorage.getItem(DISPATCH_SOUND_KEY) !== "off"; } catch { return true; }
+}
+function setDispatchSoundOn(on) {
+  try { window.localStorage.setItem(DISPATCH_SOUND_KEY, on ? "on" : "off"); } catch { /* ignore */ }
+}
+
+function playDispatchSound(name, { force = false } = {}) {
+  if (!force && !isDispatchSoundOn()) return;
+  const sound = DISPATCH_SOUNDS[name];
+  if (!sound) return;
+  withDispatchAudio((ctx) => {
+    const start = Math.max(ctx.currentTime + 0.03, dispatchAudioNextFree);
+    dispatchAudioNextFree = start + sound.dur + 0.18;
+    sound.play(ctx, start);
+  });
+}
+
+// How long until everything already queued has finished ringing — a
+// spoken line waits this long so the voice doesn't talk over the chime.
+function dispatchSoundQueueMs() {
+  if (!dispatchAudioCtx || dispatchAudioCtx.state !== "running") return 0;
+  return Math.max(0, (dispatchAudioNextFree - dispatchAudioCtx.currentTime) * 1000);
+}
+
+// Two soft rising notes — deliberately NOT one of the loud board sounds
+// above: this plays app-wide (every screen) whenever someone posts an
+// update, so it stays gentle. Shares the same single AudioContext.
 function playUpdateChime() {
-  try {
-    const Ctx = window.AudioContext || window.webkitAudioContext;
-    if (!Ctx) return;
-    const ctx = new Ctx();
-    [520, 660].forEach((freq, i) => {
-      const osc = ctx.createOscillator();
-      const gain = ctx.createGain();
-      osc.connect(gain);
-      gain.connect(ctx.destination);
-      osc.frequency.value = freq;
-      osc.type = "sine";
-      const start = ctx.currentTime + i * 0.11;
-      gain.gain.setValueAtTime(0.001, start);
-      gain.gain.exponentialRampToValueAtTime(0.22, start + 0.02);
-      gain.gain.exponentialRampToValueAtTime(0.001, start + 0.3);
-      osc.start(start);
-      osc.stop(start + 0.3);
-    });
-  } catch { /* best-effort only */ }
+  withDispatchAudio((ctx) => {
+    const start = ctx.currentTime + 0.02;
+    [520, 660].forEach((freq, i) => dispatchTone(ctx, start, freq, i * 0.11, 0.3, "sine", 0.22));
+  });
 }
 
 // Fetches only progress-update history entries newer than sinceMs,
@@ -13276,77 +13442,31 @@ function fixDispatchPronunciation(text) {
   return out;
 }
 
-// Assignment announcement only (by design — arrival and finished
-// already have their own distinct beep/chime, and voice on top of
-// those too would be noisy). Plays alongside whichever beep is already
-// wired up elsewhere, not instead of it.
-function announceDispatchAssignment(staffName, vehicleLabel) {
-  try {
-    if (!window.speechSynthesis) return;
-    const spokenVehicle = fixDispatchPronunciation(vehicleLabel);
-    const utter = new SpeechSynthesisUtterance(`${staffName}, you've been assigned the ${spokenVehicle}. Please update who will be working on it.`);
-    const voice = getBestDispatchVoice();
-    if (voice) utter.voice = voice;
-    utter.lang = voice?.lang || "en-GB";
-    utter.rate = 1;
-    utter.pitch = 1;
-    utter.volume = 1;
-    window.speechSynthesis.speak(utter);
-  } catch { /* best-effort only — a silent tablet shouldn't block the board */ }
+// Speaks one line on the board's voice, after `delayMs` (so it can wait
+// for its own chime to finish). Honours the board's Sound on/off pill.
+// speechSynthesis queues lines itself, so several in a row never talk
+// over each other.
+function speakDispatch(text, delayMs = 0) {
+  if (!text || !window.speechSynthesis || !isDispatchSoundOn()) return;
+  const say = () => {
+    try {
+      const utter = new SpeechSynthesisUtterance(fixDispatchPronunciation(text));
+      const voice = getBestDispatchVoice();
+      if (voice) utter.voice = voice;
+      utter.lang = voice?.lang || "en-GB";
+      utter.rate = 1;
+      utter.pitch = 1;
+      utter.volume = 1;
+      window.speechSynthesis.speak(utter);
+    } catch { /* best-effort only — a silent tablet shouldn't block the board */ }
+  };
+  if (delayMs > 0) setTimeout(say, delayMs); else say();
 }
 
-function playDispatchDoneChime() {
-  // Job marked finished — a rising two-note chime (like a doorbell "ding
-  // dong" in reverse), intentionally shaped differently from the flat
-  // arrival ping above so the two are easy to tell apart by ear alone
-  // without looking at the screen.
-  try {
-    const Ctx = window.AudioContext || window.webkitAudioContext;
-    if (!Ctx) return;
-    const ctx = new Ctx();
-    const notes = [
-      { freq: 660, start: 0, dur: 0.16 },
-      { freq: 990, start: 0.14, dur: 0.32 },
-    ];
-    notes.forEach(({ freq, start, dur }) => {
-      const osc = ctx.createOscillator();
-      const gain = ctx.createGain();
-      osc.connect(gain);
-      gain.connect(ctx.destination);
-      osc.frequency.value = freq;
-      osc.type = "sine";
-      const t0 = ctx.currentTime + start;
-      gain.gain.setValueAtTime(0.001, t0);
-      gain.gain.exponentialRampToValueAtTime(0.3, t0 + 0.02);
-      gain.gain.exponentialRampToValueAtTime(0.001, t0 + dur);
-      osc.start(t0);
-      osc.stop(t0 + dur);
-    });
-  } catch { /* best-effort only — a silent tablet shouldn't block the board */ }
-}
-
-// 6:45pm "update the app before leaving" reminder — deliberately harsh
-// and attention-grabbing (unlike the other two calm sounds above), a
-// rising-falling siren sweep, loud and at full volume. Meant to be
-// impossible to ignore, not pleasant.
-function playDispatchAlarm() {
-  try {
-    const Ctx = window.AudioContext || window.webkitAudioContext;
-    if (!Ctx) return;
-    const ctx = new Ctx();
-    const osc = ctx.createOscillator();
-    const gain = ctx.createGain();
-    osc.connect(gain);
-    gain.connect(ctx.destination);
-    osc.type = "square";
-    const dur = 0.9;
-    osc.frequency.setValueAtTime(600, ctx.currentTime);
-    osc.frequency.linearRampToValueAtTime(1200, ctx.currentTime + dur / 2);
-    osc.frequency.linearRampToValueAtTime(600, ctx.currentTime + dur);
-    gain.gain.setValueAtTime(0.5, ctx.currentTime);
-    osc.start(ctx.currentTime);
-    osc.stop(ctx.currentTime + dur);
-  } catch { /* best-effort only */ }
+// The assignment call-out — wording unchanged from the original board.
+// Now plays after the "assigned" pips instead of on top of them.
+function announceDispatchAssignment(staffName, vehicleLabel, delayMs = 0) {
+  speakDispatch(`${staffName}, you've been assigned the ${vehicleLabel}. Please update who will be working on it.`, delayMs);
 }
 
 const rowKey = (jobId, categoryKey) => `${jobId}::${categoryKey}`;
@@ -13434,373 +13554,910 @@ function staffForRole(team, role) {
   return team.filter((m) => m.role !== "detailing" && m.role !== "admin" && m.role !== "intake");
 }
 
-function DispatchJobCardImpl({ row, ticketNo, isDone, isStarted, startedAt, now, assignedNames, onClick }) {
-  const { job, categoryLabel } = row;
-  const isPartsRemoval = STAGES[job.stageIndex]?.key === "parts_removal";
-  const isStaleUnassigned = (!assignedNames || assignedNames.length === 0) && !isStarted && !isDone && businessMsElapsed(job.createdAt, now) > STALE_UNASSIGNED_MS;
-  const isStaleInProgress = isStarted && !isDone && startedAt && businessMsElapsed(new Date(startedAt).getTime(), now) > STALE_IN_PROGRESS_MS;
-  const isStale = isStaleUnassigned || isStaleInProgress;
-  const ageTier = dispatchAgeTier(job.createdAt, now);
-  const edgeColor = isStale ? COLORS.red : ageTier.color;
+/* ---- Dispatch Board: per-row state ----------------------------------
+   Every (job, service category) row on the board is in exactly one of
+   these states, worked out fresh from the job's own fields + history on
+   every render (nothing new stored for it in the database):
+
+     new        arrived less than 1 shop hour ago
+     unassigned nobody on it (between "new" and "late")
+     late       nobody on it after 1 shop hour           — pulses, sounds once
+     assigned   someone on it, not started
+     progress   started (redo = the last QC sent it back)
+     stale      started, no update/start for 3 shop hours — pulses, sounds + voice once
+     qc         sent to QC, waiting for Noel/Reagen/Ahmed
+     qclate     waiting on QC more than 30 shop minutes  — pulses, sounds once
+
+   The QC step lives entirely in `history` (no migration): entries with
+   stage "qc", label = the category label and note "Sent to QC" /
+   "QC passed" / "QC failed: <reason>". Only QC entries AFTER the latest
+   "Started" entry for that category count, so re-starting a category
+   (e.g. after "Not started yet") always begins a clean QC cycle. Passing
+   QC is the same service_done + "Marked done" write JobDetail and the
+   old Finished button make, so reports and JobDetail are unaffected. */
+const DISPATCH_NEW_MS = 60 * 60 * 1000; // first shop hour after arrival shows as "New"
+const DISPATCH_QC_LATE_MS = 30 * 60 * 1000; // waiting on QC longer than this pulses
+const DISPATCH_NEW_CAR_WINDOW_MS = 30 * 60 * 1000; // wall-clock: only announce genuinely fresh arrivals
+const QC_APPROVER_IDS = ["noel", "reagen", "ahmed"];
+function isQcApprover(session) { return !!session && QC_APPROVER_IDS.includes(session.id); }
+const QC_FAIL_REASONS = ["Missed a spot", "Swirls or haze left", "Interior not finished", "Fit or gap issue", "Other"];
+
+// The seven colours Mr.CAP can change from the board (key = what's
+// stored in app_settings "dispatch_colors"). Defaults match the approved
+// TV mockup.
+const DISPATCH_THEME = [
+  { key: "new", name: "New car", desc: "First hour after it arrives", def: "#3FD37A", sample: "NEW" },
+  { key: "late", name: "Needs someone", desc: "Nobody assigned after 1 shop hour", def: "#FF9F0A", sample: "NEEDS SOMEONE" },
+  { key: "assigned", name: "Assigned", desc: "Someone is on it, not started", def: "#5AA9E6", sample: "ASSIGNED" },
+  { key: "progress", name: "In progress", desc: "Started, timer running", def: "#C9A227", sample: "IN PROGRESS" },
+  { key: "stale", name: "No update", desc: "No update for 3 shop hours", def: "#FF453A", sample: "NO UPDATE" },
+  { key: "qc", name: "QC", desc: "Ready for or waiting on QC", def: "#A78BFA", sample: "READY FOR QC" },
+  { key: "done", name: "Finished", desc: "The flash when a car passes QC", def: "#E8C34A", sample: "FINISHED" },
+];
+const DISPATCH_HEX_RE = /^#[0-9a-f]{6}$/i;
+const DISPATCH_SWATCHES = ["#3FD37A", "#00C7BE", "#5AA9E6", "#0A84FF", "#A78BFA", "#BF5AF2", "#FF6FB5", "#FF453A", "#FF9F0A", "#FFD60A", "#C9A227", "#E9E4D4"];
+function resolveDispatchColors(saved) {
+  const out = {};
+  for (const t of DISPATCH_THEME) {
+    const v = saved ? saved[t.key] : null;
+    out[t.key] = typeof v === "string" && DISPATCH_HEX_RE.test(v) ? v : t.def;
+  }
+  return out;
+}
+
+const DISPATCH_STATES = {
+  new:        { label: "New", theme: "new", pulse: false },
+  unassigned: { label: "Waiting", theme: null, pulse: false },
+  late:       { label: "Needs someone", theme: "late", pulse: true },
+  assigned:   { label: "Assigned", theme: "assigned", pulse: false },
+  progress:   { label: "In progress", theme: "progress", pulse: false },
+  redo:       { label: "Redo after QC", theme: "progress", pulse: false },
+  stale:      { label: "No update", theme: "stale", pulse: true },
+  qc:         { label: "Ready for QC", theme: "qc", pulse: false },
+  qclate:     { label: "QC waiting", theme: "qc", pulse: true },
+};
+// States that sound (once) the moment a row moves into them.
+const DISPATCH_ATTENTION_STATES = ["late", "stale", "qclate"];
+
+function dispatchMs(v) {
+  if (v === null || v === undefined || v === false || v === true) return null;
+  const t = typeof v === "number" ? v : new Date(v).getTime();
+  return Number.isFinite(t) ? t : null;
+}
+
+// A history entry matches this category if it was tagged with the
+// category's key (new entries); for older entries with no `cat`, fall
+// back to matching on the label text (which is what could get renamed
+// and break this in the first place).
+function dispatchEntryMatchesCat(h, categoryKey, categoryLabel) {
+  return h.cat ? h.cat === categoryKey : h.label === categoryLabel;
+}
+// A progress update with no category tag AND a label that isn't any
+// known service category label is a job-wide update (e.g. posted from
+// the Live Updates composer, which labels the entry with the make/model
+// rather than a category) — it counts as "an update" for every category
+// on the job, not just one.
+function dispatchIsJobWideUpdate(h) {
+  return !h.cat && !SERVICES.some((s) => s.label === h.label);
+}
+function dispatchRowInfo(job, categoryKey, categoryLabel, now) {
+  const history = job.history || [];
+  const assigned = (job.assignedTeam || {})[categoryKey] || [];
+  const startedRaw = (job.serviceStarted || {})[categoryKey];
+  let startIdx = -1;
+  let startEntryAt = null;
+  for (let i = 0; i < history.length; i++) {
+    const h = history[i];
+    if (h && h.stage === "service" && dispatchEntryMatchesCat(h, categoryKey, categoryLabel) && h.note === "Started") { startIdx = i; startEntryAt = dispatchMs(h.at); }
+  }
+  let qc = null;
+  let lastProgressAt = null;
+  for (let i = 0; i < history.length; i++) {
+    const h = history[i];
+    if (!h) continue;
+    if (h.stage === "progress_update") {
+      if (!dispatchEntryMatchesCat(h, categoryKey, categoryLabel) && !dispatchIsJobWideUpdate(h)) continue;
+      const at = dispatchMs(h.at);
+      if (at && (!lastProgressAt || at > lastProgressAt)) lastProgressAt = at;
+    } else if (h.stage === "qc" && dispatchEntryMatchesCat(h, categoryKey, categoryLabel) && i > startIdx) {
+      qc = h;
+    }
+  }
+  const ageMs = businessMsElapsed(job.createdAt, now);
+  const info = { state: "unassigned", assigned, startedAt: null, qcAt: null, lastUpdateAt: null, redoReason: null };
+  if (startedRaw) {
+    // Older rows stored plain `true` instead of a timestamp — fall back to
+    // the matching "Started" history entry, then the last write.
+    const startedAt = dispatchMs(startedRaw) ?? startEntryAt ?? job.updatedAt;
+    info.startedAt = startedAt;
+    if (qc && qc.note === "Sent to QC") {
+      info.qcAt = dispatchMs(qc.at) ?? startedAt;
+      info.state = businessMsElapsed(info.qcAt, now) > DISPATCH_QC_LATE_MS ? "qclate" : "qc";
+      return info;
+    }
+    const failed = qc && typeof qc.note === "string" && qc.note.startsWith("QC failed") ? qc : null;
+    if (failed) info.redoReason = failed.note.replace(/^QC failed:?\s*/, "") || "QC failed";
+    // "Last update" = latest progress update on the job, or the start —
+    // and a QC send-back counts too, so a car that just came back from
+    // QC isn't instantly flagged "no update".
+    info.lastUpdateAt = Math.max(startedAt || 0, lastProgressAt || 0, failed ? (dispatchMs(failed.at) || 0) : 0);
+    info.state = businessMsElapsed(info.lastUpdateAt, now) > STALE_IN_PROGRESS_MS ? "stale" : failed ? "redo" : "progress";
+    return info;
+  }
+  if (!assigned.length) info.state = ageMs > STALE_UNASSIGNED_MS ? "late" : ageMs < DISPATCH_NEW_MS ? "new" : "unassigned";
+  else info.state = ageMs < DISPATCH_NEW_MS ? "new" : "assigned";
+  return info;
+}
+
+// "New car in. Toyota Land Cruiser, for Detailing." — category labels
+// lose their "(Smartech)"-style suffix so the voice doesn't read brackets.
+// (There's no vehicle colour stored anywhere in the app yet, so the
+// mockup's "White ..." part is left out rather than guessed.)
+function dispatchNewCarLine(job) {
+  const cats = (job.serviceTypes || [])
+    .map((k) => (SERVICES.find((s) => s.key === k)?.label || k).replace(/\s*\(.*\)/, ""))
+    .filter(Boolean);
+  const catText = cats.length > 1 ? `${cats.slice(0, -1).join(", ")} and ${cats[cats.length - 1]}` : cats[0];
+  if (job.makeModel) return catText ? `New car in. ${job.makeModel}, for ${catText}.` : `New car in. ${job.makeModel}.`;
+  return catText ? `New car in, for ${catText}.` : "New car in.";
+}
+
+// CSS custom properties for one state colour. Colours are validated
+// #rrggbb, so the translucent variants are just the hex plus an alpha
+// byte (works on older Android Chrome, unlike color-mix()).
+function dispatchColorVars(color) {
+  const c = DISPATCH_HEX_RE.test(color || "") ? color : COLORS.muted;
+  return { "--c": c, "--c16": `${c}29`, "--c45": `${c}73`, "--c60": `${c}99` };
+}
+
+const DISPATCH_AVATAR_COLORS = [
+  ["#4A3418", "#FFC078"], ["#2B2A5C", "#B5B3FF"], ["#12454D", "#7FDDEB"], ["#5A1F3C", "#FFA3CC"],
+  ["#1C4A2A", "#8FE0A5"], ["#4D2A12", "#FFB27F"], ["#3A2F4F", "#D9C2FF"], ["#12384D", "#9AD1F5"],
+  ["#4A4414", "#F0E08A"], ["#4D1717", "#FF9C9C"],
+];
+function DispatchAvatar({ id, name }) {
+  let hash = 0;
+  for (const ch of String(id || name || "?")) hash = (hash * 31 + ch.charCodeAt(0)) >>> 0;
+  const [bg, fg] = DISPATCH_AVATAR_COLORS[hash % DISPATCH_AVATAR_COLORS.length];
+  return <span className="dsp-av" style={{ background: bg, color: fg }} aria-hidden="true">{(name || id || "?").charAt(0).toUpperCase()}</span>;
+}
+
+// Big UAE-style plate for the TV: emirate strip, category, number. Falls
+// back to the whole string on the plate face for VINs / odd imports.
+const DISPATCH_PLATE_EMIRATE = { DXB: "DUBAI", AUH: "A.D.", SHJ: "SHJ", AJM: "AJM", UAQ: "UAQ", RAK: "RAK", FUJ: "FUJ" };
+function DispatchPlate({ plate, large = false }) {
+  const { code, rest } = parsePlate(plate);
+  const m = code ? String(rest || "").match(/^(\S{1,3})\s+(.+)$/) : null;
   return (
-    <div
-      onClick={onClick}
-      className="mrcap-press"
-      style={{
-        background: COLORS.panel, border: `1px solid ${edgeColor}`, borderLeft: `4px solid ${edgeColor}`, borderRadius: 14,
-        padding: 12, marginBottom: 9, cursor: "pointer", opacity: isDone ? 0.6 : 1,
-        display: "flex", gap: 12, alignItems: "flex-start",
-      }}
-    >
-      <div style={{
-        flexShrink: 0, width: 44, height: 44, borderRadius: 10, background: COLORS.panel2,
-        display: "flex", flexDirection: "column", alignItems: "center", justifyContent: "center",
-      }}>
-        <div style={{ fontSize: 8.5, fontWeight: 700, color: COLORS.muted, letterSpacing: 0.5 }}>TICKET</div>
-        <div style={{ fontFamily: MONO_FONT, fontSize: 16, fontWeight: 700, color: COLORS.gold }}>{ticketNo}</div>
-      </div>
-      <div style={{ flex: 1, minWidth: 0 }}>
-        <div style={{ display: "flex", justifyContent: "space-between", alignItems: "flex-start", gap: 6, flexWrap: "wrap" }}>
-          <PlateChip plate={job.plate} size="sm" />
-          <div style={{ display: "flex", alignItems: "center", gap: 6 }}>
-            {isDone && <CheckCircle2 size={15} color={COLORS.green} />}
-            {!isDone && isStarted && <Clock size={14} color={COLORS.gold} />}
-            {job.damageNotes && <AlertCircle size={14} color={COLORS.red} />}
-            {ageTier.isNew && !isStale && (
-              <span style={{ fontSize: 9, fontWeight: 700, color: "#3fb950", border: `1px solid #3fb950`, borderRadius: 999, padding: "1px 6px" }}>NEW</span>
-            )}
-            {job.priority === "urgent" || job.priority === "high" ? (
-              <span style={{ fontSize: 9.5, fontWeight: 700, color: COLORS.red, border: `1px solid ${COLORS.red}`, borderRadius: 999, padding: "1px 7px", textTransform: "uppercase" }}>{job.priority}</span>
-            ) : null}
-          </div>
-        </div>
-        <div style={{ fontSize: 12.5, color: COLORS.muted, marginTop: 2 }}>{job.makeModel}</div>
-        {dispatchWhatToDo(job, row.categoryKey) ? (
-          <div style={{ fontSize: 12, color: COLORS.ink, marginTop: 6, opacity: 0.85, overflow: "hidden", textOverflow: "ellipsis", display: "-webkit-box", WebkitLineClamp: 2, WebkitBoxOrient: "vertical" }}>{dispatchWhatToDo(job, row.categoryKey)}</div>
-        ) : null}
-        <div style={{ display: "flex", alignItems: "center", gap: 6, marginTop: 8, flexWrap: "wrap" }}>
-          <span style={{
-            fontSize: 10.5, fontWeight: 600, padding: "3px 8px", borderRadius: 999,
-            background: isPartsRemoval ? COLORS.gold : COLORS.panel2,
-            color: isPartsRemoval ? COLORS.darkText : COLORS.muted,
-          }}>{STAGES[job.stageIndex]?.label || "—"}</span>
-          <span style={{ fontSize: 10.5, fontWeight: 600, padding: "3px 8px", borderRadius: 999, background: COLORS.panel2, color: COLORS.ink }}>{categoryLabel}</span>
-        </div>
-        <div style={{ fontSize: 11.5, marginTop: 7, color: isDone ? COLORS.green : isStarted ? COLORS.gold : (assignedNames?.length ? COLORS.goldBright : COLORS.muted) }}>
-          {isDone ? "Finished" : isStarted ? `In progress${formatDispatchElapsed(startedAt, now) ? ` · ${formatDispatchElapsed(startedAt, now)}` : ""}` : assignedNames?.length ? `Assigned: ${assignedNames.join(", ")}` : "Unassigned — tap to assign"}
-        </div>
-        {isStale && (
-          <div style={{ fontSize: 10.5, fontWeight: 700, color: COLORS.red, marginTop: 4 }}>
-            ⚠ {isStaleInProgress ? "In progress a while — check on this" : "Sitting unassigned a while"}
-          </div>
-        )}
+    <span className={`dsp-plate${large ? " dsp-plate-lg" : ""}`} title={plate || ""}>
+      {code && <span className="dsp-plate-em" aria-hidden="true">{DISPATCH_PLATE_EMIRATE[code] || code}</span>}
+      {m && <span className="dsp-plate-code">{m[1]}</span>}
+      <span className="dsp-plate-num">{m ? m[2] : (rest || "—")}</span>
+    </span>
+  );
+}
+
+// Scales a size drawn for the 1080x1920 portrait TV mockup to the space
+// the board actually has. --u is "1px on the TV": the smaller of the
+// board's width/1080 and the screen's height/1920 (so a landscape desktop
+// doesn't get TV-sized text), never below a readable phone minimum.
+const du = (px, min) => `max(${min}px, calc(${px} * var(--u)))`;
+const DISPATCH_COND_FONT = "'IBM Plex Sans Condensed', 'IBM Plex Sans', system-ui, sans-serif";
+const DISPATCH_CSS = `
+${FONT_IMPORT}
+.dsp-u { --u: min(calc(100cqw / 1080), calc(100vh / 1920)); }
+.dsp-root { container-type: inline-size; font-family: ${BODY_FONT}; color: ${COLORS.ink}; }
+.dsp-root.dsp-fill { flex: 1; min-height: 0; overflow-y: auto; overflow-x: hidden; }
+.dsp-kiosk { height: 100vh; height: 100dvh; container-type: inline-size; display: flex; flex-direction: column; overflow: hidden; background: #0b0b0c; font-family: ${BODY_FONT}; color: ${COLORS.ink}; }
+:where(.dsp-board, .dsp-scrim, .dsp-eod, .dsp-toast, .dsp-userbar) * { box-sizing: border-box; }
+:where(.dsp-board, .dsp-scrim, .dsp-eod, .dsp-toast, .dsp-userbar) button { font-family: inherit; color: inherit; cursor: pointer; border: 0; background: none; padding: 0; margin: 0; }
+:where(.dsp-board, .dsp-scrim, .dsp-eod, .dsp-toast, .dsp-userbar) button:focus-visible { outline: 4px solid rgba(232,195,74,0.7); outline-offset: 3px; }
+.dsp-board { display: flex; flex-direction: column; box-sizing: border-box; padding-bottom: 6px; background: radial-gradient(1000px 560px at 50% -6%, rgba(201,162,39,0.14), rgba(10,10,9,0) 62%), ${COLORS.paper}; }
+.dsp-board.dsp-fill { height: 100%; }
+
+.dsp-userbar { flex-shrink: 0; min-height: ${du(64, 44)}; display: flex; align-items: center; justify-content: space-between; gap: 12px; padding: 0 ${du(40, 14)}; border-bottom: 1px solid ${COLORS.line}; font-size: ${du(22, 12)}; color: ${COLORS.muted}; }
+.dsp-userbar b { color: ${COLORS.ink}; }
+.dsp-userbar-sw { height: ${du(44, 30)}; padding: 0 ${du(22, 12)}; border-radius: 999px; border: 1px solid ${COLORS.line}; font-size: ${du(20, 11.5)}; color: ${COLORS.muted}; flex-shrink: 0; }
+
+.dsp-head { padding: ${du(28, 14)} ${du(40, 14)} 0; display: flex; justify-content: space-between; align-items: flex-end; gap: ${du(16, 10)}; flex-wrap: wrap; }
+.dsp-eyebrow { font-size: ${du(22, 11)}; font-weight: 700; letter-spacing: ${du(7, 3)}; color: ${COLORS.gold}; }
+.dsp-title { font-family: ${DISPATCH_COND_FONT}; font-size: ${du(92, 34)}; line-height: 0.95; font-weight: 700; letter-spacing: -1.5px; margin: ${du(4, 2)} 0 0; color: ${COLORS.ink}; }
+.dsp-clock { text-align: right; margin-left: auto; }
+.dsp-clock-t { font-family: ${MONO_FONT}; font-size: ${du(64, 26)}; font-weight: 600; line-height: 1; font-variant-numeric: tabular-nums; }
+.dsp-clock-d { font-size: ${du(22, 12)}; color: ${COLORS.muted}; margin-top: ${du(8, 6)}; display: flex; gap: ${du(10, 6)}; align-items: center; justify-content: flex-end; flex-wrap: wrap; }
+.dsp-snd, .dsp-cust { display: inline-flex; align-items: center; gap: 8px; height: ${du(36, 30)}; padding: 0 ${du(14, 11)}; border-radius: 999px; font-size: ${du(18, 12)}; font-weight: 700; white-space: nowrap; }
+.dsp-snd-on { background: rgba(63,211,122,0.14); color: #3FD37A; }
+.dsp-snd-off { background: rgba(255,69,58,0.16); color: #FF8A80; }
+.dsp-snd-tap { background: rgba(255,159,10,0.16); color: #FFB44D; animation: dspBlink 1.6s ease-in-out infinite; }
+.dsp-cust { background: rgba(201,162,39,0.16); color: ${COLORS.goldBright}; }
+.dsp-cust svg { width: ${du(20, 14)}; height: ${du(20, 14)}; }
+@keyframes dspBlink { 0%, 100% { opacity: 1; } 50% { opacity: 0.55; } }
+
+.dsp-floor { padding: ${du(26, 14)} ${du(40, 14)} 0; }
+.dsp-floor-lab { font-size: ${du(19, 11)}; font-weight: 700; letter-spacing: ${du(3, 1.5)}; color: ${COLORS.muted}; text-transform: uppercase; margin-bottom: ${du(12, 8)}; display: flex; justify-content: space-between; gap: 10px; }
+.dsp-pills { display: grid; grid-template-columns: repeat(5, minmax(0, 1fr)); gap: ${du(12, 6)}; }
+.dsp-pill { background: ${COLORS.panel}; border: 1px solid ${COLORS.line}; border-radius: ${du(22, 12)}; padding: ${du(14, 8)} ${du(16, 9)}; display: flex; align-items: center; gap: ${du(14, 8)}; min-width: 0; }
+.dsp-pill-nm { font-size: ${du(22, 11.5)}; font-weight: 700; white-space: normal; overflow: hidden; display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical; line-height: 1.15; word-break: break-word; }
+.dsp-pill-ct { font-size: ${du(19, 11)}; color: ${COLORS.goldBright}; margin-top: 2px; line-height: 1.25; }
+.dsp-free { font-size: ${du(22, 12.5)}; color: #3FD37A; font-weight: 600; margin-top: ${du(12, 8)}; line-height: 1.4; }
+.dsp-free b { font-weight: 800; letter-spacing: 0.5px; }
+.dsp-free-none { color: ${COLORS.muted}; }
+.dsp-av { width: ${du(52, 30)}; height: ${du(52, 30)}; border-radius: 999px; display: inline-flex; align-items: center; justify-content: center; font-weight: 700; font-size: ${du(22, 13)}; flex-shrink: 0; font-family: ${BODY_FONT}; }
+@container (max-width: 760px) { .dsp-pills { grid-template-columns: repeat(3, minmax(0, 1fr)); } }
+@container (max-width: 460px) { .dsp-pills { grid-template-columns: repeat(2, minmax(0, 1fr)); } }
+
+.dsp-legend { display: flex; justify-content: space-between; align-items: center; gap: ${du(14, 8)}; flex-wrap: wrap; padding: ${du(18, 12)} ${du(40, 14)} 0; }
+.dsp-legend-keys { display: flex; gap: ${du(22, 10)}; row-gap: 6px; flex-wrap: wrap; font-size: ${du(18, 11.5)}; color: ${COLORS.muted}; }
+.dsp-legend-keys span { display: inline-flex; align-items: center; gap: ${du(8, 5)}; }
+.dsp-legend-keys i { width: ${du(14, 9)}; height: ${du(14, 9)}; border-radius: 4px; display: inline-block; }
+.dsp-legend-ctl { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }
+.dsp-alerts { display: inline-flex; align-items: center; gap: 6px; height: ${du(40, 30)}; padding: 0 ${du(14, 10)}; border-radius: 999px; background: rgba(255,69,58,0.16); color: #FF8A80; font-size: ${du(18, 12)}; font-weight: 700; white-space: nowrap; }
+.dsp-sort { display: flex; gap: 4px; background: ${COLORS.panel2}; border-radius: ${du(14, 10)}; padding: 3px; }
+.dsp-sort button { height: ${du(40, 30)}; padding: 0 ${du(16, 11)}; border-radius: ${du(11, 8)}; font-size: ${du(17, 12)}; font-weight: 700; color: ${COLORS.muted}; white-space: nowrap; }
+.dsp-sort button.on { background: ${COLORS.gold}; color: ${COLORS.darkText}; }
+.dsp-alerts-detail { padding: 8px ${du(40, 14)} 0; font-size: ${du(18, 12)}; color: ${COLORS.muted}; display: flex; flex-direction: column; gap: 3px; }
+
+.dsp-unclass { margin: ${du(18, 12)} ${du(30, 12)} 0; background: #1a1408; border: 1px solid rgba(201,162,39,0.33); border-radius: ${du(22, 12)}; padding: ${du(18, 12)}; }
+.dsp-unclass-h { font-size: ${du(20, 12.5)}; font-weight: 700; color: ${COLORS.goldBright}; margin-bottom: ${du(12, 10)}; }
+.dsp-unclass-list { display: flex; gap: ${du(12, 9)}; overflow-x: auto; padding-bottom: 2px; scrollbar-width: none; }
+.dsp-unclass-item { flex-shrink: 0; min-width: ${du(220, 150)}; background: ${COLORS.panel}; border: 1px solid ${COLORS.line}; border-radius: ${du(16, 10)}; padding: ${du(14, 10)}; text-align: left; display: flex; flex-direction: column; gap: 6px; }
+.dsp-unclass-item .m { font-size: ${du(18, 11.5)}; color: ${COLORS.muted}; }
+
+.dsp-cols { flex: 1; min-height: 0; display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: ${du(22, 10)}; padding: ${du(22, 12)} ${du(30, 12)} ${du(30, 14)}; }
+.dsp-fill .dsp-cols { grid-template-rows: minmax(0, 1fr); }
+.dsp-col { display: flex; flex-direction: column; min-height: 0; background: #0F0E0C; border: 1px solid ${COLORS.line}; border-radius: ${du(30, 16)}; overflow: hidden; }
+.dsp-col-h { display: flex; align-items: center; gap: ${du(14, 8)}; padding: ${du(22, 12)} ${du(24, 12)} ${du(18, 10)}; border-bottom: 1px solid ${COLORS.line}; }
+.dsp-dot { width: ${du(18, 10)}; height: ${du(18, 10)}; border-radius: 999px; flex-shrink: 0; }
+.dsp-col-h h2 { margin: 0; font-family: ${DISPATCH_COND_FONT}; font-size: ${du(30, 14)}; font-weight: 700; letter-spacing: -0.3px; flex: 1; min-width: 0; color: ${COLORS.ink}; line-height: 1.05; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.dsp-n { min-width: ${du(52, 28)}; height: ${du(52, 28)}; border-radius: 999px; background: #26231D; font-size: ${du(26, 13)}; font-weight: 700; display: inline-flex; align-items: center; justify-content: center; padding: 0 ${du(14, 8)}; flex-shrink: 0; }
+.dsp-warn { height: ${du(40, 24)}; padding: 0 ${du(14, 8)}; border-radius: 999px; background: rgba(255,69,58,0.16); color: #FF8A80; font-size: ${du(19, 11)}; font-weight: 700; display: inline-flex; align-items: center; white-space: nowrap; flex-shrink: 0; }
+.dsp-list { flex: 1; min-height: 0; overflow-y: auto; padding: ${du(16, 10)}; display: flex; flex-direction: column; gap: ${du(16, 10)}; scrollbar-width: none; }
+.dsp-list::-webkit-scrollbar { display: none; }
+.dsp-empty { color: ${COLORS.muted}; text-align: center; font-size: ${du(28, 13)}; padding: ${du(80, 30)} 0; }
+@container (max-width: 640px) {
+  .dsp-cols { grid-template-columns: minmax(0, 1fr); }
+  .dsp-fill .dsp-cols { grid-template-rows: none; }
+  .dsp-board.dsp-fill { height: auto; }
+  .dsp-list { overflow: visible; flex: none; }
+}
+
+.dsp-card { width: 100%; text-align: left; background: ${COLORS.panel}; border-radius: ${du(26, 14)}; box-shadow: 0 0 0 2px var(--c); overflow: hidden; display: flex; flex-direction: column; flex-shrink: 0; transition: transform 0.12s ease; color: ${COLORS.ink}; }
+.dsp-card:active { transform: scale(0.985); }
+.dsp-band { display: flex; align-items: center; justify-content: space-between; gap: 10px; padding: ${du(12, 7)} ${du(18, 11)}; background: var(--c16); }
+.dsp-st { font-size: ${du(20, 11)}; font-weight: 700; letter-spacing: ${du(1.6, 1)}; color: var(--c); text-transform: uppercase; display: inline-flex; align-items: center; gap: ${du(10, 6)}; min-width: 0; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.dsp-st i { width: ${du(12, 8)}; height: ${du(12, 8)}; border-radius: 999px; background: var(--c); display: inline-block; flex-shrink: 0; }
+.dsp-tk { font-family: ${MONO_FONT}; font-size: ${du(22, 12)}; font-weight: 700; color: ${COLORS.muted}; flex-shrink: 0; }
+.dsp-cbody { padding: ${du(16, 10)} ${du(20, 11)} ${du(18, 11)}; display: flex; flex-direction: column; gap: ${du(10, 6)}; min-width: 0; }
+.dsp-model { font-size: ${du(27, 14)}; font-weight: 600; line-height: 1.2; overflow-wrap: anywhere; }
+.dsp-cat { font-size: ${du(18, 10.5)}; font-weight: 700; color: ${COLORS.muted}; letter-spacing: 1px; text-transform: uppercase; }
+.dsp-todo { font-size: ${du(22, 12.5)}; color: #CFC8B4; line-height: 1.35; display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical; overflow: hidden; }
+.dsp-redo { align-self: flex-start; font-size: ${du(18, 11)}; font-weight: 700; color: #FF8A80; background: rgba(255,69,58,0.14); border-radius: 999px; padding: ${du(5, 3)} ${du(12, 8)}; }
+.dsp-foot { display: flex; align-items: center; justify-content: space-between; gap: 10px; margin-top: ${du(4, 2)}; }
+.dsp-avs { display: flex; }
+.dsp-avs .dsp-av { width: ${du(50, 28)}; height: ${du(50, 28)}; font-size: ${du(21, 12)}; box-shadow: 0 0 0 3px ${COLORS.panel}; }
+.dsp-avs .dsp-av + .dsp-av { margin-left: min(-6px, calc(-10 * var(--u))); }
+.dsp-nobody { font-size: ${du(21, 12)}; color: ${COLORS.muted}; font-weight: 600; }
+.dsp-timer { font-family: ${MONO_FONT}; font-size: ${du(32, 16)}; font-weight: 700; display: inline-flex; align-items: baseline; gap: ${du(8, 5)}; color: var(--c); font-variant-numeric: tabular-nums; white-space: nowrap; flex-shrink: 0; }
+.dsp-timer small { font-family: ${BODY_FONT}; font-size: ${du(17, 10)}; font-weight: 600; color: ${COLORS.muted}; letter-spacing: 0.5px; }
+.dsp-timer-muted { color: ${COLORS.muted}; }
+.dsp-pulse { animation: dspPulse 1.6s ease-in-out infinite; }
+@keyframes dspPulse { 0%, 100% { box-shadow: 0 0 0 2px var(--c), 0 0 0 0 transparent; } 50% { box-shadow: 0 0 0 4px var(--c), 0 0 46px 6px var(--c45); } }
+.dsp-arrive { animation: dspArrive 1.2s ease-out 1; }
+@keyframes dspArrive { 0% { transform: translateY(-30px) scale(0.96); opacity: 0; } 40% { opacity: 1; } 60% { box-shadow: 0 0 0 5px var(--c), 0 0 70px 12px var(--c60); } 100% { transform: none; } }
+.dsp-leaving { animation: dspLeave 1.4s ease-in forwards; pointer-events: none; }
+@keyframes dspLeave { 0% { box-shadow: 0 0 0 5px var(--c), 0 0 80px 16px var(--c60); } 45% { transform: scale(1.02); box-shadow: 0 0 0 5px var(--c), 0 0 80px 16px var(--c60); } 100% { transform: translateX(120%); opacity: 0; } }
+
+.dsp-plate { display: inline-flex; align-items: stretch; height: ${du(58, 30)}; border-radius: ${du(10, 6)}; background: ${COLORS.plate}; color: #15130E; box-shadow: inset 0 0 0 2px #CFC8B4; overflow: hidden; align-self: flex-start; max-width: 100%; flex-shrink: 0; }
+.dsp-plate-em { writing-mode: vertical-rl; transform: rotate(180deg); font-size: ${du(11, 7)}; font-weight: 700; letter-spacing: ${du(1.5, 0.6)}; background: #1d1b16; color: ${COLORS.ink}; padding: 0 ${du(5, 3)}; display: flex; align-items: center; justify-content: center; white-space: nowrap; overflow: hidden; }
+.dsp-plate-code { font-family: ${MONO_FONT}; font-size: ${du(30, 16)}; font-weight: 700; padding: 0 ${du(10, 6)} 0 ${du(12, 7)}; display: flex; align-items: center; border-right: 2px solid #CFC8B4; }
+.dsp-plate-num { font-family: ${MONO_FONT}; font-size: ${du(36, 18)}; font-weight: 700; letter-spacing: ${du(2, 1)}; padding: 0 ${du(14, 8)}; display: flex; align-items: center; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; min-width: 0; }
+.dsp-plate-lg { height: ${du(92, 44)}; border-radius: ${du(14, 8)}; }
+.dsp-plate-lg .dsp-plate-code { font-size: ${du(48, 22)}; padding: 0 ${du(16, 9)} 0 ${du(18, 10)}; }
+.dsp-plate-lg .dsp-plate-num { font-size: ${du(60, 26)}; padding: 0 ${du(22, 12)}; }
+.dsp-plate-lg .dsp-plate-em { font-size: ${du(15, 8)}; padding: 0 ${du(8, 4)}; }
+
+.dsp-hidden { margin: 0 ${du(30, 12)} ${du(20, 14)}; background: #141414; border: 1px solid ${COLORS.line}; border-radius: ${du(22, 12)}; padding: ${du(18, 12)}; }
+.dsp-hidden-h { font-size: ${du(20, 12.5)}; font-weight: 700; color: ${COLORS.muted}; margin-bottom: 10px; }
+.dsp-hidden-row { display: flex; justify-content: space-between; align-items: center; gap: 10px; background: ${COLORS.panel2}; border-radius: ${du(14, 8)}; padding: ${du(12, 9)} ${du(16, 12)}; margin-top: 8px; }
+.dsp-hidden-row .m { font-size: ${du(20, 12)}; color: ${COLORS.muted}; margin-left: 8px; }
+.dsp-hidden-row button { min-height: ${du(52, 30)}; padding: 0 ${du(20, 12)}; border-radius: 999px; box-shadow: inset 0 0 0 1px ${COLORS.gold}; color: ${COLORS.gold}; font-size: ${du(19, 11.5)}; font-weight: 700; flex-shrink: 0; }
+
+.dsp-scrim { position: fixed; inset: 0; background: rgba(0,0,0,0.72); display: flex; align-items: center; justify-content: center; padding: ${du(50, 12)} ${du(40, 10)}; z-index: 200; font-family: ${BODY_FONT}; color: ${COLORS.ink}; }
+.dsp-modal { width: min(100%, max(340px, calc(960 * var(--u)))); max-height: 100%; overflow-y: auto; background: ${COLORS.panel}; border-radius: ${du(44, 20)}; box-shadow: 0 0 0 2px var(--c), 0 50px 140px rgba(0,0,0,0.8); padding: ${du(40, 18)} ${du(46, 16)} ${du(46, 20)}; display: flex; flex-direction: column; gap: ${du(30, 16)}; scrollbar-width: none; }
+.dsp-modal::-webkit-scrollbar { display: none; }
+.dsp-m-top { display: flex; justify-content: space-between; align-items: flex-start; gap: ${du(20, 10)}; }
+.dsp-m-eye { font-size: ${du(22, 11.5)}; font-weight: 700; letter-spacing: ${du(3, 1)}; color: ${COLORS.gold}; text-transform: uppercase; margin-bottom: ${du(14, 8)}; }
+.dsp-m-model { font-size: ${du(38, 17)}; font-weight: 600; margin-top: ${du(16, 8)}; overflow-wrap: anywhere; }
+.dsp-m-meta { font-size: ${du(22, 12)}; color: ${COLORS.muted}; margin-top: ${du(8, 4)}; display: flex; gap: 8px; flex-wrap: wrap; align-items: center; }
+.dsp-m-meta .prio { color: #FF8A80; font-weight: 700; text-transform: uppercase; }
+.dsp-m-title { font-family: ${DISPATCH_COND_FONT}; font-size: ${du(64, 28)}; font-weight: 700; line-height: 1; }
+.dsp-m-sub { font-size: ${du(26, 13)}; color: ${COLORS.muted}; margin-top: ${du(12, 6)}; line-height: 1.4; }
+.dsp-x { width: ${du(96, 44)}; height: ${du(96, 44)}; border-radius: 999px; background: #26231D; display: inline-flex; align-items: center; justify-content: center; flex-shrink: 0; }
+.dsp-x svg { width: ${du(38, 20)}; height: ${du(38, 20)}; }
+.dsp-flow { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: ${du(10, 6)}; }
+.dsp-step { border-radius: ${du(20, 10)}; background: ${COLORS.panel2}; padding: ${du(16, 8)} ${du(18, 9)}; border: 2px solid transparent; min-width: 0; }
+.dsp-step .k { font-size: ${du(17, 9.5)}; font-weight: 700; letter-spacing: ${du(1.5, 0.5)}; color: ${COLORS.muted}; text-transform: uppercase; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.dsp-step .v { font-size: ${du(25, 12.5)}; font-weight: 700; margin-top: 4px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.dsp-step.done .v { color: ${COLORS.muted}; }
+.dsp-step.now { border-color: var(--c); background: var(--c16); }
+.dsp-step.now .k { color: var(--c); }
+.dsp-sec-l { font-size: ${du(21, 11.5)}; font-weight: 700; letter-spacing: ${du(2, 0.6)}; color: ${COLORS.muted}; text-transform: uppercase; margin-bottom: ${du(12, 7)}; display: flex; justify-content: space-between; gap: 4px 10px; flex-wrap: wrap; }
+.dsp-sec-l em { font-style: normal; letter-spacing: 0; text-transform: none; font-weight: 500; }
+.dsp-boxy { background: ${COLORS.panel2}; border-radius: ${du(26, 12)}; padding: ${du(24, 12)} ${du(28, 13)}; font-size: ${du(32, 14.5)}; line-height: 1.4; white-space: pre-wrap; overflow-wrap: anywhere; }
+.dsp-dmg { background: rgba(255,159,10,0.1); box-shadow: inset 0 0 0 2px rgba(255,159,10,0.4); color: #FFD08A; }
+.dsp-sentback { box-shadow: inset 0 0 0 2px rgba(255,69,58,0.5); }
+.dsp-photos { display: flex; gap: ${du(12, 7)}; overflow-x: auto; padding-bottom: 2px; }
+.dsp-photos img { width: ${du(160, 78)}; height: ${du(160, 78)}; object-fit: cover; border-radius: ${du(14, 8)}; border: 1px solid ${COLORS.line}; flex-shrink: 0; }
+.dsp-diagram { width: 100%; height: auto; display: block; border-radius: ${du(14, 8)}; border: 1px solid ${COLORS.line}; }
+.dsp-parts { display: flex; flex-direction: column; gap: ${du(8, 5)}; }
+.dsp-parts div { font-size: ${du(26, 13)}; background: ${COLORS.panel2}; border-radius: ${du(14, 8)}; padding: ${du(14, 8)} ${du(18, 11)}; }
+.dsp-staff { display: flex; flex-wrap: wrap; gap: ${du(14, 7)}; }
+.dsp-sbtn { min-height: ${du(88, 44)}; padding: ${du(8, 4)} ${du(28, 14)} ${du(8, 4)} ${du(14, 6)}; border-radius: 999px; background: ${COLORS.panel2}; display: inline-flex; align-items: center; gap: ${du(16, 8)}; font-size: ${du(32, 14)}; font-weight: 600; box-shadow: 0 0 0 1px ${COLORS.line}; text-align: left; }
+.dsp-sbtn.on { box-shadow: 0 0 0 4px ${COLORS.goldBright}; background: rgba(201,162,39,0.14); }
+.dsp-sbtn:disabled { opacity: 0.4; cursor: default; }
+.dsp-sbtn .dsp-av { width: ${du(60, 32)}; height: ${du(60, 32)}; font-size: ${du(25, 13)}; }
+.dsp-sbtn small { font-size: ${du(22, 11)}; color: ${COLORS.muted}; font-weight: 500; }
+.dsp-acts { display: flex; gap: ${du(16, 8)}; flex-wrap: wrap; }
+.dsp-big { flex: 1 1 ${du(260, 140)}; min-height: ${du(128, 52)}; border-radius: ${du(34, 16)}; font-size: ${du(42, 16)}; font-weight: 800; display: inline-flex; align-items: center; justify-content: center; gap: 16px; padding: 0 ${du(20, 12)}; text-align: center; }
+.dsp-big-gold { background: ${COLORS.gold}; color: #140F00; }
+.dsp-big-qc { background: #A78BFA; color: #160B33; }
+.dsp-big-pass { background: #3FD37A; color: #052B10; }
+.dsp-big-fail { box-shadow: inset 0 0 0 3px #FF453A; color: #FF8A80; }
+.dsp-big-ghost { flex: 0 1 ${du(330, 140)}; background: #26231D; font-size: ${du(30, 14)}; font-weight: 600; }
+.dsp-big-full { flex: 1 1 100%; width: 100%; margin-top: ${du(14, 8)}; min-height: ${du(96, 46)}; }
+.dsp-big:disabled { opacity: 0.35; cursor: default; }
+.dsp-note { font-size: ${du(26, 13)}; color: ${COLORS.muted}; text-align: center; line-height: 1.45; }
+.dsp-note b { color: #A78BFA; }
+.dsp-chips { display: flex; flex-wrap: wrap; gap: ${du(12, 7)}; }
+.dsp-chip { min-height: ${du(76, 40)}; padding: 0 ${du(28, 14)}; border-radius: 999px; background: ${COLORS.panel2}; font-size: ${du(28, 13)}; font-weight: 600; box-shadow: 0 0 0 1px ${COLORS.line}; }
+.dsp-chip:disabled { opacity: 0.5; cursor: default; }
+.dsp-chip-red { box-shadow: inset 0 0 0 2px #FF453A; color: #FF8A80; }
+.dsp-chip-sm { min-height: ${du(60, 34)}; font-size: ${du(22, 12)}; }
+.dsp-textarea { width: 100%; background: ${COLORS.panel2}; border: 1px solid ${COLORS.line}; border-radius: ${du(20, 10)}; padding: ${du(18, 10)}; font-size: ${du(26, 14)}; color: ${COLORS.ink}; font-family: inherit; resize: vertical; margin-top: ${du(12, 8)}; }
+.dsp-post { margin-top: ${du(10, 8)}; width: 100%; min-height: ${du(80, 42)}; border-radius: ${du(22, 10)}; background: ${COLORS.gold}; color: ${COLORS.darkText}; font-size: ${du(28, 13.5)}; font-weight: 700; }
+.dsp-post:disabled { opacity: 0.5; cursor: default; }
+.dsp-menu { background: ${COLORS.panel2}; border-radius: ${du(26, 12)}; overflow: hidden; }
+.dsp-menu button { width: 100%; min-height: ${du(96, 48)}; padding: 0 ${du(30, 14)}; font-size: ${du(30, 14)}; display: flex; align-items: center; justify-content: space-between; text-align: left; gap: 10px; }
+.dsp-menu button + button { border-top: 1px solid ${COLORS.line}; }
+.dsp-menu button:disabled { opacity: 0.5; cursor: default; }
+.dsp-menu .danger { color: #FF7B70; }
+.dsp-menu svg { width: ${du(28, 16)}; height: ${du(28, 16)}; flex-shrink: 0; color: ${COLORS.muted}; }
+
+.dsp-cz-row { display: flex; flex-direction: column; gap: ${du(14, 10)}; background: ${COLORS.panel2}; border-radius: ${du(26, 14)}; padding: ${du(22, 12)} ${du(24, 12)}; }
+.dsp-cz-top { display: flex; align-items: center; gap: ${du(18, 10)}; }
+.dsp-cz-prev { width: ${du(210, 104)}; flex-shrink: 0; border-radius: ${du(18, 10)}; background: ${COLORS.panel}; box-shadow: 0 0 0 3px var(--c); overflow: hidden; }
+.dsp-cz-prev span { display: block; padding: ${du(10, 5)} ${du(14, 7)}; background: var(--c16); color: var(--c); font-size: ${du(18, 9)}; font-weight: 700; letter-spacing: ${du(1.4, 0.5)}; text-transform: uppercase; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.dsp-cz-prev b { display: block; padding: ${du(10, 5)} ${du(14, 7)}; font-family: ${MONO_FONT}; font-size: ${du(26, 13)}; color: var(--c); }
+.dsp-cz-name { font-size: ${du(30, 15)}; font-weight: 700; }
+.dsp-cz-desc { font-size: ${du(21, 12)}; color: ${COLORS.muted}; margin-top: 2px; }
+.dsp-cz-clash { font-size: ${du(20, 12)}; color: #FFB44D; font-weight: 600; margin-top: 4px; }
+.dsp-cz-sw { display: flex; flex-wrap: wrap; gap: ${du(12, 8)}; align-items: center; }
+.dsp-cz-sw .sw { width: ${du(60, 34)}; height: ${du(60, 34)}; border-radius: 999px; box-shadow: inset 0 0 0 2px rgba(255,255,255,0.2); }
+.dsp-cz-sw .sw.on { box-shadow: 0 0 0 4px ${COLORS.panel2}, 0 0 0 7px ${COLORS.ink}; }
+.dsp-cz-pick { position: relative; width: ${du(60, 34)}; height: ${du(60, 34)}; border-radius: 999px; background: conic-gradient(#ff453a, #ffd60a, #3fd37a, #00c7be, #0a84ff, #bf5af2, #ff453a); overflow: hidden; cursor: pointer; flex-shrink: 0; }
+.dsp-cz-pick input { position: absolute; inset: 0; width: 100%; height: 100%; opacity: 0; cursor: pointer; border: 0; padding: 0; }
+
+.dsp-toast { position: fixed; left: 0; right: 0; bottom: ${du(56, 18)}; display: flex; justify-content: center; z-index: 400; pointer-events: none; padding: 0 12px; font-family: ${BODY_FONT}; color: ${COLORS.ink}; }
+.dsp-toast > div { pointer-events: auto; min-height: ${du(96, 48)}; padding: ${du(10, 8)} ${du(14, 8)} ${du(10, 8)} ${du(38, 18)}; border-radius: ${du(48, 24)}; background: rgba(38,35,29,0.97); box-shadow: 0 0 0 2px var(--c), 0 24px 60px rgba(0,0,0,0.6); font-size: ${du(32, 13.5)}; font-weight: 600; display: flex; align-items: center; gap: ${du(26, 12)}; max-width: min(100%, max(340px, calc(960 * var(--u)))); }
+.dsp-toast > div.noundo { padding-right: ${du(38, 18)}; }
+.dsp-toast button { min-height: ${du(72, 36)}; padding: 0 ${du(32, 14)}; border-radius: 999px; background: #26231D; color: ${COLORS.goldBright}; font-size: ${du(30, 13)}; font-weight: 700; flex-shrink: 0; }
+
+.dsp-eod { position: fixed; inset: 0; z-index: 300; background: rgba(20,4,4,0.96); display: flex; flex-direction: column; padding: ${du(60, 22)} ${du(50, 16)} ${du(50, 18)}; gap: ${du(26, 12)}; animation: dspEodEdge 1s steps(2) infinite; font-family: ${BODY_FONT}; color: ${COLORS.ink}; }
+@keyframes dspEodEdge { 0% { box-shadow: inset 0 0 0 ${du(18, 8)} #FF2D20; } 100% { box-shadow: inset 0 0 0 ${du(18, 8)} #5a0c07; } }
+.dsp-eod.dsp-eod-clear { animation: none; box-shadow: inset 0 0 0 ${du(18, 8)} #3FD37A; background: rgba(3,20,10,0.96); }
+.dsp-eod-eye { font-size: ${du(24, 12)}; font-weight: 700; letter-spacing: ${du(4, 2)}; color: #FFB4AA; }
+.dsp-eod-clear .dsp-eod-eye, .dsp-eod-clear .dsp-eod-sub { color: #A6F0C2; }
+.dsp-eod h2 { margin: 0; font-family: ${DISPATCH_COND_FONT}; font-size: ${du(84, 30)}; line-height: 1; color: #fff; }
+.dsp-eod-sub { font-size: ${du(30, 14)}; color: #FFB4AA; }
+.dsp-eod-warn { align-self: flex-start; font-size: ${du(24, 12.5)}; font-weight: 700; color: #fff; background: rgba(0,0,0,0.3); border-radius: 999px; padding: ${du(8, 5)} ${du(18, 12)}; }
+.dsp-prog { height: ${du(20, 10)}; border-radius: 999px; background: rgba(255,255,255,0.12); overflow: hidden; flex-shrink: 0; }
+.dsp-prog i { display: block; height: 100%; background: #3FD37A; transition: width 0.4s ease; }
+.dsp-eod-list { flex: 1; min-height: 0; overflow-y: auto; display: flex; flex-direction: column; gap: ${du(14, 10)}; scrollbar-width: none; }
+.dsp-eod-item { background: rgba(0,0,0,0.4); border-radius: ${du(26, 14)}; padding: ${du(20, 12)} ${du(22, 12)}; display: flex; flex-direction: column; gap: ${du(14, 10)}; box-shadow: 0 0 0 2px rgba(255,69,58,0.5); flex-shrink: 0; }
+.dsp-eod-item.ok { box-shadow: 0 0 0 2px rgba(63,211,122,0.6); opacity: 0.55; }
+.dsp-eod-row { display: flex; align-items: center; gap: ${du(18, 10)}; min-width: 0; }
+.dsp-eod-model { font-size: ${du(26, 14)}; font-weight: 600; }
+.dsp-eod-why { font-size: ${du(24, 12.5)}; color: #FFB4AA; font-weight: 600; }
+.dsp-eod-item.ok .dsp-eod-why { color: #3FD37A; }
+.dsp-eod-btns { display: flex; gap: ${du(12, 8)}; flex-wrap: wrap; }
+.dsp-eod-btns button { min-height: ${du(72, 42)}; padding: 0 ${du(26, 14)}; border-radius: 999px; background: rgba(255,255,255,0.1); font-size: ${du(26, 13)}; font-weight: 700; color: #fff; }
+.dsp-eod-btns button.p { background: #3FD37A; color: #052B10; }
+.dsp-eod-btns button:disabled { opacity: 0.5; cursor: default; }
+.dsp-eod-dis { align-self: center; min-height: ${du(72, 42)}; padding: 0 ${du(30, 16)}; border-radius: 999px; background: rgba(255,255,255,0.08); font-size: ${du(24, 12.5)}; color: #FFB4AA; flex-shrink: 0; }
+
+@media (prefers-reduced-motion: reduce) {
+  .dsp-pulse, .dsp-arrive, .dsp-leaving, .dsp-snd-tap, .dsp-eod { animation: none; }
+  .dsp-card { transition: none; }
+}
+`;
+
+// Formats an elapsed shop-hours span for the card timer ("23m", "1h 12m").
+function dispatchElapsed(fromMs, now) {
+  return formatDispatchElapsed(fromMs, now) || "0m";
+}
+
+function DispatchJobCardImpl({ rowId, jobId, ticketNo, plate, model, categoryLabel, todo, stateLabel, color, pulse, timerLabel, timerText, timerMuted, redoReason, people, arriving, leaving, onOpen }) {
+  const cls = `dsp-card${pulse ? " dsp-pulse" : ""}${arriving ? " dsp-arrive" : ""}${leaving ? " dsp-leaving" : ""}`;
+  return (
+    <button type="button" className={cls} style={dispatchColorVars(color)} onClick={() => onOpen(rowId, jobId)} aria-label={`${stateLabel}: ${plate || "no plate"}${model ? `, ${model}` : ""}, ${categoryLabel}. Tap to open.`}>
+      <span className="dsp-band">
+        <span className="dsp-st"><i />{stateLabel}</span>
+        <span className="dsp-tk">#{ticketNo}</span>
+      </span>
+      <span className="dsp-cbody">
+        <DispatchPlate plate={plate} />
+        {model ? <span className="dsp-model">{model}</span> : null}
+        <span className="dsp-cat">{categoryLabel}</span>
+        {todo ? <span className="dsp-todo">{todo}</span> : null}
+        {redoReason ? <span className="dsp-redo">Sent back: {redoReason}</span> : null}
+        <span className="dsp-foot">
+          {people.length
+            ? <span className="dsp-avs">{people.slice(0, 3).map((p) => <DispatchAvatar key={p.id} id={p.id} name={p.name} />)}</span>
+            : <span className="dsp-nobody">Nobody yet · tap to assign</span>}
+          <span className={`dsp-timer${timerMuted ? " dsp-timer-muted" : ""}`}>{timerLabel ? <small>{timerLabel}</small> : null}{timerText}</span>
+        </span>
+      </span>
+    </button>
+  );
+}
+// Every prop is a primitive (or compared by content), and the parent
+// passes a stable onOpen — so a card only re-renders when something it
+// actually shows changed: its state, colour (including a Mr.CAP colour
+// change or live preview), timer text, people, or the arrive/leave flash.
+// No customer name on the card: it's on a 60" screen in the workshop.
+const DispatchJobCard = memo(DispatchJobCardImpl, (prev, next) => (
+  prev.rowId === next.rowId && prev.jobId === next.jobId && prev.ticketNo === next.ticketNo &&
+  prev.plate === next.plate && prev.model === next.model && prev.categoryLabel === next.categoryLabel &&
+  prev.todo === next.todo && prev.stateLabel === next.stateLabel && prev.color === next.color &&
+  prev.pulse === next.pulse && prev.timerLabel === next.timerLabel && prev.timerText === next.timerText &&
+  prev.timerMuted === next.timerMuted && prev.redoReason === next.redoReason &&
+  prev.arriving === next.arriving && prev.leaving === next.leaving && prev.onOpen === next.onOpen &&
+  prev.people.map((p) => `${p.id}:${p.name}`).join(",") === next.people.map((p) => `${p.id}:${p.name}`).join(",")
+));
+
+// Header clock — its own tiny component with its own timer, so ticking
+// the time doesn't re-render the whole board.
+function DispatchClock({ children }) {
+  const [now, setNow] = useState(() => new Date());
+  useEffect(() => {
+    const t = setInterval(() => setNow(new Date()), 10000);
+    return () => clearInterval(t);
+  }, []);
+  return (
+    <div className="dsp-clock">
+      <div className="dsp-clock-t">{now.toLocaleTimeString("en-GB", { hour: "2-digit", minute: "2-digit" })}</div>
+      <div className="dsp-clock-d">
+        {children}
+        <span>{now.toLocaleDateString("en-GB", { weekday: "short", day: "numeric", month: "short" })}</span>
       </div>
     </div>
   );
 }
-// Custom comparator: `row.job` staying the SAME reference (from the
-// smart-merge in refresh() below) is what actually lets this skip
-// re-rendering on most polls. assignedNames is a fresh array every
-// render regardless, so it's compared by content instead of reference.
-const DispatchJobCard = memo(DispatchJobCardImpl, (prev, next) => (
-  prev.row.job === next.row.job && prev.row.categoryKey === next.row.categoryKey &&
-  prev.ticketNo === next.ticketNo && prev.isDone === next.isDone && prev.isStarted === next.isStarted &&
-  prev.startedAt === next.startedAt && prev.now === next.now &&
-  (prev.assignedNames || []).join(",") === (next.assignedNames || []).join(",")
-));
 
-// End-of-day "update the app" reminder — full-screen, flashing red,
-// impossible to dismiss accidentally (needs exactly 5 taps). Fires once
-// at 6:45pm local time and stays dismissed for the rest of that day,
-// tracked in localStorage by date string so a page refresh mid-alarm
-// doesn't bring it back, but it's fresh again tomorrow.
-function DispatchEndOfDayReminder({ onDismiss, unclassifiedCount }) {
+// True while the browser still won't let this page make sound (nobody
+// has tapped it since it loaded — typical right after the TV reboots).
+function dispatchAudioBlocked() {
+  const activation = navigator.userActivation;
+  if (activation && !activation.hasBeenActive) return true;
+  return !!dispatchAudioCtx && dispatchAudioCtx.state !== "running";
+}
+
+// Sound on/off pill. Amber "Tap for sound" means sound is on but the
+// browser is still blocking it until someone touches the screen.
+function DispatchSoundPill() {
+  const [on, setOn] = useState(isDispatchSoundOn);
+  const [blocked, setBlocked] = useState(dispatchAudioBlocked);
+  useEffect(() => {
+    const t = setInterval(() => setBlocked(dispatchAudioBlocked()), 2000);
+    return () => clearInterval(t);
+  }, []);
+  const tap = () => {
+    if (on && blocked) {
+      unlockDispatchAudio();
+      playDispatchSound("started");
+      setBlocked(false);
+      return;
+    }
+    const next = !on;
+    setDispatchSoundOn(next);
+    setOn(next);
+    if (next) { unlockDispatchAudio(); playDispatchSound("started"); }
+    else { try { window.speechSynthesis?.cancel(); } catch { /* ignore */ } }
+  };
+  const mode = !on ? "off" : blocked ? "tap" : "on";
+  return (
+    <button type="button" onClick={tap} className={`dsp-snd dsp-snd-${mode}`} aria-pressed={on} title={mode === "off" ? "Turn sound on" : "Turn sound off"}>
+      {mode === "off" ? "Sound off" : mode === "tap" ? "Tap for sound" : "Sound on"}
+    </button>
+  );
+}
+
+// Closes a board pop-up on Escape (desktop use).
+function useDispatchEscape(onClose) {
+  const ref = useRef(onClose);
+  ref.current = onClose;
+  useEffect(() => {
+    const onKey = (e) => { if (e.key === "Escape") ref.current(); };
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  }, []);
+}
+
+// Mr.CAP-only colour customiser. Edits a draft that the board shows live
+// (the parent renders with the draft while this is open); nothing is
+// written until "Save for every screen", which stores only the states
+// that differ from the defaults.
+function DispatchColorCustomiser({ saved, draft, setDraft, onCancel, onSave, saving }) {
+  useDispatchEscape(onCancel);
+  const savedColors = resolveDispatchColors(saved);
+  const draftColors = resolveDispatchColors(draft);
+  const changed = DISPATCH_THEME.some((t) => draftColors[t.key].toLowerCase() !== savedColors[t.key].toLowerCase());
+  const pick = (key, color) => setDraft((d) => ({ ...(d || {}), [key]: color }));
+  return createPortal(
+    <div className="dsp-u dsp-scrim" onClick={onCancel}>
+      <div className="dsp-modal" style={dispatchColorVars(COLORS.line)} role="dialog" aria-modal="true" aria-label="Board colours" onClick={(e) => e.stopPropagation()}>
+        <div className="dsp-m-top">
+          <div>
+            <div className="dsp-m-eye">Mr.CAP only</div>
+            <div className="dsp-m-title">Board colours</div>
+            <div className="dsp-m-sub">Tap a colour to try it on the board. Nothing changes on other screens until you save.</div>
+          </div>
+          <button type="button" className="dsp-x" onClick={onCancel} aria-label="Close"><X color={COLORS.ink} strokeWidth={2.6} /></button>
+        </div>
+        {DISPATCH_THEME.map((t) => {
+          const cur = draftColors[t.key];
+          const clash = DISPATCH_THEME.find((o) => o.key !== t.key && draftColors[o.key].toLowerCase() === cur.toLowerCase());
+          return (
+            <div key={t.key} className="dsp-cz-row">
+              <div className="dsp-cz-top">
+                <div className="dsp-cz-prev" style={dispatchColorVars(cur)}><span>{t.sample}</span><b>1h 12m</b></div>
+                <div style={{ minWidth: 0 }}>
+                  <div className="dsp-cz-name">{t.name}</div>
+                  <div className="dsp-cz-desc">{t.desc}</div>
+                  {clash && <div className="dsp-cz-clash">Same as {clash.name}. Staff won't be able to tell them apart.</div>}
+                </div>
+              </div>
+              <div className="dsp-cz-sw">
+                {DISPATCH_SWATCHES.map((c) => (
+                  <button key={c} type="button" className={`sw${c.toLowerCase() === cur.toLowerCase() ? " on" : ""}`} style={{ background: c }} onClick={() => pick(t.key, c)} aria-label={`${t.name} ${c}`} aria-pressed={c.toLowerCase() === cur.toLowerCase()} />
+                ))}
+                <label className="dsp-cz-pick" title="Any colour">
+                  <input type="color" value={cur.toLowerCase()} onChange={(e) => { if (DISPATCH_HEX_RE.test(e.target.value)) pick(t.key, e.target.value.toUpperCase()); }} aria-label={`Pick any colour for ${t.name}`} />
+                </label>
+                {cur.toLowerCase() !== t.def.toLowerCase() && (
+                  <button type="button" className="dsp-chip dsp-chip-sm" onClick={() => pick(t.key, t.def)}>Default</button>
+                )}
+              </div>
+            </div>
+          );
+        })}
+        <div className="dsp-acts">
+          <button type="button" className="dsp-big dsp-big-gold" disabled={!changed || saving} onClick={onSave}>{saving ? "Saving…" : "Save for every screen"}</button>
+          <button type="button" className="dsp-big dsp-big-ghost" onClick={() => setDraft({})}>Reset all</button>
+        </div>
+      </div>
+    </div>,
+    document.body
+  );
+}
+
+// End-of-day checklist (6:45pm) — replaces the old "tap 5 times" red
+// screen. Lists every car on the board that needs a word before people
+// leave; each button makes the real write (a progress update with that
+// text, or the actual QC / finish), and the item clears. When the list
+// is empty it turns green and closes itself. Siren 3x on open, then once
+// every 20s while anything is left. "Dismiss anyway" still needs 5 taps.
+function DispatchEndOfDayChecklist({ views, session, unclassifiedCount, onAction, onDismiss }) {
+  const approver = isQcApprover(session);
+  // Snapshot of what needed doing when it opened — the list shouldn't
+  // grow or reshuffle under someone's finger while they work through it.
+  const [items] = useState(() => {
+    const now = Date.now();
+    const out = [];
+    for (const v of views) {
+      const { info, row } = v;
+      const base = { key: v.key, plate: row.job.plate, model: row.job.makeModel, categoryLabel: row.categoryLabel };
+      if (info.state === "qc" || info.state === "qclate") {
+        out.push({ ...base, why: `Waiting for QC · ${dispatchElapsed(info.qcAt, now)}`, opts: approver ? ["Passed", "Check first thing tomorrow"] : ["Check first thing tomorrow"] });
+      } else if (info.startedAt) {
+        out.push({ ...base, why: `In progress · last update ${dispatchElapsed(info.lastUpdateAt, now)} ago`, opts: ["Continue tomorrow", "Waiting on parts", "Send to QC"] });
+      } else if (!info.assigned.length) {
+        out.push({ ...base, why: "Nobody assigned", opts: ["Start tomorrow morning", "Waiting on customer approval"] });
+      }
+    }
+    return out;
+  });
+  const [done, setDone] = useState({});
+  const [busyKey, setBusyKey] = useState(null);
   const [taps, setTaps] = useState(0);
-  const [flashOn, setFlashOn] = useState(true);
+  const liveKeys = new Set(views.map((v) => v.key));
+  // A car finished/moved elsewhere while this was open counts as handled.
+  const okText = (it) => done[it.key] || (!liveKeys.has(it.key) ? "Finished" : null);
+  const total = items.length;
+  const okCount = items.filter((it) => okText(it)).length;
+  const allDone = okCount === total;
+  const remainingRef = useRef(total - okCount);
+  remainingRef.current = total - okCount;
+  const onDismissRef = useRef(onDismiss);
+  onDismissRef.current = onDismiss;
 
   useEffect(() => {
-    playDispatchAlarm();
-    const soundLoop = setInterval(playDispatchAlarm, 1100);
-    const flashLoop = setInterval(() => setFlashOn((f) => !f), 400);
-    return () => { clearInterval(soundLoop); clearInterval(flashLoop); };
+    if (remainingRef.current > 0) { playDispatchSound("eod"); playDispatchSound("eod"); playDispatchSound("eod"); }
+    const t = setInterval(() => { if (remainingRef.current > 0) playDispatchSound("eod"); }, 20000);
+    return () => clearInterval(t);
   }, []);
+  const cheeredRef = useRef(false);
+  useEffect(() => {
+    if (!allDone) return undefined;
+    if (total > 0 && !cheeredRef.current) { cheeredRef.current = true; playDispatchSound("done"); }
+    const t = setTimeout(() => onDismissRef.current(), 3500);
+    return () => clearTimeout(t);
+  }, [allDone, total]);
 
-  const handleTap = () => {
+  const act = async (it, option) => {
+    if (busyKey) return;
+    setBusyKey(it.key);
+    const ok = await onAction(it.key, option);
+    setBusyKey(null);
+    if (ok) setDone((d) => ({ ...d, [it.key]: option }));
+  };
+  const tapDismiss = () => {
     const next = taps + 1;
     if (next >= 5) { onDismiss(); return; }
     setTaps(next);
   };
 
   return createPortal(
-    <div
-      onClick={handleTap}
-      style={{
-        position: "fixed", inset: 0, zIndex: 999, cursor: "pointer",
-        background: flashOn ? "#c81e1e" : "#3d0808",
-        display: "flex", flexDirection: "column", alignItems: "center", justifyContent: "center",
-        padding: 24, textAlign: "center", transition: "background 0.15s linear",
-      }}
-    >
-      <div style={{ fontSize: 15, fontWeight: 700, color: "#fff", opacity: 0.85, letterSpacing: 1, marginBottom: 14 }}>
-        END OF DAY
-      </div>
-      <div style={{ fontFamily: DISPLAY_FONT, fontWeight: 700, fontSize: 34, color: "#fff", lineHeight: 1.25, maxWidth: 480 }}>
-        Please update the app before leaving...
-      </div>
+    <div className={`dsp-u dsp-eod${allDone ? " dsp-eod-clear" : ""}`} role="alertdialog" aria-modal="true" aria-label="End of day checklist">
+      <div className="dsp-eod-eye">6:45 PM · END OF DAY</div>
+      <h2>{allDone ? "Board is up to date." : "Update these cars before you leave"}</h2>
+      <div className="dsp-eod-sub">{allDone ? "Thanks. Closing in a moment." : `${okCount} of ${total} done. Each one clears as you fix it.`}</div>
       {unclassifiedCount > 0 && (
-        <div style={{ marginTop: 18, fontSize: 15, fontWeight: 700, color: "#fff", opacity: 0.9, background: "rgba(0,0,0,0.2)", borderRadius: 999, padding: "6px 16px" }}>
-          ⚠ {unclassifiedCount} job{unclassifiedCount === 1 ? "" : "s"} still need{unclassifiedCount === 1 ? "s" : ""} a service type
-        </div>
+        <div className="dsp-eod-warn">⚠ {unclassifiedCount} job{unclassifiedCount === 1 ? "" : "s"} still need{unclassifiedCount === 1 ? "s" : ""} a service type</div>
       )}
-      <div style={{ marginTop: 34, fontSize: 16, fontWeight: 700, color: "#fff" }}>
-        Tap {5 - taps} more time{5 - taps === 1 ? "" : "s"} to dismiss
+      <div className="dsp-prog"><i style={{ width: `${total ? (okCount / total) * 100 : 100}%` }} /></div>
+      <div className="dsp-eod-list">
+        {items.map((it) => {
+          const ok = okText(it);
+          return (
+            <div key={it.key} className={`dsp-eod-item${ok ? " ok" : ""}`}>
+              <div className="dsp-eod-row">
+                <DispatchPlate plate={it.plate} />
+                <div style={{ minWidth: 0 }}>
+                  <div className="dsp-eod-model">{it.model || it.categoryLabel}</div>
+                  <div className="dsp-eod-why">{ok ? `Done: ${ok}` : `${it.categoryLabel} · ${it.why}`}</div>
+                </div>
+              </div>
+              {!ok && (
+                <div className="dsp-eod-btns">
+                  {it.opts.map((o, k) => (
+                    <button key={o} type="button" className={k === 0 ? "p" : ""} disabled={!!busyKey} onClick={() => act(it, o)}>
+                      {busyKey === it.key ? "Saving…" : o}
+                    </button>
+                  ))}
+                </div>
+              )}
+            </div>
+          );
+        })}
       </div>
-      <div style={{ display: "flex", gap: 8, marginTop: 16 }}>
-        {[0, 1, 2, 3, 4].map((i) => (
-          <div key={i} style={{ width: 14, height: 14, borderRadius: "50%", background: i < taps ? "#fff" : "rgba(255,255,255,0.3)" }} />
-        ))}
-      </div>
+      {!allDone && (
+        <button type="button" className="dsp-eod-dis" onClick={tapDismiss}>
+          Dismiss anyway · tap {5 - taps} more time{5 - taps === 1 ? "" : "s"}
+        </button>
+      )}
     </div>,
     document.body
   );
 }
 
-function DispatchDetailModal({ row, ticketNo, isDone, isStarted, startedAt, now, assignedIds, assignedNames, staffOptions, moveOptions, canWriteUpdate, canManageVisibility, onClose, onToggleDone, onToggleStarted, onAssign, onMove, onAddUpdate, onToggleHidden, saving }) {
+// Centre pop-up for one (job, category) row: where it is in the flow,
+// what to do, damage, photos, parts, who's on it, the one big action for
+// its current state, quick updates, move / hide. Everything the old
+// sheet could do is still here.
+function DispatchDetailModal({ row, info, color, ticketNo, now, session, team, assignedIds, staffOptions, moveOptions, canWriteUpdate, canManageVisibility, canFinishDirect, onClose, onStart, onUnstart, onSendToQc, onPassQc, onFailQc, onFinishDirect, onAssign, onMove, onAddUpdate, onToggleHidden, saving }) {
   const { job, categoryLabel, categoryKey } = row;
   const isUnclassified = categoryKey === "_none";
   const [updateText, setUpdateText] = useState("");
+  const [failPick, setFailPick] = useState(false);
+  const [moveOpen, setMoveOpen] = useState(isUnclassified);
+  useDispatchEscape(onClose);
+  const approver = isQcApprover(session);
+  const state = info ? info.state : null;
+  const meta = state ? DISPATCH_STATES[state] : null;
+  const started = !!info?.startedAt;
+  const inQc = state === "qc" || state === "qclate";
+  const nameOf = (id) => team.find((m) => m.id === id)?.name || id;
+  const steps = info ? [
+    { k: "Assigned", v: assignedIds.length ? assignedIds.map(nameOf).join(", ") : "Nobody yet", s: started ? "done" : "now" },
+    { k: "In progress", v: started ? dispatchElapsed(info.startedAt, now) : "Not started", s: inQc ? "done" : started ? "now" : "" },
+    { k: "QC", v: inQc ? `Waiting ${dispatchElapsed(info.qcAt, now)}` : info.redoReason ? "Sent back" : "—", s: inQc ? "now" : "" },
+    { k: "Finished", v: "—", s: "" },
+  ] : [];
+  const todo = isUnclassified
+    ? "This job hasn't been assigned a service type yet. Pick one below."
+    : ((job.treatments || {})[categoryKey]?.length ? job.treatments[categoryKey].join(", ") : "No specific treatments selected for this category.");
+  const photos = [...(job.photos?.intake || []), ...(job.photos?.parts_removal || [])];
+
   return createPortal(
-    <div onClick={onClose} style={{ position: "fixed", inset: 0, background: "rgba(0,0,0,0.6)", zIndex: 200, display: "flex", alignItems: "center", justifyContent: "center", padding: 18 }}>
-      <div onClick={(e) => e.stopPropagation()} style={{ background: COLORS.panel, border: `1px solid ${COLORS.line}`, borderRadius: 16, padding: 22, maxWidth: 420, width: "100%", maxHeight: "86vh", overflowY: "auto" }}>
-        <div style={{ display: "flex", justifyContent: "space-between", alignItems: "flex-start" }}>
-          <div>
-            <div style={{ fontSize: 11, fontWeight: 700, color: COLORS.gold, letterSpacing: 0.5 }}>TICKET #{ticketNo}</div>
-            <div style={{ marginTop: 4 }}><PlateChip plate={job.plate} size="lg" /></div>
-            <div style={{ fontSize: 13, color: COLORS.muted, marginTop: 2 }}>{job.makeModel}{job.customerName ? ` · ${job.customerName}` : ""}</div>
+    <div className="dsp-u dsp-scrim" onClick={onClose}>
+      <div className="dsp-modal" style={dispatchColorVars(color)} role="dialog" aria-modal="true" aria-label={`${job.plate || "Car"} details`} onClick={(e) => e.stopPropagation()}>
+        <div className="dsp-m-top">
+          <div style={{ minWidth: 0 }}>
+            <div className="dsp-m-eye">
+              Ticket #{ticketNo}{!isUnclassified ? ` · ${categoryLabel}` : " · No service type yet"}
+              {meta ? <> · <span style={{ color }}>{meta.label}</span></> : null}
+            </div>
+            <DispatchPlate plate={job.plate} large />
+            {job.makeModel ? <div className="dsp-m-model">{job.makeModel}</div> : null}
+            <div className="dsp-m-meta">
+              <span>{STAGES[job.stageIndex]?.label || "—"}</span>
+              {job.location ? <span>· {job.location}</span> : null}
+              {job.priority ? <span className={["high", "urgent"].includes(String(job.priority).toLowerCase()) ? "prio" : ""}>· {job.priority}</span> : null}
+            </div>
           </div>
-          <button onClick={onClose} className="mrcap-press" style={{ background: "none", border: "none", cursor: "pointer", padding: 4 }}><X size={20} color={COLORS.muted} /></button>
+          <button type="button" className="dsp-x" onClick={onClose} aria-label="Close"><X color={COLORS.ink} strokeWidth={2.6} /></button>
         </div>
 
-        <div style={{ display: "flex", gap: 6, flexWrap: "wrap", marginTop: 14 }}>
-          <span style={{ fontSize: 11, fontWeight: 600, padding: "4px 10px", borderRadius: 999, background: COLORS.panel2, color: COLORS.ink }}>{STAGES[job.stageIndex]?.label || "—"}</span>
-          {!isUnclassified && (
-            <span style={{ fontSize: 11, fontWeight: 600, padding: "4px 10px", borderRadius: 999, background: COLORS.panel2, color: COLORS.ink }}>{categoryLabel}</span>
-          )}
-          {job.priority ? (
-            <span style={{ fontSize: 11, fontWeight: 700, padding: "4px 10px", borderRadius: 999, color: COLORS.red, border: `1px solid ${COLORS.red}`, textTransform: "uppercase" }}>{job.priority}</span>
-          ) : null}
+        {!isUnclassified && (
+          <div className="dsp-flow">
+            {steps.map((st) => (
+              <div key={st.k} className={`dsp-step ${st.s}`}><div className="k">{st.k}</div><div className="v">{st.v}</div></div>
+            ))}
+          </div>
+        )}
+
+        <div>
+          <div className="dsp-sec-l">What to do</div>
+          <div className="dsp-boxy">{todo}</div>
         </div>
 
-        {job.location ? (
-          <div style={{ fontSize: 12.5, color: COLORS.muted, marginTop: 12 }}>Location: <span style={{ color: COLORS.ink }}>{job.location}</span></div>
+        {!isUnclassified && job.description ? (
+          <div>
+            <div className="dsp-sec-l">Description</div>
+            <div className="dsp-boxy">{job.description}</div>
+          </div>
         ) : null}
 
-        <div style={{ marginTop: 14 }}>
-          <div style={{ fontSize: 11.5, fontWeight: 700, color: COLORS.muted, textTransform: "uppercase", letterSpacing: 0.5, marginBottom: 5 }}>What to do</div>
-          <div style={{ fontSize: 14, color: COLORS.ink, lineHeight: 1.5, background: COLORS.panel2, borderRadius: 10, padding: 12 }}>
-            {isUnclassified
-              ? "This job hasn't been assigned a service type yet — pick one below."
-              : ((job.treatments || {})[categoryKey]?.length ? (job.treatments[categoryKey]).join(", ") : "No specific treatments selected for this category.")}
+        {!isUnclassified && job.damageNotes ? (
+          <div>
+            <div className="dsp-sec-l" style={{ color: "#FFB44D" }}>Damage noted at intake</div>
+            <div className="dsp-boxy dsp-dmg">{job.damageNotes}</div>
           </div>
-        </div>
+        ) : null}
 
-        {!isUnclassified && job.description && (
-          <div style={{ marginTop: 14 }}>
-            <div style={{ fontSize: 11.5, fontWeight: 700, color: COLORS.muted, textTransform: "uppercase", letterSpacing: 0.5, marginBottom: 5 }}>Description</div>
-            <div style={{ fontSize: 14, color: COLORS.ink, lineHeight: 1.5, background: COLORS.panel2, borderRadius: 10, padding: 12 }}>{job.description}</div>
+        {!isUnclassified && info?.redoReason && !inQc ? (
+          <div>
+            <div className="dsp-sec-l" style={{ color: "#FF8A80" }}>Sent back from QC</div>
+            <div className="dsp-boxy dsp-sentback">{info.redoReason}</div>
           </div>
-        )}
+        ) : null}
 
-        {!isUnclassified && job.damageNotes && (
-          <div style={{ marginTop: 14 }}>
-            <div style={{ fontSize: 11.5, fontWeight: 700, color: COLORS.red, textTransform: "uppercase", letterSpacing: 0.5, marginBottom: 5 }}>⚠ Walk-around / Damage Notes</div>
-            <div style={{ fontSize: 14, color: COLORS.ink, lineHeight: 1.5, background: "rgba(200,60,60,0.1)", border: `1px solid ${COLORS.red}55`, borderRadius: 10, padding: 12 }}>{job.damageNotes}</div>
-          </div>
-        )}
-
-        {!isUnclassified && (job.photos?.intake?.length > 0 || job.photos?.parts_removal?.length > 0) && (
-          <div style={{ marginTop: 14 }}>
-            <div style={{ fontSize: 11.5, fontWeight: 700, color: COLORS.muted, textTransform: "uppercase", letterSpacing: 0.5, marginBottom: 5 }}>Photos</div>
-            <div style={{ display: "flex", gap: 7, overflowX: "auto", paddingBottom: 2 }}>
-              {[...(job.photos.intake || []), ...(job.photos.parts_removal || [])].map((src, i) => (
-                <img key={i} src={src} alt="" style={{ width: 78, height: 78, objectFit: "cover", borderRadius: 8, border: `1px solid ${COLORS.line}`, flexShrink: 0 }} />
-              ))}
-            </div>
+        {!isUnclassified && photos.length > 0 && (
+          <div>
+            <div className="dsp-sec-l">Photos</div>
+            <div className="dsp-photos">{photos.map((src, i) => <img key={i} src={src} alt="" />)}</div>
           </div>
         )}
 
         {!isUnclassified && job.damageDiagramImage && (
-          <div style={{ marginTop: 14 }}>
-            <div style={{ fontSize: 11.5, fontWeight: 700, color: COLORS.muted, textTransform: "uppercase", letterSpacing: 0.5, marginBottom: 5 }}>Damage Diagram</div>
-            <img src={job.damageDiagramImage} alt="Damage diagram" style={{ width: "100%", height: "auto", display: "block", borderRadius: 8, border: `1px solid ${COLORS.line}` }} />
+          <div>
+            <div className="dsp-sec-l">Damage diagram</div>
+            <img className="dsp-diagram" src={job.damageDiagramImage} alt="Damage diagram" />
           </div>
         )}
 
         {!isUnclassified && (job.parts || []).length > 0 && (
-          <div style={{ marginTop: 14 }}>
-            <div style={{ fontSize: 11.5, fontWeight: 700, color: COLORS.muted, textTransform: "uppercase", letterSpacing: 0.5, marginBottom: 5 }}>Parts on the invoice</div>
-            <div style={{ display: "flex", flexDirection: "column", gap: 5 }}>
-              {job.parts.map((p) => (
-                <div key={p.id} style={{ fontSize: 13, color: COLORS.ink, background: COLORS.panel2, borderRadius: 8, padding: "8px 11px" }}>
-                  {p.description || "Unnamed part"}{p.qty > 1 ? ` × ${p.qty}` : ""}
-                </div>
-              ))}
+          <div>
+            <div className="dsp-sec-l">Parts on the invoice</div>
+            <div className="dsp-parts">
+              {job.parts.map((p, i) => <div key={p.id || i}>{p.description || "Unnamed part"}{p.qty > 1 ? ` × ${p.qty}` : ""}</div>)}
             </div>
           </div>
         )}
 
         {!isUnclassified && (
-          <div style={{ marginTop: 14 }}>
-            <div style={{ fontSize: 11.5, fontWeight: 700, color: COLORS.muted, textTransform: "uppercase", letterSpacing: 0.5, marginBottom: 7 }}>
-              {assignedNames?.length ? `Assigned to ${assignedNames.join(", ")} — tap to add/remove (max 3)` : "Tap up to 3 names to assign"}
-            </div>
-            <div style={{ display: "flex", flexWrap: "wrap", gap: 7 }}>
-              {staffOptions.length === 0 ? (
-                <div style={{ fontSize: 12, color: COLORS.muted }}>No staff with this role yet — add them under Team.</div>
-              ) : (
-                staffOptions.map((m) => {
-                  const isSelected = (assignedIds || []).includes(m.id);
-                  const atCap = !isSelected && (assignedIds || []).length >= 3;
+          <div>
+            <div className="dsp-sec-l">Who's on it <em>tap to add or remove · up to 3</em></div>
+            {staffOptions.length === 0 ? (
+              <div className="dsp-note" style={{ textAlign: "left" }}>No staff with this role yet. Add them under Team.</div>
+            ) : (
+              <div className="dsp-staff">
+                {staffOptions.map((m) => {
+                  const isOn = assignedIds.includes(m.id);
+                  const atCap = !isOn && assignedIds.length >= 3;
                   return (
-                    <button
-                      key={m.id}
-                      onClick={() => { if (!atCap) onAssign(row, m.id); }}
-                      disabled={atCap}
-                      className="mrcap-press"
-                      style={{
-                        padding: "8px 12px", borderRadius: 999,
-                        border: `1.5px solid ${isSelected ? COLORS.gold : COLORS.line}`,
-                        background: isSelected ? COLORS.gold : COLORS.panel2,
-                        color: isSelected ? COLORS.darkText : COLORS.ink,
-                        fontSize: 12.5, fontWeight: 600, cursor: atCap ? "default" : "pointer",
-                        opacity: atCap ? 0.4 : 1,
-                      }}
-                    >
-                      {m.name}{m.specialty ? <span style={{ opacity: 0.75, fontWeight: 500 }}> — {m.specialty}</span> : null}
+                    <button key={m.id} type="button" className={`dsp-sbtn${isOn ? " on" : ""}`} disabled={atCap} aria-pressed={isOn} onClick={() => { if (!atCap) onAssign(row, m.id); }}>
+                      <DispatchAvatar id={m.id} name={m.name} />
+                      <span>{m.name}{m.specialty ? <small> · {m.specialty}</small> : null}</span>
                     </button>
                   );
-                })
-              )}
-            </div>
+                })}
+              </div>
+            )}
           </div>
         )}
 
-        <div style={{ marginTop: 14 }}>
-          <div style={{ fontSize: 11.5, fontWeight: 700, color: COLORS.muted, textTransform: "uppercase", letterSpacing: 0.5, marginBottom: 7 }}>
-            {isUnclassified ? "Set the service type — tap one" : "Move to a different section — tap where it should go"}
+        {!isUnclassified && (inQc ? (
+          approver ? (
+            failPick ? (
+              <div>
+                <div className="dsp-sec-l">What needs fixing?</div>
+                <div className="dsp-chips">
+                  {QC_FAIL_REASONS.map((r) => (
+                    <button key={r} type="button" className="dsp-chip dsp-chip-red" disabled={saving} onClick={() => { setFailPick(false); onFailQc(row, r); }}>{r}</button>
+                  ))}
+                </div>
+                <button type="button" className="dsp-big dsp-big-ghost dsp-big-full" onClick={() => setFailPick(false)}>Cancel</button>
+              </div>
+            ) : (
+              <div className="dsp-acts">
+                <button type="button" className="dsp-big dsp-big-pass" disabled={saving} onClick={() => onPassQc(row)}>Pass QC · Finished</button>
+                <button type="button" className="dsp-big dsp-big-fail" disabled={saving} onClick={() => setFailPick(true)}>Send back</button>
+              </div>
+            )
+          ) : (
+            <div className="dsp-note">Waiting for <b>Noel, Reagen or Ahmed</b> to check it.<br />You are signed in as {session.name}.</div>
+          )
+        ) : started ? (
+          <div className="dsp-acts">
+            <button type="button" className="dsp-big dsp-big-qc" disabled={saving} onClick={() => onSendToQc(row)}>Send to QC</button>
+            <button type="button" className="dsp-big dsp-big-ghost" disabled={saving} onClick={() => onUnstart(row)}>Not started yet</button>
           </div>
-          <div style={{ display: "flex", flexWrap: "wrap", gap: 7 }}>
-            {moveOptions.map((s) => (
-              <button
-                key={s.key}
-                onClick={() => onMove(row, s.key)}
-                disabled={saving}
-                className="mrcap-press"
-                style={{
-                  padding: "8px 12px", borderRadius: 999, border: `1.5px solid ${COLORS.line}`,
-                  background: COLORS.panel2, color: COLORS.ink, fontSize: 12.5, fontWeight: 600,
-                  cursor: saving ? "default" : "pointer", opacity: saving ? 0.6 : 1,
-                }}
-              >
-                {s.label}
-              </button>
-            ))}
-          </div>
-        </div>
-
-        {!isUnclassified && (
-          <div style={{ display: "flex", gap: 8, marginTop: 18 }}>
-            <button
-              onClick={() => onToggleStarted(row, !isStarted)}
-              disabled={saving || isDone}
-              className="mrcap-press"
-              style={{
-                flex: 1, padding: "13px 12px", borderRadius: 11, border: `1.5px solid ${isStarted ? COLORS.gold : COLORS.line}`,
-                background: isStarted ? `${COLORS.gold}22` : COLORS.panel2, color: isStarted ? COLORS.goldBright : COLORS.ink,
-                fontSize: 13.5, fontWeight: 700, cursor: saving || isDone ? "default" : "pointer", opacity: saving || isDone ? 0.5 : 1,
-                display: "flex", alignItems: "center", justifyContent: "center", gap: 7,
-              }}
-            >
-              <Clock size={16} />
-              {isStarted ? `In Progress${formatDispatchElapsed(startedAt, now) ? ` · ${formatDispatchElapsed(startedAt, now)} — tap to undo` : " — tap to undo"}` : "Start"}
-            </button>
-            <button
-              onClick={() => onToggleDone(row, !isDone)}
-              disabled={saving}
-              className="mrcap-press"
-              style={{
-                flex: 1, padding: "13px 12px", borderRadius: 11, border: "none",
-                background: isDone ? COLORS.panel2 : COLORS.gold, color: isDone ? COLORS.ink : COLORS.darkText,
-                fontSize: 13.5, fontWeight: 700, cursor: saving ? "default" : "pointer", opacity: saving ? 0.6 : 1,
-                display: "flex", alignItems: "center", justifyContent: "center", gap: 7,
-              }}
-            >
-              <CheckCircle2 size={16} />
-              {isDone ? "Finished — tap to undo" : "Mark Finished"}
+        ) : (
+          <div className="dsp-acts">
+            <button type="button" className="dsp-big dsp-big-gold" disabled={saving || !assignedIds.length} onClick={() => onStart(row)}>
+              {assignedIds.length ? "Start work" : "Assign someone first"}
             </button>
           </div>
-        )}
+        ))}
 
-        {!isUnclassified && isStarted && !isDone && canWriteUpdate && (
-          <div style={{ marginTop: 16 }}>
-            <div style={{ fontSize: 11.5, fontWeight: 700, color: COLORS.muted, textTransform: "uppercase", letterSpacing: 0.5, marginBottom: 7 }}>
-              Post a progress update — shows on the admin Live Updates board
-            </div>
-            <div style={{ display: "flex", flexWrap: "wrap", gap: 7, marginBottom: 9 }}>
+        {!isUnclassified && started && !inQc && (
+          <div>
+            <div className="dsp-sec-l">Quick update <em>clears the "no update" warning · shows on Live Updates</em></div>
+            <div className="dsp-chips">
               {DISPATCH_UPDATE_PRESETS.map((preset) => (
-                <button
-                  key={preset}
-                  onClick={() => { if (saving) return; onAddUpdate(row, preset); }}
-                  disabled={saving}
-                  className="mrcap-press"
-                  style={{
-                    padding: "7px 11px", borderRadius: 999, border: `1.5px solid ${COLORS.line}`,
-                    background: COLORS.panel2, color: COLORS.ink, fontSize: 11.5, fontWeight: 600,
-                    cursor: saving ? "default" : "pointer", opacity: saving ? 0.6 : 1,
-                  }}
-                >
-                  {preset}
-                </button>
+                <button key={preset} type="button" className="dsp-chip" disabled={saving} onClick={() => onAddUpdate(row, preset)}>{preset}</button>
               ))}
             </div>
-            <textarea
-              value={updateText}
-              onChange={(e) => setUpdateText(e.target.value)}
-              placeholder="Or type something not covered above…"
-              rows={2}
-              style={{
-                width: "100%", background: COLORS.panel2, border: `1px solid ${COLORS.line}`, borderRadius: 10,
-                padding: 10, fontSize: 13.5, color: COLORS.ink, fontFamily: "inherit", resize: "vertical", boxSizing: "border-box",
-              }}
-            />
-            <button
-              onClick={() => { if (!updateText.trim()) return; onAddUpdate(row, updateText.trim()); setUpdateText(""); }}
-              disabled={saving || !updateText.trim()}
-              className="mrcap-press"
-              style={{
-                marginTop: 8, width: "100%", padding: "11px 12px", borderRadius: 10, border: "none",
-                background: COLORS.gold, color: COLORS.darkText, fontSize: 13, fontWeight: 700,
-                cursor: saving || !updateText.trim() ? "default" : "pointer", opacity: saving || !updateText.trim() ? 0.5 : 1,
-              }}
-            >
-              Post Update
-            </button>
+            {canWriteUpdate && (
+              <>
+                <textarea className="dsp-textarea" value={updateText} onChange={(e) => setUpdateText(e.target.value)} placeholder="Or type something not covered above…" rows={2} />
+                <button type="button" className="dsp-post" disabled={saving || !updateText.trim()} onClick={() => { if (!updateText.trim()) return; onAddUpdate(row, updateText.trim()); setUpdateText(""); }}>Post update</button>
+              </>
+            )}
           </div>
         )}
 
-        {canManageVisibility && (
-          <button
-            onClick={() => onToggleHidden(job, true)}
-            disabled={saving}
-            className="mrcap-press"
-            style={{
-              marginTop: 18, width: "100%", padding: "10px 12px", borderRadius: 10,
-              border: `1px solid ${COLORS.line}`, background: "transparent", color: COLORS.muted,
-              fontSize: 12, fontWeight: 600, cursor: saving ? "default" : "pointer",
-            }}
-          >
-            Hide this car from the Dispatch Board
-          </button>
+        {moveOpen && (
+          <div>
+            <div className="dsp-sec-l">{isUnclassified ? "Set the service type · tap one" : "Move to"}</div>
+            <div className="dsp-chips">
+              {moveOptions.map((s) => (
+                <button key={s.key} type="button" className="dsp-chip" disabled={saving} onClick={() => onMove(row, s.key)}>{s.label}</button>
+              ))}
+            </div>
+          </div>
+        )}
+
+        {(!isUnclassified || canManageVisibility) && (
+          <div className="dsp-menu">
+            {!isUnclassified && (
+              <button type="button" onClick={() => setMoveOpen((v) => !v)} aria-expanded={moveOpen}>
+                Move to another service
+                {moveOpen ? <ChevronUp /> : <ChevronDown />}
+              </button>
+            )}
+            {!isUnclassified && canFinishDirect && !inQc && (
+              <button type="button" disabled={saving} onClick={() => onFinishDirect(row)}>
+                Mark finished without QC
+                <CheckCircle2 />
+              </button>
+            )}
+            {canManageVisibility && (
+              <button type="button" className="danger" disabled={saving} onClick={() => onToggleHidden(job, true)}>Hide this car from the board</button>
+            )}
+          </div>
         )}
       </div>
     </div>,
@@ -13808,12 +14465,14 @@ function DispatchDetailModal({ row, ticketNo, isDone, isStarted, startedAt, now,
   );
 }
 
-function DispatchBoard({ team, session }) {
+function DispatchBoard({ team, session, fill = false }) {
   const [jobs, setJobs] = useState([]);
   const [loading, setLoading] = useState(true);
   const [selectedRowKey, setSelectedRowKey] = useState(null);
   const loadedExtrasRef = useRef(new Set()); // job ids we've already fetched photos/diagram for this session
-  const openRow = (key, jobId) => {
+  // Stable identity (no deps) so the memoised cards never re-render just
+  // because the board did.
+  const openRow = useCallback((key, jobId) => {
     setSelectedRowKey(key);
     if (loadedExtrasRef.current.has(jobId)) return;
     loadedExtrasRef.current.add(jobId);
@@ -13821,20 +14480,38 @@ function DispatchBoard({ team, session }) {
       if (!extras) return;
       setJobs((prev) => prev.map((j) => (j.id === jobId ? { ...j, photos: extras.photos, damageDiagramImage: extras.damageDiagramImage } : j)));
     });
-  };
+  }, []);
   const [saving, setSaving] = useState(false);
-  const [dupeUpdateToast, setDupeUpdateToast] = useState("");
-  // Shown when a tap-to-assign write fails to actually save (e.g. a weak
-  // phone connection dropping the request). Previously this failed
-  // completely silently — the tap looked like it worked until the next
-  // poll quietly reverted it a few seconds later with no explanation.
-  const [assignErrorToast, setAssignErrorToast] = useState("");
+  // One toast slot (bottom centre, like the TV mockup) for confirmations,
+  // "already posted" and — in red — any write that failed to save. Failed
+  // saves used to fail silently until the next poll reverted them.
+  const [toast, setToast] = useState(null); // { text, color, undo }
+  const toastTimerRef = useRef(null);
+  const showToast = useCallback((text, color, undo = null, ms = 6000) => {
+    clearTimeout(toastTimerRef.current);
+    setToast({ text, color, undo });
+    toastTimerRef.current = setTimeout(() => setToast(null), ms);
+  }, []);
+  const showError = (text) => showToast(text, "#FF453A");
+  useEffect(() => () => clearTimeout(toastTimerRef.current), []);
   const [nowTick, setNowTick] = useState(() => Date.now());
   const [showAlertsDetail, setShowAlertsDetail] = useState(false);
   const [sortOrder, setSortOrder] = useState("oldest"); // "oldest" | "newest" | "priority"
   const [showEndOfDayReminder, setShowEndOfDayReminder] = useState(false);
-  const prevCountRef = useRef(null);
+  const [savedColors, setSavedColors] = useState({});
+  const [colorDraft, setColorDraft] = useState(null); // non-null while Mr.CAP's colour pop-up is open (live preview)
+  const [savingColors, setSavingColors] = useState(false);
+  const [arrivingKeys, setArrivingKeys] = useState({}); // rowKey -> true for the 1.2s "just arrived" flash
+  const [leavingKeys, setLeavingKeys] = useState({}); // rowKey -> true for the 1.4s "finished" flash before it drops off
+  const leaveTimersRef = useRef({});
+  useEffect(() => () => { Object.values(leaveTimersRef.current).forEach(clearTimeout); }, []);
   const firstLoadRef = useRef(true);
+  // Bumped at the start of every refresh() call so a slow poll that
+  // resolves after a later, faster one started can tell it's out of
+  // order and bail instead of applying stale data over fresher data.
+  const reqIdRef = useRef(0);
+  const teamRef = useRef(team);
+  teamRef.current = team;
   // Set to a future timestamp right after any local write (assign,
   // toggle, move, etc.) — refresh() skips applying its result until
   // that time passes, so a poll landing between "tap" and "server
@@ -13843,7 +14520,7 @@ function DispatchBoard({ team, session }) {
   const suppressRefreshUntilRef = useRef(0);
   const markLocalWrite = () => { suppressRefreshUntilRef.current = Date.now() + 4000; };
 
-  // Fires the end-of-day reminder once at 6:45pm local time, then stays
+  // Fires the end-of-day checklist once at 6:45pm local time, then stays
   // dismissed for the rest of that calendar day (localStorage-tracked
   // by date string, not just in-memory, so a refresh mid-alarm doesn't
   // bring it back) — but resets automatically the next day.
@@ -13857,6 +14534,7 @@ function DispatchBoard({ team, session }) {
     }
     const check = () => {
       const now = new Date();
+      if (now.getDay() === 0) return; // shop's closed Sundays — no EOD checklist to run
       const todayKey = localDateKey(now);
       const alreadyDismissed = window.localStorage?.getItem("mrcap_eod_reminder_dismissed") === todayKey;
       if (!alreadyDismissed && now.getHours() === 18 && now.getMinutes() === 45) {
@@ -13874,43 +14552,128 @@ function DispatchBoard({ team, session }) {
   };
 
   // Forces a re-render every 30s purely so elapsed-time labels ("23m")
-  // stay roughly current without needing a full data refetch.
+  // stay roughly current without needing a full data refetch. (refresh()
+  // below also bumps it the moment any row changes state.)
   useEffect(() => {
     const t = setInterval(() => setNowTick(Date.now()), 30000);
     return () => clearInterval(t);
   }, []);
 
-  const prevAssignedRef = useRef({}); // `${jobId}::${categoryKey}` -> array of assigned ids, as of the last poll
+  // Mr.CAP's board colours: loaded on mount, re-read every minute and
+  // whenever the screen wakes, so the shop TV picks up a change on its
+  // own. A failed read (null) keeps the current colours.
+  useEffect(() => {
+    let alive = true;
+    const load = async () => {
+      const loaded = await loadDispatchColors();
+      if (!alive || !loaded) return;
+      setSavedColors((prev) => (JSON.stringify(prev) === JSON.stringify(loaded) ? prev : loaded));
+    };
+    load();
+    const t = setInterval(load, 60000);
+    const onVisible = () => { if (document.visibilityState === "visible") load(); };
+    document.addEventListener("visibilitychange", onVisible);
+    return () => { alive = false; clearInterval(t); document.removeEventListener("visibilitychange", onVisible); };
+  }, []);
+  const colorSource = colorDraft || savedColors;
+  const themeColors = useMemo(() => resolveDispatchColors(colorSource), [colorSource]);
+
+  // What the last poll saw, per job/row — used to work out what CHANGED
+  // since then, so every screen with the board open (not just the one
+  // that was tapped) plays the right sound. All of these are seeded
+  // silently on the first load, so opening the board never replays the
+  // day's events.
+  const prevAssignedRef = useRef({}); // rowKey -> assigned ids
+  const seenJobIdsRef = useRef(new Set()); // job ids on the board last poll
+  const historyLenRef = useRef({}); // job id -> history length (history is append-only)
+  const rowStateRef = useRef({}); // rowKey -> state (new / late / stale / qc ...)
   const refresh = useCallback(async () => {
-    const data = await loadDispatchJobs();
+    const reqId = ++reqIdRef.current;
+    const result = await loadDispatchJobs();
+    if (!result) return; // fetch failed — keep what's on screen, try again next poll
+    // A newer poll already started (and, being a 6s interval racing a
+    // variable-latency fetch, may well finish first) — this response is
+    // out of order, discard it rather than applying stale data on top
+    // of whatever the newer one already applied.
+    if (reqId !== reqIdRef.current) return;
+    const { jobs: data, stale } = result;
     if (Date.now() < suppressRefreshUntilRef.current) return; // a local write is still settling — don't clobber it
-    // Announce newly-added assignees on EVERY device that has the board
-    // open — not just whichever device did the tapping. This is what
-    // makes a remote assignment actually announce out loud on a tablet
-    // sitting near the person being assigned, instead of only on the
-    // assigner's own screen. Skipped on the very first load so opening
-    // the board doesn't announce every existing assignment at once.
-    if (!firstLoadRef.current) {
-      for (const job of data) {
-        for (const categoryKey of job.serviceTypes) {
-          const key = `${job.id}::${categoryKey}`;
-          const before = prevAssignedRef.current[key] || [];
-          const after = job.assignedTeam[categoryKey] || [];
-          const newlyAdded = after.filter((id) => !before.includes(id));
-          for (const id of newlyAdded) {
-            const staffName = team.find((m) => m.id === id)?.name || id;
-            announceDispatchAssignment(staffName, job.makeModel || job.plate);
-          }
+    const now = Date.now();
+    // A stale (offline-cache) response must never become the silent
+    // "first load" baseline — if it did, the first genuinely-fresh poll
+    // after reconnecting would get diffed against this stale snapshot
+    // and announce every change that piled up while offline as if it
+    // had just happened. Treat every stale poll as "first" (no sounds,
+    // no diffing) and only let firstLoadRef actually flip once a
+    // non-stale response lands.
+    const first = firstLoadRef.current || stale;
+    const currentTeam = teamRef.current;
+    const nameOf = (id) => currentTeam.find((m) => m.id === id)?.name || id;
+    const sounds = new Set();
+    const newCars = [];
+    const assignLines = [];
+    const spoken = [];
+    const nextAssigned = {};
+    const nextHistoryLen = {};
+    const nextRowState = {};
+    let stateChanged = false;
+    for (const job of data) {
+      const known = seenJobIdsRef.current.has(job.id);
+      const vehicle = job.makeModel || job.plate || "car";
+      // Assignment call-outs on EVERY device that has the board open —
+      // this is what makes a remote assignment announce out loud on the
+      // tablet near the person being assigned.
+      for (const categoryKey of job.serviceTypes) {
+        const key = rowKey(job.id, categoryKey);
+        const after = job.assignedTeam[categoryKey] || [];
+        nextAssigned[key] = after;
+        if (first) continue;
+        const before = prevAssignedRef.current[key] || [];
+        for (const id of after.filter((x) => !before.includes(x))) {
+          sounds.add("assigned");
+          assignLines.push([nameOf(id), job.makeModel || job.plate]);
+        }
+      }
+      // Brand-new car on the board.
+      if (!first && !known && !job.dispatchHidden && now - job.createdAt < DISPATCH_NEW_CAR_WINDOW_MS) newCars.push(job);
+      // Started / sent to QC / QC failed / finished — read straight off
+      // the history entries added since the last poll (or since this
+      // device's own write, which already played its sound).
+      const len = job.history.length;
+      nextHistoryLen[job.id] = len;
+      const prevLen = historyLenRef.current[job.id];
+      if (!first && known && !job.dispatchHidden && typeof prevLen === "number" && len > prevLen) {
+        for (const h of job.history.slice(prevLen)) {
+          if (!h) continue;
+          if (h.stage === "service" && h.note === "Started") sounds.add("started");
+          else if (h.stage === "service" && h.note === "Marked done") sounds.add("done");
+          else if (h.stage === "qc" && h.note === "Sent to QC") { sounds.add("qc"); spoken.push(`${vehicle} is ready for QC.`); }
+          else if (h.stage === "qc" && typeof h.note === "string" && h.note.startsWith("QC failed")) sounds.add("fail");
+        }
+      }
+      if (job.dispatchHidden) continue;
+      // Needs someone / no update / QC waiting: sound ONCE, at the
+      // moment a row moves into that state (by time passing or by data),
+      // never again for as long as it stays there.
+      for (const categoryKey of job.serviceTypes) {
+        if (job.serviceDone[categoryKey]) continue;
+        const label = SERVICES.find((s) => s.key === categoryKey)?.label || categoryKey;
+        const key = rowKey(job.id, categoryKey);
+        const { state } = dispatchRowInfo(job, categoryKey, label, now);
+        nextRowState[key] = state;
+        const prevState = rowStateRef.current[key];
+        if (prevState !== state) stateChanged = true;
+        if (first || prevState === undefined || prevState === state) continue;
+        if (DISPATCH_ATTENTION_STATES.includes(state)) {
+          sounds.add(state);
+          if (state === "stale") spoken.push(`${vehicle} has had no update in over three hours.`);
         }
       }
     }
-    const nextAssignedMap = {};
-    for (const job of data) {
-      for (const categoryKey of job.serviceTypes) {
-        nextAssignedMap[`${job.id}::${categoryKey}`] = job.assignedTeam[categoryKey] || [];
-      }
-    }
-    prevAssignedRef.current = nextAssignedMap;
+    seenJobIdsRef.current = new Set(data.map((j) => j.id));
+    prevAssignedRef.current = nextAssigned;
+    historyLenRef.current = nextHistoryLen;
+    rowStateRef.current = nextRowState;
     setJobs((prev) => {
       const prevById = new Map(prev.map((j) => [j.id, j]));
       return data.map((incoming) => {
@@ -13929,12 +14692,26 @@ function DispatchBoard({ team, session }) {
       });
     });
     setLoading(false);
-    if (!firstLoadRef.current && prevCountRef.current !== null && data.length > prevCountRef.current) {
-      playDispatchBeep();
+    if (!stale) firstLoadRef.current = false;
+    if (first) return;
+    if (stateChanged) setNowTick(now);
+    if (newCars.length) {
+      sounds.add("newcar");
+      const arriving = {};
+      newCars.forEach((job) => job.serviceTypes.forEach((k) => { arriving[rowKey(job.id, k)] = true; }));
+      setArrivingKeys((prev) => ({ ...prev, ...arriving }));
+      setTimeout(() => setArrivingKeys((prev) => {
+        const next = { ...prev };
+        Object.keys(arriving).forEach((k) => { delete next[k]; });
+        return next;
+      }), 1300);
     }
-    firstLoadRef.current = false;
-    prevCountRef.current = data.length;
-  }, [team]);
+    ["newcar", "assigned", "started", "qc", "fail", "done", "late", "stale", "qclate"].forEach((s) => { if (sounds.has(s)) playDispatchSound(s); });
+    const voiceDelay = dispatchSoundQueueMs() + 150;
+    newCars.forEach((job) => speakDispatch(dispatchNewCarLine(job), voiceDelay));
+    assignLines.forEach(([name, vehicle]) => announceDispatchAssignment(name, vehicle, voiceDelay));
+    spoken.forEach((line) => speakDispatch(line, voiceDelay));
+  }, []);
 
   useEffect(() => {
     refresh();
@@ -13950,6 +14727,51 @@ function DispatchBoard({ team, session }) {
     return () => clearInterval(interval);
   }, [refresh]);
 
+  // Every history-appending write on the board goes through here: re-read
+  // the fields it touches FRESH from the server right before writing (the
+  // board's copy can be seconds old, and two people act around the same
+  // time), build the patch from that, PATCH, and say so if it fails. If
+  // the fresh read itself fails it stops rather than writing — the old
+  // code fell back to an EMPTY history there, which (e.g. offline, where
+  // the write gets queued) would have wiped the job's whole history.
+  const entry = (stage, label, note, catKey) => ({ stage, label, ...(catKey ? { cat: catKey } : {}), by: session.name, role: session.role, note, at: Date.now() });
+  const writeJob = async (job, select, build, { summary, failText }) => {
+    markLocalWrite();
+    setSaving(true);
+    const { ok: fetchOk, data, stale } = await sbFetch(`jobs?id=eq.${job.id}&select=${select}`);
+    if (stale) {
+      setSaving(false);
+      showError("No connection — not saved, try again");
+      return null;
+    }
+    const current = fetchOk && Array.isArray(data) && data[0] ? data[0] : null;
+    if (!current) {
+      setSaving(false);
+      showError(`${failText} — couldn't load the latest version of it. Check your connection and try again.`);
+      return null;
+    }
+    const patch = build(current);
+    if (!patch) { setSaving(false); return null; }
+    if (summary) withActivitySummary(summary);
+    const { ok } = await sbFetch(`jobs?id=eq.${job.id}`, {
+      method: "PATCH",
+      headers: { Prefer: "return=minimal" },
+      body: JSON.stringify({ ...patch, updated_at: new Date().toISOString() }),
+      noQueue: true,
+    });
+    markLocalWrite(); // hold the poll off a little past the save itself, not just past the tap
+    setSaving(false);
+    if (!ok) {
+      showError(`${failText} — check your connection and try again.`);
+      return null;
+    }
+    // This device plays its own sound straight away; tell the poll those
+    // entries are already accounted for so it doesn't play them again.
+    if (Array.isArray(patch.history)) historyLenRef.current[job.id] = patch.history.length;
+    return patch;
+  };
+  const applyLocal = (jobId, fields) => setJobs((prev) => prev.map((j) => (j.id === jobId ? { ...j, ...fields } : j)));
+
   // Multi-select, capped at 3 per (job, category) — separate field from
   // the single-assignee `assigned_to` JobDetail still uses, so that
   // screen's own assignment picker is completely unaffected by this.
@@ -13957,107 +14779,153 @@ function DispatchBoard({ team, session }) {
   const toggleTeamAssign = async (row, memberId) => {
     markLocalWrite();
     const { job, categoryKey } = row;
-    const current = job.assignedTeam[categoryKey] || [];
-    const isRemoving = current.includes(memberId);
-    if (!isRemoving && current.length >= DISPATCH_MAX_ASSIGNEES) return; // cap reached — no-op
-    const nextList = isRemoving ? current.filter((id) => id !== memberId) : [...current, memberId];
-    const nextAssignedTeam = { ...job.assignedTeam, [categoryKey]: nextList };
+    const localCurrent = job.assignedTeam[categoryKey] || [];
+    const isRemoving = localCurrent.includes(memberId);
+    if (!isRemoving && localCurrent.length >= DISPATCH_MAX_ASSIGNEES) return; // cap reached — no-op
+    const optimisticList = isRemoving ? localCurrent.filter((id) => id !== memberId) : [...localCurrent, memberId];
+    const optimisticAssignedTeam = { ...job.assignedTeam, [categoryKey]: optimisticList };
     const previousAssignedTeam = job.assignedTeam; // kept so we can revert cleanly if the save fails
-    setJobs((prev) => prev.map((j) => (j.id === job.id ? { ...j, assignedTeam: nextAssignedTeam } : j)));
+    setJobs((prev) => prev.map((j) => (j.id === job.id ? { ...j, assignedTeam: optimisticAssignedTeam } : j)));
     const staffName = team.find((m) => m.id === memberId)?.name || memberId;
-    withActivitySummary(isRemoving
-      ? `Dispatch board: removed ${staffName} from ${categoryKey} on ${job.plate}`
-      : `Dispatch board: added ${staffName} to ${categoryKey} on ${job.plate}`);
-    // No immediate local announcement here anymore — every open device
-    // (including this one) picks up the new assignment on its next poll
-    // and announces it then. That's what makes a remote assignment
-    // actually announce out loud on a tablet sitting near the person
-    // being assigned, instead of only confirming on the assigner's own
-    // screen while everyone else hears nothing.
-    const { ok } = await sbFetch(`jobs?id=eq.${job.id}`, {
-      method: "PATCH",
-      headers: { Prefer: "return=minimal" },
-      body: JSON.stringify({ assigned_team: nextAssignedTeam }),
+    // No immediate local announcement — every open device (including
+    // this one) picks up the new assignment on its next poll and plays
+    // the pips + call-out then, so it's heard on the TV too.
+    // Re-read assigned_team fresh (same helper every other board write
+    // uses) and toggle on THAT value, not the possibly-stale local copy —
+    // two people tapping assign around the same time must not clobber
+    // each other.
+    const patch = await writeJob(job, "assigned_team", (cur) => {
+      const freshCurrent = (cur.assigned_team || {})[categoryKey] || [];
+      const removing = freshCurrent.includes(memberId);
+      if (!removing && freshCurrent.length >= DISPATCH_MAX_ASSIGNEES) return null; // cap reached on the fresh value — no-op
+      const nextList = removing ? freshCurrent.filter((id) => id !== memberId) : [...freshCurrent, memberId];
+      return { assigned_team: { ...(cur.assigned_team || {}), [categoryKey]: nextList } };
+    }, {
+      summary: isRemoving
+        ? `Dispatch board: removed ${staffName} from ${categoryKey} on ${job.plate}`
+        : `Dispatch board: added ${staffName} to ${categoryKey} on ${job.plate}`,
+      failText: `Couldn't save ${isRemoving ? "removing" : "assigning"} ${staffName}`,
     });
-    if (!ok) {
-      // Revert the optimistic update immediately and say so, rather than
-      // letting it silently snap back on the next 6s poll with nothing
-      // shown — that gap is exactly what made this look like it "worked"
-      // on a phone with a flaky connection.
+    if (!patch) {
+      // Revert the optimistic update immediately (covers both a genuine
+      // save failure, which writeJob has already reported, and the
+      // fresh-value cap no-op above) rather than letting it silently snap
+      // back on the next 6s poll.
       setJobs((prev) => prev.map((j) => (j.id === job.id ? { ...j, assignedTeam: previousAssignedTeam } : j)));
-      setAssignErrorToast(`Couldn't save ${isRemoving ? "removing" : "assigning"} ${staffName} — check your connection and try again.`);
-      setTimeout(() => setAssignErrorToast(""), 6000);
-    }
-  };
-
-  // Mirrors JobDetail's toggleServiceDone exactly (same serviceDone shape,
-  // same history entry shape) so a job marked finished here shows up
-  // correctly there too. Re-fetches history fresh right before writing
-  // rather than trusting the board's lightweight copy, so two people
-  // acting around the same time don't clobber each other's history.
-  const toggleDone = async (row, nowDone) => {
-    markLocalWrite();
-    setSaving(true);
-    const { job, categoryKey, categoryLabel } = row;
-    const { ok: fetchOk, data } = await sbFetch(`jobs?id=eq.${job.id}&select=service_done,history`);
-    const current = fetchOk && data && data[0] ? data[0] : { service_done: job.serviceDone, history: [] };
-    const nextServiceDone = { ...(current.service_done || {}), [categoryKey]: nowDone };
-    const nextHistory = [
-      ...(current.history || []),
-      { stage: "service", label: categoryLabel, by: session.name, role: session.role, note: nowDone ? "Marked done" : "Un-marked", at: Date.now() },
-    ];
-    withActivitySummary(`Dispatch board: ${nowDone ? "marked" : "un-marked"} ${categoryLabel} done on ${job.plate}`);
-    const { ok } = await sbFetch(`jobs?id=eq.${job.id}`, {
-      method: "PATCH",
-      headers: { Prefer: "return=minimal" },
-      body: JSON.stringify({ service_done: nextServiceDone, history: nextHistory, updated_at: new Date().toISOString() }),
-    });
-    setSaving(false);
-    if (!ok) {
-      // Previously this applied the optimistic update regardless of
-      // whether the save succeeded — on a dropped connection it looked
-      // done until the next 6s poll quietly reverted it with no
-      // explanation, same failure shape as the assignment bug.
-      setAssignErrorToast(`Couldn't save ${nowDone ? "marking" : "un-marking"} ${categoryLabel} done on ${job.plate} — check your connection and try again.`);
-      setTimeout(() => setAssignErrorToast(""), 6000);
       return;
     }
-    setJobs((prev) => prev.map((j) => (j.id === job.id ? { ...j, serviceDone: nextServiceDone } : j)));
-    if (nowDone) playDispatchDoneChime();
+    applyLocal(job.id, { assignedTeam: patch.assigned_team });
   };
 
-  // Same shape and same history trail as toggleDone, kept as a fully
-  // separate field/state — a job can be started without being finished,
-  // and (deliberately) can even be marked finished without ever having
-  // been flagged started, for whoever just fixes something quick.
-  // Stores the actual start timestamp (not just true/false) so the
-  // board can show real elapsed time. A truthy value still means
-  // "started" everywhere else that checks it — this is a superset of
-  // the old boolean shape, nothing else needs to change.
+  // Start / "Not started yet". Stores the actual start timestamp (not
+  // just true/false) so the board can show real elapsed time; a truthy
+  // value still means "started" everywhere else that checks it. The
+  // "Started" history entry is also what opens a fresh QC cycle.
   const toggleStarted = async (row, nowStarted) => {
-    markLocalWrite();
-    setSaving(true);
     const { job, categoryKey, categoryLabel } = row;
-    const { ok: fetchOk, data } = await sbFetch(`jobs?id=eq.${job.id}&select=service_started,history`);
-    const current = fetchOk && data && data[0] ? data[0] : { service_started: job.serviceStarted, history: [] };
-    const nextServiceStarted = { ...(current.service_started || {}), [categoryKey]: nowStarted ? new Date().toISOString() : false };
-    const nextHistory = [
-      ...(current.history || []),
-      { stage: "service", label: categoryLabel, by: session.name, role: session.role, note: nowStarted ? "Started" : "Un-started", at: Date.now() },
-    ];
-    withActivitySummary(`Dispatch board: ${nowStarted ? "started" : "un-started"} ${categoryLabel} on ${job.plate}`);
-    const { ok } = await sbFetch(`jobs?id=eq.${job.id}`, {
-      method: "PATCH",
-      headers: { Prefer: "return=minimal" },
-      body: JSON.stringify({ service_started: nextServiceStarted, history: nextHistory, updated_at: new Date().toISOString() }),
+    const patch = await writeJob(job, "service_started,history", (cur) => ({
+      service_started: { ...(cur.service_started || {}), [categoryKey]: nowStarted ? new Date().toISOString() : false },
+      history: [...(cur.history || []), entry("service", categoryLabel, nowStarted ? "Started" : "Un-started", categoryKey)],
+    }), {
+      summary: `Dispatch board: ${nowStarted ? "started" : "un-started"} ${categoryLabel} on ${job.plate}`,
+      failText: `Couldn't save ${nowStarted ? "starting" : "un-starting"} ${categoryLabel} on ${job.plate}`,
     });
-    setSaving(false);
-    if (!ok) {
-      setAssignErrorToast(`Couldn't save ${nowStarted ? "starting" : "un-starting"} ${categoryLabel} on ${job.plate} — check your connection and try again.`);
-      setTimeout(() => setAssignErrorToast(""), 6000);
-      return;
-    }
-    setJobs((prev) => prev.map((j) => (j.id === job.id ? { ...j, serviceStarted: nextServiceStarted } : j)));
+    if (!patch) return false;
+    applyLocal(job.id, { serviceStarted: patch.service_started, history: patch.history });
+    if (nowStarted) playDispatchSound("started");
+    return true;
+  };
+
+  const sendToQc = async (row) => {
+    const { job, categoryKey, categoryLabel } = row;
+    const patch = await writeJob(job, "history", (cur) => ({
+      history: [...(cur.history || []), entry("qc", categoryLabel, "Sent to QC", categoryKey)],
+    }), { summary: `Dispatch board: sent ${categoryLabel} on ${job.plate} to QC`, failText: `Couldn't send ${job.plate} to QC` });
+    if (!patch) return false;
+    applyLocal(job.id, { history: patch.history });
+    playDispatchSound("qc");
+    speakDispatch(`${job.makeModel || job.plate} is ready for QC.`, dispatchSoundQueueMs() + 150);
+    setSelectedRowKey((k) => (k === rowKey(job.id, row.categoryKey) ? null : k));
+    showToast(`${job.plate} sent to QC`, themeColors.qc);
+    return true;
+  };
+
+  const failQc = async (row, reason) => {
+    if (!isQcApprover(session)) return false;
+    const { job, categoryKey, categoryLabel } = row;
+    const patch = await writeJob(job, "history", (cur) => ({
+      history: [...(cur.history || []), entry("qc", categoryLabel, `QC failed: ${reason}`, categoryKey)],
+    }), { summary: `Dispatch board: ${session.name} sent ${categoryLabel} on ${job.plate} back from QC (${reason})`, failText: `Couldn't send ${job.plate} back` });
+    if (!patch) return false;
+    applyLocal(job.id, { history: patch.history });
+    playDispatchSound("fail");
+    showToast(`Sent back: ${reason}`, themeColors.stale);
+    return true;
+  };
+
+  // Finished (after QC or directly): plays the fanfare, flashes the card
+  // gold for 1.4s, then lets it drop off the board. Undo is offered for
+  // a few seconds in the toast.
+  const finishLocally = (row, patch, text, undoBackToQc) => {
+    const { job, categoryKey } = row;
+    const key = rowKey(job.id, categoryKey);
+    setSelectedRowKey((k) => (k === key ? null : k));
+    applyLocal(job.id, { history: patch.history });
+    setLeavingKeys((prev) => ({ ...prev, [key]: true }));
+    playDispatchSound("done");
+    clearTimeout(leaveTimersRef.current[key]);
+    leaveTimersRef.current[key] = setTimeout(() => {
+      delete leaveTimersRef.current[key];
+      applyLocal(job.id, { serviceDone: patch.service_done });
+      setLeavingKeys((prev) => { const next = { ...prev }; delete next[key]; return next; });
+    }, 1400);
+    showToast(text, themeColors.done, () => undoFinish(row, undoBackToQc));
+  };
+
+  // Pass = the existing mark-finished write (service_done + "Marked
+  // done", exactly what JobDetail writes) plus a "QC passed" entry saying
+  // who checked it.
+  const passQc = async (row) => {
+    if (!isQcApprover(session)) return false;
+    const { job, categoryKey, categoryLabel } = row;
+    const patch = await writeJob(job, "service_done,history", (cur) => ({
+      service_done: { ...(cur.service_done || {}), [categoryKey]: true },
+      history: [...(cur.history || []), entry("qc", categoryLabel, "QC passed", categoryKey), entry("service", categoryLabel, "Marked done", categoryKey)],
+    }), { summary: `Dispatch board: ${session.name} passed QC on ${categoryLabel} for ${job.plate}`, failText: `Couldn't save passing QC on ${job.plate}` });
+    if (!patch) return false;
+    finishLocally(row, patch, `Finished ${job.plate} · passed by ${session.name}`, true);
+    return true;
+  };
+
+  // Kept from the old Finished button so nothing that used to be possible
+  // is lost ("for whoever just fixes something quick") — now limited to
+  // the QC approvers and admins, since finishing is QC's call.
+  const canFinishDirect = isQcApprover(session) || session.role === "admin";
+  const finishDirect = async (row) => {
+    if (!canFinishDirect) return false;
+    const { job, categoryKey, categoryLabel } = row;
+    const patch = await writeJob(job, "service_done,history", (cur) => ({
+      service_done: { ...(cur.service_done || {}), [categoryKey]: true },
+      history: [...(cur.history || []), entry("service", categoryLabel, "Marked done", categoryKey)],
+    }), { summary: `Dispatch board: marked ${categoryLabel} done on ${job.plate}`, failText: `Couldn't save marking ${categoryLabel} done on ${job.plate}` });
+    if (!patch) return false;
+    finishLocally(row, patch, `Finished ${job.plate}`, false);
+    return true;
+  };
+
+  const undoFinish = async (row, backToQc) => {
+    const { job, categoryKey, categoryLabel } = row;
+    const key = rowKey(job.id, categoryKey);
+    clearTimeout(leaveTimersRef.current[key]);
+    delete leaveTimersRef.current[key];
+    setLeavingKeys((prev) => { const next = { ...prev }; delete next[key]; return next; });
+    const patch = await writeJob(job, "service_done,history", (cur) => ({
+      service_done: { ...(cur.service_done || {}), [categoryKey]: false },
+      history: [...(cur.history || []), entry("service", categoryLabel, "Un-marked", categoryKey), ...(backToQc ? [entry("qc", categoryLabel, "Sent to QC", categoryKey)] : [])],
+    }), { summary: `Dispatch board: un-marked ${categoryLabel} done on ${job.plate}`, failText: `Couldn't undo finishing ${job.plate}` });
+    if (!patch) return;
+    applyLocal(job.id, { serviceDone: patch.service_done, history: patch.history });
+    setToast(null);
   };
 
   // Moves a job from one service category to another — this is how a
@@ -14067,88 +14935,59 @@ function DispatchBoard({ team, session }) {
   // different kind of work needs a fresh assignment, not a carried-over
   // one from whoever was doing the old job).
   const moveCategory = async (row, newCategoryKey) => {
-    markLocalWrite();
-    setSaving(true);
     const { job, categoryKey, categoryLabel } = row;
     const newLabel = SERVICES.find((s) => s.key === newCategoryKey)?.label || newCategoryKey;
-    const { ok: fetchOk, data } = await sbFetch(`jobs?id=eq.${job.id}&select=service_types,assigned_to,assigned_team,service_done,service_started,history`);
-    const current = fetchOk && data && data[0]
-      ? data[0]
-      : { service_types: job.serviceTypes, assigned_to: job.assignedTo, assigned_team: job.assignedTeam, service_done: job.serviceDone, service_started: job.serviceStarted, history: [] };
-    const nextServiceTypes = (current.service_types || []).filter((k) => k !== categoryKey);
-    if (!nextServiceTypes.includes(newCategoryKey)) nextServiceTypes.push(newCategoryKey);
-    const nextAssignedTo = { ...(current.assigned_to || {}) }; delete nextAssignedTo[categoryKey];
-    const nextAssignedTeam = { ...(current.assigned_team || {}) }; delete nextAssignedTeam[categoryKey];
-    const nextServiceDone = { ...(current.service_done || {}) }; delete nextServiceDone[categoryKey];
-    const nextServiceStarted = { ...(current.service_started || {}) }; delete nextServiceStarted[categoryKey];
-    const nextHistory = [
-      ...(current.history || []),
-      { stage: "service", label: `${categoryLabel} → ${newLabel}`, by: session.name, role: session.role, note: "Moved", at: Date.now() },
-    ];
-    withActivitySummary(`Dispatch board: moved ${job.plate} from ${categoryLabel} to ${newLabel}`);
-    const { ok } = await sbFetch(`jobs?id=eq.${job.id}`, {
-      method: "PATCH",
-      headers: { Prefer: "return=minimal" },
-      body: JSON.stringify({
+    const patch = await writeJob(job, "service_types,assigned_to,assigned_team,service_done,service_started,history", (cur) => {
+      const nextServiceTypes = (cur.service_types || []).filter((k) => k !== categoryKey);
+      if (!nextServiceTypes.includes(newCategoryKey)) nextServiceTypes.push(newCategoryKey);
+      const nextAssignedTo = { ...(cur.assigned_to || {}) }; delete nextAssignedTo[categoryKey];
+      const nextAssignedTeam = { ...(cur.assigned_team || {}) }; delete nextAssignedTeam[categoryKey];
+      const nextServiceDone = { ...(cur.service_done || {}) }; delete nextServiceDone[categoryKey];
+      const nextServiceStarted = { ...(cur.service_started || {}) }; delete nextServiceStarted[categoryKey];
+      return {
         service_types: nextServiceTypes, assigned_to: nextAssignedTo, assigned_team: nextAssignedTeam, service_done: nextServiceDone,
-        service_started: nextServiceStarted, history: nextHistory, updated_at: new Date().toISOString(),
-      }),
+        service_started: nextServiceStarted, history: [...(cur.history || []), entry("service", `${categoryLabel} → ${newLabel}`, "Moved")],
+      };
+    }, { summary: `Dispatch board: moved ${job.plate} from ${categoryLabel} to ${newLabel}`, failText: `Couldn't move ${job.plate} to ${newLabel}` });
+    if (!patch) return;
+    applyLocal(job.id, {
+      serviceTypes: patch.service_types, assignedTo: patch.assigned_to, assignedTeam: patch.assigned_team,
+      serviceDone: patch.service_done, serviceStarted: patch.service_started, history: patch.history,
     });
-    setSaving(false);
-    if (!ok) {
-      setAssignErrorToast(`Couldn't move ${job.plate} to ${newLabel} — check your connection and try again.`);
-      setTimeout(() => setAssignErrorToast(""), 6000);
-      return;
-    }
-    setJobs((prev) => prev.map((j) => (j.id === job.id
-      ? { ...j, serviceTypes: nextServiceTypes, assignedTo: nextAssignedTo, assignedTeam: nextAssignedTeam, serviceDone: nextServiceDone, serviceStarted: nextServiceStarted }
-      : j)));
     setSelectedRowKey(null); // the old (job, category) row this modal was showing no longer exists
+    showToast(`Moved ${job.plate} to ${newLabel}`, COLORS.gold, null, 3500);
   };
 
-  // Restricted by name, not a general permission. Originally Ahmed and
-  // Noel; Regan added alongside Noel now that Regan's scope of work
-  // includes Dispatch Board oversight (making sure the board's kept
-  // updated, and covering Noel's detailing/QC work). Written as its own
-  // history entry type ("progress_update") so the Live Updates admin
-  // board can pull just these out of the mix without picking up every
-  // Started/Finished/Moved/Assigned entry too.
-  const canWriteUpdate = ["ahmed", "noel", "regan"].includes((session.name || "").toLowerCase());
+  // Free-text updates stay restricted to these three (by id — the name
+  // check used "regan", but the live name is "Reagen", so Reagen could
+  // never post). The quick-update presets are open to whoever is working
+  // the board: they're fixed wording, and they're how a tech clears the
+  // "no update" warning on their own car. Written as their own history
+  // entry type ("progress_update") so the Live Updates admin board can
+  // pull just these out.
+  const canWriteUpdate = ["ahmed", "noel", "reagen"].includes(session.id) || ["ahmed", "noel", "reagen"].includes((session.name || "").toLowerCase());
   // Same 30s dupe gate as the JobDetail Admin Update box — stops a
   // double-tap on the same preset (e.g. "Started work" twice) from
   // logging twice, checked against the freshly-fetched history so it
   // still catches a duplicate posted from another device moments ago.
+  // Returns "ok", "dupe" or false.
   const DISPATCH_DUPE_UPDATE_WINDOW_MS = 30000;
-  const addProgressUpdate = async (row, text) => {
-    markLocalWrite();
-    setSaving(true);
-    const { job, categoryLabel } = row;
-    const { ok: fetchOk, data } = await sbFetch(`jobs?id=eq.${job.id}&select=history`);
-    const current = fetchOk && data && data[0] ? data[0] : { history: [] };
-    const recentSame = (current.history || [])
-      .filter((h) => h.stage === "progress_update" && h.note === text)
-      .slice(-1)[0];
-    if (recentSame && Date.now() - recentSame.at < DISPATCH_DUPE_UPDATE_WINDOW_MS) {
-      setSaving(false);
-      setDupeUpdateToast(`Already posted "${text}" on ${job.plate} — wait a moment before posting it again.`);
-      setTimeout(() => setDupeUpdateToast(""), 3000);
-      return;
+  const addProgressUpdate = async (row, text, { quiet = false } = {}) => {
+    const { job, categoryKey, categoryLabel } = row;
+    let dupe = false;
+    const patch = await writeJob(job, "history", (cur) => {
+      const recentSame = (cur.history || []).filter((h) => h && h.stage === "progress_update" && h.note === text).slice(-1)[0];
+      if (recentSame && Date.now() - recentSame.at < DISPATCH_DUPE_UPDATE_WINDOW_MS) { dupe = true; return null; }
+      return { history: [...(cur.history || []), entry("progress_update", categoryLabel, text, categoryKey)] };
+    }, { summary: `Dispatch board: ${session.name} posted an update on ${job.plate}`, failText: `Couldn't post the update on ${job.plate}` });
+    if (dupe) {
+      if (!quiet) showToast(`Already posted "${text}" on ${job.plate} — wait a moment before posting it again.`, COLORS.gold, null, 3000);
+      return "dupe";
     }
-    const nextHistory = [
-      ...(current.history || []),
-      { stage: "progress_update", label: categoryLabel, by: session.name, role: session.role, note: text, at: Date.now() },
-    ];
-    withActivitySummary(`Dispatch board: ${session.name} posted an update on ${job.plate}`);
-    const { ok } = await sbFetch(`jobs?id=eq.${job.id}`, {
-      method: "PATCH",
-      headers: { Prefer: "return=minimal" },
-      body: JSON.stringify({ history: nextHistory, updated_at: new Date().toISOString() }),
-    });
-    setSaving(false);
-    if (!ok) {
-      setAssignErrorToast(`Couldn't post the update on ${job.plate} — check your connection and try again.`);
-      setTimeout(() => setAssignErrorToast(""), 6000);
-    }
+    if (!patch) return false;
+    applyLocal(job.id, { history: patch.history });
+    if (!quiet) showToast(`Posted "${text}" on ${job.plate}`, themeColors.progress, null, 3500);
+    return "ok";
   };
 
   // Fully manual by request — no automatic location-based hiding.
@@ -14156,39 +14995,45 @@ function DispatchBoard({ team, session }) {
   // flag. Hides the *whole job* from the board, not just one category.
   const canManageVisibility = canManageDispatchVisibility(session);
   const toggleDispatchHidden = async (job, hide) => {
-    markLocalWrite();
-    setSaving(true);
-    const { ok: fetchOk, data } = await sbFetch(`jobs?id=eq.${job.id}&select=history`);
-    const current = fetchOk && data && data[0] ? data[0] : { history: [] };
-    const nextHistory = [
-      ...(current.history || []),
-      { stage: "dispatch_visibility", label: job.plate, by: session.name, role: session.role, note: hide ? "Hidden from Dispatch Board" : "Shown on Dispatch Board again", at: Date.now() },
-    ];
-    withActivitySummary(`Dispatch board: ${session.name} ${hide ? "hid" : "unhid"} ${job.plate}`);
-    setJobs((prev) => prev.map((j) => (j.id === job.id ? { ...j, dispatchHidden: hide } : j)));
-    const { ok } = await sbFetch(`jobs?id=eq.${job.id}`, {
-      method: "PATCH",
-      headers: { Prefer: "return=minimal" },
-      body: JSON.stringify({ dispatch_hidden: hide, history: nextHistory, updated_at: new Date().toISOString() }),
-    });
-    setSaving(false);
-    if (!ok) {
-      // This one applies its optimistic update before the write (unlike
-      // the others above), so on failure it needs an actual revert, not
-      // just skipping the update.
-      setJobs((prev) => prev.map((j) => (j.id === job.id ? { ...j, dispatchHidden: !hide } : j)));
-      setAssignErrorToast(`Couldn't ${hide ? "hide" : "unhide"} ${job.plate} — check your connection and try again.`);
-      setTimeout(() => setAssignErrorToast(""), 6000);
-      return;
-    }
+    applyLocal(job.id, { dispatchHidden: hide }); // optimistic — reverted below if the save fails
+    const patch = await writeJob(job, "history", (cur) => ({
+      dispatch_hidden: hide,
+      history: [...(cur.history || []), entry("dispatch_visibility", job.plate, hide ? "Hidden from Dispatch Board" : "Shown on Dispatch Board again")],
+    }), { summary: `Dispatch board: ${session.name} ${hide ? "hid" : "unhid"} ${job.plate}`, failText: `Couldn't ${hide ? "hide" : "unhide"} ${job.plate}` });
+    if (!patch) { applyLocal(job.id, { dispatchHidden: !hide }); return; }
+    applyLocal(job.id, { history: patch.history });
     if (hide) setSelectedRowKey(null); // it's about to disappear from the visible columns
   };
 
-  // ticket number in that column. Finished rows are dropped entirely —
-  // once cleared, it comes off the board rather than sitting there
-  // dimmed. Jobs with no service type yet ("_none") go into their own
-  // "needs classification" bucket rather than being dumped into a
-  // colored column with a meaningless badge.
+  // The 6:45 checklist's buttons, by item key + option text.
+  const runEndOfDayAction = async (key, option) => {
+    const row = rowsByKey[key];
+    if (!row) return true; // already gone from the board — nothing left to do
+    if (option === "Send to QC") return sendToQc(row);
+    if (option === "Passed") return passQc(row);
+    const res = await addProgressUpdate(row, option, { quiet: true });
+    return res === "ok" || res === "dupe";
+  };
+
+  const saveColors = async () => {
+    if (!colorDraft) return;
+    const resolved = resolveDispatchColors(colorDraft);
+    const changedOnly = {};
+    DISPATCH_THEME.forEach((t) => { if (resolved[t.key].toLowerCase() !== t.def.toLowerCase()) changedOnly[t.key] = resolved[t.key].toUpperCase(); });
+    setSavingColors(true);
+    withActivitySummary("Dispatch board: changed the board colours");
+    const ok = await saveDispatchColors(changedOnly, session);
+    setSavingColors(false);
+    if (!ok) { showError("Couldn't save the colours — check your connection and try again."); return; }
+    setSavedColors(changedOnly);
+    setColorDraft(null);
+    showToast("Colours saved. Every screen picks them up within a minute.", resolved.done);
+  };
+
+  // Finished rows are dropped entirely — once cleared, it comes off the
+  // board rather than sitting there dimmed. Jobs with no service type
+  // yet ("_none") go into their own "needs classification" strip rather
+  // than being dumped into a coloured column.
   const allRows = [];
   const hiddenJobs = []; // manually hidden jobs — shown in their own management panel, not the columns
   for (const job of jobs) {
@@ -14211,226 +15056,277 @@ function DispatchBoard({ team, session }) {
   }
 
   const rowsByKey = {};
-  allRows.forEach((r) => { rowsByKey[rowKey(r.job.id, r.categoryKey)] = r; });
-
-  const unclassifiedRows = allRows.filter((r) => r.categoryKey === "_none");
-  const detailingRows = allRows.filter((r) => r.role === "detailing");
-  const otherRows = allRows.filter((r) => r.role !== "detailing" && r.categoryKey !== "_none");
-
-  // Staff workload glance — how many active (not-done) rows each
-  // person currently carries across both columns, computed from what's
-  // already loaded (no extra fetch). Sorted busiest-first.
-  const workloadByStaff = {};
+  const views = []; // every classified row with its derived state
   for (const r of allRows) {
-    for (const id of r.job.assignedTeam[r.categoryKey] || []) {
-      const staffName = team.find((m) => m.id === id)?.name || id;
-      workloadByStaff[staffName] = (workloadByStaff[staffName] || 0) + 1;
+    const key = rowKey(r.job.id, r.categoryKey);
+    rowsByKey[key] = r;
+    if (r.categoryKey === "_none") continue;
+    views.push({ key, row: r, info: dispatchRowInfo(r.job, r.categoryKey, r.categoryLabel, nowTick) });
+  }
+  const unclassifiedRows = allRows.filter((r) => r.categoryKey === "_none");
+  const detailingViews = views.filter((v) => v.row.role === "detailing");
+  const otherViews = views.filter((v) => v.row.role !== "detailing");
+  const nameOf = (id) => team.find((m) => m.id === id)?.name || id;
+  const colorFor = (v) => {
+    if (leavingKeys[v.key]) return themeColors.done;
+    const theme = DISPATCH_STATES[v.info.state].theme;
+    return theme ? themeColors[theme] : COLORS.muted;
+  };
+
+  // "On the floor": everyone with a car, busiest first, as pills; with
+  // up to ~17 techs, the free ones are one compact green line instead.
+  const workload = {};
+  for (const v of views) {
+    const working = !!v.info.startedAt && v.info.state !== "qc" && v.info.state !== "qclate";
+    for (const id of v.info.assigned) {
+      const e = workload[id] || (workload[id] = { cars: 0, working: false });
+      e.cars += 1;
+      if (working) e.working = true;
     }
   }
-  const workloadSorted = Object.entries(workloadByStaff).sort((a, b) => b[1] - a[1]);
+  const busy = Object.entries(workload)
+    .map(([id, e]) => ({ id, name: nameOf(id), ...e }))
+    .sort((a, b) => b.cars - a.cars || a.name.localeCompare(b.name));
+  const freeNames = team
+    .filter((m) => !["admin", "intake", "accountant"].includes(m.role) && !isSmartechPortal(m) && !workload[m.id])
+    .map((m) => m.name);
 
-  // Unified alerts count — the three separate signals that used to be
-  // scattered (stale-unassigned border, stale-in-progress border, the
-  // classification strip) rolled into one glanceable number. Same
-  // thresholds as the per-card borders, just tallied.
-  let staleUnassignedCount = 0;
-  let staleInProgressCount = 0;
-  for (const r of allRows) {
-    if (r.categoryKey === "_none") continue;
-    const assignedIds = r.job.assignedTeam[r.categoryKey] || [];
-    const startedAt = r.job.serviceStarted[r.categoryKey];
-    const isDone = r.job.serviceDone[r.categoryKey];
-    if (isDone) continue;
-    if (!startedAt && assignedIds.length === 0 && businessMsElapsed(r.job.createdAt, nowTick) > STALE_UNASSIGNED_MS) staleUnassignedCount += 1;
-    else if (startedAt && businessMsElapsed(new Date(startedAt).getTime(), nowTick) > STALE_IN_PROGRESS_MS) staleInProgressCount += 1;
-  }
-  const totalAlerts = staleUnassignedCount + staleInProgressCount + unclassifiedRows.length;
+  // One glanceable alerts number: needs someone + no update + QC waiting
+  // + no service type — the same states the cards pulse for.
+  const alertCounts = { late: 0, stale: 0, qclate: 0 };
+  views.forEach((v) => { if (v.info.state in alertCounts) alertCounts[v.info.state] += 1; });
+  const totalAlerts = alertCounts.late + alertCounts.stale + alertCounts.qclate + unclassifiedRows.length;
 
   const selectedRow = selectedRowKey ? rowsByKey[selectedRowKey] : null;
+  const selectedView = selectedRow ? views.find((v) => v.key === selectedRowKey) || null : null;
 
-  const Column = ({ title, accent, rowsForColumn }) => (
-    <div style={{ flex: 1, minWidth: 0, display: "flex", flexDirection: "column", background: "#101215", border: `1px solid ${COLORS.line}`, borderRadius: 14, overflow: "hidden" }}>
-      <div style={{ padding: "14px 16px", borderBottom: `2px solid ${accent}`, display: "flex", alignItems: "center", justifyContent: "space-between" }}>
-        <div style={{ fontFamily: DISPLAY_FONT, fontWeight: 700, fontSize: 17, color: accent }}>{title}</div>
-        <div style={{ fontSize: 12, fontWeight: 700, color: accent, background: `${accent}22`, borderRadius: 999, padding: "2px 10px" }}>{rowsForColumn.length}</div>
-      </div>
-      <div style={{ padding: 14, overflowY: "auto", flex: 1, minHeight: 200 }}>
-        {rowsForColumn.length === 0 ? (
-          <div style={{ textAlign: "center", color: COLORS.muted, fontSize: 13, marginTop: 30 }}>Nothing here right now</div>
-        ) : (
-          rowsForColumn.map((r, i) => {
-            const key = rowKey(r.job.id, r.categoryKey);
-            return (
-              <DispatchJobCard
-                key={key}
-                row={r}
-                ticketNo={i + 1}
-                isDone={!!r.job.serviceDone[r.categoryKey]}
-                isStarted={!!r.job.serviceStarted[r.categoryKey]}
-                startedAt={r.job.serviceStarted[r.categoryKey] || null}
-                now={nowTick}
-                assignedNames={(r.job.assignedTeam[r.categoryKey] || []).map((id) => team.find((m) => m.id === id)?.name || id)}
-                onClick={() => openRow(key, r.job.id)}
-              />
-            );
-          })
-        )}
-      </div>
-    </div>
-  );
+  const renderCard = (v, i) => {
+    const { info, row } = v;
+    const meta = DISPATCH_STATES[info.state];
+    const leaving = !!leavingKeys[v.key];
+    let timerLabel = "";
+    let timerText;
+    let timerMuted = false;
+    if (info.state === "qc" || info.state === "qclate") { timerLabel = "WAITING"; timerText = dispatchElapsed(info.qcAt, nowTick); }
+    else if (info.startedAt) {
+      if (info.state === "stale") { timerLabel = "LAST UPDATE"; timerText = dispatchElapsed(info.lastUpdateAt, nowTick); }
+      else timerText = dispatchElapsed(info.startedAt, nowTick);
+    } else { timerLabel = "IN"; timerText = dispatchElapsed(row.job.createdAt, nowTick); timerMuted = true; }
+    return (
+      <DispatchJobCard
+        key={v.key}
+        rowId={v.key}
+        jobId={row.job.id}
+        ticketNo={i + 1}
+        plate={row.job.plate}
+        model={row.job.makeModel || ""}
+        categoryLabel={row.categoryLabel}
+        todo={dispatchWhatToDo(row.job, row.categoryKey) || ""}
+        stateLabel={leaving ? "Finished" : meta.label}
+        color={colorFor(v)}
+        pulse={meta.pulse && !leaving}
+        timerLabel={timerLabel}
+        timerText={timerText}
+        timerMuted={timerMuted}
+        redoReason={info.redoReason || ""}
+        people={info.assigned.map((id) => ({ id, name: nameOf(id) }))}
+        arriving={!!arrivingKeys[v.key]}
+        leaving={leaving}
+        onOpen={openRow}
+      />
+    );
+  };
+  const renderColumn = (title, dot, list) => {
+    const warn = list.filter((v) => DISPATCH_STATES[v.info.state].pulse).length;
+    return (
+      <section className="dsp-col" aria-label={title}>
+        <div className="dsp-col-h">
+          <span className="dsp-dot" style={{ background: dot }} />
+          <h2>{title}</h2>
+          {warn > 0 && <span className="dsp-warn">{warn} need{warn === 1 ? "s" : ""} a look</span>}
+          <span className="dsp-n">{list.length}</span>
+        </div>
+        <div className="dsp-list">
+          {list.length === 0
+            ? <div className="dsp-empty">{loading ? "Loading…" : "All clear."}</div>
+            : list.map(renderCard)}
+        </div>
+      </section>
+    );
+  };
 
   const selectedTicketNo = selectedRow
-    ? (selectedRow.categoryKey === "_none" ? unclassifiedRows : selectedRow.role === "detailing" ? detailingRows : otherRows).findIndex((r) => rowKey(r.job.id, r.categoryKey) === selectedRowKey) + 1
+    ? (selectedRow.categoryKey === "_none"
+      ? unclassifiedRows.findIndex((r) => rowKey(r.job.id, r.categoryKey) === selectedRowKey)
+      : (selectedRow.role === "detailing" ? detailingViews : otherViews).findIndex((v) => v.key === selectedRowKey)) + 1
     : null;
 
   return (
-    <div className="mrcap-view" style={{ padding: 16, display: "flex", flexDirection: "column", gap: 14, minHeight: "calc(100vh - 80px)" }}>
-      {dupeUpdateToast && createPortal(
-        <div style={{ position: "fixed", bottom: 18, right: 18, left: 18, zIndex: 9999, display: "flex", justifyContent: "flex-end", pointerEvents: "none" }}>
-          <div style={{ maxWidth: 340, width: "100%", background: COLORS.panel, border: `1px solid ${COLORS.gold}`, borderRadius: 12, padding: "12px 14px", boxShadow: "0 10px 26px rgba(0,0,0,0.5)", color: COLORS.gold, fontSize: 12.5, fontWeight: 600 }}>
-            {dupeUpdateToast}
-          </div>
-        </div>,
-        document.body
-      )}
-      {assignErrorToast && createPortal(
-        <div style={{ position: "fixed", top: 18, right: 18, left: 18, zIndex: 9999, display: "flex", justifyContent: "flex-end", pointerEvents: "none" }}>
-          <div style={{ maxWidth: 340, width: "100%", background: COLORS.panel, border: `1px solid ${COLORS.red}`, borderRadius: 12, padding: "12px 14px", boxShadow: "0 10px 26px rgba(0,0,0,0.5)", color: COLORS.red, fontSize: 12.5, fontWeight: 600 }}>
-            {assignErrorToast}
-          </div>
-        </div>,
-        document.body
-      )}
-      <div style={{ display: "flex", justifyContent: "space-between", alignItems: "flex-end", flexWrap: "wrap", gap: 10 }}>
-        <div style={{ display: "flex", alignItems: "center", gap: 12 }}>
-          <div style={{ width: 46, height: 46, borderRadius: 11, background: "#fff", display: "flex", alignItems: "center", justifyContent: "center", padding: "7px 9px", boxSizing: "border-box", flexShrink: 0, border: `1px solid ${COLORS.line}`, boxShadow: `0 0 0 1px rgba(74,100,120,0.35), 0 8px 20px -10px rgba(0,0,0,0.6)` }}>
-            <img src={LOGO_LOCKUP_SRC} alt="Mr.CAP. / Beneloom" style={{ width: "100%", height: "100%", objectFit: "contain" }} />
-          </div>
+    <div className={`mrcap-view dsp-root dsp-u${fill ? " dsp-fill" : ""}`} onClickCapture={unlockDispatchAudio}>
+      <style>{DISPATCH_CSS}</style>
+      <div className={`dsp-board${fill ? " dsp-fill" : ""}`}>
+        <header className="dsp-head">
           <div>
-          <div style={{ display: "flex", alignItems: "center", gap: 10 }}>
-            <div style={{ fontFamily: DISPLAY_FONT, fontWeight: 700, fontSize: 20, color: COLORS.ink }}>Dispatch Board</div>
-            {totalAlerts > 0 && (
-              <button
-                onClick={() => setShowAlertsDetail((v) => !v)}
-                className="mrcap-press"
-                style={{ display: "flex", alignItems: "center", gap: 5, background: "rgba(168,64,47,0.15)", border: `1px solid ${COLORS.red}`, borderRadius: 999, padding: "3px 10px 3px 8px", cursor: "pointer" }}
-              >
-                <AlertCircle size={12} color={COLORS.red} />
-                <span style={{ fontSize: 12, fontWeight: 700, color: COLORS.red }}>{totalAlerts} alert{totalAlerts === 1 ? "" : "s"}</span>
+            <div className="dsp-eyebrow">MR.CAP.</div>
+            <h1 className="dsp-title">Dispatch</h1>
+          </div>
+          <DispatchClock>
+            {isSuperAdmin(session) && (
+              <button type="button" className="dsp-cust" onClick={() => { setSelectedRowKey(null); setColorDraft({ ...savedColors }); }}>
+                <Palette /> Colours
               </button>
             )}
-          </div>
-          <div style={{ fontSize: 12, color: COLORS.muted, marginTop: 2 }}>
-            {loading ? "Loading…" : `${sortOrder === "priority" ? "Priority" : sortOrder === "oldest" ? "Oldest" : "Newest"} first · updates automatically · last checked ${new Date().toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" })}`}
-          </div>
-          {showAlertsDetail && totalAlerts > 0 && (
-            <div className="mrcap-fade" style={{ marginTop: 8, fontSize: 12, color: COLORS.muted, display: "flex", flexDirection: "column", gap: 3 }}>
-              {staleUnassignedCount > 0 && <div>• {staleUnassignedCount} sitting unassigned too long</div>}
-              {staleInProgressCount > 0 && <div>• {staleInProgressCount} in progress too long — check on these</div>}
-              {unclassifiedRows.length > 0 && <div>• {unclassifiedRows.length} still need a service type</div>}
+            <DispatchSoundPill />
+          </DispatchClock>
+        </header>
+
+        <div className="dsp-floor">
+          <div className="dsp-floor-lab"><span>On the floor</span><span>cars each</span></div>
+          {busy.length > 0 ? (
+            <div className="dsp-pills">
+              {busy.map((p) => (
+                <div key={p.id} className="dsp-pill">
+                  <DispatchAvatar id={p.id} name={p.name} />
+                  <div style={{ minWidth: 0 }}>
+                    <div className="dsp-pill-nm">{p.name}</div>
+                    <div className="dsp-pill-ct">{p.cars} car{p.cars === 1 ? "" : "s"}{p.working ? " · working" : ""}</div>
+                  </div>
+                </div>
+              ))}
             </div>
+          ) : (
+            <div className="dsp-free dsp-free-none">{loading ? "Loading…" : "Nobody has a car assigned right now."}</div>
           )}
+          {freeNames.length > 0 && <div className="dsp-free"><b>Free:</b> {freeNames.join(", ")}</div>}
         </div>
-        </div>
-        <div style={{ display: "flex", gap: 6, background: COLORS.panel2, borderRadius: 10, padding: 3 }}>
-          {["oldest", "newest", "priority"].map((opt) => (
-            <button
-              key={opt}
-              onClick={() => setSortOrder(opt)}
-              className="mrcap-press"
-              style={{
-                padding: "7px 14px", borderRadius: 8, border: "none", cursor: "pointer",
-                background: sortOrder === opt ? COLORS.gold : "transparent",
-                color: sortOrder === opt ? COLORS.darkText : COLORS.muted,
-                fontSize: 12.5, fontWeight: 700, textTransform: "capitalize",
-              }}
-            >
-              {opt === "priority" ? "Priority first" : `${opt} first`}
-            </button>
-          ))}
-        </div>
-      </div>
-      {workloadSorted.length > 0 && (
-        <div style={{ display: "flex", gap: 7, overflowX: "auto", paddingBottom: 2 }}>
-          {workloadSorted.map(([name, count]) => (
-            <div key={name} style={{ flexShrink: 0, fontSize: 12, color: COLORS.ink, background: COLORS.panel2, border: `1px solid ${COLORS.line}`, borderRadius: 999, padding: "6px 12px" }}>
-              <span style={{ fontWeight: 700 }}>{name}</span> <span style={{ color: COLORS.muted }}>· {count} active</span>
-            </div>
-          ))}
-        </div>
-      )}
-      {unclassifiedRows.length > 0 && (
-        <div style={{ background: "#1a1408", border: `1px solid ${COLORS.gold}55`, borderRadius: 12, padding: 14 }}>
-          <div style={{ fontSize: 12.5, fontWeight: 700, color: COLORS.goldBright, marginBottom: 10 }}>
-            ⚠ {unclassifiedRows.length} job{unclassifiedRows.length === 1 ? "" : "s"} need{unclassifiedRows.length === 1 ? "s" : ""} a service type — tap to classify
+
+        <div className="dsp-legend">
+          <div className="dsp-legend-keys">
+            {[["new", "New"], ["late", "Needs someone"], ["assigned", "Assigned"], ["progress", "In progress"], ["stale", "No update"], ["qc", "QC"]].map(([k, l]) => (
+              <span key={k}><i style={{ background: themeColors[k] }} />{l}</span>
+            ))}
           </div>
-          <div style={{ display: "flex", gap: 9, overflowX: "auto", paddingBottom: 2 }}>
-            {unclassifiedRows.map((r) => (
-              <div
-                key={rowKey(r.job.id, r.categoryKey)}
-                onClick={() => openRow(rowKey(r.job.id, r.categoryKey), r.job.id)}
-                className="mrcap-press"
-                style={{
-                  flexShrink: 0, minWidth: 160, background: COLORS.panel, border: `1px solid ${COLORS.line}`,
-                  borderRadius: 10, padding: 10, cursor: "pointer",
-                }}
-              >
-                <div style={{ fontFamily: MONO_FONT, fontWeight: 700, fontSize: 13, color: COLORS.ink }}>{r.job.plate}</div>
-                <div style={{ fontSize: 11.5, color: COLORS.muted }}>{r.job.makeModel}</div>
+          <div className="dsp-legend-ctl">
+            {totalAlerts > 0 && (
+              <button type="button" className="dsp-alerts" onClick={() => setShowAlertsDetail((v) => !v)} aria-expanded={showAlertsDetail}>
+                <AlertCircle size={14} /> {totalAlerts} alert{totalAlerts === 1 ? "" : "s"}
+              </button>
+            )}
+            <div className="dsp-sort" role="group" aria-label="Sort">
+              {["oldest", "newest", "priority"].map((opt) => (
+                <button key={opt} type="button" className={sortOrder === opt ? "on" : ""} aria-pressed={sortOrder === opt} onClick={() => setSortOrder(opt)}>
+                  {opt === "priority" ? "Priority first" : opt === "oldest" ? "Oldest first" : "Newest first"}
+                </button>
+              ))}
+            </div>
+          </div>
+        </div>
+        {showAlertsDetail && totalAlerts > 0 && (
+          <div className="dsp-alerts-detail mrcap-fade">
+            {alertCounts.late > 0 && <div>• {alertCounts.late} sitting with nobody assigned for over an hour</div>}
+            {alertCounts.stale > 0 && <div>• {alertCounts.stale} in progress with no update for 3+ hours — check on these</div>}
+            {alertCounts.qclate > 0 && <div>• {alertCounts.qclate} waiting on QC for over 30 minutes</div>}
+            {unclassifiedRows.length > 0 && <div>• {unclassifiedRows.length} still need a service type</div>}
+          </div>
+        )}
+
+        {unclassifiedRows.length > 0 && (
+          <div className="dsp-unclass">
+            <div className="dsp-unclass-h">
+              ⚠ {unclassifiedRows.length} job{unclassifiedRows.length === 1 ? "" : "s"} need{unclassifiedRows.length === 1 ? "s" : ""} a service type — tap to classify
+            </div>
+            <div className="dsp-unclass-list">
+              {unclassifiedRows.map((r) => (
+                <button key={rowKey(r.job.id, r.categoryKey)} type="button" className="dsp-unclass-item" onClick={() => openRow(rowKey(r.job.id, r.categoryKey), r.job.id)}>
+                  <DispatchPlate plate={r.job.plate} />
+                  {r.job.makeModel ? <span className="m">{r.job.makeModel}</span> : null}
+                </button>
+              ))}
+            </div>
+          </div>
+        )}
+
+        <div className="dsp-cols">
+          {renderColumn("Detailing", COLORS.gold, detailingViews)}
+          {renderColumn("Body · Dent · PPF", COLORS.blueText, otherViews)}
+        </div>
+
+        {canManageVisibility && hiddenJobs.length > 0 && (
+          <div className="dsp-hidden">
+            <div className="dsp-hidden-h">Hidden from board ({hiddenJobs.length}) — visible only to you</div>
+            {hiddenJobs.map((job) => (
+              <div key={job.id} className="dsp-hidden-row">
+                <div style={{ minWidth: 0 }}>
+                  <PlateChip plate={job.plate} size="sm" />
+                  <span className="m">{job.makeModel}{job.location ? ` · ${job.location}` : ""}</span>
+                </div>
+                <button type="button" disabled={saving} onClick={() => toggleDispatchHidden(job, false)}>Show again</button>
               </div>
             ))}
           </div>
-        </div>
-      )}
-      <div style={{ display: "flex", gap: 14, flex: 1, minHeight: 0, flexWrap: "wrap" }}>
-        <Column title="Detailing" accent={COLORS.red} rowsForColumn={detailingRows} />
-        <Column title="Denting / Bodyshop / PPF" accent={COLORS.blue} rowsForColumn={otherRows} />
+        )}
       </div>
+
       {selectedRow && (
         <DispatchDetailModal
+          key={selectedRowKey}
           row={selectedRow}
+          info={selectedView ? selectedView.info : null}
+          color={selectedView ? colorFor(selectedView) : COLORS.line}
           ticketNo={selectedTicketNo}
-          isDone={!!selectedRow.job.serviceDone[selectedRow.categoryKey]}
-          isStarted={!!selectedRow.job.serviceStarted[selectedRow.categoryKey]}
-          startedAt={selectedRow.job.serviceStarted[selectedRow.categoryKey] || null}
           now={nowTick}
+          session={session}
+          team={team}
           assignedIds={selectedRow.job.assignedTeam[selectedRow.categoryKey] || []}
-          assignedNames={(selectedRow.job.assignedTeam[selectedRow.categoryKey] || []).map((id) => team.find((m) => m.id === id)?.name || id)}
           staffOptions={staffForRole(team, selectedRow.role)}
           moveOptions={SERVICES.filter((s) => s.key !== selectedRow.categoryKey)}
           canWriteUpdate={canWriteUpdate}
           canManageVisibility={canManageVisibility}
+          canFinishDirect={canFinishDirect}
           onClose={() => setSelectedRowKey(null)}
-          onToggleDone={toggleDone}
-          onToggleStarted={toggleStarted}
+          onStart={(row) => toggleStarted(row, true)}
+          onUnstart={(row) => toggleStarted(row, false)}
+          onSendToQc={sendToQc}
+          onPassQc={passQc}
+          onFailQc={failQc}
+          onFinishDirect={finishDirect}
           onAssign={toggleTeamAssign}
           onMove={moveCategory}
-          onAddUpdate={addProgressUpdate}
+          onAddUpdate={(row, text) => addProgressUpdate(row, text)}
           onToggleHidden={toggleDispatchHidden}
           saving={saving}
         />
       )}
-      {canManageVisibility && hiddenJobs.length > 0 && (
-        <div style={{ background: "#141414", border: `1px solid ${COLORS.line}`, borderRadius: 12, padding: 14, marginTop: 4 }}>
-          <div style={{ fontSize: 12.5, fontWeight: 700, color: COLORS.muted, marginBottom: 10 }}>
-            Hidden from board ({hiddenJobs.length}) — visible only to you
-          </div>
-          <div style={{ display: "flex", flexDirection: "column", gap: 8 }}>
-            {hiddenJobs.map((job) => (
-              <div key={job.id} style={{ display: "flex", justifyContent: "space-between", alignItems: "center", background: COLORS.panel2, borderRadius: 8, padding: "9px 12px" }}>
-                <div>
-                  <PlateChip plate={job.plate} size="sm" />
-                  <span style={{ fontSize: 12, color: COLORS.muted, marginLeft: 8 }}>{job.makeModel}{job.location ? ` · ${job.location}` : ""}</span>
-                </div>
-                <button onClick={() => toggleDispatchHidden(job, false)} className="mrcap-press" style={{ padding: "5px 12px", borderRadius: 999, border: `1px solid ${COLORS.gold}`, background: "transparent", color: COLORS.gold, fontSize: 11.5, fontWeight: 700, cursor: "pointer" }}>
-                  Show again
-                </button>
-              </div>
-            ))}
-          </div>
-        </div>
+      {colorDraft && isSuperAdmin(session) && (
+        <DispatchColorCustomiser
+          saved={savedColors}
+          draft={colorDraft}
+          setDraft={setColorDraft}
+          onCancel={() => setColorDraft(null)}
+          onSave={saveColors}
+          saving={savingColors}
+        />
       )}
-      {showEndOfDayReminder && <DispatchEndOfDayReminder onDismiss={dismissEndOfDayReminder} unclassifiedCount={unclassifiedRows.length} />}
+      {toast && createPortal(
+        <div className="dsp-u dsp-toast" role="status">
+          <div className={toast.undo ? "" : "noundo"} style={dispatchColorVars(toast.color)}>
+            <span>{toast.text}</span>
+            {toast.undo && (
+              <button type="button" onClick={() => { const undo = toast.undo; setToast(null); undo(); }}>Undo</button>
+            )}
+          </div>
+        </div>,
+        document.body
+      )}
+      {showEndOfDayReminder && !loading && (
+        <DispatchEndOfDayChecklist
+          views={views}
+          session={session}
+          unclassifiedCount={unclassifiedRows.length}
+          onAction={runEndOfDayAction}
+          onDismiss={dismissEndOfDayReminder}
+        />
+      )}
     </div>
   );
 }
@@ -14455,7 +15351,8 @@ const PROGRESS_UPDATE_DUPE_WINDOW_MS = 30000;
 async function postProgressUpdateToJob(jobId, text, session) {
   const trimmed = (text || "").trim();
   if (!trimmed || !jobId || !session) return { ok: false };
-  const { ok, data } = await sbFetch(`jobs?id=eq.${jobId}&select=history,plate,make_model`);
+  const { ok, data, stale } = await sbFetch(`jobs?id=eq.${jobId}&select=history,plate,make_model`);
+  if (stale) return { ok: false };
   const current = ok && data && data[0] ? data[0] : null;
   if (!current) return { ok: false };
   const recentSame = (current.history || [])
@@ -14470,6 +15367,7 @@ async function postProgressUpdateToJob(jobId, text, session) {
     method: "PATCH",
     headers: { Prefer: "return=minimal" },
     body: JSON.stringify({ history: nextHistory, updated_at: new Date().toISOString() }),
+    noQueue: true,
   });
   if (!writeOk) return { ok: false };
   return { ok: true, entry: { jobId, plate: current.plate, makeModel: current.make_model, ...entry } };
@@ -14970,14 +15868,15 @@ function UpdatePreviewModal({ update, onClose, onOpenJob, session, onPosted }) {
 /* ---------------- Dispatch Kiosk (standalone entry point) ----------------
    Reachable directly at /dispatch — bypasses the normal staff-PIN login
    entirely. Regular staff just tap their name and go straight in, no
-   PIN, fast for a shared tablet passed between people all day. The four
-   people who can also manage what shows on the board (AJF, Ahmed,
-   Laani, Mr Cap — see canManageDispatchVisibility) get an extra PIN
-   step using their real, existing PIN — same credential as the full
-   app, not a new shared code — which unlocks the admin controls
-   (hide/show, etc.) right there on the tablet. Session persists in its
-   own localStorage key, separate from the main app's session, so
-   logging into one doesn't affect the other. */
+   PIN, fast for a shared tablet passed between people all day. QC
+   approvers (Noel, Reagen, Ahmed) and admins — by id, see the
+   KIOSK_PIN_IDS list in `pick` below — get an extra PIN step using
+   their real, existing PIN — same credential as the full app, not a
+   new shared code — which unlocks QC actions and (for the subset who
+   also pass canManageDispatchVisibility) the board-visibility controls
+   right there on the tablet. Session persists in its own localStorage
+   key, separate from the main app's session, so logging into one
+   doesn't affect the other. */
 export function DispatchKiosk() {
   const [team, setTeam] = useState(DEFAULT_TEAM);
   const [ready, setReady] = useState(false);
@@ -14995,7 +15894,12 @@ export function DispatchKiosk() {
 
   useEffect(() => {
     (async () => {
-      setTeam(await loadTeam());
+      // Same dynamic categories/roles load the main app does on mount, so
+      // the TV shows whatever category names are currently configured
+      // instead of the hardcoded defaults (which is also what QC-state
+      // matching by category key relies on lining up).
+      const [t] = await Promise.all([loadTeam(), loadDynamicServicesAndRoles()]);
+      setTeam(t);
       setReady(true);
     })();
     // This tablet stays open all day — pick up anyone added since it loaded
@@ -15032,8 +15936,12 @@ export function DispatchKiosk() {
   };
 
   const pick = (member) => {
-    const needsPin = ["ajf", "ahmed", "laani", "mr.cap"].includes((member.name || "").toLowerCase());
-    // Gate on the admin name list alone now, not member.pin's presence
+    // QC approvers and admins by id — a name can be renamed (e.g. "Lani"
+    // vs. "laani") but the id is stable. Anyone whose role is "admin"
+    // also needs the PIN, even if their id isn't in the fixed list.
+    const KIOSK_PIN_IDS = ["noel", "reagen", "ahmed", "laani", "suhail", "owner"];
+    const needsPin = KIOSK_PIN_IDS.includes(member.id) || member.role === "admin";
+    // Gate on the id/role list alone now, not member.pin's presence
     // — that field is never fetched anymore (verify-pin checks it
     // server-side instead), so it would always be falsy here.
     if (needsPin) {
@@ -15078,19 +15986,23 @@ export function DispatchKiosk() {
   }
 
   if (session) {
+    // Exactly one screen tall: the board fills whatever is left under the
+    // user bar and scrolls its two columns inside themselves, so the
+    // header, clock and workload strip stay in view on the TV. (On a
+    // narrow phone the board stacks the columns and scrolls as a whole.)
     return (
-      <div style={{ minHeight: "100vh", background: "#0b0b0c" }}>
-        <div style={{ height: 3, background: COLORS.blue }} />
-        <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", padding: "10px 16px", borderBottom: `1px solid ${COLORS.line}` }}>
-          <div style={{ fontSize: 12, color: COLORS.muted }}>Working the board as <span style={{ color: COLORS.ink, fontWeight: 700 }}>{session.name}</span></div>
-          <button onClick={switchUser} className="mrcap-press" style={{ fontSize: 11.5, color: COLORS.muted, background: "none", border: `1px solid ${COLORS.line}`, borderRadius: 999, padding: "5px 12px", cursor: "pointer" }}>
+      <div className="dsp-u dsp-kiosk">
+        <div style={{ height: 3, background: COLORS.blue, flexShrink: 0 }} />
+        <div className="dsp-userbar">
+          <div>Working the board as <b>{session.name}</b></div>
+          <button type="button" onClick={switchUser} className="dsp-userbar-sw">
             Switch user
           </button>
         </div>
         {showMorningReminder && <MorningReminderBanner onDismiss={() => { setShowMorningReminder(false); dismissMorningReminder("mrcap_kiosk"); }} />}
         <AnnouncementBanner session={session} />
         <LiveUpdateBroadcaster />
-        <DispatchBoard team={team} session={session} />
+        <DispatchBoard team={team} session={session} fill />
       </div>
     );
   }
