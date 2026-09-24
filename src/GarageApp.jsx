@@ -19,6 +19,11 @@ import {
   PAYMENT_METHODS, CHEQUE_STATUSES, paymentSummary, linesFromInvoiceRows, blankLine, issueProblems, reconcileCsv, formatLongDate,
 } from "./billing.js";
 import ReportsDashboard from "./ReportsDashboard.jsx";
+import {
+  buildSheet, SHAPE_LABEL, SHAPE_ZONES, TINT_KEYS, PARTIAL_OK, PRESETS, PRESET_ORDER, ZNAME, zoneName, groupOf,
+  allZones, presetZones, makeScope, rescope, scopeKeys, scopeLabel, breakdown as ppfBreakdown, nextZoneState, zonesFor,
+  isZoneActive, computeTotals as ppfComputeTotals, hasSpare as ppfHasSpare, PPF_SVG_DEFS, injectPPFDiagramStyles,
+} from "./ppfDiagram.js";
 
 /* ---------------------------------------------------------------
    Mr.CAP — Vehicle Workflow Tracker
@@ -167,6 +172,16 @@ function isSimplifiedRole(session) {
 // keeps working until every device is confirmed on the new bundle.
 function isSmartechPortal(member) {
   return !!member && (member.dashboardMode === "smartech" || member.dashboardMode === "subcontractor");
+}
+
+// A 5th dashboardMode value: routes straight into the PPF Room kiosk
+// screen (see PPFRoomKiosk) before the normal Shell/nav ever renders —
+// same "scoped portal, not a screen someone navigates to" pattern as
+// isSmartechPortal above. No prices, no customer name/phone anywhere on
+// this screen, and it stays logged in overnight (exempt from
+// checkAutoLogout — see the two call sites).
+function isPPFRoomKiosk(member) {
+  return !!member && member.dashboardMode === "ppfroom";
 }
 
 // Who can review/approve Smartech's submitted purchases: every admin,
@@ -1405,19 +1420,35 @@ async function findOrCreateCustomer(name, phone, customerType) {
   });
   return created && data ? data[0] : null;
 }
-async function findOrCreateVehicle(customerId, plate, makeModel) {
+async function findOrCreateVehicle(customerId, plate, makeModel, vehicleDetails = {}) {
+  const { make, model, modelYear, color, bodyType } = vehicleDetails;
+  const detailFields = {
+    ...(make ? { make } : {}), ...(model ? { model } : {}), ...(modelYear ? { model_year: modelYear } : {}),
+    ...(color ? { color } : {}), ...(bodyType ? { body_type: bodyType } : {}),
+  };
   const { ok, data } = await sbFetch(`vehicles?plate=eq.${encodeURIComponent(plate)}&select=*&limit=1`);
   if (ok && data && data.length) {
     // Ownership is only ever changed when the person at intake has
     // explicitly confirmed it (via the "different owner now" choice in the
     // form) — never silently, since a typo'd plate could otherwise
     // reassign someone else's car without anyone noticing.
+    //
+    // Vehicle details (make/model/year/colour/body type) DO get kept
+    // current here, though — intake is the one place these are actually
+    // entered, so the next lookup of this plate should see the latest.
+    if (Object.keys(detailFields).length) {
+      const { ok: patched } = await sbFetch(`vehicles?id=eq.${data[0].id}`, {
+        method: "PATCH",
+        body: JSON.stringify({ ...detailFields, updated_at: new Date().toISOString() }),
+      });
+      if (patched) return { ...data[0], ...detailFields };
+    }
     return data[0];
   }
   const { ok: created, data: createdData } = await sbFetch("vehicles", {
     method: "POST",
     headers: { Prefer: "return=representation" },
-    body: JSON.stringify([{ customer_id: customerId, plate, make_model: makeModel }]),
+    body: JSON.stringify([{ customer_id: customerId, plate, make_model: makeModel, ...detailFields }]),
   });
   return created && createdData ? createdData[0] : null;
 }
@@ -1451,6 +1482,15 @@ function rowToJob(r) {
   const job = {
     id: r.id, customerId: r.customer_id, vehicleId: r.vehicle_id,
     plate: r.plate, makeModel: r.make_model, customerName: r.customer_name, customerPhone: r.customer_phone,
+    // Structured vehicle fields, layered on top of the legacy makeModel
+    // combined string (see composeMakeModel) — every existing reader
+    // that only knows makeModel keeps working untouched.
+    make: r.make || "", model: r.model || "", modelYear: r.model_year || "", color: r.color || "", bodyType: r.body_type || "",
+    // PPF Room feature: ppfScope is Ahmed's scope (set on the job card),
+    // ppfProgress is the tablet's tap progress — both just round-tripped
+    // here so any other save on this job never clobbers them.
+    ppfScope: r.ppf_scope || null,
+    ppfProgress: r.ppf_progress || null,
     description: r.description, damageNotes: r.damage_notes, priority: r.priority, location: r.location,
     serviceTypes: r.service_types || [], serviceDone: r.service_done || {}, assignedTo: r.assigned_to || {},
     assignedTeam: r.assigned_team || {}, serviceStep: r.service_step || {},
@@ -1486,6 +1526,7 @@ function rowToJob(r) {
   // (see saveJob). Enumerable on purpose: every screen updates a job by
   // spreading it into a new object, and the snapshot has to ride along.
   job._base = rowSnapshot(job);
+  learnVehicle(job.make, job.model);
   return job;
 }
 function rowSnapshot(job) {
@@ -1496,7 +1537,17 @@ function rowSnapshot(job) {
 function jobToRow(job) {
   return {
     id: job.id, customer_id: job.customerId || null, vehicle_id: job.vehicleId || null,
-    plate: job.plate, make_model: job.makeModel, customer_name: job.customerName, customer_phone: job.customerPhone,
+    plate: job.plate,
+    // makeModel stays the combined display string every other screen
+    // reads — recomputed from make/model on every save when a
+    // structured make is set; legacy jobs with no make keep whatever
+    // makeModel they already had.
+    make_model: composeMakeModel(job.make, job.model, job.makeModel),
+    make: job.make || null, model: job.model || null, model_year: job.modelYear || null,
+    color: job.color || null, body_type: job.bodyType || null,
+    ppf_scope: job.ppfScope || null,
+    ppf_progress: job.ppfProgress || null,
+    customer_name: job.customerName, customer_phone: job.customerPhone,
     description: job.description, damage_notes: job.damageNotes, priority: job.priority, location: job.location,
     service_types: job.serviceTypes || [], service_done: job.serviceDone || {}, assigned_to: job.assignedTo || {},
     assigned_team: job.assignedTeam || {}, service_step: job.serviceStep || {},
@@ -1526,6 +1577,41 @@ function jobToRow(job) {
     created_by: job.createdBy, updated_at: new Date().toISOString(),
   };
 }
+// Combined "Make Model" display string every existing screen reads.
+// Structured make/model win once set; a legacy job with no make keeps
+// whatever makeModel it already had (nothing here ever blanks it out).
+function composeMakeModel(make, model, fallbackMakeModel) {
+  const m = (make || "").trim();
+  if (!m) return fallbackMakeModel || "";
+  return [m, (model || "").trim()].filter(Boolean).join(" ");
+}
+
+/* ---------------- Learned vehicle make/model catalog ----------------
+   The Make/Model combo boxes (VehicleDetailsFields) suggest the built-in
+   VEHICLE_CATALOG plus anything staff have actually typed before, so a
+   one-off make/model entered once is offered again next time. Kept as
+   plain module state — not React state — since it only ever grows and
+   dozens of unrelated screens would otherwise need it prop-drilled in;
+   same reasoning as the WHATSAPP_TEMPLATES/SERVICES caches elsewhere in
+   this file. Fed by every job row that comes back from the server
+   (rowToJob) and by the job list index (loadIndex).
+*/
+const learnedMakeModels = new Map(); // lowercase make -> { canonical, models: Map(lowercase model -> canonical model) }
+function learnVehicle(make, model) {
+  const m = (make || "").trim();
+  if (!m) return;
+  const key = m.toLowerCase();
+  let entry = learnedMakeModels.get(key);
+  if (!entry) { entry = { canonical: m, models: new Map() }; learnedMakeModels.set(key, entry); }
+  const mod = (model || "").trim();
+  if (mod) entry.models.set(mod.toLowerCase(), mod);
+}
+function getLearnedMakes() { return Array.from(learnedMakeModels.values()).map((e) => e.canonical); }
+function getLearnedModels(make) {
+  const entry = learnedMakeModels.get((make || "").trim().toLowerCase());
+  return entry ? Array.from(entry.models.values()) : [];
+}
+
 /* ---------------- device-local session (which login this phone remembers) ---------------- */
 // Not shared/business data — just "who's logged in on this device" — so a
 // plain localStorage read/write is the right tool, not a Supabase round-trip.
@@ -1576,7 +1662,11 @@ function localDateKey(d = new Date()) {
 //     that's proof a night has passed, regardless of what hour it
 //     currently reads.
 const AUTO_LOGOUT_HOUR = 21; // 9pm
-function checkAutoLogout(keyPrefix, hasSession, clearSessionFn) {
+function checkAutoLogout(keyPrefix, hasSession, clearSessionFn, exemptDashboardMode) {
+  // The PPF Room kiosk stays logged in overnight like the Dispatch/QC
+  // kiosks already do — it has no customer data on screen and is meant
+  // to be walked up to and tapped all day without re-authenticating.
+  if (exemptDashboardMode === "ppfroom") return;
   if (!hasSession) return;
   const now = new Date();
   const todayKey = localDateKey(now);
@@ -1890,7 +1980,18 @@ function generateJobCardPDF(job) {
   y += headerH + 4;
 
   // ---- Bill To / Car Info block ----
-  const billH = 90;
+  // Structured make/model win when present; legacy jobs (no job.make)
+  // fall back to the old "split the combined string on the first space"
+  // guess, exactly as before.
+  const legacyMake = (job.makeModel || "").split(" ")[0] || "";
+  const legacyModel = (job.makeModel || "").split(" ").slice(1).join(" ") || "";
+  const carRows = [["Make:", job.make || legacyMake], ["Model:", job.model || legacyModel], ["Plate:", job.plate], ["Job Card:", job.id ? job.id.slice(0, 8).toUpperCase() : ""]];
+  if (job.modelYear) carRows.push(["Year:", String(job.modelYear)]);
+  // Colour only if it still fits inside the box without overflowing —
+  // 6 rows is the most this layout can hold before the text runs past
+  // the box's bottom edge.
+  if (job.color && carRows.length < 6) carRows.push(["Colour:", job.color]);
+  const billH = 90 + Math.max(0, carRows.length - 4) * 14;
   box(margin, pageW - margin * 2, billH);
   doc.line(midX, y, midX, y + billH);
 
@@ -1902,7 +2003,6 @@ function generateJobCardPDF(job) {
 
   doc.setFont("helvetica", "bold"); doc.setFontSize(9); doc.setTextColor(...DARK);
   doc.text("Car Info", midX + 8, y + 14);
-  const carRows = [["Make:", (job.makeModel || "").split(" ")[0] || ""], ["Model:", (job.makeModel || "").split(" ").slice(1).join(" ") || ""], ["Plate:", job.plate], ["Job Card:", job.id ? job.id.slice(0, 8).toUpperCase() : ""]];
   carRows.forEach((row, i) => { label(row[0], midX + 8, y + 30 + i * 14); value(row[1], midX + 60, y + 30 + i * 14, 8.5); });
 
   y += billH + 14;
@@ -2155,6 +2255,7 @@ function generateQuotePDF(quote) {
 
 function summaryOf(job) {
   const stage = STAGES[job.stageIndex];
+  learnVehicle(job.make, job.model);
   return {
     id: job.id, plate: job.plate, makeModel: job.makeModel, customerName: job.customerName, customerPhone: job.customerPhone,
     priority: job.priority, location: job.location, stageKey: stage.key, stageLabel: stage.label,
@@ -2171,14 +2272,16 @@ async function loadIndex() {
   // pilot where job volume keeps climbing. Still ordered newest-first,
   // so the jobs that actually matter for the working list are never
   // the ones that would get dropped if this cap is ever hit.
-  const { ok, data } = await sbFetch(`jobs?select=id,plate,make_model,customer_name,customer_phone,priority,location,stage_index,service_types,service_done,service_reviewed,history,on_hold,on_hold_note,on_hold_since,followup_date,followup_note,warranty_expiry,customer_notify,created_at,updated_at&created_at=gte.${DEFAULT_VIEW_CUTOFF}&order=updated_at.desc&limit=900`);
+  const { ok, data } = await sbFetch(`jobs?select=id,plate,make_model,make,model,body_type,customer_name,customer_phone,priority,location,stage_index,service_types,service_done,service_reviewed,ppf_scope,ppf_progress,history,on_hold,on_hold_note,on_hold_since,followup_date,followup_note,warranty_expiry,customer_notify,created_at,updated_at&created_at=gte.${DEFAULT_VIEW_CUTOFF}&order=updated_at.desc&limit=900`);
   if (!ok || !data) return [];
   return data.map((r) => {
     const stage = STAGES[r.stage_index] || STAGES[0];
+    learnVehicle(r.make, r.model);
     return {
-      id: r.id, plate: r.plate, makeModel: r.make_model, customerName: r.customer_name, customerPhone: r.customer_phone,
+      id: r.id, plate: r.plate, makeModel: r.make_model, make: r.make || "", model: r.model || "", bodyType: r.body_type || "", customerName: r.customer_name, customerPhone: r.customer_phone,
       priority: r.priority, location: r.location, stageKey: stage.key, stageLabel: stage.label,
       serviceTypes: r.service_types || [], serviceDone: r.service_done || {}, serviceReviewed: r.service_reviewed || {},
+      ppfScope: r.ppf_scope || null, ppfProgress: r.ppf_progress || null,
       history: r.history || [],
       onHold: !!r.on_hold, onHoldNote: r.on_hold_note || null, onHoldSince: r.on_hold_since ? new Date(r.on_hold_since).getTime() : null,
       followupDate: r.followup_date || null, followupNote: r.followup_note || null, warrantyExpiry: r.warranty_expiry || null,
@@ -2424,7 +2527,9 @@ async function createJob(job, { reassignVehicle = false, customerType = null } =
     };
   }
   const customer = await findOrCreateCustomer(job.customerName, job.customerPhone, customerType);
-  const vehicle = customer ? await findOrCreateVehicle(customer.id, job.plate, job.makeModel) : null;
+  const vehicle = customer ? await findOrCreateVehicle(customer.id, job.plate, job.makeModel, {
+    make: job.make, model: job.model, modelYear: job.modelYear, color: job.color, bodyType: job.bodyType,
+  }) : null;
   // Ownership only changes here, explicitly, when intake staff confirmed
   // via the "New owner now" choice — never inferred automatically.
   if (vehicle && reassignVehicle && customer && vehicle.customer_id !== customer.id) {
@@ -2586,7 +2691,7 @@ function blankProforma() {
   return {
     id: null, number: null, entity: "ZB", status: "draft", job_id: null, quote_id: null, customer_id: null,
     bill_to: { name: "", phone: "", trn: "", address: "", email: "" },
-    car: { makeModel: "", color: "", plate: "", vin: "" },
+    car: { makeModel: "", color: "", plate: "", vin: "", year: "" },
     lines: [blankLine()], vat_rate: VAT_RATE, payment_terms: "Cash on delivery", delivery_terms: "", notes: "",
     valid_until: localDateKey(d), supersedes: null,
   };
@@ -2600,7 +2705,7 @@ function proformaSeedFromJob(job) {
     job_id: job.id, customer_id: job.customerId || null,
     entity: job.commissionEntity === "head_office" ? "ZH" : "ZB",
     bill_to: { name: job.customerName || "", phone: job.customerPhone || "", trn: "", address: "", email: "" },
-    car: { makeModel: job.makeModel || "", color: "", plate: job.plate || "", vin: "" },
+    car: { makeModel: job.makeModel || "", color: job.color || "", plate: job.plate || "", vin: "", year: job.modelYear || "" },
     lines: rows.length ? linesFromInvoiceRows(rows) : [blankLine()],
   };
 }
@@ -2953,6 +3058,7 @@ function generateProformaPDF(p) {
   doc.setFont("helvetica", "normal"); doc.setFontSize(8.5);
   const noteLines = [];
   if (car.makeModel) noteLines.push(`MAKE/MODEL: ${car.makeModel}`);
+  if (car.year) noteLines.push(`YEAR: ${car.year}`);
   if (car.color) noteLines.push(`COLOR: ${car.color}`);
   if (car.plate) noteLines.push(`PLATE NO: ${car.plate}`);
   if (car.vin) noteLines.push(`VIN: ${car.vin}`);
@@ -3515,6 +3621,337 @@ function LocationPicker({ location, setLocation, session }) {
 
 function Field({ label, children }) {
   return <div style={{ marginBottom: 18 }}><label style={labelStyle}>{label}</label><div style={{ marginTop: 8 }}>{children}</div></div>;
+}
+
+/* ---------------- Structured vehicle details (make/model/year/colour/body type) ----------------
+   Shared by Quick Intake, New Job Card and Edit Job Card. Make/Model are
+   searchable combo boxes seeded from VEHICLE_CATALOG plus whatever's been
+   learned from real jobs (see learnVehicle in the data layer above);
+   Year/Colour are chip pickers; Body type is 4 big picture buttons. */
+const VEHICLE_CATALOG = {
+  "Nissan": ["Patrol", "Patrol Nismo", "Armada", "X-Trail", "Altima"],
+  "Toyota": ["Land Cruiser", "Land Cruiser 250", "Prado", "FJ Cruiser", "Corolla Cross", "Camry", "Fortuner", "Hilux", "Sequoia"],
+  "Lexus": ["LX 570", "LX 600", "LX 700", "RX 450h", "NX 300", "LS 460L", "LS 500", "GX"],
+  "Mercedes-Benz": ["G 63", "GLS 63", "GLS", "GLE", "S 500", "S 580", "Maybach S", "C 300", "E 300", "SL 500", "S-Class Coupe", "V 250", "EQS"],
+  "BMW": ["7 Series", "750Li", "X3", "X5", "X7", "XM", "iX", "M3", "M5"],
+  "Audi": ["Q7", "Q8", "RS Q8", "R8", "S8", "A8"],
+  "Porsche": ["911 GT3 RS", "911 Carrera GTS", "911 Turbo S", "Cayenne", "Macan", "Taycan"],
+  "Land Rover": ["Defender 90", "Defender 110", "Defender 130", "Range Rover", "Range Rover Sport", "Range Rover Vogue", "Range Rover Velar"],
+  "Rolls-Royce": ["Cullinan", "Spectre", "Ghost", "Phantom"],
+  "Bentley": ["Bentayga", "Continental GT"],
+  "Ferrari": ["812 Superfast", "Purosangue", "SF90", "Roma"],
+  "Lamborghini": ["Revuelto", "Urus", "Huracán"],
+  "McLaren": [],
+  "Aston Martin": ["DBX"],
+  "Cadillac": ["Escalade"],
+  "Chevrolet": ["Tahoe", "Silverado", "Blazer", "Suburban"],
+  "GMC": ["Sierra", "Yukon"],
+  "Ford": ["Raptor", "F-150", "Expedition", "Mustang", "Bronco"],
+  "Jeep": ["Wrangler", "Gladiator", "Grand Cherokee", "Wrangler 392"],
+  "Dodge": [],
+  "RAM": ["1500 TRX"],
+  "Tesla": ["Model 3", "Model Y", "Model S", "Model X", "Cybertruck"],
+  "BYD": [],
+  "Denza": ["B8"],
+  "Zeekr": ["9X", "8X", "001"],
+  "Lotus": ["Eletre"],
+  "Genesis": [],
+  "Hyundai": [],
+  "Kia": [],
+  "Changan": ["X5 Plus", "UNI-K"],
+  "Jetour": ["X70", "T2"],
+  "Geely": [],
+  "Rox": ["01", "Adamas"],
+  "Tank": ["700", "500"],
+  "GAC": ["Emkoo"],
+  "Hongqi": [],
+  "Lucid": [],
+  "Maserati": [],
+  "Mini": ["Cooper"],
+  "Volkswagen": [],
+  "Volvo": ["S90", "XC90"],
+  "Suzuki": ["Jimny", "Grand Vitara"],
+  "Mitsubishi": [],
+  "Infiniti": ["QX80"],
+  "Xiaomi": ["SU7"],
+};
+const VEHICLE_COLORS = ["White", "Black", "Silver", "Grey", "Blue", "Red", "Green", "Beige", "Gold", "Other"];
+const BODY_TYPES = [
+  { key: "suv", label: "SUV" },
+  { key: "sedan", label: "Sedan" },
+  { key: "coupe", label: "Coupe" },
+  { key: "pickup", label: "Pickup" },
+];
+const BODY_TYPE_LABEL = Object.fromEntries(BODY_TYPES.map((b) => [b.key, b.label]));
+
+// Suggests a body type from make/model keywords (staff always still has
+// to tap it, this is just a head start). Checked pickup/coupe first since
+// those are the categories most likely to be masked by a looser SUV/sedan
+// match ("Wrangler" vs "Gladiator", "S 500" vs "SL 500", etc).
+const BODY_TYPE_HINTS_PICKUP = ["raptor", "f-150", "f150", "sierra", "silverado", "gladiator", "hilux", "ram 1500", "1500 trx", "cybertruck"];
+const BODY_TYPE_HINTS_COUPE = ["911", "812", "r8", "revuelto", "huracán", "huracan", "mustang", "sl 500", "s-class coupe", "spectre", "continental gt", "roma", "sf90"];
+const BODY_TYPE_HINTS_SUV = ["patrol", "land cruiser", "lx 570", "lx 600", "lx 700", "gx", "g 63", "gls", "escalade", "tahoe", "range rover", "defender", "cullinan", "urus", "x5", "x7", "q7", "wrangler", "jimny", "tank 700", "tank 500", "zeekr 9x", "denza b8", "v 250"];
+const BODY_TYPE_HINTS_SEDAN = ["s 500", "s 580", "7 series", "750li", "s8", "a8", "ls 460l", "ls 500", "model 3", "c 300", "e 300", "s90", "ghost", "phantom", "eqs", "taycan", "mini cooper"];
+function suggestBodyType(make, model) {
+  const s = `${make || ""} ${model || ""}`.trim().toLowerCase();
+  if (!s) return null;
+  if (BODY_TYPE_HINTS_PICKUP.some((k) => s.includes(k))) return "pickup";
+  if (BODY_TYPE_HINTS_COUPE.some((k) => s.includes(k))) return "coupe";
+  if (BODY_TYPE_HINTS_SUV.some((k) => s.includes(k))) return "suv";
+  if (BODY_TYPE_HINTS_SEDAN.some((k) => s.includes(k))) return "sedan";
+  return null;
+}
+// "2025 · White · SUV" — whatever's actually set, skipping the rest.
+function vehicleSubline(job) {
+  return [job.modelYear || "", job.color || "", job.bodyType ? BODY_TYPE_LABEL[job.bodyType] || "" : ""].filter(Boolean).join(" · ");
+}
+
+function catalogModelsFor(make) {
+  const key = Object.keys(VEHICLE_CATALOG).find((k) => k.toLowerCase() === (make || "").trim().toLowerCase());
+  return key ? VEHICLE_CATALOG[key] : [];
+}
+function makeOptions() {
+  const merged = new Map();
+  Object.keys(VEHICLE_CATALOG).forEach((m) => merged.set(m.toLowerCase(), m));
+  getLearnedMakes().forEach((m) => merged.set(m.toLowerCase(), m));
+  return Array.from(merged.values()).sort((a, b) => a.localeCompare(b));
+}
+function modelOptionsFor(make) {
+  const merged = new Map();
+  catalogModelsFor(make).forEach((m) => merged.set(m.toLowerCase(), m));
+  getLearnedModels(make).forEach((m) => merged.set(m.toLowerCase(), m));
+  return Array.from(merged.values()).sort((a, b) => a.localeCompare(b));
+}
+
+// Best-effort split of a legacy combined makeModel string into structured
+// fields, for pre-filling Edit Job Card on an old job that only has
+// makeModel. Nothing is saved from this until the user actually saves —
+// see EditJobScreen.
+function prefillFromLegacyMakeModel(makeModel) {
+  const text = String(makeModel || "").replace(/\//g, " ").replace(/\s+/g, " ").trim();
+  if (!text) return { make: "", model: "", color: "", modelYear: "" };
+  const words = text.split(" ");
+  const catalogMakes = Object.keys(VEHICLE_CATALOG).concat(getLearnedMakes());
+  let matchedMake = "";
+  let rest = words;
+  for (let n = Math.min(3, words.length); n >= 1; n--) {
+    const candidate = words.slice(0, n).join(" ");
+    const found = catalogMakes.find((m) => m.toLowerCase() === candidate.toLowerCase());
+    if (found) { matchedMake = found; rest = words.slice(n); break; }
+  }
+  let modelYear = "";
+  let color = "";
+  const remaining = [];
+  rest.forEach((w) => {
+    const clean = w.replace(/[^\w-]/g, "");
+    if (!modelYear && /^(19|20)\d{2}$/.test(clean) && Number(clean) >= 1950 && Number(clean) <= 2100) { modelYear = clean; return; }
+    const colorMatch = !color && VEHICLE_COLORS.find((c) => c.toLowerCase() === clean.toLowerCase() && c !== "Other");
+    if (colorMatch) { color = colorMatch; return; }
+    remaining.push(w);
+  });
+  return { make: matchedMake, model: remaining.join(" ").trim(), color, modelYear };
+}
+
+// Small side-profile silhouettes for the body-type picture buttons —
+// rough on purpose, just enough to read as "tall boxy SUV" vs "low sleek
+// sedan" vs "raked coupe" vs "cab + bed pickup" at a glance.
+function BodyTypeIcon({ type, color }) {
+  const common = { width: 40, height: 20, viewBox: "0 0 64 32", fill: "none", stroke: color, strokeWidth: 2.2, strokeLinejoin: "round", strokeLinecap: "round" };
+  if (type === "suv") return (
+    <svg {...common}>
+      <path d="M3 24 L3 15 Q3 11 8 11 L15 11 L19 5 Q21 3 25 3 L42 3 Q46 3 48 6 L52 11 L57 11 Q61 11 61 16 L61 24 Z" />
+      <circle cx="16" cy="25" r="4" fill={color} stroke="none" />
+      <circle cx="48" cy="25" r="4" fill={color} stroke="none" />
+    </svg>
+  );
+  if (type === "coupe") return (
+    <svg {...common}>
+      <path d="M3 24 L3 20 Q6 20 9 16 L20 7 Q24 4 29 4 L38 4 Q43 4 46 9 L53 17 Q58 18 60 20 L60 24 Z" />
+      <circle cx="15" cy="25" r="4" fill={color} stroke="none" />
+      <circle cx="47" cy="25" r="4" fill={color} stroke="none" />
+    </svg>
+  );
+  if (type === "pickup") return (
+    <svg {...common}>
+      <path d="M3 24 L3 16 Q3 12 7 12 L13 12 L17 6 Q19 4 23 4 L31 4 L31 13 L37 13 L37 24" />
+      <path d="M37 16 L58 16 Q61 16 61 19 L61 24 L37 24 Z" />
+      <circle cx="14" cy="25" r="4" fill={color} stroke="none" />
+      <circle cx="50" cy="25" r="4" fill={color} stroke="none" />
+    </svg>
+  );
+  // sedan (default)
+  return (
+    <svg {...common}>
+      <path d="M3 24 L3 19 Q5 19 7 16 L15 8 Q18 5 23 5 L40 5 Q44 5 46 9 L52 17 Q57 18 60 19 L60 24 Z" />
+      <circle cx="15" cy="25" r="4" fill={color} stroke="none" />
+      <circle cx="47" cy="25" r="4" fill={color} stroke="none" />
+    </svg>
+  );
+}
+
+// Searchable combo box used for both Make and Model — a plain text input
+// plus a big-touch-row dropdown filtered as you type, with a "+ Use as
+// new…" row when nothing matches exactly. Fully controlled: `value` is
+// the source of truth (typing calls onChangeText on every keystroke, so
+// free text staff never picks from the list still gets saved).
+function VehicleComboBox({ value, onChangeText, options, placeholder, inputRef, kind }) {
+  const [open, setOpen] = useState(false);
+  const wrapRef = useRef(null);
+  const localRef = useRef(null);
+  const setRef = (el) => { localRef.current = el; if (inputRef) inputRef.current = el; };
+  useEffect(() => {
+    if (!open) return undefined;
+    const onDoc = (e) => { if (wrapRef.current && !wrapRef.current.contains(e.target)) setOpen(false); };
+    document.addEventListener("mousedown", onDoc);
+    return () => document.removeEventListener("mousedown", onDoc);
+  }, [open]);
+  const q = (value || "").trim().toLowerCase();
+  const filtered = q ? options.filter((o) => o.toLowerCase().includes(q)) : options;
+  const exact = options.some((o) => o.toLowerCase() === q);
+  return (
+    <div ref={wrapRef} style={{ position: "relative" }}>
+      <input
+        ref={setRef}
+        style={inputStyle}
+        value={value || ""}
+        placeholder={placeholder}
+        onFocus={() => setOpen(true)}
+        onChange={(e) => { onChangeText(e.target.value); setOpen(true); }}
+        onKeyDown={(e) => { if (e.key === "Escape" || e.key === "Enter") { setOpen(false); e.currentTarget.blur(); } }}
+      />
+      {open && (filtered.length > 0 || q) && (
+        <div style={{ position: "absolute", zIndex: 30, top: "100%", left: 0, right: 0, marginTop: 4, background: COLORS.panel, border: `1px solid ${COLORS.line}`, borderRadius: 12, maxHeight: 260, overflowY: "auto", boxShadow: "0 12px 30px rgba(0,0,0,0.5)" }}>
+          {filtered.slice(0, 60).map((o) => (
+            <button key={o} type="button" onMouseDown={(e) => e.preventDefault()} onClick={() => { onChangeText(o); setOpen(false); }} className="mrcap-press" style={{ display: "block", width: "100%", textAlign: "left", padding: "12px 14px", minHeight: 44, background: "none", border: "none", borderBottom: `1px solid ${COLORS.line}`, color: COLORS.ink, fontSize: 14, cursor: "pointer" }}>
+              {o}
+            </button>
+          ))}
+          {q && !exact && (
+            <button type="button" onMouseDown={(e) => e.preventDefault()} onClick={() => { onChangeText(value.trim()); setOpen(false); }} className="mrcap-press" style={{ display: "block", width: "100%", textAlign: "left", padding: "12px 14px", minHeight: 44, background: "none", border: "none", color: COLORS.gold, fontSize: 13.5, fontWeight: 600, cursor: "pointer" }}>
+              + Use "{value.trim()}" as a new {kind}
+            </button>
+          )}
+        </div>
+      )}
+    </div>
+  );
+}
+
+const YEAR_RECENT_CHIPS = [2027, 2026, 2025, 2024, 2023];
+const YEAR_OLDER = Array.from({ length: 2022 - 1990 + 1 }, (_, i) => 2022 - i);
+
+// Reusable Make/Model/Year/Colour/Body-type block for Quick Intake, New
+// Job Card and Edit Job Card. Fully controlled — `values` is the current
+// {make, model, modelYear, color, bodyType}, and onChange(patch) merges
+// a partial update into the caller's own state.
+function VehicleDetailsFields({ values, onChange, bodyTypeRequired, showBodyTypeMissing }) {
+  const { make = "", model = "", modelYear = "", color = "", bodyType = "" } = values || {};
+  const modelInputRef = useRef(null);
+  const [showOlderYears, setShowOlderYears] = useState(false);
+  const isCustomColor = !!color && !VEHICLE_COLORS.slice(0, -1).includes(color);
+  const [showOtherColor, setShowOtherColor] = useState(isCustomColor);
+
+  const suggestedBodyType = !bodyType ? suggestBodyType(make, model) : null;
+
+  const setMake = (v) => {
+    const hadSlash = v.includes("/");
+    onChange({ make: v.replace(/\//g, "") });
+    if (hadSlash) modelInputRef.current?.focus();
+  };
+  const setModel = (v) => onChange({ model: v.replace(/\//g, "") });
+
+  return (
+    <div>
+      <Field label="Make">
+        <VehicleComboBox value={make} onChangeText={setMake} options={makeOptions()} placeholder="e.g. Nissan" kind="make" />
+      </Field>
+      <Field label="Model (optional)">
+        <VehicleComboBox inputRef={modelInputRef} value={model} onChangeText={setModel} options={modelOptionsFor(make)} placeholder="e.g. Patrol" kind="model" />
+        <div style={{ fontSize: 11, color: COLORS.muted, marginTop: 6 }}>Leave blank if the car is just one name (e.g. Defender, Jimny)</div>
+      </Field>
+
+      <Field label="Year (optional)">
+        <div style={{ display: "flex", gap: 7, flexWrap: "wrap" }}>
+          {YEAR_RECENT_CHIPS.map((y) => (
+            <button key={y} type="button" onClick={() => onChange({ modelYear: Number(modelYear) === y ? "" : y })} className="mrcap-press" aria-pressed={Number(modelYear) === y} style={{ ...selectChipStyle(Number(modelYear) === y), minHeight: 44, minWidth: 58 }}>{y}</button>
+          ))}
+          <button
+            type="button"
+            onClick={() => {
+              if (modelYear && !YEAR_RECENT_CHIPS.includes(Number(modelYear))) { onChange({ modelYear: "" }); setShowOlderYears(false); }
+              else setShowOlderYears((v) => !v);
+            }}
+            className="mrcap-press"
+            aria-pressed={showOlderYears || (!!modelYear && !YEAR_RECENT_CHIPS.includes(Number(modelYear)))}
+            style={{ ...selectChipStyle(showOlderYears || (!!modelYear && !YEAR_RECENT_CHIPS.includes(Number(modelYear)))), minHeight: 44 }}
+          >
+            {modelYear && !YEAR_RECENT_CHIPS.includes(Number(modelYear)) ? modelYear : "Older…"}
+          </button>
+        </div>
+        {showOlderYears && (
+          <div style={{ display: "grid", gridTemplateColumns: "repeat(4, 1fr)", gap: 6, marginTop: 8 }}>
+            {YEAR_OLDER.map((y) => (
+              <button key={y} type="button" onClick={() => onChange({ modelYear: Number(modelYear) === y ? "" : y })} className="mrcap-press" aria-pressed={Number(modelYear) === y} style={{ ...selectChipStyle(Number(modelYear) === y), minHeight: 44, padding: "0 4px", fontSize: 12 }}>{y}</button>
+            ))}
+          </div>
+        )}
+      </Field>
+
+      <Field label="Colour (optional)">
+        <div style={{ display: "flex", gap: 7, flexWrap: "wrap" }}>
+          {VEHICLE_COLORS.map((c) => {
+            const on = c === "Other" ? showOtherColor : color === c;
+            return (
+              <button
+                key={c}
+                type="button"
+                onClick={() => {
+                  if (c === "Other") { setShowOtherColor(true); if (!isCustomColor) onChange({ color: "" }); }
+                  else { setShowOtherColor(false); onChange({ color: color === c ? "" : c }); }
+                }}
+                className="mrcap-press"
+                aria-pressed={on}
+                style={{ ...selectChipStyle(on), minHeight: 44 }}
+              >
+                {c}
+              </button>
+            );
+          })}
+        </div>
+        {showOtherColor && (
+          <input style={{ ...inputStyle, maxWidth: 240 }} value={isCustomColor ? color : ""} onChange={(e) => onChange({ color: e.target.value })} placeholder="e.g. Matte Grey" />
+        )}
+      </Field>
+
+      <Field label={bodyTypeRequired ? "Body type" : "Body type (optional)"}>
+        {suggestedBodyType && <div style={{ fontSize: 11.5, color: COLORS.gold, marginBottom: 8, fontWeight: 600 }}>Suggested — tap to confirm</div>}
+        <div style={{ display: "grid", gridTemplateColumns: "repeat(4, 1fr)", gap: 8 }}>
+          {BODY_TYPES.map((bt) => {
+            const on = bodyType === bt.key;
+            const suggested = !on && suggestedBodyType === bt.key;
+            return (
+              <button
+                key={bt.key}
+                type="button"
+                onClick={() => onChange({ bodyType: on ? "" : bt.key })}
+                className="mrcap-press"
+                aria-pressed={on}
+                style={{
+                  display: "flex", flexDirection: "column", alignItems: "center", gap: 6, padding: "12px 6px", borderRadius: 12, minHeight: 60,
+                  border: on ? `1.5px solid ${COLORS.gold}` : suggested ? `1.5px dashed ${COLORS.gold}` : `1px solid ${COLORS.line}`,
+                  background: on ? "rgba(201,162,39,0.16)" : COLORS.panel, cursor: "pointer",
+                }}
+              >
+                <BodyTypeIcon type={bt.key} color={on ? COLORS.goldBright : COLORS.muted} />
+                <span style={{ fontSize: 11.5, fontWeight: on ? 700 : 500, color: on ? COLORS.goldBright : COLORS.ink }}>{bt.label}</span>
+              </button>
+            );
+          })}
+        </div>
+        {showBodyTypeMissing && <div style={{ fontSize: 12, color: COLORS.dangerText, marginTop: 8, fontWeight: 600 }}>Pick the car type</div>}
+      </Field>
+    </div>
+  );
 }
 
 // "Didn't find the pricing module? Add one here" — sits at the end of
@@ -4247,7 +4684,7 @@ export default function GarageApp() {
       // A Smartech portal session never needs the shop-wide job index —
       // it fetches its own scoped list instead (see SmartechPortal), so
       // skip the shared fetch entirely for it.
-      if (!isSmartechPortal(restoredSession)) await refreshIndex();
+      if (!isSmartechPortal(restoredSession) && !isPPFRoomKiosk(restoredSession)) await refreshIndex();
       setReady(true);
     })();
   }, [refreshIndex]);
@@ -4261,7 +4698,7 @@ export default function GarageApp() {
         setSession(null);
         setCurrentActor(null);
         saveLocalSession(null);
-      });
+      }, session?.dashboardMode);
     };
     check();
     const t = setInterval(check, 5 * 60 * 1000);
@@ -4276,7 +4713,7 @@ export default function GarageApp() {
   // dashboard list, not whatever job someone might be mid-edit on, so it
   // can't clobber in-progress work.
   useEffect(() => {
-    if (!ready || !session || isSmartechPortal(session)) return;
+    if (!ready || !session || isSmartechPortal(session) || isPPFRoomKiosk(session)) return;
     const interval = setInterval(() => { refreshIndex(); }, 45000);
     const onVisible = () => { if (document.visibilityState === "visible") refreshIndex(); };
     const onFocus = () => { refreshIndex(); };
@@ -4366,6 +4803,13 @@ export default function GarageApp() {
   // shop-wide job index.
   if (isSmartechPortal(session)) {
     return <Shell><SmartechPortal session={session} onLogout={onLogout} /></Shell>;
+  }
+
+  // PPF Room kiosk: a team member with dashboardMode "ppfroom" sees only
+  // this screen — no nav, no menus, no prices, no customer name/phone
+  // anywhere, same routing pattern as the Smartech portal above.
+  if (isPPFRoomKiosk(session)) {
+    return <Shell><PPFRoomKiosk session={session} onLogout={onLogout} /></Shell>;
   }
 
   // Desktop back-office mode: only offered at login to admin/intake (see
@@ -5372,7 +5816,14 @@ function Dashboard({ index, session, team, onOpen, onJobDeleted, canArchive, onR
   const active = visible.filter((j) => j.stageKey !== "collected");
   const highPriority = active.filter((j) => j.priority === "High");
 
+  // "Brought in today" — cars whose job was created since midnight, so
+  // intake (Lani) can see at a glance which of today's arrivals still need
+  // their job card filled in.
+  const todayStart = new Date(); todayStart.setHours(0, 0, 0, 0);
+  const broughtToday = (j) => (j.createdAt || 0) >= todayStart.getTime();
+
   const filtered = visible.filter((j) => {
+    if (filter === "today" && !broughtToday(j)) return false;
     if (filter === "open" && j.stageKey === "collected") return false;
     if (filter === "mine" && j.stageKey !== "service") return false;
     if (filter === "collected" && j.stageKey !== "collected") return false;
@@ -5386,9 +5837,9 @@ function Dashboard({ index, session, team, onOpen, onJobDeleted, canArchive, onR
     return true;
   });
 
-  const filterTabs = [["open", "Open"], ["mine", "In Service"], ["all", "All"]];
-  if (canArchive) filterTabs.splice(2, 0, ["collected", "Collected"]);
-  const tabCount = (k) => visible.filter((j) => (k === "open" ? j.stageKey !== "collected" : k === "mine" ? j.stageKey === "service" : k === "collected" ? j.stageKey === "collected" : true)).length;
+  const filterTabs = [["open", "Open"], ["today", "Brought in today"], ["mine", "In Service"], ["all", "All"]];
+  if (canArchive) filterTabs.splice(3, 0, ["collected", "Collected"]);
+  const tabCount = (k) => visible.filter((j) => (k === "open" ? j.stageKey !== "collected" : k === "today" ? broughtToday(j) : k === "mine" ? j.stageKey === "service" : k === "collected" ? j.stageKey === "collected" : true)).length;
 
   const grouped = STAGES.map((s) => ({ stage: s, jobs: filtered.filter((j) => j.stageKey === s.key && !j.onHold) })).filter((g) => g.jobs.length || filter !== "open" || g.stage.key !== "collected");
   // On Hold is shown as its own section regardless of which pipeline stage
@@ -5953,6 +6404,19 @@ function QuickIntakeForm({ session, onCreated, onCancel, onFullForm }) {
   const [saving, setSaving] = useState(false);
   const [saveError, setSaveError] = useState(false);
   const fileRef = useRef(null);
+  const [make, setMake] = useState("");
+  const [model, setModel] = useState("");
+  const [modelYear, setModelYear] = useState("");
+  const [color, setColor] = useState("");
+  const [bodyType, setBodyType] = useState("");
+  const [saveAttempted, setSaveAttempted] = useState(false);
+  const setVehicle = (patch) => {
+    if ("make" in patch) setMake(patch.make);
+    if ("model" in patch) setModel(patch.model);
+    if ("modelYear" in patch) setModelYear(patch.modelYear);
+    if ("color" in patch) setColor(patch.color);
+    if ("bodyType" in patch) setBodyType(patch.bodyType);
+  };
 
   const addPhotos = async (files) => {
     const compressed = await Promise.all(Array.from(files).map((f) => compressImage(f)));
@@ -5961,10 +6425,12 @@ function QuickIntakeForm({ session, onCreated, onCancel, onFullForm }) {
 
   const submit = async () => {
     if (!plate.trim()) return;
+    if (!bodyType) { setSaveAttempted(true); return; }
     setSaving(true);
     const now = Date.now();
     const job = {
-      plate: plate.trim().toUpperCase(), makeModel: "", customerName: customerName.trim() || "—", customerPhone: "",
+      plate: plate.trim().toUpperCase(), makeModel: composeMakeModel(make, model, ""), customerName: customerName.trim() || "—", customerPhone: "",
+      make: make.trim(), model: model.trim(), modelYear: modelYear || null, color: color || null, bodyType: bodyType || null,
       description: "", damageNotes: "", priority: "Medium", location: BASE_LOCATIONS[0],
       serviceTypes: [], treatments: {}, treatmentPrices: {}, discountPercent: 0, priceHistory: [],
       serviceDone: {}, assignedTo: {}, stageIndex: 0,
@@ -5989,6 +6455,8 @@ function QuickIntakeForm({ session, onCreated, onCancel, onFullForm }) {
 
       <Field label="Plate"><PlatePicker value={plate} onChange={setPlate} /></Field>
       <Field label="Whose car (optional)"><input style={inputStyle} value={customerName} onChange={(e) => setCustomerName(e.target.value)} placeholder="Skip if you don't know it yet" /></Field>
+
+      <VehicleDetailsFields values={{ make, model, modelYear, color, bodyType }} onChange={setVehicle} bodyTypeRequired showBodyTypeMissing={saveAttempted && !bodyType} />
 
       <Field label="Photos">
         <input ref={fileRef} type="file" accept="image/*" capture="environment" multiple style={{ display: "none" }} onChange={(e) => { if (e.target.files.length) addPhotos(e.target.files); e.target.value = ""; }} />
@@ -6029,7 +6497,19 @@ function QuickIntakeForm({ session, onCreated, onCancel, onFullForm }) {
 function NewJobForm({ session, team, onCreated, onCancel }) {
   const [, setRefreshTick] = useState(0); // forces a re-render so a just-added pricing module shows immediately
   const [plate, setPlate] = useState("");
-  const [makeModel, setMakeModel] = useState("");
+  const [make, setMake] = useState("");
+  const [model, setModel] = useState("");
+  const [modelYear, setModelYear] = useState("");
+  const [color, setColor] = useState("");
+  const [bodyType, setBodyType] = useState("");
+  const [saveAttempted, setSaveAttempted] = useState(false);
+  const setVehicle = (patch) => {
+    if ("make" in patch) setMake(patch.make);
+    if ("model" in patch) setModel(patch.model);
+    if ("modelYear" in patch) setModelYear(patch.modelYear);
+    if ("color" in patch) setColor(patch.color);
+    if ("bodyType" in patch) setBodyType(patch.bodyType);
+  };
   const [customerName, setCustomerName] = useState("");
   const [customerPhone, setCustomerPhone] = useState("");
   const [description, setDescription] = useState("");
@@ -6142,8 +6622,21 @@ function NewJobForm({ session, team, onCreated, onCancel }) {
     if (isVinMode || p.length < 3) { setPlateMatch(null); setOwnerChoice(null); setPlateHistory(null); return; }
     const t = setTimeout(async () => {
       const { ok, data } = await sbFetch(`vehicles?plate=eq.${encodeURIComponent(p)}&select=*,customers(name,phone,customer_type)&limit=1`);
-      setPlateMatch(ok && data && data.length ? data[0] : null);
+      const matched = ok && data && data.length ? data[0] : null;
+      setPlateMatch(matched);
       setOwnerChoice(null);
+      // A plate we already have on file — pre-fill the structured vehicle
+      // fields from it (only into whatever's still blank, never over
+      // something staff already typed).
+      if (matched) {
+        setVehicle({
+          ...(!make && matched.make ? { make: matched.make } : {}),
+          ...(!model && matched.model ? { model: matched.model } : {}),
+          ...(!modelYear && matched.model_year ? { modelYear: matched.model_year } : {}),
+          ...(!color && matched.color ? { color: matched.color } : {}),
+          ...(!bodyType && matched.body_type ? { bodyType: matched.body_type } : {}),
+        });
+      }
       // Most recent past job on this plate (any stage) — a quick "we've
       // seen this car before, here's what was last done" note at intake,
       // so Ahmed/Lani don't have to go dig through the archive.
@@ -6211,6 +6704,7 @@ function NewJobForm({ session, team, onCreated, onCancel }) {
 
   const submit = async () => {
     if (!plate.trim() || !customerName.trim() || hasUnresolvedMismatch || !termsAccepted) return;
+    if (!bodyType) { setSaveAttempted(true); return; }
     // Signature is encouraged, not required — but don't let it slip
     // through silently. First tap with no signature shows a one-time
     // warning; tapping again proceeds without it.
@@ -6222,7 +6716,8 @@ function NewJobForm({ session, team, onCreated, onCancel }) {
       // insert (jobs.id defaults to gen_random_uuid()). We read the
       // assigned id back from Supabase's response after saving.
       plate: plate.trim().toUpperCase(),
-      makeModel: makeModel.trim(),
+      makeModel: composeMakeModel(make, model, ""),
+      make: make.trim(), model: model.trim(), modelYear: modelYear || null, color: color || null, bodyType: bodyType || null,
       customerName: customerName.trim(),
       customerPhone: customerPhone.trim(),
       description: description.trim(),
@@ -6306,7 +6801,7 @@ function NewJobForm({ session, team, onCreated, onCancel }) {
         </div>
       )}
 
-      <Field label="Make / model"><input style={inputStyle} value={makeModel} onChange={(e) => setMakeModel(e.target.value)} placeholder="e.g. Prado" /></Field>
+      <VehicleDetailsFields values={{ make, model, modelYear, color, bodyType }} onChange={setVehicle} bodyTypeRequired showBodyTypeMissing={saveAttempted && !bodyType} />
       <Field label="Customer name"><input style={inputStyle} value={customerName} onChange={(e) => setCustomerName(e.target.value)} placeholder="Customer full name" /></Field>
       <Field label="Customer phone"><input type="tel" inputMode="numeric" style={inputStyle} value={customerPhone} onChange={(e) => setCustomerPhone(e.target.value.replace(/[^0-9]/g, ""))} placeholder="050 xxx xxxx" /></Field>
 
@@ -6620,7 +7115,16 @@ function PartsEditor({ parts, onChange, showTotal }) {
 function EditJobScreen({ job, session, onSaved, onCancel }) {
   const [, setRefreshTick] = useState(0); // forces a re-render so a just-added pricing module shows immediately
   const [plate, setPlate] = useState(job.plate);
-  const [makeModel, setMakeModel] = useState(job.makeModel);
+  // Legacy jobs (no structured make yet) get a best-effort split of their
+  // combined makeModel string as a starting point — nothing is saved
+  // until the user actually hits Save.
+  const [vehicleDetails, setVehicleDetails] = useState(() => {
+    if (job.make) return { make: job.make, model: job.model || "", modelYear: job.modelYear || "", color: job.color || "", bodyType: job.bodyType || "" };
+    const guess = prefillFromLegacyMakeModel(job.makeModel);
+    return { make: guess.make, model: guess.model, modelYear: guess.modelYear, color: guess.color, bodyType: "" };
+  });
+  const { make, model, modelYear, color, bodyType } = vehicleDetails;
+  const setVehicle = (patch) => setVehicleDetails((v) => ({ ...v, ...patch }));
   const [customerName, setCustomerName] = useState(job.customerName);
   const [customerPhone, setCustomerPhone] = useState(job.customerPhone);
   const [description, setDescription] = useState(job.description);
@@ -6689,7 +7193,11 @@ function EditJobScreen({ job, session, onSaved, onCancel }) {
     diff("Plate", job.plate, plate.trim().toUpperCase());
     diff("Customer name", job.customerName, customerName.trim());
     diff("Customer phone", job.customerPhone, customerPhone.trim());
-    diff("Make/model", job.makeModel, makeModel.trim());
+    diff("Make", job.make || "", make.trim());
+    diff("Model", job.model || "", model.trim());
+    diff("Year", job.modelYear || "", modelYear || "");
+    diff("Colour", job.color || "", color || "");
+    diff("Body type", job.bodyType || "", bodyType || "");
     diff("Description", job.description, description.trim());
     diff("Damage notes", job.damageNotes, damageNotes.trim());
     diff("Priority", job.priority, priority);
@@ -6748,7 +7256,8 @@ function EditJobScreen({ job, session, onSaved, onCancel }) {
 
     const updated = {
       ...job,
-      plate: plate.trim().toUpperCase(), makeModel: makeModel.trim(),
+      plate: plate.trim().toUpperCase(), makeModel: composeMakeModel(make, model, job.makeModel),
+      make: make.trim() || null, model: model.trim() || null, modelYear: modelYear || null, color: color || null, bodyType: bodyType || null,
       customerName: customerName.trim(), customerPhone: customerPhone.trim(),
       description: description.trim(), damageNotes: damageNotes.trim(),
       priority, location, serviceTypes, treatments, treatmentPrices, smartechPieces, discountPercent, parts,
@@ -6777,7 +7286,7 @@ function EditJobScreen({ job, session, onSaved, onCancel }) {
     <div className="mrcap-view" style={{ padding: "0 18px 34px" }}>
       <SectionTitle>Edit Job Card</SectionTitle>
       <Field label="Plate number"><input style={{ ...inputStyle, fontFamily: MONO_FONT, letterSpacing: 0.5 }} value={plate} onChange={(e) => setPlate(e.target.value)} /></Field>
-      <Field label="Make / model"><input style={inputStyle} value={makeModel} onChange={(e) => setMakeModel(e.target.value)} /></Field>
+      <VehicleDetailsFields values={vehicleDetails} onChange={setVehicle} />
       <Field label="Customer name"><input style={inputStyle} value={customerName} onChange={(e) => setCustomerName(e.target.value)} /></Field>
       <Field label="Customer phone"><input type="tel" inputMode="numeric" style={inputStyle} value={customerPhone} onChange={(e) => setCustomerPhone(e.target.value.replace(/[^0-9]/g, ""))} /></Field>
 
@@ -6998,6 +7507,19 @@ function JobDetail({ id, initialJob, session, team, onChanged, onBack, canArchiv
   const [saveFailed, setSaveFailed] = useState(false);
   const [retrying, setRetrying] = useState(false);
   const updateRef = useRef(null); // "Post update" in the bottom bar scrolls here
+  // Debounced Parts & fees save (see updateJobParts): latest job + callback
+  // kept in refs so a pending save still goes out if the card closes.
+  const jobRef = useRef(job);
+  jobRef.current = job;
+  const onChangedRef = useRef(onChanged);
+  onChangedRef.current = onChanged;
+  const partsSaveTimerRef = useRef(null);
+  useEffect(() => () => {
+    if (!partsSaveTimerRef.current) return;
+    clearTimeout(partsSaveTimerRef.current);
+    const pending = jobRef.current;
+    if (pending) saveJob(pending).then((ok) => onChangedRef.current && onChangedRef.current(pending, ok));
+  }, []);
   const notifyChanged = (updatedJob, savedOk) => {
     setSaveFailed(!savedOk);
     onChanged(updatedJob, savedOk);
@@ -7186,11 +7708,25 @@ function JobDetail({ id, initialJob, session, team, onChanged, onBack, canArchiv
   // of only inside Edit Job — same PartsEditor component, same data
   // (job.parts), just an inline save on every change like the other
   // quick-edit handlers on this screen.
-  const updateJobParts = async (newParts) => {
-    const updated = { ...job, parts: newParts, updatedAt: Date.now() };
-    const saved = await saveJob(updated);
-    setJob(updated);
-    notifyChanged(updated, saved);
+  // Parts & fees are typed into, so each keystroke must not wait on a
+  // server round-trip: that made every letter take ~4s to appear. The
+  // screen updates at once and the save goes out after a short pause in
+  // typing (and is flushed if the job card closes first).
+  const updateJobParts = (newParts) => {
+    setJob((j) => ({ ...j, parts: newParts, updatedAt: Date.now() }));
+    clearTimeout(partsSaveTimerRef.current);
+    partsSaveTimerRef.current = setTimeout(() => { flushPartsSave(); }, 800);
+  };
+  const flushPartsSave = async () => {
+    clearTimeout(partsSaveTimerRef.current);
+    partsSaveTimerRef.current = null;
+    const current = jobRef.current;
+    if (!current) return;
+    const saved = await saveJob(current);
+    // saveJob refreshes _base on the object it was given; carry that onto
+    // whatever the latest state is so the next diff starts from it.
+    setJob((j) => (j && j !== current && j.id === current.id ? { ...j, _base: current._base } : j));
+    notifyChanged(current, saved);
   };
 
   // Used to be the customer-facing status line. Repurposed per request:
@@ -7228,13 +7764,22 @@ function JobDetail({ id, initialJob, session, team, onChanged, onBack, canArchiv
     notifyChanged(updated, saved);
   };
 
-  const reviewService = async (key) => {
+  const reviewService = async (key, extra) => {
     const current = (job.serviceReviewed || {})[key];
     const updated = {
       ...job,
       serviceReviewed: { ...(job.serviceReviewed || {}), [key]: current ? undefined : { by: session.name, at: Date.now() } },
       updatedAt: Date.now(),
     };
+    // PPF's review step also records Ahmed's corrected panel list and the
+    // film-metres/roll-width he measured (owner request, waste-per-model
+    // tracking) — stored alongside the plain serviceReviewed approval flag.
+    if (key === "ppf" && !current && extra) {
+      updated.ppfProgress = {
+        ...(job.ppfProgress || {}),
+        review: { actualKeys: extra.actualKeys || [], note: extra.note || "", filmMetres: extra.filmMetres ?? null, rollWidth: extra.rollWidth ?? null, by: session.name, at: Date.now() },
+      };
+    }
     const saved = await saveJob(updated);
     setJob(updated);
     notifyChanged(updated, saved);
@@ -7394,6 +7939,7 @@ function JobDetail({ id, initialJob, session, team, onChanged, onBack, canArchiv
         <div className="mrcap-rise" style={{ display: "flex", flexDirection: "column", alignItems: "center", gap: 10, marginBottom: 22, textAlign: "center" }}>
           <PlateChip plate={job.plate} size="lg" />
           <div style={{ fontFamily: DISPLAY_FONT, fontWeight: 700, fontSize: 24, color: COLORS.ink, lineHeight: 1.15 }}>{job.makeModel || "Vehicle"}</div>
+          {vehicleSubline(job) && <div style={{ fontSize: 12.5, color: COLORS.muted, marginTop: -6 }}>{vehicleSubline(job)}</div>}
           <div style={{ display: "flex", gap: 6, flexWrap: "wrap", justifyContent: "center" }}>
             <Pill tone={stageTone(stage.key)}>{stage.label}</Pill>
             {job.priority === "High" && <Pill tone="red">Urgent</Pill>}
@@ -7500,6 +8046,7 @@ function JobDetail({ id, initialJob, session, team, onChanged, onBack, canArchiv
             </div>
           );
         })}
+        {job.serviceTypes.includes("ppf") && <PPFOfficeView job={job} team={team} />}
         {damageViewerOpen && job.damageDiagramImage && (
           <PhotoViewer photos={[{ src: job.damageDiagramImage, label: "Damage diagram" }]} index={0} onClose={() => window.history.back()} onNavigate={() => {}} />
         )}
@@ -7552,6 +8099,7 @@ function JobDetail({ id, initialJob, session, team, onChanged, onBack, canArchiv
         </div>
         <PlateChip plate={job.plate} size="lg" style={{ alignSelf: "flex-start" }} />
         <div style={{ fontFamily: DISPLAY_FONT, fontSize: 27, fontWeight: 700, lineHeight: 1.12, color: COLORS.ink, overflowWrap: "anywhere" }}>{job.makeModel || "Vehicle"}</div>
+        {vehicleSubline(job) && <div style={{ fontSize: 13, color: COLORS.muted, marginTop: -6 }}>{vehicleSubline(job)}</div>}
         <div style={{ fontSize: 13, color: COLORS.muted, display: "flex", alignItems: "center", gap: 6, flexWrap: "wrap" }}>
           <Building2 size={13} /> {job.location}{job.createdAt ? <> · in since {fmtTime(job.createdAt)}</> : null}
         </div>
@@ -7787,6 +8335,8 @@ function JobDetail({ id, initialJob, session, team, onChanged, onBack, canArchiv
                         <div style={{ display: "flex", alignItems: "center", gap: 6, fontSize: 12, color: COLORS.successText }}>
                           <CheckCircle2 size={14} color={COLORS.successText} /> {s.reviewerNote} — {review.by}
                         </div>
+                      ) : canReview && s.key === "ppf" ? (
+                        <PPFReviewerPanel job={job} onApprove={(extra) => reviewService("ppf", extra)} />
                       ) : canReview ? (
                         <button onClick={() => reviewService(s.key)} className="mrcap-press" style={{ ...primaryBtnStyle, width: "100%", minHeight: 42, padding: "8px", fontSize: 13 }}>
                           Confirm review
@@ -7802,6 +8352,11 @@ function JobDetail({ id, initialJob, session, team, onChanged, onBack, canArchiv
           </div>
         </section>
       )}
+
+      {job.serviceTypes.includes("ppf") && (
+        <PPFScopeEditor job={job} session={session} team={team} onSaved={(updated, saved) => { setJob(updated); notifyChanged(updated, saved); }} />
+      )}
+      {job.serviceTypes.includes("ppf") && <PPFOfficeView job={job} team={team} />}
 
       {hasPermission(session, team, "editJob") && (
         <section style={{ ...cardStyle, marginBottom: 16 }}>
@@ -10868,6 +11423,7 @@ function ProformaEditor({ seed, session, onCancel, onDone }) {
         <div style={{ ...smallLabel, marginBottom: 10 }}>Vehicle</div>
         <Field label="Make / model"><input style={inp} value={p.car.makeModel} onChange={(e) => setCar("makeModel", e.target.value)} /></Field>
         <div style={{ display: "flex", gap: 8 }}>
+          <div style={{ flex: 1 }}><Field label="Year (optional)"><input style={{ ...inp, fontFamily: MONO_FONT }} inputMode="numeric" value={p.car.year || ""} onChange={(e) => setCar("year", e.target.value.replace(/[^0-9]/g, "").slice(0, 4))} placeholder="e.g. 2025" /></Field></div>
           <div style={{ flex: 1 }}><Field label="Colour"><input style={inp} value={p.car.color} onChange={(e) => setCar("color", e.target.value)} /></Field></div>
           <div style={{ flex: 1 }}><Field label="Plate no."><input style={{ ...inp, fontFamily: MONO_FONT }} value={p.car.plate} onChange={(e) => setCar("plate", e.target.value.toUpperCase())} /></Field></div>
         </div>
@@ -12908,6 +13464,7 @@ function DashboardModePicker({ value, onChange }) {
     { key: "full", label: "Full Dashboard" },
     { key: "workshop", label: "Workshop Floor" },
     { key: "smartech", label: "Smartech Portal" },
+    { key: "ppfroom", label: "PPF Room" },
   ];
   // Cosmetic normalization only — a member row still saved as the old
   // "subcontractor" value highlights the same as "smartech" here since
@@ -13092,13 +13649,13 @@ async function loadDispatchJobs() {
   // dropped request doesn't blank the board and then "re-announce"
   // every car as new when the next poll succeeds.
   const { ok, data, stale } = await sbFetch(
-    "jobs?select=id,plate,make_model,customer_name,description,damage_notes,priority,location,stage_index,service_types,assigned_to,assigned_team,service_done,service_started,treatments,parts,history,dispatch_hidden,created_at,updated_at&or=(stage_index.neq.5,stage_index.is.null)&order=created_at.asc&limit=900"
+    "jobs?select=id,plate,make_model,color,customer_name,description,damage_notes,priority,location,stage_index,service_types,assigned_to,assigned_team,service_done,service_started,treatments,parts,history,dispatch_hidden,created_at,updated_at&or=(stage_index.neq.5,stage_index.is.null)&order=created_at.asc&limit=900"
   );
   if (!ok || !Array.isArray(data)) return null;
   const jobs = data
     .filter((r) => r.stage_index !== 5) // 5 = Collected — done, doesn't belong on a live queue
     .map((r) => ({
-      id: r.id, plate: r.plate, makeModel: r.make_model, customerName: r.customer_name,
+      id: r.id, plate: r.plate, makeModel: r.make_model, color: r.color || "", customerName: r.customer_name,
       description: r.description, damageNotes: r.damage_notes,
       damageDiagramImage: null, photos: {}, // filled in on-demand by loadDispatchJobExtras()
       priority: r.priority, location: r.location,
@@ -13293,6 +13850,15 @@ function InternalUpdatesWidget({ team, onOpenJob, session, index }) {
     } catch { return Date.now(); }
   })());
 
+  // While the panel is open the page behind it must not move: without this,
+  // wheeling past the end of the feed on a PC scrolled the dashboard instead.
+  useEffect(() => {
+    if (!open) return;
+    const prev = document.body.style.overflow;
+    document.body.style.overflow = "hidden";
+    return () => { document.body.style.overflow = prev; };
+  }, [open]);
+
   useEffect(() => {
     // Absolute count since last seen (lastSeenRef only moves when the panel
     // opens), so each poll replaces the badge rather than re-adding the
@@ -13346,7 +13912,7 @@ function InternalUpdatesWidget({ team, onOpenJob, session, index }) {
       </button>
       {open && createPortal(
         <div onClick={() => setOpen(false)} style={{ position: "fixed", inset: 0, background: "rgba(0,0,0,0.55)", zIndex: 300, display: "flex", justifyContent: "flex-end" }}>
-          <div onClick={(e) => e.stopPropagation()} className="mrcap-fade" style={{ width: "min(420px, 100%)", height: "100%", background: COLORS.paper, borderLeft: `1px solid ${COLORS.line}`, overflowY: "auto" }}>
+          <div onClick={(e) => e.stopPropagation()} className="mrcap-fade" style={{ width: "min(420px, 100%)", height: "100%", background: COLORS.paper, borderLeft: `1px solid ${COLORS.line}`, overflowY: "auto", overscrollBehavior: "contain" }}>
             <div style={{ position: "sticky", top: 0, background: COLORS.paper, borderBottom: `1px solid ${COLORS.line}`, padding: "14px 16px", display: "flex", justifyContent: "space-between", alignItems: "center", zIndex: 1 }}>
               <div style={{ fontFamily: DISPLAY_FONT, fontWeight: 700, fontSize: 15, color: COLORS.ink }}>Internal Updates</div>
               <button onClick={() => setOpen(false)} className="mrcap-press" style={{ background: "none", border: "none", cursor: "pointer", color: COLORS.muted, padding: 4 }}><X size={18} /></button>
@@ -13976,7 +14542,7 @@ function dispatchElapsed(fromMs, now) {
   return formatDispatchElapsed(fromMs, now) || "0m";
 }
 
-function DispatchJobCardImpl({ rowId, jobId, ticketNo, plate, model, categoryLabel, todo, stateLabel, color, pulse, timerLabel, timerText, timerMuted, redoReason, people, arriving, leaving, onOpen }) {
+function DispatchJobCardImpl({ rowId, jobId, ticketNo, plate, model, carColor, categoryLabel, todo, stateLabel, color, pulse, timerLabel, timerText, timerMuted, redoReason, people, arriving, leaving, onOpen }) {
   const cls = `dsp-card${pulse ? " dsp-pulse" : ""}${arriving ? " dsp-arrive" : ""}${leaving ? " dsp-leaving" : ""}`;
   return (
     <button type="button" className={cls} style={dispatchColorVars(color)} onClick={() => onOpen(rowId, jobId)} aria-label={`${stateLabel}: ${plate || "no plate"}${model ? `, ${model}` : ""}, ${categoryLabel}. Tap to open.`}>
@@ -13986,7 +14552,7 @@ function DispatchJobCardImpl({ rowId, jobId, ticketNo, plate, model, categoryLab
       </span>
       <span className="dsp-cbody">
         <DispatchPlate plate={plate} />
-        {model ? <span className="dsp-model">{model}</span> : null}
+        {model ? <span className="dsp-model">{model}{carColor ? ` · ${carColor}` : ""}</span> : null}
         <span className="dsp-cat">{categoryLabel}</span>
         {todo ? <span className="dsp-todo">{todo}</span> : null}
         {redoReason ? <span className="dsp-redo">Sent back: {redoReason}</span> : null}
@@ -14007,7 +14573,7 @@ function DispatchJobCardImpl({ rowId, jobId, ticketNo, plate, model, categoryLab
 // No customer name on the card: it's on a 60" screen in the workshop.
 const DispatchJobCard = memo(DispatchJobCardImpl, (prev, next) => (
   prev.rowId === next.rowId && prev.jobId === next.jobId && prev.ticketNo === next.ticketNo &&
-  prev.plate === next.plate && prev.model === next.model && prev.categoryLabel === next.categoryLabel &&
+  prev.plate === next.plate && prev.model === next.model && prev.carColor === next.carColor && prev.categoryLabel === next.categoryLabel &&
   prev.todo === next.todo && prev.stateLabel === next.stateLabel && prev.color === next.color &&
   prev.pulse === next.pulse && prev.timerLabel === next.timerLabel && prev.timerText === next.timerText &&
   prev.timerMuted === next.timerMuted && prev.redoReason === next.redoReason &&
@@ -14289,7 +14855,7 @@ function DispatchDetailModal({ row, info, color, ticketNo, now, session, team, a
               {meta ? <> · <span style={{ color }}>{meta.label}</span></> : null}
             </div>
             <DispatchPlate plate={job.plate} large />
-            {job.makeModel ? <div className="dsp-m-model">{job.makeModel}</div> : null}
+            {job.makeModel ? <div className="dsp-m-model">{job.makeModel}{job.color ? ` · ${job.color}` : ""}</div> : null}
             <div className="dsp-m-meta">
               <span>{STAGES[job.stageIndex]?.label || "—"}</span>
               {job.location ? <span>· {job.location}</span> : null}
@@ -15120,6 +15686,7 @@ function DispatchBoard({ team, session, fill = false }) {
         ticketNo={i + 1}
         plate={row.job.plate}
         model={row.job.makeModel || ""}
+        carColor={row.job.color || ""}
         categoryLabel={row.categoryLabel}
         todo={dispatchWhatToDo(row.job, row.categoryKey) || ""}
         stateLabel={leaving ? "Finished" : meta.label}
@@ -15865,6 +16432,878 @@ function UpdatePreviewModal({ update, onClose, onOpenJob, session, onPosted }) {
   );
 }
 
+/* ================================================================
+   PPF ROOM — scope editor (job card), kiosk (tablet), office view
+   (job card) and the reviewer-step extension for Ahmed's approval.
+   Diagram geometry/constants come from ./ppfDiagram.js; everything
+   here is app wiring: data shapes, saveJob calls, history entries.
+================================================================ */
+
+// ---- normalized "car" shape ppfDiagram.js's functions expect ----
+function ppfCarFromJob(job) {
+  const sc = job.ppfScope || null;
+  return {
+    bodyShape: job.bodyType || "",
+    tintBooked: !!(sc && sc.extras && sc.extras.tint),
+    spare: !!(sc && sc.spare),
+    extras: (sc && sc.extras) || {},
+    scope: { preset: (sc && sc.preset) || "custom", edited: !!(sc && sc.edited), z: (sc && sc.zones) || {} },
+  };
+}
+function ppfDoneSet(job) {
+  const z = (job.ppfProgress && job.ppfProgress.zones) || {};
+  return new Set(Object.keys(z).filter((k) => z[k] && z[k].doneAt && !z[k].skipped));
+}
+function ppfSkippedSet(job) {
+  const z = (job.ppfProgress && job.ppfProgress.zones) || {};
+  return new Set(Object.keys(z).filter((k) => z[k] && z[k].skipped));
+}
+const PPF_STATE_LABEL = { waiting_scope: "Waiting for Ahmed", not_started: "Not started", in_progress: "In progress", ready: "All done", with_ahmed: "With Ahmed" };
+function ppfKioskStatus(job) {
+  if (!job.ppfScope) return "waiting_scope";
+  if (job.serviceDone && job.serviceDone.ppf) return "with_ahmed";
+  if (!job.ppfProgress || !job.ppfProgress.startedAt) return "not_started";
+  const car = ppfCarFromJob(job);
+  const t = ppfComputeTotals(car, ppfDoneSet(job), ppfSkippedSet(job));
+  return (t.total > 0 && t.done === t.total) ? "ready" : "in_progress";
+}
+// sedan/coupe: 2-2.5 shop-days; SUV/pickup: 3-4 shop-days. A shop-day is
+// the same 10-hour open window (9am-7pm) businessMsElapsed already uses.
+function ppfTargetHours(bodyType) {
+  const wide = bodyType === "suv" || bodyType === "pickup";
+  return wide ? { min: 30, max: 40 } : { min: 20, max: 25 };
+}
+function ppfWhatBookedLabel(job, matcher) {
+  const picks = (job.treatments || {}).ppf || [];
+  return picks.find((t) => matcher.test(t)) || null;
+}
+// Tint defaults ON when a Window Tinting treatment is booked; foilwork
+// (labelled by whichever of these was actually booked) defaults ON when
+// FoilWork / a sticker install / a PPF removal is booked.
+function ppfDefaultExtras(job) {
+  const tint = !!ppfWhatBookedLabel(job, /window tint/i);
+  const foilLabel = ppfWhatBookedLabel(job, /foilwork|sticker installation|ppf removal/i);
+  return { tint, foilwork: !!foilLabel, foilworkLabel: foilLabel || "FoilWork", doorCups: false };
+}
+
+// ---- audio / haptics (only ever started by a tap, same as the mockup) ----
+let ppfAudioCtx = null;
+function ppfCtx() { if (!ppfAudioCtx) { try { ppfAudioCtx = new (window.AudioContext || window.webkitAudioContext)(); } catch { ppfAudioCtx = null; } } return ppfAudioCtx; }
+function ppfTone(freq, dur, type, peak, delay) {
+  const a = ppfCtx(); if (!a) return;
+  try {
+    if (a.state === "suspended") a.resume();
+    const t0 = a.currentTime + (delay || 0), osc = a.createOscillator(), gain = a.createGain();
+    osc.type = type || "sine"; osc.frequency.setValueAtTime(freq, t0);
+    gain.gain.setValueAtTime(0.0001, t0);
+    gain.gain.exponentialRampToValueAtTime(peak || 0.2, t0 + 0.012);
+    gain.gain.exponentialRampToValueAtTime(0.0001, t0 + dur);
+    osc.connect(gain); gain.connect(a.destination);
+    osc.start(t0); osc.stop(t0 + dur + 0.02);
+  } catch { /* ignore */ }
+}
+function ppfPlayDing() { ppfTone(880, 0.16, "sine", 0.22, 0); ppfTone(1320, 0.14, "sine", 0.16, 0.05); }
+function ppfPlayUndo() { ppfTone(320, 0.14, "triangle", 0.18, 0); }
+function ppfPlayChime() { ppfTone(660, 0.18, "sine", 0.2, 0); ppfTone(990, 0.18, "sine", 0.18, 0.09); ppfTone(1320, 0.24, "sine", 0.18, 0.18); }
+function ppfPlayStart() { ppfTone(520, 0.12, "square", 0.12, 0); ppfTone(780, 0.14, "square", 0.1, 0.08); }
+function ppfVibrate(ms) { try { if (navigator.vibrate) navigator.vibrate(ms); } catch { /* ignore */ } }
+
+// ---- one-time DOM setup: SVG <defs> (icons/patterns) + diagram CSS ----
+let ppfDefsInjected = false;
+function injectPPFSvgDefsOnce() {
+  if (ppfDefsInjected || typeof document === "undefined") return;
+  if (document.getElementById("ppf-svg-defs-root")) { ppfDefsInjected = true; return; }
+  const div = document.createElement("div");
+  div.id = "ppf-svg-defs-root";
+  div.style.cssText = "position:absolute;width:0;height:0;overflow:hidden;";
+  div.innerHTML = PPF_SVG_DEFS;
+  document.body.appendChild(div);
+  ppfDefsInjected = true;
+}
+const PPF_ROOM_CSS = `
+.ppfr-bp{ position:relative; border-radius:16px; border:1px solid #1F3D60; background:linear-gradient(165deg,#0B1E33,#0E2742); overflow:hidden; }
+.ppfr-bp-scroll{ overflow-x:auto; overflow-y:hidden; -webkit-overflow-scrolling:touch; transition:filter .2s ease; }
+.ppfr-bp-scroll svg.bp-svg{ display:block; width:100%; height:auto; max-height:66vh; }
+.ppfr-bp.locked .ppfr-bp-scroll{ filter:grayscale(.7) brightness(.55); pointer-events:none; }
+.ppfr-start-overlay{ position:absolute; inset:0; display:flex; align-items:center; justify-content:center; z-index:5; background:rgba(6,14,26,.4); }
+.ppfr-start-btn{ width:150px; height:150px; border-radius:50%; background:radial-gradient(circle at 35% 30%, #E8C34A, #C9A227 60%, #9C7D1A); border:none; color:#1a1608; font-weight:700; font-size:22px; display:flex; flex-direction:column; align-items:center; justify-content:center; gap:8px; cursor:pointer; box-shadow:0 10px 30px rgba(0,0,0,.5); font-family:'IBM Plex Sans Condensed','IBM Plex Sans',sans-serif; }
+.ppfr-card{ transition:transform .1s ease; }
+.ppfr-card:active{ transform:scale(.97); }
+@keyframes ppfrPulse{ 0%,100%{ box-shadow:0 0 0 0 rgba(74,122,87,.55);} 50%{ box-shadow:0 0 0 12px rgba(74,122,87,0);} }
+.ppfr-finish-pulse{ animation:ppfrPulse 1.6s ease-in-out infinite; }
+@media (max-width:760px){ .ppfr-bp-scroll svg.bp-svg{ min-width:760px; } }
+`;
+let ppfRoomStylesInjected = false;
+function injectPPFRoomStyles() {
+  if (ppfRoomStylesInjected || typeof document === "undefined") return;
+  if (document.getElementById("ppf-room-styles")) { ppfRoomStylesInjected = true; return; }
+  const style = document.createElement("style");
+  style.id = "ppf-room-styles";
+  style.textContent = PPF_ROOM_CSS;
+  document.head.appendChild(style);
+  ppfRoomStylesInjected = true;
+}
+function usePPFRoomSetup() {
+  useEffect(() => { injectPPFDiagramStyles(); injectPPFRoomStyles(); injectPPFSvgDefsOnce(); }, []);
+}
+
+// ---- diagram panel: renders buildSheet() and delegates taps ----
+function PPFDiagramPanel({ car, mode, progress, onZoneTap, locked, minHeight, overlay }) {
+  const svg = useMemo(() => buildSheet(car, mode, progress), [car.bodyShape, car.tintBooked, car.spare, JSON.stringify(car.scope.z), mode, progress && progress.done && Array.from(progress.done).join(","), progress && progress.skipped && Array.from(progress.skipped).join(",")]);
+  const onClick = (e) => {
+    if (!onZoneTap) return;
+    const el = e.target.closest && e.target.closest("[data-zone]");
+    if (!el) return;
+    onZoneTap(el.getAttribute("data-zone"));
+  };
+  if (!car.bodyShape) {
+    return <div style={{ ...cardStyle, textAlign: "center", color: COLORS.muted, fontSize: 13, padding: 24 }}>Body shape not set yet.</div>;
+  }
+  return (
+    <div className={`ppfr-bp${locked ? " locked" : ""}`} style={{ minHeight: minHeight || undefined }}>
+      <div className="ppfr-bp-scroll" onClick={onClick} dangerouslySetInnerHTML={{ __html: svg }} />
+      {overlay && <div className="ppfr-start-overlay">{overlay}</div>}
+    </div>
+  );
+}
+
+// ---- body-shape picker for legacy jobs with no bodyType set ----
+function PPFBodyShapePicker({ value, onSelect, disabled }) {
+  return (
+    <div style={{ display: "grid", gridTemplateColumns: "repeat(4, 1fr)", gap: 8 }}>
+      {BODY_TYPES.map((b) => (
+        <button
+          key={b.key}
+          type="button"
+          disabled={disabled}
+          onClick={() => onSelect(b.key)}
+          className="mrcap-press"
+          style={{ background: value === b.key ? "#211c0c" : COLORS.panel2, border: `2px solid ${value === b.key ? COLORS.gold : COLORS.line}`, borderRadius: 14, padding: "12px 6px", display: "flex", flexDirection: "column", alignItems: "center", gap: 6, cursor: disabled ? "default" : "pointer" }}
+        >
+          <BodyTypeIcon type={b.key} color={value === b.key ? COLORS.goldBright : COLORS.ink} />
+          <span style={{ fontFamily: DISPLAY_FONT, fontWeight: 700, fontSize: 13, color: value === b.key ? COLORS.goldBright : COLORS.ink }}>{b.label}</span>
+        </button>
+      ))}
+    </div>
+  );
+}
+
+/* ---------------- PPF scope editor (Ahmed, on the job card) ----------------
+   Editable by admins + role "intake"; read-only preview for everyone else
+   (they get PPFOfficeView instead — see JobDetail). Every tap edits local
+   draft state; "Send to PPF Room" is the one thing that actually saves. */
+function PPFScopeEditor({ job, session, team, onSaved }) {
+  usePPFRoomSetup();
+  const canEdit = session.role === "admin" || session.role === "intake";
+  const defaults = ppfDefaultExtras(job);
+  const [bodyType, setBodyType] = useState(job.bodyType || "");
+  const [scope, setScope] = useState(() => job.ppfScope ? { preset: job.ppfScope.preset, edited: !!job.ppfScope.edited, z: { ...(job.ppfScope.zones || {}) } } : { preset: "partial_front", edited: false, z: {} });
+  const [extras, setExtras] = useState(() => job.ppfScope ? { ...defaults, ...(job.ppfScope.extras || {}) } : defaults);
+  const [spare, setSpare] = useState(!!(job.ppfScope && job.ppfScope.spare));
+  const [note, setNote] = useState((job.ppfScope && job.ppfScope.note) || "");
+  const [collapsed, setCollapsed] = useState(!!job.ppfScope);
+  const [saving, setSaving] = useState(false);
+  const [hint, setHint] = useState(null); // { label, count, oftenSkipped, avgDays, avgFilm, typicalKeys, perPanelFallback }
+  const [savingBodyType, setSavingBodyType] = useState(false);
+
+  useEffect(() => {
+    let cancelled = false;
+    (async () => {
+      if (!job.make) { setHint(null); return; }
+      const enc = (s) => encodeURIComponent(s);
+      let rows = [];
+      let label = null;
+      if (job.make && job.model) {
+        const { ok, data } = await sbFetch(`jobs?select=id,make,model,body_type,ppf_scope,ppf_progress&make=eq.${enc(job.make)}&model=eq.${enc(job.model)}&ppf_progress-%3Ereview=not.is.null&limit=50`);
+        if (ok && data && data.length) { rows = data; label = `${job.make} ${job.model}`.trim(); }
+      }
+      if (!rows.length && (bodyType || job.bodyType)) {
+        const bt = bodyType || job.bodyType;
+        const { ok, data } = await sbFetch(`jobs?select=id,make,model,body_type,ppf_scope,ppf_progress&body_type=eq.${enc(bt)}&ppf_progress-%3Ereview=not.is.null&limit=80`);
+        if (ok && data && data.length) { rows = data; label = `${BODY_TYPE_LABEL[bt] || bt}`; }
+      }
+      if (cancelled) return;
+      if (!rows.length) { setHint(null); return; }
+      const reviews = rows.map((r) => (r.ppf_progress || {}).review).filter(Boolean);
+      if (!reviews.length) { setHint(null); return; }
+      // most-common actual panels (present in >=50% of reviewed jobs)
+      const freq = {};
+      reviews.forEach((rv) => (rv.actualKeys || []).forEach((k) => { freq[k] = (freq[k] || 0) + 1; }));
+      const half = reviews.length / 2;
+      const typicalKeys = Object.keys(freq).filter((k) => freq[k] >= half);
+      // often-skipped panels (present as skipped in >=30% of jobs, min 2)
+      const skipFreq = {};
+      rows.forEach((r) => {
+        const zones = ((r.ppf_progress || {}).zones) || {};
+        Object.keys(zones).forEach((k) => { if (zones[k] && zones[k].skipped) skipFreq[k] = (skipFreq[k] || 0) + 1; });
+      });
+      const oftenSkipped = Object.keys(skipFreq).filter((k) => skipFreq[k] >= Math.max(2, rows.length * 0.3)).sort((a, b) => skipFreq[b] - skipFreq[a]).slice(0, 4).map((k) => zoneName(k, bodyType || job.bodyType || rows[0].body_type));
+      // avg shop-days (business hours / 10h day)
+      const days = reviews.map((rv, i) => {
+        const pr = (rows[i].ppf_progress) || {};
+        if (!pr.startedAt || !pr.finishedAt) return null;
+        return businessMsElapsed(new Date(pr.startedAt).getTime(), new Date(pr.finishedAt).getTime()) / 3600000 / 10;
+      }).filter((d) => d != null && d > 0);
+      const avgDays = days.length ? (days.reduce((a, b) => a + b, 0) / days.length) : null;
+      // avg film metres + metres/panel fallback
+      const films = reviews.filter((rv) => rv.filmMetres != null).map((rv) => Number(rv.filmMetres));
+      const avgFilm = films.length ? (films.reduce((a, b) => a + b, 0) / films.length) : null;
+      const perPanel = reviews.filter((rv) => rv.filmMetres != null && (rv.actualKeys || []).length > 0)
+        .map((rv) => Number(rv.filmMetres) / rv.actualKeys.length);
+      const perPanelFallback = perPanel.length ? { rate: perPanel.reduce((a, b) => a + b, 0) / perPanel.length, n: perPanel.length } : null;
+      setHint({ label, count: rows.length, oftenSkipped, avgDays, avgFilm, typicalKeys, perPanelFallback });
+    })();
+    return () => { cancelled = true; };
+  }, [job.make, job.model, bodyType, job.bodyType]);
+
+  const effectiveBodyType = bodyType || job.bodyType || "";
+  const carDraft = { bodyShape: effectiveBodyType, tintBooked: extras.tint, spare, extras, scope };
+
+  const chooseBodyType = async (bt) => {
+    setBodyType(bt);
+    setSavingBodyType(true);
+    const updated = { ...job, bodyType: bt, updatedAt: Date.now() };
+    const saved = await saveJob(updated);
+    setSavingBodyType(false);
+    onSaved(updated, saved);
+  };
+
+  const applyPreset = (p) => {
+    setScope({ preset: p, edited: false, z: presetZones(p, { bodyShape: effectiveBodyType, spare }) });
+    ppfTone2();
+  };
+  function ppfTone2() { try { ppfPlayDing(); } catch { /* ignore */ } }
+
+  const toggleZone = (key) => {
+    if (!canEdit) return;
+    setScope((s) => {
+      const next = nextZoneState({ scope: s }, key);
+      const z = { ...s.z };
+      if (next) z[key] = next; else delete z[key];
+      return { preset: s.preset === "custom" ? "custom" : s.preset, edited: s.preset !== "custom" ? true : s.edited, z };
+    });
+    ppfVibrate(8);
+  };
+
+  const useTypical = () => {
+    if (!hint || !hint.typicalKeys) return;
+    const z = {};
+    hint.typicalKeys.forEach((k) => { z[k] = "full"; });
+    setScope({ preset: "custom", edited: true, z });
+  };
+
+  const send = async () => {
+    setSaving(true);
+    const n = scopeKeys({ bodyShape: effectiveBodyType, spare, scope }).length;
+    const ppfScope = {
+      preset: scope.preset, edited: scope.edited, zones: scope.z,
+      extras: { tint: extras.tint, foilwork: extras.foilwork, doorCups: extras.doorCups },
+      spare, note, setBy: session.name, setAt: Date.now(),
+    };
+    const label = scopeLabel({ bodyShape: effectiveBodyType, spare, scope });
+    const updated = {
+      ...job,
+      bodyType: effectiveBodyType || job.bodyType,
+      ppfScope,
+      history: [...(job.history || []), { stage: "ppf_scope", label: "PPF Room", by: session.name, role: session.role, note: `PPF scope set: ${label} · ${n} panel${n === 1 ? "" : "s"}`, at: Date.now() }],
+      updatedAt: Date.now(),
+    };
+    const saved = await saveJob(updated);
+    setSaving(false);
+    setCollapsed(true);
+    onSaved(updated, saved);
+  };
+
+  const n = scopeKeys({ bodyShape: effectiveBodyType, spare, scope }).length;
+
+  if (collapsed) {
+    return (
+      <section style={{ ...cardStyle, marginBottom: 16 }}>
+        <button onClick={() => setCollapsed(false)} className="mrcap-press" style={{ width: "100%", background: "none", border: "none", padding: 0, cursor: "pointer", textAlign: "left" }}>
+          <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", gap: 8 }}>
+            <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
+              <ShieldCheck size={16} color={COLORS.gold} />
+              <div style={{ fontFamily: DISPLAY_FONT, fontWeight: 700, fontSize: 15, color: COLORS.ink }}>PPF scope</div>
+            </div>
+            <ChevronDown size={16} color={COLORS.muted} />
+          </div>
+          <div style={{ fontSize: 12.5, color: COLORS.muted, marginTop: 6 }}>
+            {job.ppfScope ? `${scopeLabel({ bodyShape: effectiveBodyType, spare, scope })} · ${n} panel${n === 1 ? "" : "s"}` : "Not set yet"}
+          </div>
+        </button>
+      </section>
+    );
+  }
+
+  return (
+    <section style={{ ...cardStyle, marginBottom: 16 }}>
+      <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", gap: 8, marginBottom: 10 }}>
+        <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
+          <ShieldCheck size={16} color={COLORS.gold} />
+          <div style={{ fontFamily: DISPLAY_FONT, fontWeight: 700, fontSize: 16, color: COLORS.ink }}>PPF scope</div>
+        </div>
+        {job.ppfScope && <button onClick={() => setCollapsed(true)} className="mrcap-press" style={{ background: "none", border: "none", color: COLORS.muted, cursor: "pointer", padding: 4 }}><ChevronUp size={16} /></button>}
+      </div>
+      {!canEdit && <div style={{ fontSize: 12, color: COLORS.muted, marginBottom: 10 }}>Read-only — only admins and intake can edit the scope.</div>}
+
+      {!effectiveBodyType ? (
+        <div>
+          <div style={{ fontSize: 13, color: COLORS.muted, marginBottom: 10 }}>Body shape wasn't set at intake — pick it to open the scope diagram.</div>
+          <PPFBodyShapePicker value={bodyType} onSelect={chooseBodyType} disabled={!canEdit || savingBodyType} />
+        </div>
+      ) : (
+        <fieldset disabled={!canEdit} style={{ border: "none", padding: 0, margin: 0 }}>
+          <div style={{ display: "flex", flexWrap: "wrap", gap: 6, marginBottom: 10 }}>
+            {PRESET_ORDER.map((p) => {
+              const on = scope.edited ? p === "custom" : scope.preset === p;
+              const label = (p === "custom" && scope.edited) ? "Custom (edited)" : PRESETS[p].label;
+              return (
+                <button key={p} type="button" onClick={() => applyPreset(p)} className="mrcap-press" style={{ background: on ? COLORS.gold : COLORS.panel2, border: `1px solid ${on ? COLORS.gold : COLORS.line}`, color: on ? COLORS.darkText : COLORS.ink, borderRadius: 999, padding: "8px 14px", fontFamily: DISPLAY_FONT, fontWeight: 700, fontSize: 13, cursor: canEdit ? "pointer" : "default" }}>
+                  {label}
+                </button>
+              );
+            })}
+          </div>
+
+          {hint && (
+            <div style={{ background: "rgba(201,162,39,0.08)", border: `1px solid ${COLORS.goldDeep}`, borderRadius: 12, padding: "10px 12px", marginBottom: 10, fontSize: 12.5, color: COLORS.ink, lineHeight: 1.5 }}>
+              <div>Past {hint.label} jobs ({hint.count}): {hint.typicalKeys.length ? `usually ${hint.typicalKeys.length} panels` : "not enough data yet"}
+                {hint.oftenSkipped.length ? ` · often skipped: ${hint.oftenSkipped.join(", ")}` : ""}
+                {hint.avgDays ? ` · avg ${hint.avgDays.toFixed(1)} shop-days` : ""}
+                {hint.avgFilm ? ` · avg ${hint.avgFilm.toFixed(1)} m film` : ""}
+              </div>
+              {!hint.avgFilm && hint.perPanelFallback && (
+                <div style={{ marginTop: 4, color: COLORS.muted }}>est. ~{(hint.perPanelFallback.rate * n).toFixed(1)} m film ({hint.perPanelFallback.rate.toFixed(1)} m/panel from {hint.perPanelFallback.n} {BODY_TYPE_LABEL[effectiveBodyType] || ""} jobs)</div>
+              )}
+              {canEdit && hint.typicalKeys.length > 0 && (
+                <button type="button" onClick={useTypical} className="mrcap-press" style={{ marginTop: 8, background: COLORS.panel2, border: `1px solid ${COLORS.gold}`, color: COLORS.goldBright, borderRadius: 8, padding: "6px 12px", fontSize: 12, fontWeight: 700, cursor: "pointer" }}>Use typical</button>
+              )}
+            </div>
+          )}
+
+          <div style={{ marginBottom: 10 }}>
+            <PPFDiagramPanel car={carDraft} mode="scope" onZoneTap={toggleZone} minHeight={260} />
+          </div>
+
+          <div style={{ display: "flex", justifyContent: "space-between", alignItems: "flex-end", gap: 10, marginBottom: 10, flexWrap: "wrap" }}>
+            <div>
+              <div style={{ fontFamily: DISPLAY_FONT, fontWeight: 700, fontSize: 26, color: COLORS.ink }}><span style={{ color: COLORS.goldBright }}>{n}</span> panel{n === 1 ? "" : "s"} to do</div>
+              <div style={{ fontFamily: MONO_FONT, fontSize: 12.5, color: COLORS.muted, marginTop: 4 }}>{ppfBreakdown({ bodyShape: effectiveBodyType, spare, scope })}</div>
+            </div>
+          </div>
+          <div style={{ fontSize: 11.5, color: COLORS.muted, marginBottom: 10 }}>Tap a panel to add or remove it. Bonnet and front fenders: Off → Full → ½ (front 40%) → Off.</div>
+
+          <div style={{ display: "flex", flexWrap: "wrap", gap: 6, marginBottom: 10 }}>
+            <button type="button" onClick={() => setExtras((x) => ({ ...x, tint: !x.tint }))} className="mrcap-press" style={extraChipStyle(extras.tint)}>{extras.tint ? "✓ " : "+ "}Window tint · 4 glass areas</button>
+            <button type="button" onClick={() => setExtras((x) => ({ ...x, foilwork: !x.foilwork }))} className="mrcap-press" style={extraChipStyle(extras.foilwork)}>{extras.foilwork ? "✓ " : "+ "}{extras.foilworkLabel || "FoilWork"} (whole job)</button>
+            <button type="button" onClick={() => setExtras((x) => ({ ...x, doorCups: !x.doorCups }))} className="mrcap-press" style={extraChipStyle(extras.doorCups)}>{extras.doorCups ? "✓ " : "+ "}Door cups & edges</button>
+          </div>
+
+          {effectiveBodyType === "suv" && (
+            <div style={{ marginBottom: 10 }}>
+              <button type="button" onClick={() => setSpare((s) => !s)} className="mrcap-press" style={extraChipStyle(spare)}>{spare ? "✓ " : "+ "}Spare wheel on back</button>
+            </div>
+          )}
+
+          <textarea value={note} onChange={(e) => setNote(e.target.value)} placeholder="Note for the PPF team (optional)" style={{ width: "100%", minHeight: 64, background: COLORS.panel2, border: `1px solid ${COLORS.line}`, borderRadius: 10, color: COLORS.ink, padding: 10, fontFamily: BODY_FONT, fontSize: 13.5, marginBottom: 10, boxSizing: "border-box" }} />
+
+          {canEdit && (
+            <button type="button" onClick={send} disabled={saving || n === 0} className="mrcap-press" style={{ ...primaryBtnStyle, width: "100%", opacity: (saving || n === 0) ? 0.6 : 1 }}>
+              {saving ? "Sending…" : "Send to PPF Room"}
+            </button>
+          )}
+        </fieldset>
+      )}
+    </section>
+  );
+}
+function extraChipStyle(on) {
+  return { background: on ? "#2a2410" : COLORS.panel2, border: `1px solid ${on ? COLORS.gold : COLORS.line}`, color: on ? COLORS.goldBright : COLORS.ink, borderRadius: 10, padding: "8px 12px", fontSize: 12.5, fontWeight: 600, cursor: "pointer" };
+}
+
+/* ---------------- Office view (read-only, job card) ---------------- */
+function PPFOfficeView({ job, team }) {
+  usePPFRoomSetup();
+  if (!job.ppfScope) {
+    return (
+      <section style={{ ...cardStyle, marginBottom: 16 }}>
+        <div style={{ display: "flex", alignItems: "center", gap: 8, marginBottom: 6 }}><ShieldCheck size={16} color={COLORS.muted} /><div style={{ fontFamily: DISPLAY_FONT, fontWeight: 700, fontSize: 15, color: COLORS.ink }}>PPF Room</div></div>
+        <div style={{ fontSize: 12.5, color: COLORS.muted }}>Scope not set yet — waiting on Ahmed.</div>
+      </section>
+    );
+  }
+  const car = ppfCarFromJob(job);
+  const doneSet = ppfDoneSet(job), skippedSet = ppfSkippedSet(job);
+  const t = ppfComputeTotals(car, doneSet, skippedSet);
+  const status = ppfKioskStatus(job);
+  const keys = scopeKeys(car);
+  const pr = job.ppfProgress || {};
+  const started = pr.startedAt || null;
+  const workedMs = started ? businessMsElapsed(new Date(started).getTime(), pr.finishedAt ? new Date(pr.finishedAt).getTime() : Date.now()) : 0;
+  const workedHours = workedMs / 3600000;
+  const target = ppfTargetHours(job.bodyType);
+  const overTarget = started && !pr.finishedAt && workedHours > target.max;
+  const review = pr.review || null;
+  const ppfTeam = (team || []).filter((m) => m.role === "ppf");
+  const log = (pr.log || []).slice().reverse().slice(0, 20);
+  return (
+    <section style={{ ...cardStyle, marginBottom: 16 }}>
+      <div style={{ display: "flex", alignItems: "center", gap: 8, marginBottom: 10 }}>
+        <ShieldCheck size={16} color={COLORS.gold} />
+        <div style={{ fontFamily: DISPLAY_FONT, fontWeight: 700, fontSize: 16, color: COLORS.ink }}>PPF Room</div>
+        <span style={{ marginLeft: "auto" }}><Pill tone={status === "ready" || status === "with_ahmed" ? "green" : status === "in_progress" ? "yellow" : "default"}>{PPF_STATE_LABEL[status]}</Pill></span>
+      </div>
+
+      <div style={{ marginBottom: 10 }}>
+        <PPFDiagramPanel car={car} mode="ro" progress={{ done: doneSet, skipped: skippedSet }} minHeight={220} />
+      </div>
+
+      <div style={{ fontFamily: MONO_FONT, fontWeight: 700, fontSize: 15, color: COLORS.ink, marginBottom: 4 }}>{t.done} of {t.total}</div>
+      <div style={{ fontSize: 12.5, color: COLORS.muted, marginBottom: 10 }}>{scopeLabel(car)} · {keys.length} panel{keys.length === 1 ? "" : "s"}</div>
+      <div style={{ display: "flex", flexWrap: "wrap", gap: 4, marginBottom: 10 }}>
+        {keys.map((k) => (
+          <span key={k} style={{ fontSize: 11, background: COLORS.panel2, border: `1px solid ${COLORS.line}`, borderRadius: 999, padding: "3px 9px", color: doneSet.has(k) ? COLORS.successText : skippedSet.has(k) ? COLORS.muted : COLORS.ink }}>
+            {doneSet.has(k) ? "✓ " : skippedSet.has(k) ? "⊘ " : ""}{zoneName(k, job.bodyType)}{car.scope.z[k] === "partial" ? " (½)" : ""}
+          </span>
+        ))}
+      </div>
+      {(car.extras.tint || car.extras.foilwork || car.extras.doorCups) && (
+        <div style={{ fontSize: 12.5, color: COLORS.ink, marginBottom: 10 }}>
+          Also: {[car.extras.tint && "Window tint (4)", car.extras.foilwork && "FoilWork", car.extras.doorCups && "Door cups & edges"].filter(Boolean).join(" · ")}
+        </div>
+      )}
+      {job.ppfScope.note && <div style={{ fontSize: 12.5, color: COLORS.muted, marginBottom: 10 }}>Note: "{job.ppfScope.note}"</div>}
+
+      <div style={{ display: "flex", flexWrap: "wrap", gap: 8, marginBottom: 10 }}>
+        <div style={{ flex: 1, minWidth: 130, background: COLORS.panel2, border: `1px solid ${COLORS.line}`, borderRadius: 10, padding: "8px 10px" }}>
+          <div style={{ fontSize: 10.5, color: COLORS.muted, textTransform: "uppercase" }}>Started</div>
+          <div style={{ fontFamily: MONO_FONT, fontSize: 12.5, color: COLORS.ink }}>{started ? fmtTime(new Date(started).getTime()) : "Not started yet"}</div>
+        </div>
+        <div style={{ flex: 1, minWidth: 130, background: COLORS.panel2, border: `1px solid ${COLORS.line}`, borderRadius: 10, padding: "8px 10px" }}>
+          <div style={{ fontSize: 10.5, color: COLORS.muted, textTransform: "uppercase" }}>Work time (shop hours)</div>
+          <div style={{ fontFamily: MONO_FONT, fontSize: 12.5, color: COLORS.ink }}>{Math.floor(workedHours)}h {Math.round((workedHours % 1) * 60)}m</div>
+          <div style={{ fontSize: 10.5, color: COLORS.muted, marginTop: 4 }}>Target: {BODY_TYPE_LABEL[job.bodyType] || ""} {target.min / 10}–{target.max / 10} days</div>
+          {overTarget && <Pill tone="red">Over target</Pill>}
+        </div>
+      </div>
+
+      {review && (
+        <div style={{ background: COLORS.panel2, border: `1px solid ${COLORS.line}`, borderRadius: 10, padding: "8px 10px", marginBottom: 10 }}>
+          <div style={{ fontSize: 10.5, color: COLORS.muted, textTransform: "uppercase" }}>Film used</div>
+          <div style={{ fontFamily: MONO_FONT, fontSize: 13, color: COLORS.ink }}>
+            {review.filmMetres != null ? `${Number(review.filmMetres).toFixed(1)} m (${review.rollWidth || "?"} m roll)` : "Not recorded"}
+          </div>
+        </div>
+      )}
+
+      {ppfTeam.length > 0 && (
+        <div style={{ marginBottom: 10 }}>
+          <div style={{ fontSize: 10.5, color: COLORS.muted, textTransform: "uppercase", marginBottom: 4 }}>PPF team credit</div>
+          <div style={{ display: "flex", gap: 6 }}>
+            {ppfTeam.map((m) => <span key={m.id} title={m.name} style={{ width: 30, height: 30, borderRadius: "50%", background: COLORS.panel, border: `1px solid ${COLORS.goldDeep}`, color: COLORS.goldBright, display: "flex", alignItems: "center", justifyContent: "center", fontWeight: 700, fontSize: 12.5, fontFamily: DISPLAY_FONT }}>{m.name[0]}</span>)}
+          </div>
+        </div>
+      )}
+
+      {log.length > 0 && (
+        <div>
+          <div style={{ fontSize: 10.5, color: COLORS.muted, textTransform: "uppercase", marginBottom: 4 }}>Activity</div>
+          <ul style={{ listStyle: "none", margin: 0, padding: 0, display: "flex", flexDirection: "column", gap: 4, maxHeight: 200, overflowY: "auto" }}>
+            {log.map((a, i) => (
+              <li key={i} style={{ display: "flex", gap: 8, fontSize: 12, borderBottom: `1px solid ${COLORS.line}`, paddingBottom: 4 }}>
+                <span style={{ color: a.action === "undone" ? COLORS.dangerText : COLORS.successText, fontWeight: 600 }}>
+                  {a.key === "job" ? (a.action === "started" ? "▶ Job started" : "✓ Sent to Ahmed") : `${a.action === "done" ? "✓" : a.action === "skipped" ? "⊘" : "↶"} ${zoneName(a.key, job.bodyType)}`}
+                </span>
+                <span style={{ marginLeft: "auto", color: COLORS.muted, fontFamily: MONO_FONT, fontSize: 11 }}>{fmtTime(a.at)}</span>
+              </li>
+            ))}
+          </ul>
+        </div>
+      )}
+    </section>
+  );
+}
+
+/* ---------------- Reviewer step extension (Ahmed's approval) ----------------
+   Swapped in for the plain "Confirm review" button when s.key === "ppf". */
+function PPFReviewerPanel({ job, onApprove }) {
+  usePPFRoomSetup();
+  const car = ppfCarFromJob(job);
+  const doneSet = ppfDoneSet(job);
+  const [actualKeys, setActualKeys] = useState(() => Array.from(doneSet));
+  const [note, setNote] = useState("");
+  const [filmMetres, setFilmMetres] = useState("");
+  const [rollWidth, setRollWidth] = useState(() => { try { return window.localStorage.getItem("mrcap_ppf_roll_width") || "1.52"; } catch { return "1.52"; } });
+  const [customRoll, setCustomRoll] = useState("");
+  const [submitting, setSubmitting] = useState(false);
+
+  const setRoll = (v) => { setRollWidth(v); try { window.localStorage.setItem("mrcap_ppf_roll_width", v); } catch { /* ignore */ } };
+
+  const actualSet = new Set(actualKeys);
+  const toggleActual = (key) => {
+    setActualKeys((cur) => cur.includes(key) ? cur.filter((k) => k !== key) : [...cur, key]);
+  };
+  const step = (delta) => setFilmMetres((v) => { const n = Math.max(0, Math.round(((Number(v) || 0) + delta) * 2) / 2); return String(n); });
+
+  const submit = async () => {
+    setSubmitting(true);
+    const rw = rollWidth === "other" ? (Number(customRoll) || null) : Number(rollWidth);
+    await onApprove({ actualKeys, note, filmMetres: filmMetres !== "" ? Number(filmMetres) : null, rollWidth: rw });
+    setSubmitting(false);
+  };
+
+  return (
+    <div>
+      <div style={{ marginBottom: 8 }}>
+        <PPFDiagramPanel car={{ ...car, scope: { z: scopeKeys(car).reduce((o, k) => ({ ...o, [k]: car.scope.z[k] || "full" }), {}) } }} mode="tablet" progress={{ done: actualSet }} onZoneTap={toggleActual} minHeight={220} />
+      </div>
+      <div style={{ fontSize: 11.5, color: COLORS.muted, marginBottom: 10 }}>Tap panels to correct the actual set — pre-filled from what the tablet marked done.</div>
+
+      <div style={{ marginBottom: 10 }}>
+        <div style={{ fontSize: 11, color: COLORS.muted, textTransform: "uppercase", marginBottom: 6 }}>Film used (metres, optional)</div>
+        <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
+          <button type="button" onClick={() => step(-0.5)} className="mrcap-press" style={{ width: 44, height: 44, borderRadius: 10, background: COLORS.panel2, border: `1px solid ${COLORS.line}`, color: COLORS.ink, fontSize: 20, fontWeight: 700, cursor: "pointer" }}>−</button>
+          <input type="number" step="0.5" min="0" value={filmMetres} onChange={(e) => setFilmMetres(e.target.value)} placeholder="0.0" style={{ width: 90, textAlign: "center", background: COLORS.panel2, border: `1px solid ${COLORS.line}`, borderRadius: 10, padding: "10px 6px", fontFamily: MONO_FONT, fontSize: 16, color: COLORS.ink }} />
+          <button type="button" onClick={() => step(0.5)} className="mrcap-press" style={{ width: 44, height: 44, borderRadius: 10, background: COLORS.panel2, border: `1px solid ${COLORS.line}`, color: COLORS.ink, fontSize: 20, fontWeight: 700, cursor: "pointer" }}>+</button>
+          <select value={rollWidth} onChange={(e) => setRoll(e.target.value)} style={{ marginLeft: "auto", background: COLORS.panel2, border: `1px solid ${COLORS.line}`, borderRadius: 10, padding: "10px 8px", color: COLORS.ink, fontSize: 13 }}>
+            <option value="1.52">1.52 m roll</option>
+            <option value="1.22">1.22 m roll</option>
+            <option value="other">Other</option>
+          </select>
+          {rollWidth === "other" && <input type="number" step="0.01" value={customRoll} onChange={(e) => setCustomRoll(e.target.value)} placeholder="m" style={{ width: 60, background: COLORS.panel2, border: `1px solid ${COLORS.line}`, borderRadius: 10, padding: "10px 6px", color: COLORS.ink, fontSize: 13 }} />}
+        </div>
+      </div>
+
+      <textarea value={note} onChange={(e) => setNote(e.target.value)} placeholder="Comment (optional)" style={{ width: "100%", minHeight: 56, background: COLORS.panel2, border: `1px solid ${COLORS.line}`, borderRadius: 10, color: COLORS.ink, padding: 10, fontFamily: BODY_FONT, fontSize: 13, marginBottom: 10, boxSizing: "border-box" }} />
+
+      <button onClick={submit} disabled={submitting} className="mrcap-press" style={{ ...primaryBtnStyle, width: "100%", minHeight: 42, padding: "8px", fontSize: 13, opacity: submitting ? 0.6 : 1 }}>
+        {submitting ? "Saving…" : "Confirm review"}
+      </button>
+    </div>
+  );
+}
+
+/* ---------------- PPF Room kiosk (tablet, standalone screen) ---------------- */
+function PPFRoomKiosk({ session, onLogout }) {
+  usePPFRoomSetup();
+  const [jobs, setJobs] = useState([]);
+  const [loading, setLoading] = useState(true);
+  const [openId, setOpenId] = useState(null);
+  const [openJob, setOpenJob] = useState(null);
+  const [justDone, setJustDone] = useState(null);
+  const [sheet, setSheet] = useState(null); // { type: "undo"|"finish"|"success", key }
+  const wakeLockRef = useRef(null);
+
+  const refresh = useCallback(async () => {
+    const { ok, data } = await sbFetch(`jobs?select=id,plate,make,model,body_type,service_types,service_done,service_reviewed,treatments,ppf_scope,ppf_progress,stage_index,updated_at&order=updated_at.desc&limit=900`);
+    if (!ok || !data) { setLoading(false); return; }
+    const scoped = data.filter((r) => {
+      if ((STAGES[r.stage_index] || STAGES[0]).key === "collected") return false;
+      if (!(r.service_types || []).includes("ppf")) return false;
+      if ((r.service_reviewed || {}).ppf) return false;
+      return true;
+    }).map((r) => ({
+      id: r.id, plate: r.plate, make: r.make || "", model: r.model || "", bodyType: r.body_type || "",
+      serviceTypes: r.service_types || [], serviceDone: r.service_done || {}, treatments: r.treatments || {},
+      ppfScope: r.ppf_scope || null, ppfProgress: r.ppf_progress || null,
+    }));
+    setJobs(scoped);
+    setLoading(false);
+  }, []);
+
+  useEffect(() => { refresh(); }, [refresh]);
+  useEffect(() => {
+    if (openId) return; // never clobber a car that's open with unsaved taps
+    const t = setInterval(refresh, 15000);
+    return () => clearInterval(t);
+  }, [openId, refresh]);
+
+  useEffect(() => {
+    let released = false;
+    const request = async () => {
+      try {
+        if ("wakeLock" in navigator) {
+          wakeLockRef.current = await navigator.wakeLock.request("screen");
+        }
+      } catch { /* tolerate rejection — not fatal */ }
+    };
+    request();
+    const onVisible = () => { if (document.visibilityState === "visible" && !released) request(); };
+    document.addEventListener("visibilitychange", onVisible);
+    return () => {
+      released = true;
+      document.removeEventListener("visibilitychange", onVisible);
+      try { wakeLockRef.current && wakeLockRef.current.release(); } catch { /* ignore */ }
+    };
+  }, []);
+
+  const openCar = async (id) => {
+    setOpenId(id);
+    const j = await loadJob(id);
+    setOpenJob(j);
+  };
+  const backToList = () => { setOpenId(null); setOpenJob(null); refresh(); };
+
+  if (openId) {
+    return (
+      <PPFRoomCarScreen
+        jobId={openId}
+        job={openJob}
+        onJobChange={setOpenJob}
+        onBack={backToList}
+        sheet={sheet}
+        setSheet={setSheet}
+        justDone={justDone}
+        setJustDone={setJustDone}
+      />
+    );
+  }
+
+  return (
+    <div style={{ padding: "18px 18px 40px", maxWidth: 1100, margin: "0 auto" }}>
+      <div style={{ display: "flex", alignItems: "center", gap: 12, marginBottom: 18, flexWrap: "wrap" }}>
+        <ShieldCheck size={26} color={COLORS.gold} />
+        <div style={{ fontFamily: DISPLAY_FONT, fontWeight: 700, fontSize: 24, color: COLORS.ink, letterSpacing: 1 }}>PPF ROOM</div>
+        <span style={{ marginLeft: "auto" }}><Pill>{session.name}</Pill></span>
+        <button onClick={onLogout} className="mrcap-press" style={{ background: COLORS.panel2, border: `1px solid ${COLORS.line}`, color: COLORS.muted, borderRadius: 10, padding: "8px 14px", fontSize: 12.5, cursor: "pointer" }}>Log out</button>
+      </div>
+      {loading ? (
+        <div style={{ color: COLORS.muted, textAlign: "center", padding: 40 }}>Loading…</div>
+      ) : jobs.length === 0 ? (
+        <div style={{ color: COLORS.muted, textAlign: "center", padding: 40 }}>No PPF jobs right now.</div>
+      ) : (
+        <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fill, minmax(240px, 1fr))", gap: 14 }}>
+          {jobs.map((j) => <PPFRoomCarCard key={j.id} job={j} onOpen={() => openCar(j.id)} />)}
+        </div>
+      )}
+    </div>
+  );
+}
+
+function PPFRoomCarCard({ job, onOpen }) {
+  const status = ppfKioskStatus(job);
+  const disabled = status === "waiting_scope";
+  const car = ppfCarFromJob(job);
+  const t = ppfComputeTotals(car, ppfDoneSet(job), ppfSkippedSet(job));
+  const pct = t.total ? Math.round((t.done / t.total) * 100) : 0;
+  const ringColor = status === "in_progress" ? COLORS.gold : status === "ready" ? COLORS.green : status === "with_ahmed" ? COLORS.blue : COLORS.muted;
+  const borderColor = status === "in_progress" ? COLORS.gold : status === "ready" ? COLORS.green : status === "with_ahmed" ? COLORS.blue : COLORS.line;
+  const treatments = job.treatments && job.treatments.ppf ? job.treatments.ppf : [];
+  const tint = /window tint/i.test(treatments.join(" "));
+  const whole = /foilwork|sticker installation|ppf removal/i.test(treatments.join(" "));
+  return (
+    <button onClick={disabled ? undefined : onOpen} disabled={disabled} className="ppfr-card mrcap-press" style={{ textAlign: "left", background: COLORS.panel2, border: `1px solid ${COLORS.line}`, borderLeft: `6px solid ${borderColor}`, borderRadius: 16, padding: 14, cursor: disabled ? "default" : "pointer", opacity: disabled ? 0.6 : 1, display: "flex", flexDirection: "column", gap: 10 }}>
+      <div style={{ display: "flex", justifyContent: "space-between", alignItems: "flex-start", gap: 8 }}>
+        <PlateChip plate={job.plate} size="md" />
+        <div style={{ display: "flex", gap: 6 }}>
+          <ShieldCheck size={16} color={COLORS.muted} />
+          {tint && <Palette size={16} color={COLORS.muted} />}
+          {whole && <Sparkles size={16} color={COLORS.muted} />}
+        </div>
+      </div>
+      <div>
+        <div style={{ fontFamily: DISPLAY_FONT, fontWeight: 700, fontSize: 18, color: COLORS.ink }}>{job.make || "—"}</div>
+        <div style={{ fontSize: 13, color: COLORS.muted }}>{job.model || ""}</div>
+      </div>
+      <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", gap: 10 }}>
+        <span style={{ fontFamily: DISPLAY_FONT, fontWeight: 700, fontSize: 13, textTransform: "uppercase", letterSpacing: 0.5, color: ringColor }}>{PPF_STATE_LABEL[status]}</span>
+        <div style={{ width: 52, height: 52, borderRadius: "50%", flexShrink: 0, background: `conic-gradient(${ringColor} calc(${pct} * 3.6deg), ${COLORS.line} 0)`, display: "flex", alignItems: "center", justifyContent: "center" }}>
+          <div style={{ width: 38, height: 38, borderRadius: "50%", background: COLORS.panel2, display: "flex", alignItems: "center", justifyContent: "center", fontFamily: MONO_FONT, fontWeight: 700, fontSize: 11, color: COLORS.ink }}>{t.done}/{t.total}</div>
+        </div>
+      </div>
+    </button>
+  );
+}
+
+function PPFRoomCarScreen({ jobId, job, onJobChange, onBack, sheet, setSheet, justDone, setJustDone }) {
+  if (!job) return <div style={{ padding: 40, textAlign: "center", color: COLORS.muted }}>Loading…</div>;
+  const car = ppfCarFromJob(job);
+  const doneSet = ppfDoneSet(job);
+  const skippedSet = ppfSkippedSet(job);
+  const totals = ppfComputeTotals(car, doneSet, skippedSet);
+  const pct = totals.total ? Math.round((totals.done / totals.total) * 100) : 0;
+  const started = !!(job.ppfProgress && job.ppfProgress.startedAt);
+  const allResolved = totals.total > 0 && totals.done === totals.total;
+  const lastKey = job.ppfProgress && job.ppfProgress.history && job.ppfProgress.history.length ? job.ppfProgress.history[job.ppfProgress.history.length - 1] : null;
+
+  const persist = async (updated, playSound) => {
+    onJobChange(updated);
+    if (playSound) playSound();
+    const saved = await saveJob(updated);
+    if (saved) onJobChange((cur) => (cur && cur.id === updated.id ? { ...cur, _base: updated._base } : cur));
+  };
+
+  const start = () => {
+    const now = Date.now();
+    const updated = {
+      ...job,
+      ppfProgress: { startedAt: now, zones: {}, history: [], log: [{ key: "job", action: "started", at: now }] },
+      history: [...(job.history || []), { stage: "ppf_room", label: "PPF Room", by: "PPF Room", role: "ppf", note: "PPF started", at: now }],
+      updatedAt: now,
+    };
+    ppfVibrate(14);
+    persist(updated, ppfPlayStart);
+  };
+
+  const resolveZone = (key, action) => {
+    const now = Date.now();
+    const pr = job.ppfProgress || { startedAt: Date.now(), zones: {}, history: [], log: [] };
+    const zones = { ...(pr.zones || {}) };
+    let history = (pr.history || []).slice();
+    if (action === "done") { zones[key] = { doneAt: now }; history.push(key); }
+    else if (action === "skipped") { zones[key] = { doneAt: now, skipped: true }; history.push(key); }
+    else { delete zones[key]; const idx = history.lastIndexOf(key); if (idx > -1) history.splice(idx, 1); }
+    const log = [...(pr.log || []), { key, action: action === "done" ? "done" : action === "skipped" ? "skipped" : "undone", at: now }];
+    const updated = { ...job, ppfProgress: { ...pr, zones, history, log }, updatedAt: now };
+    return updated;
+  };
+
+  const tapZone = (key) => {
+    if (!isZoneActive(car, key) || !started) return;
+    if (doneSet.has(key) || skippedSet.has(key)) { setSheet({ type: "undo", key }); return; }
+    const updated = resolveZone(key, "done");
+    setJustDone(key);
+    ppfVibrate(18);
+    setTimeout(() => setJustDone(null), 340);
+    persist(updated, ppfPlayDing).then(() => {
+      const t2 = ppfComputeTotals(ppfCarFromJob(updated), ppfDoneSet(updated), ppfSkippedSet(updated));
+      if (t2.total > 0 && t2.done === t2.total) setTimeout(ppfPlayChime, 220);
+    });
+  };
+
+  const undoFooter = () => {
+    if (!lastKey) return;
+    const updated = resolveZone(lastKey, "undo");
+    ppfVibrate(10);
+    persist(updated, ppfPlayUndo);
+  };
+
+  const closeSheet = () => setSheet(null);
+  const sheetNotDone = () => { if (sheet && sheet.key) { const u = resolveZone(sheet.key, "undo"); persist(u, ppfPlayUndo); } closeSheet(); };
+  const sheetNotNeeded = () => { if (sheet && sheet.key) { const u = resolveZone(sheet.key, "skipped"); persist(u, ppfPlayDing); } closeSheet(); };
+
+  const finish = () => setSheet({ type: "finish" });
+  const confirmFinish = async () => {
+    const now = Date.now();
+    const pr = job.ppfProgress || {};
+    const updated = {
+      ...job,
+      ppfProgress: { ...pr, finishedAt: now, log: [...(pr.log || []), { key: "job", action: "finished", at: now }] },
+      serviceDone: { ...job.serviceDone, ppf: true },
+      history: [...(job.history || []), { stage: "ppf_room", label: "PPF Room", by: "PPF Room", role: "ppf", note: "PPF finished — sent to Ahmed", at: now }],
+      updatedAt: now,
+    };
+    onJobChange(updated);
+    ppfPlayChime(); ppfVibrate(30);
+    await saveJob(updated);
+    setSheet({ type: "success" });
+  };
+
+  return (
+    <div style={{ padding: "14px 14px 30px", maxWidth: 1100, margin: "0 auto" }}>
+      <div style={{ display: "flex", alignItems: "center", gap: 12, marginBottom: 12, flexWrap: "wrap" }}>
+        <button onClick={onBack} className="mrcap-press" style={{ width: 56, height: 56, borderRadius: 14, background: COLORS.panel2, border: `1px solid ${COLORS.line}`, display: "flex", alignItems: "center", justifyContent: "center", cursor: "pointer", flexShrink: 0 }}><ChevronLeft size={26} color={COLORS.ink} /></button>
+        <PlateChip plate={job.plate} size="md" />
+        <div style={{ minWidth: 0 }}>
+          <div style={{ fontFamily: DISPLAY_FONT, fontWeight: 700, fontSize: 17, color: COLORS.ink }}>{job.make}</div>
+          <div style={{ fontSize: 12.5, color: COLORS.muted }}>{job.model}</div>
+        </div>
+        <span style={{ marginLeft: "auto" }}><Pill>{job.ppfScope ? scopeLabel(car) : "—"}</Pill></span>
+      </div>
+
+      <div style={{ display: "flex", gap: 12, alignItems: "stretch", flexWrap: "wrap" }}>
+        <div style={{ flex: "1 1 500px", minWidth: 0 }}>
+          <PPFDiagramPanel
+            car={car} mode="tablet" progress={{ done: doneSet, skipped: skippedSet }} onZoneTap={tapZone} locked={!started} minHeight={320}
+            overlay={!started ? (
+              <button onClick={start} className="ppfr-start-btn mrcap-press">
+                <Check size={36} /> START
+              </button>
+            ) : null}
+          />
+        </div>
+        {(car.extras.foilwork || car.extras.doorCups) && (
+          <div style={{ flex: "0 0 180px", display: "flex", flexDirection: "column", gap: 10 }}>
+            {car.extras.foilwork && (
+              <button onClick={() => tapZone("foilwork")} className="mrcap-press" style={wholeTileStyle(doneSet.has("foilwork") || skippedSet.has("foilwork"))}>
+                <Sparkles size={40} /><div style={{ fontFamily: DISPLAY_FONT, fontWeight: 700, fontSize: 18 }}>FoilWork</div><div style={{ fontSize: 11 }}>Whole job</div>
+              </button>
+            )}
+            {car.extras.doorCups && (
+              <button onClick={() => tapZone("door_cups")} className="mrcap-press" style={wholeTileStyle(doneSet.has("door_cups") || skippedSet.has("door_cups"))}>
+                <ShieldCheck size={40} /><div style={{ fontFamily: DISPLAY_FONT, fontWeight: 700, fontSize: 18 }}>Door cups</div><div style={{ fontSize: 11 }}>Whole job</div>
+              </button>
+            )}
+          </div>
+        )}
+      </div>
+
+      <div style={{ display: "flex", gap: 10, marginTop: 14, flexWrap: "wrap" }}>
+        <button onClick={undoFooter} disabled={!lastKey || !started} className="mrcap-press" style={{ display: "flex", alignItems: "center", gap: 10, minHeight: 72, minWidth: 160, background: COLORS.panel2, border: `2px solid ${COLORS.goldDeep}`, borderRadius: 16, padding: "10px 16px", cursor: (!lastKey || !started) ? "default" : "pointer", opacity: (!lastKey || !started) ? 0.4 : 1 }}>
+          <RotateCcw size={28} color={COLORS.goldBright} />
+          <span style={{ textAlign: "left" }}>
+            <span style={{ display: "block", fontFamily: DISPLAY_FONT, fontWeight: 700, fontSize: 18, color: COLORS.ink }}>UNDO</span>
+            <span style={{ display: "block", fontSize: 12, color: COLORS.muted }}>{lastKey ? zoneName(lastKey, job.bodyType) : "—"}</span>
+          </span>
+        </button>
+        {allResolved && started ? (
+          <button onClick={finish} className="ppfr-finish-pulse mrcap-press" style={{ flex: 1, minHeight: 72, borderRadius: 16, background: COLORS.green, border: "none", color: "#06210f", fontFamily: DISPLAY_FONT, fontWeight: 700, fontSize: 20, cursor: "pointer", display: "flex", alignItems: "center", justifyContent: "center", gap: 8 }}>
+            <Check size={26} /> FINISH
+          </button>
+        ) : (
+          <div style={{ flex: 1, minWidth: 200, display: "flex", alignItems: "center", gap: 14, background: COLORS.panel2, border: `1px solid ${COLORS.line}`, borderRadius: 16, padding: "10px 16px" }}>
+            <div style={{ flex: 1, height: 16, borderRadius: 999, background: COLORS.line, overflow: "hidden" }}><div style={{ height: "100%", width: `${pct}%`, background: COLORS.gold, borderRadius: 999, transition: "width .25s ease" }} /></div>
+            <span style={{ fontFamily: MONO_FONT, fontWeight: 700, fontSize: 18, color: COLORS.ink, whiteSpace: "nowrap" }}>{totals.done} / {totals.total}</span>
+          </div>
+        )}
+      </div>
+
+      {sheet && sheet.type === "undo" && (
+        <PPFSheetOverlay onClose={closeSheet}>
+          <RotateCcw size={48} color={COLORS.goldBright} />
+          <div style={{ fontFamily: DISPLAY_FONT, fontWeight: 700, fontSize: 20, color: COLORS.ink }}>{zoneName(sheet.key, job.bodyType)}</div>
+          <div style={{ display: "flex", gap: 8, width: "100%" }}>
+            <button onClick={sheetNotDone} className="mrcap-press" style={{ flex: 1, minHeight: 64, borderRadius: 12, background: COLORS.red, border: "none", color: "#fff0ec", fontWeight: 700, fontSize: 14, cursor: "pointer" }}>↶ Not done</button>
+            <button onClick={sheetNotNeeded} className="mrcap-press" style={{ flex: 1, minHeight: 64, borderRadius: 12, background: COLORS.panel2, border: `1px solid ${COLORS.line}`, color: COLORS.ink, fontWeight: 700, fontSize: 14, cursor: "pointer" }}>⊘ Not needed</button>
+            <button onClick={closeSheet} className="mrcap-press" style={{ flex: 1, minHeight: 64, borderRadius: 12, background: COLORS.green, border: "none", color: "#06210f", fontWeight: 700, fontSize: 14, cursor: "pointer" }}>✓ Keep</button>
+          </div>
+        </PPFSheetOverlay>
+      )}
+      {sheet && sheet.type === "finish" && (
+        <PPFSheetOverlay onClose={closeSheet}>
+          <ShieldCheck size={48} color={COLORS.green} />
+          <div style={{ fontFamily: DISPLAY_FONT, fontWeight: 700, fontSize: 20, color: COLORS.ink }}>All done?</div>
+          <div style={{ fontSize: 13, color: COLORS.muted }}>Send to Ahmed for checking</div>
+          <div style={{ display: "flex", gap: 8, width: "100%" }}>
+            <button onClick={closeSheet} className="mrcap-press" style={{ flex: 1, minHeight: 64, borderRadius: 12, background: COLORS.panel2, border: `1px solid ${COLORS.line}`, color: COLORS.ink, fontWeight: 700, fontSize: 14, cursor: "pointer" }}>Not yet</button>
+            <button onClick={confirmFinish} className="mrcap-press" style={{ flex: 1, minHeight: 64, borderRadius: 12, background: COLORS.green, border: "none", color: "#06210f", fontWeight: 700, fontSize: 14, cursor: "pointer" }}>Yes</button>
+          </div>
+        </PPFSheetOverlay>
+      )}
+      {sheet && sheet.type === "success" && (
+        <PPFSheetOverlay onClose={onBack}>
+          <CheckCircle2 size={64} color={COLORS.green} />
+          <div style={{ fontFamily: DISPLAY_FONT, fontWeight: 700, fontSize: 20, color: COLORS.ink }}>Sent to Ahmed</div>
+          <div style={{ fontSize: 13, color: COLORS.muted }}>Ahmed checks next</div>
+          <button onClick={onBack} className="mrcap-press" style={{ ...primaryBtnStyle, width: "100%" }}>Back to cars</button>
+        </PPFSheetOverlay>
+      )}
+    </div>
+  );
+}
+function wholeTileStyle(completed) {
+  return { minHeight: 120, background: completed ? "rgba(63,178,106,.35)" : "linear-gradient(165deg,#0B1E33,#0E2742)", border: `3px ${completed ? "solid" : "dashed"} ${completed ? "#3FE07A" : "#DDE8F5"}`, borderRadius: 16, color: "#DDE8F5", display: "flex", flexDirection: "column", alignItems: "center", justifyContent: "center", gap: 8, cursor: "pointer", padding: 16 };
+}
+function PPFSheetOverlay({ children, onClose }) {
+  return (
+    <div onMouseDown={(e) => { if (e.target === e.currentTarget) onClose(); }} style={{ position: "fixed", inset: 0, background: "rgba(6,6,5,.72)", display: "flex", alignItems: "center", justifyContent: "center", zIndex: 200, padding: 16 }}>
+      <div style={{ background: COLORS.panel, border: `1px solid ${COLORS.line}`, borderRadius: 18, padding: "24px 20px", maxWidth: 420, width: "100%", textAlign: "center", display: "flex", flexDirection: "column", alignItems: "center", gap: 14 }}>
+        {children}
+      </div>
+    </div>
+  );
+}
+
 /* ---------------- Dispatch Kiosk (standalone entry point) ----------------
    Reachable directly at /dispatch — bypasses the normal staff-PIN login
    entirely. Regular staff just tap their name and go straight in, no
@@ -15921,7 +17360,7 @@ export function DispatchKiosk() {
       checkAutoLogout("mrcap_kiosk", !!session, () => {
         setSession(null);
         try { window.localStorage.removeItem("mrcap_kiosk_session"); } catch { /* ignore */ }
-      });
+      }, session?.dashboardMode);
     };
     check();
     const t = setInterval(check, 5 * 60 * 1000);
