@@ -1,4 +1,4 @@
-import React, { useState, useEffect, useRef, useCallback, memo } from "react";
+import React, { useState, useEffect, useRef, useCallback, useMemo, memo, Fragment } from "react";
 import { createPortal } from "react-dom";
 import {
   Plus, ChevronLeft, Camera, Check, Wrench, Car, Search,
@@ -6,9 +6,24 @@ import {
   LayoutDashboard, ListChecks, UserPlus, ShieldCheck, Archive, ShieldAlert,
   Users, BarChart3, Phone, Download, Upload, FileText, Send, PauseCircle,
   MessageSquare, TrendingUp, RotateCcw, ExternalLink, Star, AlertCircle,
-  Sparkles, Hammer, Armchair, ChevronUp, ChevronDown, GripVertical
+  Sparkles, Hammer, Armchair, ChevronUp, ChevronDown, GripVertical,
+  XCircle, Trash2, MoreVertical, MessageCircle, ArrowRight, Minus, Palette
 } from "lucide-react";
 import { jsPDF } from "jspdf";
+import { Capacitor } from "@capacitor/core";
+import { PushNotifications } from "@capacitor/push-notifications";
+import { Bell } from "lucide-react";
+import { Receipt, Banknote } from "lucide-react";
+import {
+  VAT_RATE_DEFAULT, r2, computeTotals, fmtMoney, fmtPct, amountInWords, proformaNumber, receiptNumber, proformaCounterKey,
+  PAYMENT_METHODS, CHEQUE_STATUSES, paymentSummary, linesFromInvoiceRows, blankLine, issueProblems, reconcileCsv, formatLongDate,
+} from "./billing.js";
+import ReportsDashboard from "./ReportsDashboard.jsx";
+import {
+  buildSheet, SHAPE_LABEL, SHAPE_ZONES, TINT_KEYS, PARTIAL_OK, PRESETS, PRESET_ORDER, ZNAME, zoneName, groupOf,
+  allZones, presetZones, makeScope, rescope, scopeKeys, scopeLabel, breakdown as ppfBreakdown, nextZoneState, zonesFor,
+  isZoneActive, computeTotals as ppfComputeTotals, hasSpare as ppfHasSpare, PPF_SVG_DEFS, injectPPFDiagramStyles,
+} from "./ppfDiagram.js";
 
 /* ---------------------------------------------------------------
    Mr.CAP — Vehicle Workflow Tracker
@@ -28,6 +43,7 @@ let ROLE_DEFS = {
   dentrepair: { label: "Dent Repair",       color: "#B37A2E", simplified: true },
   bodyshop:   { label: "Body Work (Smartech)", color: "#B3402B", simplified: true },
   upholstery: { label: "Upholstery (Beneloom)", color: "#A6752C", simplified: true },
+  accountant: { label: "Accountant",        color: "#5B6B7A", simplified: false },
 };
 
 // Every real, individually-toggleable capability in the app. Admins
@@ -44,6 +60,7 @@ const PERMISSIONS = [
   { key: "archive",    label: "Archive" },
   { key: "customers",  label: "Customers" },
   { key: "quotations", label: "Quotations" },
+  { key: "billing",    label: "Billing (proformas & payments)" },
   { key: "reports",    label: "Reports" },
   { key: "team",       label: "Team" },
   { key: "import",     label: "Import" },
@@ -79,7 +96,7 @@ const DEFAULT_TEAM = [
     permissions: { newJob: true, editJob: false, sendBack: false, delete: false, archive: false, customers: false, quotations: false, reports: false, team: false, import: false, googleReview: false, markupCalc: false, statusUpdate: false } },
   { id: "fakher", name: "Fakher", role: "dentrepair", pin: null,
     permissions: { newJob: true, editJob: false, sendBack: false, delete: false, archive: false, customers: false, quotations: false, reports: false, team: false, import: false, googleReview: false, markupCalc: false, statusUpdate: false } },
-  { id: "jobish", name: "Jobish", role: "bodyshop", pin: null,
+  { id: "jobish", name: "Smartech", role: "bodyshop", pin: null,
     permissions: { newJob: true, editJob: false, sendBack: false, delete: false, archive: false, customers: false, quotations: false, reports: false, team: false, import: false, googleReview: false, markupCalc: false, statusUpdate: false } },
 ];
 
@@ -89,6 +106,9 @@ const DEFAULT_TEAM = [
 function hasPermission(session, team, key) {
   if (!session) return false;
   if (session.role === "admin") return true;
+  // Accountants always have Billing (they are there for it); everything else
+  // an accountant can reach is still switched on per person like anyone else.
+  if (key === "billing" && session.role === "accountant") return true;
   const member = team.find((m) => m.id === session.id);
   return !!member?.permissions?.[key];
 }
@@ -106,7 +126,10 @@ function isSuperAdmin(session) {
 // widget, per Suhail's request. Dashboard/screen access no longer reads
 // from this list (see dashboardMode / hasFullDashboard below) — this is
 // now purely the attendance-tracker roster.
-const CORE_FOUR = ["ahmed", "laani", "regan", "noel"];
+// These are the team_members ids (and the lowercased names they're stored
+// under in staff_out_today). Reagen's live name is "Reagen" — it was
+// misspelt "regan" here, so Reagen never matched and never saw the widget.
+const CORE_FOUR = ["ahmed", "laani", "reagen", "noel"];
 
 // Which screens a team member sees: the full admin-style dashboard/case
 // file, or the stripped-down workshop-floor view. Used to be a hardcoded
@@ -139,12 +162,50 @@ function isSimplifiedRole(session) {
   if (hasFullDashboard(session)) return false;
   return !!ROLE_DEFS[session.role]?.simplified;
 }
+// A 4th dashboardMode value, distinct from 'auto'/'full'/'workshop' above:
+// routes straight into a scoped, job-only portal (see SmartechPortal)
+// before the normal Shell/nav/dashboard ever renders. Smartech is a
+// separately-licensed body-shop vendor, not shop staff — they should see
+// only their own assigned jobs, nothing else. Accepts both "smartech"
+// (current) and "subcontractor" (the old value this was renamed from) so
+// an older cached client/APK build that still writes "subcontractor"
+// keeps working until every device is confirmed on the new bundle.
+function isSmartechPortal(member) {
+  return !!member && (member.dashboardMode === "smartech" || member.dashboardMode === "subcontractor");
+}
+
+// A 5th dashboardMode value: routes straight into the PPF Room kiosk
+// screen (see PPFRoomKiosk) before the normal Shell/nav ever renders —
+// same "scoped portal, not a screen someone navigates to" pattern as
+// isSmartechPortal above. No prices, no customer name/phone anywhere on
+// this screen, and it stays logged in overnight (exempt from
+// checkAutoLogout — see the two call sites).
+function isPPFRoomKiosk(member) {
+  return !!member && member.dashboardMode === "ppfroom";
+}
+
+// Who can review/approve Smartech's submitted purchases: every admin,
+// plus Ahmed and Laani by name (a deliberate exception outside the role
+// system, same pattern as isSuperAdmin below — they're not role "admin",
+// but the shop wants them here specifically).
+function canApproveSmartech(session) {
+  return !!session && (session.role === "admin" || session.id === "ahmed" || session.id === "laani");
+}
+
+// Who's on the Smartech <-> office chat: admins, Ahmed and Laani by name
+// (same named exception as canApproveSmartech), plus Smartech. On the office
+// side the thread has no screen of its own: it's merged into the admin
+// Live Updates feed with an inline reply box (LiveUpdatesBoard), so no
+// extra bubble/nav entry to tap. SmartechPortal keeps its own Chat screen.
+function canUseSmartechChat(session) {
+  return !!session && (session.role === "admin" || session.id === "ahmed" || session.id === "laani" || isSmartechPortal(session));
+}
 
 // Who can hide/show a car on the Dispatch Board entirely (e.g. it's
 // actually sitting at Smartech, not on-site) — a named list by request,
 // not a toggleable permission flag.
 function canManageDispatchVisibility(session) {
-  return !!session && ["ajf", "ahmed", "laani", "mr.cap"].includes((session.name || "").toLowerCase());
+  return !!session && ["ahmed", "laani", "suhail", "owner"].includes(session.id);
 }
 
 const BASE_LOCATIONS = ["Mr.CAP. (Main)", "Beneloom (Upholstery)", "Smartech (Body & Paint)"];
@@ -198,8 +259,8 @@ Amount to be paid by the Customer upon vehicle delivery: AED + 5% VAT
 CUSTOMER SIGNS BY THIS AGREES WITH THE ABOVE MENTIONED TERMS AND CONDITIONS AS WRITTEN ON THE BACK SIDE OF THIS VEHICLE RECEIPT.`;
 
 // The 13 standard car panels for Body Work damage marking — a fixed
-// checklist so every job uses the same real terms Jobish/Smartech
-// recognize, rather than free text.
+// checklist so every job uses the same real terms Smartech recognizes,
+// rather than free text.
 const CAR_PANELS = [
   "Bonnet", "Roof", "Front Bumper", "Rear Bumper",
   "Front-Left Door", "Front-Right Door", "Rear-Left Door", "Rear-Right Door",
@@ -249,21 +310,69 @@ let SERVICES = [
       { name: "Window Tinting - Windshield", retail: 700, b2b: 500 },
     ] },
   { key: "dentrepair", label: "Dent Repair",      role: "dentrepair",
-    // Genuinely size-dependent per the shop — no auto-fill for this one at all.
-    treatments: [{ name: "Dent Removal", retail: null, b2b: null }] },
+    // Genuinely size-dependent per the shop — no auto-fill for either at all.
+    // "Paintless Dent Removal" stays in-house (Fakher); "Dent & Paint" is
+    // routed to Smartech (see SMARTECH_TREATMENT_NAMES) since it needs
+    // paint work Smartech does, not Mr.CAP.
+    treatments: [
+      { name: "Paintless Dent Removal", retail: null, b2b: null },
+      { name: "Dent & Paint", retail: null, b2b: null, perPiece: true },
+    ] },
   { key: "bodyshop",   label: "Body Work (Smartech)", role: "bodyshop",
     treatments: [
       { name: "BodyWorks (Smart Paint)", retail: 1000, b2b: 700 },
       { name: "BodyWorks (min charge)", retail: 800, b2b: 600 },
-      { name: "RimRepair - Painted", retail: 500, b2b: 250 },
-      { name: "RimRepair - Diamond cut", retail: 600, b2b: 300 },
-      { name: "Panels", retail: null, b2b: null },
+      { name: "RimRepair - Painted", retail: 500, b2b: 250, perPiece: true },
+      { name: "RimRepair - Diamond cut", retail: 600, b2b: 300, perPiece: true },
+      { name: "Panels", retail: null, b2b: null, perPiece: true },
     ] },
   { key: "upholstery", label: "Upholstery (Beneloom)", role: "upholstery",
     // No prices were given for any Beneloom treatment — all manual-entry.
     treatments: ["Upholstery", "RoofLifting", "SteerRefresh", "QuietCar", "CarbonFiber", "StarLiner", "DashRenew"]
       .map((name) => ({ name, retail: null, b2b: null })) },
 ];
+
+// A job routes to Smartech (sets smartechFlag, unlocks the intake form's
+// Smartech description/photos section, and shows up in the Smartech
+// dashboard) when the whole "bodyshop" category is selected, OR the
+// specific "Dent & Paint" treatment is picked under Dent Repair —
+// "Paintless Dent Removal" stays in-house with Fakher and never routes
+// to Smartech.
+function jobRoutesToSmartech(serviceTypes, treatments) {
+  if ((serviceTypes || []).includes("bodyshop")) return true;
+  return ((treatments && treatments.dentrepair) || []).includes("Dent & Paint");
+}
+
+// Per-piece pricing: a treatment (any category — rim repair, body panels,
+// etc.) can be flagged `perPiece` from the Services & Pricing screen. When
+// it is, the number stored in treatmentPrices is the PRICE PER PIECE, and
+// the real line amount used everywhere (subtotals, invoices, proformas) is
+// price x quantity. Quantity lives in job.smartechPieces (same
+// "serviceKey::name" keys as treatmentPrices) — the same field the
+// Smartech dashboard already displays piece counts from, since in
+// practice the per-piece treatments are exactly the Smartech-routed ones
+// (rims, panels, dent & paint). When a treatment is NOT flagged per-piece,
+// nothing changes from before: the stored price already IS the line total.
+function isPerPieceTreatment(serviceKey, name) {
+  const svc = SERVICES.find((s) => s.key === serviceKey);
+  return !!svc?.treatments?.find((t) => t.name === name)?.perPiece;
+}
+function treatmentLineTotal(serviceKey, name, price, qty) {
+  const amt = Number(price) || 0;
+  if (!isPerPieceTreatment(serviceKey, name)) return amt;
+  return amt * Math.max(1, Number(qty) || 1);
+}
+// treatmentPrices/treatmentQty are both keyed "serviceKey::name" — this is
+// the one place "what's the real subtotal" gets computed, used by every
+// job form so a per-piece treatment's price x qty is never missed.
+function treatmentPricesSubtotal(treatmentPrices, treatmentQty) {
+  return Object.entries(treatmentPrices || {}).reduce((sum, [key, price]) => {
+    const sep = key.indexOf("::");
+    const serviceKey = key.slice(0, sep);
+    const name = key.slice(sep + 2);
+    return sum + treatmentLineTotal(serviceKey, name, price, (treatmentQty || {})[key]);
+  }, 0);
+}
 
 // One small icon per service category, purely for the dashboard job card's
 // icon row — keyed off SERVICES[].key so it stays in sync automatically if
@@ -360,11 +469,19 @@ const COLORS = {
   red: "#A8402F",        // desaturated crimson
   green: "#4A7A57",      // desaturated forest
   blue: "#4A6478",       // desaturated steel
+  // Readable text tints of the three status colours above — the base
+  // colours are fills/borders; these are for words sitting on dark.
+  successText: "#7FB08C",
+  dangerText: "#E58A76",
+  blueText: "#8FB4CC",
+  plate: "#F2EEE3",      // UAE number-plate face
+  plateEdge: "#D8D2C0",
 };
 
-const FONT_IMPORT = `@import url('https://fonts.googleapis.com/css2?family=Playfair+Display:wght@500;600;700&family=IBM+Plex+Mono:wght@400;500;600&family=Inter:wght@400;500;600;700&display=swap');`;
+const FONT_IMPORT = `@import url('https://fonts.googleapis.com/css2?family=Playfair+Display:wght@500;600;700&family=IBM+Plex+Sans:wght@400;500;600;700&family=IBM+Plex+Sans+Condensed:wght@600;700&family=IBM+Plex+Mono:wght@400;500;600;700&display=swap');`;
 const DISPLAY_FONT = "'Playfair Display', serif";
-const MONO_FONT = "'IBM Plex Mono', monospace";
+const MONO_FONT = "'IBM Plex Mono', ui-monospace, monospace";
+const BODY_FONT = "'IBM Plex Sans', -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif";
 
 const LOGO_SRC = "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAKAAAACgCAYAAACLz2ctAAADyUlEQVR4nO3cO67XZRCA4RdjQoiVbgASNkBYjY3rsGIzlrQkLsOwDCsbGxrFQgzHc/6X3+W7zDfzvuVMM8VTz7PXL199xmxS38w+wGonQJuaAG1qArSpCdCmJkAb1g/f//VkJkAb0ts3n3j38x9P5gK07r1984n3v/x+cSdA69otfCBA69g9fCBA69QWfCBA69BWfCBAa9wefCBAa9hefCBAa9QRfCBAa9BRfCBAO9kZfCBAO9FZfCBAO1gLfCBAO1ArfCBA21lLfCBA21FrfCBA21gPfCBA21AvfCBAu1NPfCBAu1FvfCBAu9IIfCBAu9AofCBAe9RIfCBAe9BofCBA+9IMfCBAYx4+EGD5ZuIDAZZuNj4QYNki4AMBliwKPhBguSLhAwGWKho+EGCZIuIDAZYoKj4QYPoi4wMBpi46PhBg2lbABwJM2Sr4QIDpWgkfCDBVq+EDAaZpRXwgwBStig8EuHwr4wMBLt3q+ECAy5YBHwhwybLgAwEuVyZ8IMClyoYPBLhMGfGBAJcoKz4QYPgy4wMBhi47PhBg2CrgAwGGrAo+EGC4KuEDAYaqGj4QYJgq4gMBhqgqPhDg9CrjAwFOrTo+EOC0xPdvApyQ+L4mwMGJ7/8JcGDie5oAByW+ywlwQOK7ngA7J77bCbBj4rufADslvm0JsEPi254AGye+fQmwYeLbnwAbJb5jCbBB4jueAE8mvnMJ8ETiO58ADya+NgnwQOJrlwB3Jr62CXBH4mufADcmvj4JcEPi65cA7yS+vgnwRuLrnwCvJL4xCfBC4huXAB8lvrEJ8EHiG58AvyS+OQkQ8c2sPEDxza00QPHNryxA8cWoJEDxxakcQPHFqhRA8cWrDEDxxawEQPHFLT1A8cUuNUDxxS8tQPGtUUqA4lundADFt1apAIpvvdIAFN+apQAovnVbHqD41m5pgOJbv2UBii9HSwIUX56WAyi+XC0FUHz5Wgag+HK2BEDx5S08QPHlLjRA8eUvLEDx1SgkQPHVKRxA8dUqFEDx1SsMQPHVLARA8dVtOkDx1W4qQPHZNIDiM5gEUHz2X8MBis8eNhSg+OxxwwCKzy41BKD47FrdAYrPbtUVoPjsXt0Ais+21AWg+GxrzQGKz/bUFKD4bG/NAIrPjtQEoPjsaKcBis/OdAqg+OxshwGKz1p0CKD4rFW7AYrPWrYLoPisdZsBis96tAmg+KxXdwGKz3p2E6D4rHffXlu8ePE3P/34Jx9+/W7kPZa43z4+fzJ79vrlq88TbjEDAvyGsdoJ0KYmQJvaP8GTGNgZTFNOAAAAAElFTkSuQmCC";
 const LOGO_LOCKUP_SRC = "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAB6EAAAHKCAYAAABCLj4YAAEAAElEQVR4nOz9e3hU9b33/7/XZu5rfwmt9h67utObWFHBTOmPyI9EKUyoICCHQFKryCYECIp+lUJCtCe1NY3H1hZDAkVvTxzkcCNY7wSiUFCwJCKacIfwlSaCQnX4mjp1fltrJntvh71+f9ChIVlrZs3MmllzeD6ui+vSyay13pnDWivrtT7vj6JpmgAAAAAAAAAAAAAAYIV/srsAAAAAAAAAAAAAAED6IIQGAAAAAAAAAAAAAFiGEBoAAAAAAAAAAAAAYBlCaAAAAAAAAAAAAACAZQihAQAAAAAAAAAAAACWIYQGAAAAAAAAAAAAAFiGEBoAAAAAAAAAAAAAYBlCaAAALHL69GntlVde0bxer2Z3LQAAAAAAAAAA2MVhdwEAAKSiQCAgf/rTn7Rjx47Jrl27ZOvWrRf8PDs7W7vlllvklltukauuukpUVVVsKhUAAAAAAAAAgIRSNI3BWgAAhNPT06O1t7fLa6+9JgcPHpR9+/ZFtHx2drbccsstMm3aNLnmmmsIpQEAAAAAAAAAaYsQGgAAHcGRzi+//LK89NJL0tHRYen6s7Oz5a677pLJkyfL6NGjZciQIYTSAAAAAAAAAIC0QAgNAID8I3R+4403pKGhIeKRzrHKy8uTm266SSZPnixjx45VHA5mzAAAAAAAAAAApCZCaABAxjp9+rT25ptv6s7pbLcpU6ZISUmJXHfddfLtb3+bUBoAAAAAAAAAkDIIoQEAGcPr9WrvvPOObNq0KelC53CmTJkiixcvlvHjx8uwYcNo3Q0AAAAAAAAASFqE0ACAtNXT06O98cYbsmfPHnnxxRelu7vb7pIsM2/ePJk1a5ZMnTpVVFUllAYAAAAAAAAAJA1CaABA2ujp6dHa29vltddek5deekk6OjrsLikhsrOz5ZZbbpFp06bJNddcQygNAAAAAAAAALAVITQAIGUFAgH505/+pL3xxhvyzDPPZEzoHE52drbcddddMnnyZBk9erQMGTKEUBoAAAAAAAAAkDCE0ACAlHLs2DHtjTfekIaGBtm3b5/d5aSEvLw8uemmm2Ty5MkyduxYxeFw2F0SAAAAAAAAACCNEUIDAJLa6dOntTfffFN27dolW7dutbuctDBlyhQpKSmR6667Tr797W8TSgMAAAAAAAAALEUIDQBIKl6vV3vnnXdkz549Ul9fb3c5GWHKlCmyePFiGT9+vAwbNozW3QAAAAAAAACAmBBCAwBs1dPTo7W3t8uLL74oL774onR3d9tdUsabN2+elJWVyTXXXCOqqhJKAwAAAAAAAAAiQggNAEioYOj82muvyUsvvSQdHR12l4QQsrOz5ZZbbpFp06YRSgMAAAAAAAAATCGEBgDEVSAQkD/96U/aG2+8IQ0NDbJv3z67S0IM8vLy5KabbpLJkyfL6NGjZciQIYTSAAAAAAAAAIALEEIDACx3+vRpbdeuXYTOGSAYSt94443y7W9/W3E4HHaXBAAAAAAAAACwGSE0ACBmp0+f1t58803ZtWuXbN261e5ybDFlyhQpKSkRn88nTz75ZMbObR18Ha677jpCaQAAAAAAAADIUITQAICIeb1e7Z133pE9e/bIiy++mJGBa7i21LxG58ybN09mzZol48ePl2HDhtG6GwAAAAAARMXj8VwQZhxpa4tqPbm5LhnylSEXPPbN7GxlEDfSA4ClCKEBAGH19PRo7e3t8uKLL2ZsoJqdnS233HKLTJs2Ta677rqI50JmtPg58+bNk7KyMrnmmmtEVVVCaQAAAAAAICLnQua/dHfLmTNn5Gh7u/g+9cmJ996Tzs7OhNbhcrlkxFVXyRVXXimXDbtMLrroIhk+YgRBNQBEiBAaADBAIBCQw4cPa6+99pq89NJL0tHRYXdJtgiO4p06darlgemxY8e0N954I6Pnze4b7BNKAwAAAACQOTwej3byxAk5+Mc/yuFDbyU8aI6Wqqry3XHjZEx+voz8zki5/IorxOl0cj0DAHQQQgMAJBAIyJ/+9KeMD0X7zmc8atSohP0BEXz9X3755YwO/cO1OAcAALEZPuxyLgDANidPn0qZc7u21lZt08YXZGdjo92lJIXKqipZXllhy/u3uq5eq6uttWPTtnEXuqXgmmtl/oIygi2klV6/Xzt8+LAc/OMf5ZVdTeL1eu0uyVKzi4tl0uTrZUx+vuTk5PDdNeDz+bSOo0flWMcx2fPqqylz80G8uFwu+dFPfyITJkxIiVH2Ho9HW/fcc3LyxAlpaW6xu5y0Eey+EOS8xClXjx4tIiJDhw6Vf8nOlkucThmclZVy+xZCaADIUMH20OvWrcvY0DkYet54443y7W9/W3EkyclesP35a6+9Jk8++WRGtj8XSd73BwCAVEUIDTulSgjd1dmlFU2fbncZScXlcsmu3a/a8v6Nu+ZaLd2Cqkg8u+55mThpUkp8dwA9Pp9Pa9q5S7Zt3ZpxYeOixeUy4Xvfk7Fjx6ZkcGS1s4GA3FperhFc6lNVVR57/NdJvc/nHCk5BG9Wu2zYZSlx0wshNABkCK/Xq+3duzej5yQOtn++5ZZbUmqkrdfr1d555x3Zs2dPxs7JLWLfSHUAANIFITTslCohdCaOvDXj7SNtCR+V6/P5tGvH5Cdyk0np2PF3CbCQUoIjnn/768czLng24i50y+LbbsvoQJrja3iqqkrzoTeTdkT0orIybiJIUu5Ct0yZeoNMmnx90oXShNAAkKYILs+pqKhIuzmHg6PYM/mGApF/zNk9fvx4GTZsWFq8twAAxBMhNOyUKiF0VUWlRhvugewYkXtg/35tyeJbE7nJpPRE3SopLilJie8PMluwTe+GdevtLiWpuQvdUrFihYwePTppw0artbW2anNvnmN3GSkhWff53BiWOlRVldKyMrlh2jTJdeXa/lkihAaANEEL53MyMZg8duxYxs/nLZKeNxwAAGAlQmjYiRA6tS1aXC6/qK5O6Hv4UE2NRphlbzt0wIyuzi7tqbVrhX1nZIJB0Y03/SDpRi5ajRG05qmqKofeeTvpPg+NDQ3a3ZUr7C4DEUqGOccJoQEghR07dkx7+eWX5aWXXpKOjg67y7FF3xbNzBssEggE5E9/+lPGfy6CrdenTZsm1113Xcq0XgcAIJ4IoWGnVAmhZ02fodE+diA7Loqzz/oHO9qhA+F4PB7tziW303LbArOLi6Vs4QLJLyhIy+85+/PIJOM+nxA6tamqKvf+/H6ZOnVqwqcEIIQGgBRz+vRpbePGjRk72jkvL09uuukmmTx5ckrN62wXRsifU1FRIbfccou43W4+LwCAjMUFQCSK87+fFd//b9AFj6VKCM33xNiB5oMJG63n8Xi0iYUTErGplJCs7VmRmXr9fu23v/kNbbfjwOVySc3DD6VVGE0b58ht27E96T4DhNDpI9HnFP+UqA0BAGLT09OjlZaWapdffrlUV1dnTJiYnZ0tFRUV0tTUJF988YUcPXpUeeCBBxS3260QQIc3ZMgQxe12Kw888IDy8ccfK5988ok0NTVJRUWF3aUlVH19vRQWFsrVV1+tnT59mguLAAAAcTJm9L/LL37qs7sMxMGRtra03BYA8xobGrTrr5tIAB0nnZ2dMvfmOTJr+gytrbU1La5dnPrgA7tLSDnH3z1udwlIY3dXrpBZ02doHo8nIfsYQmgASAGvvPKK9pWvfEW2bt1qdykJMW/ePNm8ebN88skn8vHHHyt1dXXKzJkzCZ0toKqqMnPmTKWurk7RNE05deqUbN68WebNm2d3aQnR0dEhl19+uTz44INaIBCwuxwAAIC0Mmb0v8uLGzPjZtlMtP+11xO2rZe2b0/YtgCE1+v3a4vKyrS7K1eI1+u1u5y0l05hNIFq5LgRC/HW2dkpEwsnyAsbNmpn43x9lBAaAJJYIBCQBx98UCsqKrK7lLiaMmWKrF69Wk6dOiWapilbtmxRSktLFVVVCZ3jbNiwYUppaamyZcsW5csvv1Q6Ojpk9erVMmXKFLtLi6vq6mqZMWOG1tPTk9J/zAEAACQLAuj0t7OxUeJ9oVJE5GwgIC3NLXHfDgBz2lpbteuvm8j30gbBMHpRWVnCRi1ajUA1cjsbG+0uARmiprpabi0vj2sQTQgNAEls4cKFWnV1td1lWC4vL09qamqko6NDvvzyS2Xv3r3KsmXLlGHDhhE628jhcMioUaOUZcuWKXv37lW+/PJLpbm5WWpqaiQvL8/u8iy3b98++f73vy+MiAYAAIgNAXTmOHny/biHIInYBgBzVtfVa3NvnsPoZ5u1NLfIxMIJ8lBNjdbr96fUPpJANTo+ny+l3mekrpbmFikcN16L12eOEBoAktSDDz6opUv77ezsbKmpqZHm5uYL5nUeNWqU4nA47C4PBhwOhwTnkz569KjyxRdfSHNzs1RUVEh2drbd5Vli3759MmPGDFpzAwAARIkAOrO8ffhwWmwDQGhnAwF5qKZGq6uttbsU9LFh3Xq5/rqJ0tjQkBIBJUFq9JhLG4nk9XqlaNr0uHxnCaEBIAm98sorKT8CuqKiQpqams7P6/zAAw8obrebeZ1T2JAhQxS3263U1dUpH3/8sfLJJ59IU1OTVFRU2F1aTPbt2yf33HMPfxgBAABEiAA68+zb+4e02AYAY2cDAbm1vFzbsG693aVAh9frlbsrV8iisrK4jVy0ivcTRtBHi7m0kWjxCqIJoQEgyfT09Gi33Xab3WVEbN68ebJ58+bz8zrX1dUpM2fOZF7nNKaqqjJz5kylrq5O0TRNOXXqlGzevFnmzZtnd2kRq6+vl2PHjiX1H28AAADJhAA6M7U0t0g8W8H2+v0a884C9gkG0HwPk19Lc4tcOyY/qUdFd3V12l1CymIubdghGERbOUc0ITQAJJnbb79duruT/2LOlClTZPXq1efndd6yZYtSWlrKvM4ZbNiwYUppaamyZcsW5csvv1Q6Ojpk9erVMmXKFLtLM6WsrMzuEgAAAFICAXRmO348fqOz4rluAKERQKemZB4Vvf+11+0uIWUxlzbs4vV65dbycs2qIJoQGgCSSE9PT9LOA52Xl3fBvM579+5Vli1bxrzO0OVwOGTUqFHKsmXLlL179ypffvml0tzcLDU1NZKXl2d3ebo6OjqkpaUl6f5oAwAASCYE0Hiz5c2UXDeA0Nb+bi0BdIpqaW6RomnT5cD+/Ul1TeOtQ4fsLiGlJeONBcgMLc0tsmXzFks+f4TQAJBEVq5caXcJ52VnZ5+f1/mLL76Qo0ePMq8zouZwOMTtdisPPPCAcvToUeWLL76Q5uZmqaiokOzsbLvLO++Xv/yl3SUAAAAkLQJoiIjsefXVlFw3AGMvbNio1dXW2l0GYuD1emXJ4lvtLuO8Xr9f83qZEzoWpz74wO4SkMFqqqvF4/HEHEQTQgNAEnnyySdt3X5wXudPPvlEPv744/PzOhM6w2pDhgxR3G63UldXp3z88cfKJ598Ik1NTVJRUWFrXfv27ZOenh7uNAUAAOiHABpBnZ2dcRmd5fP5tM5O5g8FEq2rs0urqa62uwykmU99PrtLSHnH32WKCtjrziW3x7wOQmgASBJer1dL9FzQwXmdT506JZqmnZ/XWVVVQmcklKqqysyZM5W6ujpF0zTl1KlTsnnzZpk3b17Ca2lvb0/4NgEAAJIZATT66zh6NCXWCSC0s4GAlC9YYHcZSENH2trsLiHl8RrCbp2dndLY0BDTjYeE0ACQJN555524byM4r3NHR4d8+eWXSnBe52HDhhE6I6kMGzZMKS0tVbZs2aJ8+eWXSkdHh6xevVqmTJkS922/+OKLcd8GAABAqiCAhp6Df/xjSqwTQGiPPvIILZMRF0e5wT9mOxsb7S4BkLsrV0iv3x91EE0IDQBJ4oM4zPORnZ0tNTU10tzcfMG8zqNGjVIcDofl2wPiweFwyKhRo5Rly5Ype/fuVb788kulublZampqJC8vz/Lt8Qc4AADAOQTQMPLKrqaUWCcAY12dXdqGdevtLgNp6vCht+wuIS3EY/oLIFJ79+6NellCaABIEm+++aYl66moqJCmpqbz8zo/8MADitvtZl5npA2HwyFut1t54IEHlKNHjypffPGFNDc3S0VFhWRnZ8e8/nfffdeCKgEAAFIbATRC8Xq94vF4LLsw7vF4GI0JJNg9K1bYXQLS1NlAQDo7O+0uIy2cisOgJSBSjz38iJwNBKJalhAaANJIc3Oz1NXVKTNnzmReZ2SMIUOGKG63W6mrq1M6OjpiDqI7OjosqgwAACA1EUDDDCvnqmTeSyCx2lpbNUJCxMvH3d2M3rXI8XeP210CIF6vVw4ePBjV95oQGgDSiNvtJnhGRlNVVZk0aZLdZQAAAKSsTA+gXS6X3SWkjP2vvZ6U6wIQXvXPf2F3CUhjJ0+csLuEtMFNWkgWv/3141EtRwgNAAAAAACAjA+gRURGXHWV3SWkjJ2NjVG3ZuzrbCAgOxsbLagofY3Jz7e7BKQRRkEj3o51HLO7hLTB8RHJorOzM6o5ygmhAQAAAAAAMhwBNKJx8uT7MbdctWIdAMyrX7XK7hKQ5lrfedvuEtJKNMEfEA9NO3dFvAwhNAAAAAAAQAYjgP4HRpxG5u3Dh5NiHekuKyvL7hKQJnw+n9bS3GJ3GUhzfMasdeqDD+wuARARkW1bt0a8DCE0AAAAAABAhiKAvtCl37rU7hJSyr69f0iKdaSz2cXF4nQ6FbvrQHqIZhQbEAmPx8OoXYu92fKm3SXI0KFD7S4BSSCaltyE0AAAAAAAABmIAHqgCRMmKKqq2l1GymhpbolpXuhev59RmWHc85Mf210C0kg0o9iASJw8ccLuEtJOMrQ3zy8oUFwul91lIAk0HzwY0fMJoQEAAAAAADIMAbS+QQ6H3Pvz++0uI6W0t7dHPert+PHjVpaSdiqrqiQnJ4dR0LCEz+fTOjs77S4Dae6jDz+yu4S0kyw3a91x1512l4AksP+11yN6PiE0AACIm97/EHnPI9qRk6L5/ia0ZAIAAEgCBNChFRUVKbOLi+0uI2XE0iY0GVqMJqttO7bL8soKAmhYpuPoUbtLQAY40tZmdwlpKRnanBeXlCjPrnte6BiT2XY2Nkb0fEJoAABguc2vi/a9u0XLXyra96tFyh4TKVwhMvI20R7dKlrvf9hdIQAAQGYigA5vkMMhtfV1XGg1ac+rr9qybLqqrKqSY8fflfyCAgJoWOrgH/9odwnIAJEGVDAnWdqcT5w0SXn9jQPCzXqZLZKbIgihAQCAZXx/E+22laI9slnkr5/pP2fTPpFp94r2xw5GRgMAACQSAXRkJk6apBx6521l247t4i50211O0urs7JRevz/ic3taA19IVVV5+0ibLK+sUAZnZRFAw3Kv7GqyuwSkOZ/Px3WeODnWcczuEs4bnJWl1NbXKdt2bBfmic5MkdwUQQgNAAAs0fsfIt+vFjlkYlq3v34mcmfduVbd8a8MAAAABNDRyy8oUDZs2qRs27GdkdEGDh8+HPEytAa+UNOe3eJ0OgmfERe9fr/m9XrtLgNp7tQHH9hdQtpqfedtu0sYIL+gQNm1+1WluqbG7lKQYJF01iCEBgAAlnhgg2hGo5+NLHlC5Ox/xaceAAAAnEMAbY38ggKl+dCbCqN+BoqmzS+tgf/BXegmgEZcferz2V0CMsCZM2fsLiFttTS32F2CoQWLFipNu3fbXQYSiJHQAAAgoY6cFK0p8sEP8tfPRP7nLkZDAwAAxAsBtLUGORyycctmRkT3E02bX1oD/8NNc+bYXQLS3JG2NrtLSIjZxcXStHu3HGg+KCdPn1JOnj6lvH2kTZp272YO2wTY/9rrdpeQ1iKZhzfRcl25SmVVld1lIEEiuSmCEBoAAMRs9zvRL/u/DlhWBgAAAPoggI4Pp9OpLF22zO4ykorX641oLlCPx0Nr4D6GDh1qdwlASnMXuuVA80Gpra9Tcl25Sk5OzvnOAk6nU8l15Sq19XXKgeaD4i5021lqWnvr0CG7S0hrkYw+tcOS25fYXQISqNfvN3XeRwgNAABi9k5n9Mv+9bNz80kDAADAOgTQ8VU0e5bdJSSd5oMHTT83U0ZlmvUv2dl2l4A0d7S93e4S4kZVVamtr5e+wbORnJwc5fn16xWCaOsx73j8Hes4ZncJIQ3OylLSueOAy+WSbTu2S9fJE0qw00L/f8eOvysHmg/KE3WrJN2nbzE7zQMhNAAAiFmXJ7blfX+jJTcAAIBVCKDjz+l0Mjd0P5G0YaVlK5BYvk/Td07o7S//PqI51Qc5HPLU008zrYLFPvzwI7tLSHut77xtdwlh3bl0qd0lxE3Nww9JfkGBMsjhMHzO4KwsJScnRykuKVF27X5V2bZje9rua8zeUGj8agEAAAAAACClEEAnzoirrpLOzhhaAqWZnY2NUltfF/Z5ZwMB2dnYmICKkEk8Ho92pK1N/nz6z/LB+++Lz/eptDS3iKqq8t1x40RExHmJU64ePVoKJ0yIKLRE8nK5XKZGQPc3OCtLmTmrSNuwbn0cqspMXV0cD+Mtknl47TLkK0PsLiFuoulakl9QoDTt2a0VTZsumdopgBAaAAAAAAAgDRBAJ9aY/HzC1H66Oru0XFduyEDo5Mn36YIES/h8Pq1p5y7ZtnWr4Q0hXq9X93vqcrm0ufPmSen80pCj2pDcps2YEfWyE773PSGEtk46t3xPJh6PR4vmxgvYx+l0Kk17dmvXjsm3uxRL7X/tdSkuKQn7PNpxAwAAAAAApDgC6MS7+GsX211C0nn78GFLnpNper7osbuElHI2EJAXNmzUrh2TLzXV1VF1JOjs7JSa6mopmTVb8/l83BiRokbljYp62eEjRlhYCQ4fesvuEjLCyRMn7C4BUXA6nWk9X3Yo3OYFAAAAAACQwgigkSz27f2DLFi0MOxzcKGurk7JdeVGvXyv3689+8yz8sH771tYVeJdceWVMt49XkaPHm04Otnj8Wh3Lrndslb4nZ2dcu2YfGnavTvsKH4kH4Lk5HA2EGB6igQ51nFMJk6aZHcZiELJjd9Pqw46J957z9TzCKEBAAAAAABSFAE0kklLc4ucDQTEKEDs9fu1VJjTMpV4PB5tYuEEu8uwTF1trYiIduz4uzI4K+uCULittVWbe/OcuGz3qbVrTc1pjvRxidNpdwlp4+PubroJJEjrO2/bXQKilG43zZi98YR23AAAAAAAACmIABrJqL293TCMOH78eCJLyQj7X3vd7hLi4tlnnr3g/+MZQIuI7GxslF6/nyAtg/S/yQHRO9LWZncJGYMbuZBqCKEBAAAAAABSDAE0ktWbLW9G9TNEJ13bm2/ZtEnOBgIiEv8AOmjv3r1x3waQjo62t9tdQkbxeDzcMIOUQQgNAAAAAACQQgigkcz2vPpqVD9DdNJ1VJzX65Xc4SO04cMuT0gADSB6J0+csLuEjMLrjWRh5oYIQmgAAAAAAIAUQQCNZNfZ2anb1tjn82lm5w8EAKSOdL0ZJlkd6zhmdwmAaYTQAAAAAAAAKYAAGqni8OHDAx7rOHrUhkoAAPGUDq2hZxcX211CRFrfedvuEgDTCKEBAAAAAACSHAE0UsnBP/7R1GMAgNSW6q2hVVWVSZOvt7uMiDDyHKmEEBoAAAAAACCJEUAj1byyq8nUYwCA1JbqraG/O26cjMnPt7uMiKXDCHRkBkJoAAAAAACAJEUAjVTk9XrF5/Odv0Du8Xg0r9drZ0kAgDj44P337S4hJmPy8+Wb2dmK3XVE6khbm90lAKYQQgMAAAAAACQhAmiksuaDB8//NxfLASA97WxstLuEmIz8zkgZ5HCIqqp2lxKRo+3tdpcAmDq/I4QGAAAAAABIMgTQSHX7X3td978BAOmhb8eLVPUv2dkicq4tdyo5fOgtu0sATCGEBgAAAAAASCIE0EgHfUfHpfpIOQDJ6eSJE3aXkNFOffCB3SXELCcnRxERmTT5ertLiUhnZ6ecDQTsLgMIy2F3AQAAAAAAADiHABrppKuzK+VHyQFIXp9//rndJWS04+8et7uEmLgL3ef/e+jQoTZWEp2Pu7u1YIgOJCtCaAAAAAAAgCRAAI108/bhw3aXAACIEzPzwSaz4SNGnP/vy6+4wsZKonOkrU1ycnLsLgMIiRAaAAAAAADAZgTQSEfbtm61uwQAQJy8deiQ3SXE5OrRo8//t9PpVEQkpbp3HG1vl+KSErvLAEJiTmgAAAAAAAAbEUAjXXV2dkpnZ6fdZQBARphdXJywbfX6/ZrX603Y9uJhTH7+Bf/ftz13Kjh86C27SwDCIoQGAAAAAACwCQE0AABINR9++JHdJcTsm9nZF8ynXHDNtXaVEpXOzk45GwjYXQYQEiE0AAAAAACADQigAQBAKurqSu0uF6qqyiDHhbPVXjbsMpuqid7H3d0p1UIcmYcQGgAAAAAAIMEIoAEAsFci21enm/2vvW53CTH57rhxAx7r3547FRxpa7O7BGQwM98ZQmgAAAAAAIAEIoAGAACp7K1Dh+wuISaTJl8/4LH+7blTwdH2drtLAEIihAYAAAAAAEgQAmgAAJLDFVdeaXcJlnJe4kzIds4GAuL1ehOyrXgZOnTogMcGORyiqqoN1UTv8KG37C4BCIkQGgCADNH7HyLveUTbdVi0za+LduSkaL6/CXPHAAAAJAgBNAAAyWPJ7UtSLnQ0oqqq/OjHP07IttJhHuLLr7hC93G9Nt3JrLOzU84GAnaXARhyhH8KAABIZb3/IfLABtGaDuv/PDdHtDXLRYZ+XVKu7RAAAECqIIAGACC5DM7KUta/8IL21Nq1srOx0e5yoqaqqqx5cq0MzspKyHWddJiH2Ol06r5WY/LzU+6z8HF3t5aTk8M1PSTcJc7w3RcIoQEASGNHToq2Yq3IXz8zfk6XR2TqT0Xuny/a/OsJogEAAKxGAA0AQHLKdeUqtfV1cs9PfqylWriam+uSb33r0oSFz0GpPg/x7OJiw5+N/M7IBFZijSNtbZKTk2N3GchAZvY9hNAAAKSpM38Vrewx889/ZLPIxUNEmzWWIBoAAMAqBNAAACS/nJwchSDPnFSfhzjUXOD/kp2dwEqscbS9XYpLSuwuA9DFnNAAAKShs/8lsmx15Mv95GkR5okGAACwBgE0AABIN52dnXaXEJNReaMMf5aKba1T/aYApCaXy2XqeYTQAACkoVffEa3LE92yT+2ythYAAIBMRAANIBG27dhudwkAMojH40n5gQvDR4wI+XN3oTtBlVijs7NTzgYCdpeBDDPiqqtMPY8QGgCANPTG0eiX3bTPujoAAAAyEQE0gETJLyhQmnbvlkWLy+0uBUAGOHnihN0lxOyb2dkhRzuHC6mT0cfd3Sl/cwBSy5j8fFPPI4QGACANNR2ObXlacgMAAESHABpAouW6cpVfVFcrJ0+fUrbt2G66RSYAROpYxzG7S4iJy+WSQQ5HyOdcPXp0Yoqx0JG2NrtLQIa5+GsXm3oeITQAAGnGigC59z+sqAQAACCzEEADsFt+QYGya/eryrYd20VVVbvLAZBmWt952+4SYjJ23HfDPsfsCM9kcrS93e4SEEY6dBHoKzeXOaEBAMhIBMgAAACJRwANIJnkFxQor79xIOXmNgWQ3FqaW+wuISZmRjlf4nTGvxCLHT70lt0lIIx1zz1ndwmWUr9h7kY3QmgAAAAAAIAYEEADSEaDs7KU59evVxgRDcAKPp8v5aduMzN6c3BWVsrtNzs7O6XX70/59ydd+Xw+LdVv4OjP6XSGnFs9iBAaAAAAAAAgSgTQAJLZIIdD7v35/XaXASANnPrgA7tLiNm3vnWpqed9d9y4OFdivQ8//MjuEqDD5/NpRdOm212GpWYXF5t+LiE0AAAAAABAFAigAaSCwgkT7C4BQBo4/u5xu0uI2eCsLFOjN1NxXuiurk67S0A/Ho9HK5o2Xbxer92lWCqS7wchNAAAAAAAQIQIoAGkCrMtMwEglCNtbXaXEJNIRm+O/M7IOFYSH/tfe93uEtLayy/93vRze/1+raqiUptYOCHtAmiRyL4fjjjWAQAAAAAAkHYIoAEAQKbZ2dhodwkxiWT05r9kZ8exkvh469Ahu0tIa3W1tdL6ztvalKk3yMVfu1j3OUfb2+XwobekszO9R6WPHEkIDQAAAAAAYDkCaABIT0OHDrW7BCBp+Xw+ze4aYhXJ6M2cnBxFRFLqd/Z6vdLr92tmW44jci3NLdLS3GJ3GbZyuVym29qL0I4bAAAAAADAFAJoAEhPqqpKfkEBwQ1gwPtJ6rcUjnR0s7vQHadK4ufDDz+yuwSkubnz5kX0fEJoAAAAAACAMAigASA9LVpcLttfNj/XJ5CJurpSv73w30c3mzZ8xIh4lRI36fA+IbldO3ZsRM+nHTcAAAAAAEAIBNAAkLxUVZV7f36/TJ06NaIWoQDM2//a63aXEBNVVSNe5urRo60vJM72v/a6FJeU2F0G0tjw4VdGdJwlhAYAAAAAADBAAA0AyeuJulVSVFSkDHJwmRuIp7cOHbK7hJh4vanfTtyMVH+fkNwWLS6XSI+3HJ0BALCR72+i9f6HyOB/FnF+VbhjGwAAIIkQQANAclJVVZr27Ban08nf0UCc9fr9WjqEuB6PRzPbkvtsICBH29vjXJH1vF6v9Pr9Gl0hEA8zi4oiXoYQGgCABPP9TbSndols2jfgR1rRWJEVPxAZ+nUCaQAAADsRQANAcnIXuqW2vp4AGkiQT30+u0uwxMTCCTK7uFibNPn6Cx4fk59/wf+//NLvZcumTSk7evrDDz+SXFeu3WUgzaiqKvkFBREfdwmhAQBIoF2HRfvJ08Y/bzp87t/980X714miDPqnxNUGAACAcwigASA5qaoqz69fT/ttIIGOtLXZXYJldjY2ys7GRrvLiKuurk5CaFiutKwsquW4tA0AQII8ujV0AN3XI5tFfvasaPGtCAAAAP0RQANIR6qq2l2CJda/8ELE81ECiE0qtqXOZPtfe93uEpCG5i8ghAYAIGm95xFNp/12SE2HRf7YQRANAACQKATQANLVd8eNs7uEmC1aXC65rlxacAMJdvjQW3aXgAi8deiQ3SUgzcwuLo56CgxCaAAAEmDJE9Et9/P1Ir3/YWkpAAAA0EEAjXTmcrnsLiFh0mXELwa67/77CaCBBDsbCEhnZ6fdZSACXq9Xev1+BrXAMmULF0S9LCE0AABxduavov31s+iW/etnIn/6iNHQAAAA8UQAjXQ3d948u0tImGjnLERym11cTBtuwAYfd3dzTSoFffjhR3aXgDThcrkkv6Ag6pvACKEBAIiz9//f2Jb/04fW1AEAAICBCKCRCSZNvj4jRgi7XC65bNhldpeBOBiTn293CUBGOnnihN0lIApdXYxehzVqHn4opuUJoQEAiLP/53Rsy7eftKQMAAAA9EMAjUySCSOEp82YYXcJiJNrx461uwQgIx3rOGZ3CYjC/tdet7sEpAF3oTumUdAihNAAAMTdKa5rAgAAJB0CaGSaG6ZNs7uEuBvvHm93CYiTIV8ZYncJQEZqfedtu0tAFN46dMjuEpAGHvnVr2JeByE0AAAAAADIKATQyETDh18Z00iWVDB69Oi0/x0BIJFamlvsLgFR8Hq90uv3M583oja7uFhycnJiPq8ihAYAAAAAABmDABqZapDDIYsWl9tdRty4C90yyOGwuwwASBsej4cQM4V9+OFHdpeAFKWqqjz6q8csWRchNAAAAAAAyAgE0Mh0M4uK7C4hbqZMvcHuEgAgrZw8ccLuEhCDtw8ftrsEpKjHHv+1DM7KsqS7DLcHAgDwd76/ifb/nBLJdopcqooy+J/trggAAABWIYAGzrerTsuRbdeOHWt3CQBSlMfj0Y60tdldRsQuuugiybv6anE6nXGZiuAjRtKmtCNtbbJg0UK7y0CKmV1cLBMnTbJsn0IIDQDIaL3/IVL7e9E27RvwI+3rF4v8ZK7IrLHCvGIAAAApjAAaOCfYknvDuvV2l2K5XFcuf7cBiEiv36+NGvkdu8uwglZZVSXLKyss3Q+mYjCPf9jZ2Ci19XV2l4EUoqqq/PaJlZbuR2jHDQDIWH/sEG3avboBtIiI/PUzkZ88LXLbStF8f0vP0QIAAADpjgAauFA6tuSeXVxsdwkAUtB9P7vX7hIsU1dba/kczjsbG61cHWzg8/m4nglTVFWVpj27ZZDD2rHLhNAAgIz0xw7R7qw7FzSHc+i4yPerz42aBgAAQOoggAYG+ntL7rQyafL1dpcAIAWlW8i68vHfWLYuwsv0cOqDD+wuASlizZNr49LanxAaAJBxfH87F0BH4q+fiTywgdHQAAAAqYIAGtA3yOFIu5HDhRMm2F0CAKQVwsv0cPzd43aXgBTw7LrnJb+gIC43KRJCAwAyzmNbo1uu6bDIkZME0QAAAMmOABoIreTG79tdgmVUVY3LyB0AyGRnzpyxuwRYgHm9Ec62Hdtl4qRJcTuPIoQGAGScpsPRL/sWNxACAAAkNQJoILyxY8faXYJlZs5KvzmuAcBu+1973e4SYIF0azkPa23bsT1uI6CDCKEBABnlzF9jG8ncdsKqShAv7777bkzLz5s3z6JKAABAohFAA+YMzspS3IVuu8uwxITvfc/uEpAAf+lm3w4k0luHDtldAizC/N7Qk4gAWoQQGgCSxvjx42Neh9fr5aQijPf/39iWP8RI6KTX0dFhdwkAAMAGBNBAZBbfdpvdJVginUZ1wxitgYHE6fX7Na/Xa3cZsAjze6MvVVXlQPPBhATQIoTQAJA0nE5nzOvo6emxoJL09nmv3RUAAADAagTQQOTSIbx1uVwyOCuL+aABwEIffviR3SXAQsffZUQNznEXuqX50JtKTk5Ows6dCKEBAKb0/ofIex7RjpwUzfe32Fpam3Hmr6L9sSNx2wMAAEBqIoAGopMOLbmnzZhhdwkAkDSsmv+3q6vTkvUgORxpa7O7BCSBJ+pWyYZNm5RBDkdCt5vYrQEA4upvf/ubpes7+18i/+uAaP9zl8hfPxvwY21Zicj/PUuUQRbd0vSeR7RfbzNseW359pB+rGhJr6qqFaUAAIAEIIAGYnPTnDnS0txidxlRG++OfVorAMCFjra3210CLLSzsVFq6+vsLgM2mV1cLI/+6jHbOsdwGR8AksSoUaNiXsexY8csqOScM38V7eYa0R7ZrBtAi4jImgaRST8S7T1PbCOVz/6XyObXRft+deg5l63aHtKXFS3p06EtIQAAmYAAGohd4YQJdpcQk9GjR9OKGwAsdvjQW3aXAIv5fD6upWYYl8slTbt3S219nWLn1CWE0ACQJL761a/aXcJ5vr+JNvWnIl2e8M/962ci368+N4o52u397NlzYbcZwe2d+StBNAayuhsAAABITgTQgDWcTqficrnsLiMq7kK3JLqlJACku7OBgHR20o473Zz64AO7S0CCuFwu2bZju+za/aqS68q1/WY9QmgASCOHDx+2ZD0/fjryZZY8cW5Ec6T+2CFaUxRlL1sd3faQ3qzoBnDZZZdZUAkAAIgXAmjAWnPnzbO7hKhMmXqD3SUAQNr5uLubQR9p6Pi7IVpPIi3MLi6Wpt27ZdfuV5X8ggLbw+cgQmgASBI5OTkxHxy8Xm/Mdew6LFqolthG/vqZyP/cFdno5LP/JfLz9ZFvS+TcKO3/dYDR0LiQz+eLeR1Dhw61oBIAABAPBNCA9Ypmz7K7hKhMmny93SUAQNo50tZmdwmIA97X9OQudMuz656XY8ffldr6uqQY+dwfITQAJAmHBW3E3n333ZjX8cbR6JfdG+H5TLdPNKP5ps14/f9EvyzS05tvvml3CQAAIE4IoIH4SNWW3FbcyA0AuNDR9na7S0Ac7GxstLsEWMDlcsmixeXng+cNmzYpEydNsnXO53CYOAUAksiUKVNk3759US/f0dERcw3RtMYO6vKcG908yOQtTv/n/ei3JSISzYhtpDcrbsQYNmxY0p64AQCQqQiggfiaO2+e1FRX212GabOLi+0uAQDS0skTJ+wuAXHi8/k0p9PJNa8YqaoqM2cVydWjRydsm0OHDpWRI0dKMofNRgihASCJqKoa8zq8Xq+mqmpUByTf32Jvb93tE23o18XU9js+iHVrImf+an57SH9W3IgBAACSCwE0EH9Fs2elVAhdcuP37S4BANJSS3OL3SUgTk598IE4nU67y0hp23Zsl2SabzkVEEIDQBKxogVaT09P1GH2xUNEEUncPMtfGxL7OpxfJYDGOT09PTF/dufNm2dFKQAAwCIE0EBiOJ1ORVVVzev12l2KKXlXX213CchwZwMB+bi7WxM5N3L0q1/9qvxLdraI0Coeqcvj8STsmiAS7/i7xyW/oMDuMlLWosXlKRNA9z9GffOb/0OGfGWIZGVlSaJHwxNCA0ASGT58eMzrePPNN2XYsGFRLTvon0Ryc8611Y5WJKOS/z/Dot+OiMjXLxYZ/M+xrQPpw4oLZlZ0IwAAANYggAYSq7SsTOpqa+0uIyxVVRN+ARXw+Xxax9Gjsu6558yMFNVUVZXSsjIZ7x4vo0ePVgY5uAyP5Ecr7vR2pK1NFixaaHcZKWvxbbfZXYIhn8+nNR88KC9t3x7RMeqGadMk15Ub13Mqk7N2AgASYfz48TGv4+TJkzEtf00Mg7HHjYzs+Vf+j+i3JSIyNvaB40gjb775ZszrGDt2rAWVAACAWBFAA4l3w7RpdpdgysxZRXaXgAxxNhCQxoYGbdb0Gdq1Y/JlyeJbTbcq9nq9UldbK3NvniO5w0doD9XUaIwyTS69fj/vRz/HOo7ZXQLiaGdjo90lwEL9j1F3V66I+BhVNH26jLvmWu2hmhrN5/PFZZ/ILVgAkESGDIm9P/XBgwdjWv7mCSKb9kW37KKpkT1/6NdFGTdStEPHo9ve7TOjWw7p6fDhwzGv47LLLrOgEgAAEAsCaMAeua7clGjJPbOIEBrx19baqlX//BfS2dlpyfo2rFsvG9atl9nFxdqjv3pMBmdlMZrfAvtfe12KS0qiWvb48SgvRqWxD95/3+4SouZyueSOu+6M+3b+fPrPKdE1xIjP59PoJpL6GhsatMcefsSSrpBer/f8MaqyqkpbcvsSS49RhNAAkERUVY15TuZ9+6JMkP/uqhxRlpWItqYhsuWKxop8Ly/y+Zl/c4dI4YpIlxIpm3Ku1siXRLo6cOBAzOsYOnRo7IUAAICoEUAD9kqFltwjR0bYgguIgM/n0xaWzrcsfO5vZ2Oj7GxslOqaGq10filtumP01qFDUS97/F1C6P5SeaTsHXfdKcUlJXG/TujxeLRkP06G0nH0qEycNMnuMhClrs4u7Z4VK+J2jKqrrZW62lp5om6VZtX3iXbcAJBkpkyZEvM6vF5vTEH2/z1LlEhaa3/9YpEHF0UXCDu/KspTlZEtk5sj8tO5BNC4UEdHR8zrGDZsGJ8rAABsQgAN2C/ZW3K7XC5GkCJu2lpbtWvH5Mft4n5fNdXVcmt5uXY2EIj7ttKZ1+uVaNqcnw0EZNvWrfEoKWXFqxVvouTmJmbOvpycnJQ+BtFyPXUd2L9fK5o+PSHHqLsrV0hVRaUlxyhCaABIMlbc1f3OO+/EtPygfxJ5ukqU++eHf27ZFJH9vxVl8D9Hv73v5Ymy99fnwuVwlpWI7KgWZRBHMPRx+vTpmP9YysvLs6IUAAAQBQJoIDn8vSW33WUYmjZjht0lIE29sGGjNvfmOQndZktzixSOGx+3eTgzxZwbfxBxgProI49oiQhyUsmpDz6wu4SYDPlK7FMcmpXMx8lwWt952+4SEKGzgYCsrqvXliy+NaHb3dnYKLeWl8d8jOISPgAkmbFjx8a8jtbW1pjXMeifROZffy4cvn/+uXbbQeNGnguD/3eNyH3zrAmEh35dlB3V50ZFl025MJDuu72lxQTQGOjNN9+MeR0TJ06MvRAAABAxAmggucyclbxzLif7SG2kptV19VpNdbUt2/Z6vXLtmPyoRvNG4oorr4zn6m3l9XqlqqLC1GsYDHM2rFufgMpSC+3JzbNiHl67tDS32F0CInRrebltLeBbmlukaNr0mDolcBkfAJLM+PHjY17HwYMHLajknKFfF2X+9aL85g5Rjj937t9z94iytFgUq+dkHvRP50ZF3zdPlJdr4r89pI/Dhw/HvA4rbgABAACRIYBGKvvz6T/bXYJpR9raTD93ZlHyhtDDh18Z9m/CVHpfEimWuXOTwdH29rist7GhISnmd41mNG8kLht2WbxWnRRamltkYuEEqaqo1Lo6uwa0kPX5fFpjQ4NWOG58UrzfySjV25P/pTsx55Pp0EK/rbWV7gtRWPfccwnf5uq6es3uGwe8Xq8sLJ0f9WefEBoAkowVc4vs27dPAmlwUgSY9eKLL8a8DituAAEAAOYRQCOV9fr9KRVkPPbwI6YvHo4ePTopb/51F7plkMMR9nlbNm1KQDXWemn79riu3+fzaak8ck9EJB4jV9taW7W7K1dYvt5oBEfzxivgGpOfH5f1JpudjY1SNH265A4foQ0fdrk2a/oMbfiwy7Vrx+TL3ZUrUnoEazx5PJ6Ub0/+ZkvsHfLM+Li7O+UD3Oqf/yJu697/2utxW7fdNqxbL12dXQl7/w/s358055qdnZ3yo7vviep3J4QGgCTjcDgsmZv2T3/6U8qfFMXDVUNjW/7rF1tTB6zj9Xq1bgvueLXiBhAAAGAOATRSmc/n0+b84Ca7y4iI1+s1Pa/fIIdDFi0uT0BVkZky9Yawz+nq7ErJsLWluSWuo2A7jh6N16oT6oUNGy17jXw+n7bsrqVWrc4SLc0tUV/kD+cSpzMeq016qR6sJsrKx39jdwkxS9QNSHaMhrVaZ2enNDY0xGVfk+oj6sMpX7AgIaPhuzq7Ej4HdDg7GxujOg4TQgNAErrpptgvaLzxxhsWVJJ+LlVja+k91mVVJbDKO++8E/M68vLyxGFiVAUAAIgdATRSmcfj0YqmTU/JYKOluUWuHZNv6sJzMrbknjT5+pA/7/X7tfIFCxJUjfViaXUZis/nS7oL2dGqqa62rI3sQ7+sScpRsTsbG+My0m5wVpbiLnRbvVqkgV6/X9vZ2Gh3GTHzer2yuq4+rgNyPB5P2swnHkmHFLPaWltTfkR9OF6vVx595JG4D/y6Z8WKeG8iKjXV1RHfNEcIDQBJqKCgIOZ1NDQ0WFBJ+hn8z7GNZr7uautqgTX27NkT8zqsuPEDAACERwCNVHU2EJDVdfXaxMIJSRlcReLuyhUya/oM7cD+/QPmTQ1KxpbcoToXnQ0E5M477kjp9ybY6tLKUMDj8WgLS+dbtr5kMPfmOfLCho0xvU4ejyepQ7d4hQ9mugkgs/h8Pu3OO+6wuwzL1NXWxm2E79lAQO7/2c/isWpbeL1eKZk121SHFDM8Hk/SdZeIlw3r1stDNTWWHq/7OrB/f1KH+Q/9siai5xNCA0ASuuaaa2Jex759+6Snp4eW3Dp+Mje65b5+scjk0bGNpIb1rJgP2oobPwAAQGgE0EhVB/bv1wrHjU+aefms0NnZKUsW3yqF48ZreiNLk60l9+ziYsOfeTwerXDceK2luSWBFcXHzsZG023TQzkbCMgLGzZqEwsnpOSo/XBqqqulZNZs3c+uGXcuud3qkizV2dlp2YjvvsJ1E0Bm6ers0oqmTZd02Hf2dXflCnmopkbr9fstbd9fMmt2Whxn+urs7DTdIcVI3+NNKt8IFqkN69bLreXlmsfjsXRffTYQkHt/8lMrV2m5nY2NEsnvTQgNAElIVVUlOzs75vW0t7fHXkwamjVWlHEjI1/u4fJzI6mRPI4dO2bJfNBW3PgBAACMEUAjVT1UU6MtWXxr2l5Y9Xq9MvfmObKorGzAiJ5kasldcuP3BzyWTqPT+wq2TX+opkaLpi2zx+PRSmbN1mqqq+NRXtLo7OyUuTfPkXHXXKs1NjSYHpGWKu1i4zGiMCcnR3G5mGMMIo0NDVrR9Olpte/sa8O69TJq5HdkdV19TGH02UBADuzfn7LTcJh1d+UKqaqojDhQDYbz6X68MdLS3CITCydYOiq6qalJS4XvZSTzyBNCA0CSuuWWW2JehxUjRNPVb+6IrC132RSR7+UxCjrZWDH3eV5enqiqynsLAECcEEAjVb2wYWPazP0YTktzi6z93doLLj6PHBnFnbtxknf1hfMiBS98p9Po9P42rFsvRdOny6zpM0yP+G1saEjb0c9GvF6v3F25Qm4tLzcVNr3S1JSIsmLm9XrjMjf0HXfdafUqkUI8Ho82a/oM7e7KFXaXkhB1tbXnw+hIOkz0+v3aCxs2aoXjxqf1jWh97WxslImFE6SqotLUa+Xz+dI+nDdrw7r1UjhuvCWjop9+8ikrSoq7nY2NYvYGD0JoAEhS06ZNi3kdhNDGnF8VZf9vRSmbEvp5X79Y5KlKkfvmEUAno2eeeSbmdTAfNAAA8UMAjVS2ds0au0tIqLraWul74XlwVpbiLnTbWZKIiKiqKk6n84K/xzLpwndwxO/quvqQF3vbWlszJljS09LcIvf97N6QzzkbCEgq3Vjyhz17LF9nUVER1zYyVK/fn3E3qQTV1dbKtWPyTbcQvvOOO6Smujojwuf+djY2ysLS+SGfczYQkKJp6TuSPhper1cmFk6QWKbT6PX7U6JTR9Dhw4dNPY8QGgCSlBXtgbu7u+XYsWPMC21g0D+dC5f3/lrk8TtEisaeC51zc86NfH78DpE9j4nCCOjk1NPTo3V0dMS8nsmTJ1tQDQAA6I8AGqms1+9PiXaIVvN+cuHvvPi222yq5B9mzrqwLbjP58vI92bLpk0hf54qI3zt1N7enlLXR/a8+qrl6xzkcEhlVZXl60XyMxsYpbM7l9wu4domNzY0pN3cz5Hq7OwMOU/0yZPvZ+Rx2IymnbuiXjbVvqPrnnvO1PMIoQEgSamqquTl5cW8npdfftmCatLb0K+LMmusKL+5Q5Q/PiHKyzWi3Dfv3GPMAZ28rGjFLSIyevRoS9YDAAD+gQAaqe5Tn8/uEmzR1XXhCJyxY8faVMk/9J+buvngQZsqsZfX65VQbblTaYRvvLx16FDIn7/Z8maCKrFGZ2dnTKPqjCy5fYnVq0QKaHj5f9tdgu06Oztly+Ytht+pXr8/oztK9BXqdYhHl4Z0caStLeplzYa6yaKluSXsTR0ihNAAkNSsaBP85JNPWlAJkHzuvTd0qzUzpkyZIkOGDGGkOwAAFiKABtJHMrTkTqa5qe125swZu0tIauFG5n3w/vsJqsQ6HUePWr7OwVlZCqOhkalChYSZegNapFJxX5oKUnEE/sfd3WFvlCKEBoAkduONN8a8DlpyIx15vV5LWnGXlJRYUA0AAAgigAbSj50tuV0ulwzOyuKmUVhiZ2Oj3SVE7PPPP4/Lepf+cKmiqmpc1g0AyAw9X/SEfQ4hNAAksW9/+9uW/LFNS26km23btlmynrlz51qyHgAAQAANpCs7W3JPmzHDtm0DyeCzf/ssLusd5HDIvT+/Py7rBgBEJh5TLyRC/2lc9BBCA0ASczgcUlFREfN6nnzySQmYmKMBSBXPPPNMzOvIy8sTVVUZVQEAgAUIoIH0ZWdL7humTbNlu0g/vX5/Sl7gj2V+0XCKS0qU2cXFcVs/AMAcv99vdwlxQwgNAEnulltuiXkd3d3dcvjw4ZT8gysdXHd1bMv/969aU0e6OH36tCWtuK2Ycx0AABBAA5lgytQbbNnu8OFXctMoLMFcr/oe/dVjQltuAEA0jra3h30OITQAJLmxY8da8kf37373OytWgyhcNTS25fOusKaOdLFx40ZL1mPFnOsAAGQ6AmggMxTNnpXwbboL3TLI4Uj4dpGeLnE67S4hKQ3OylLWPLnW7jIAACno6tGjwz6HEBoAkpxVLbm3bt0qPT09jIa2waWqxHQjwf/3SqsqSX2BQECqq6tjXk9eXp6MGjWKURUAAMSAABrIHE6nU3G5XAndpl2jr5GeBmdlpeTff2Py8+O+jfyCAqWyqiru2wEA6MvKyrK7hLghhAaAFGBFS24RkXXr1lmyHkRm8D+LlE2JbtlxI0WGfj22EDud/OEPf7DkRorbb7/ditUAAJCxCKCBzDN33ryEbm/S5OsTuj0gGV38tYsTsp3llRXKosXlCdkWAOBCTqczJa/9Dh0avv0nITQApACrWnI/8sgjVqwGUfjpXFG+HsXfjr+5w/paUtm9995ryXrmzp1ryXoAAMhEBNBAZkp0S+6cnJyUvCCL5DW7uNjuEiJ20UUXJWxb991/v+IudCdsewCA1PYv2dlhn0MIDQApwKqW3N3d3dLS0kJLbhsM+ieRZ+8WiSSI3nSviPOrjIIOOn36tNbR0RHzevLy8kRVVV5XAACiQAANZK5EtuROxbAQyc95SerNCz18xIiEbWuQwyHPr19PEA0ANkjFfe8lzvDHVUJoAEgRS5YssWQ9v/zlLy1ZDyJ3VY4oex4TpWhs6OeNGynSvEpkzHAC6L5qa2stWc9jjz1myXoAAMg0BNAAEtWSu+TG7ydkO8gsM4uK7C4hIqqqJrwjAEF0alNV1e4SAETppjlz7C4hIu5CtwzOygp7jHIkohgAQOxGjRql5OXlxTwSdN++fXL69Glt2LBhBJw2GPzPIr+5Q5QVPxDt/7wv0vGByPv/r4jzqyLXXS1y1dBzYbXddSaj+vp6S9Zz3XXXWbIeAAAyCQE0ABGRa8eGuaPWInlXX52Q7SCzjB49WhGRlOkOV1pWZst2g0H0reXlWktziy01IDprnlxrdwkAolQ4YYLdJURk8W23mXoeI6EBIIXcfvvtlqznvvvus2Q9iN7Qr4sya6wo980T5bl7RPnNHef+nwBa37Fjxyy5UFBRUSFDhgzhNQYAIAIE0ACCcl25SrxH2qmqKk6nk3N2WG6Qw5FSrd5vmDbNtm0Hg+hUer0yXXVNjeQXFLDvBFJUIqc9sYLZGwYJoQEghSxevNiS9WzdulV6enpS5u5f4I033rBkPVa1tQcAIFMQQAPoL96jM2fOSq2WyUgtqdLqXVVVyXXl2hooDnI4pLa+TnmibpWdZcCEyqoqWbBoIQE0kOLuuOtOu0swxeVymb5hkBAaAFLIkCFDlHkWzcG1cuVKS9YDJMIzzzwT8zry8vJk1KhR/FEGAIBJBNAA9MR7dGaqzduL1DJx0qSUGGl278/vt7uE84pLSpSm3buZbzhJVdfUyPLKCq51AGmgqKgo7h1nrFDz8EOmn0sIDQAp5t5777VkPdXV1YyGRsr4xje+EfM6HnvsMQsqAQAgMxBAAzAS75bcI0eOjNu605XH4+Fv+whEcvHcDi6XS4qKipIqVMx15SpNe3anVDvzdKeqqjTt3s0IaCCNDHI4kuomJD2zi4sjav1PCA0AKWbUqFFKXl6eJetiNDRSxYQJE2JaPjs7W2644Qb+MAMAwAQCaADhxKslt8vlksFZWZy3I67yCwoUd6Hb7jIM1Tz8kAxyOOwuYwCn06nU1tcpz657nlHRNptdXCyvv3HA9pbtAKxXVFSU1B077vnJjyN6PiE0AKQgq0Z0MhoaqaKgoCCm5e+66y5xJOEf8QAAJBsCaABmxKsl97QZM+KyXqC/R371K7tL0OUudEc0wswOEydNUl5/4wCjom2gqqps27FdauvrFG7YAdLTIIdDVq5aZXcZuiqrqiQnJyeifQ8hNACkoBtuuEHJzs62ZF2MhkYquO6662Ja/p577rGoEgAA0hcBNACz4jX6Lt7zTQNBOTk5yrYd2+0u4wKqqsrz69enRLA4OCtLqa2vU7bt2C7JPGIvXaiqKk/UrZLmQ28qyX6TAoDY5bpyleqaGrvLuIC70C1Lf7g04v0PITQApCCHwyH332/N/BDV1dVy+vRpRkMjqQ0ZMkTZvHlzVMtWVFTIkCFD+CMNAIAQCKABRGrR4nLL1zl8+JWctyNh8gsKlMqqKrvLEJG/z++7Z3dStuEOJb+gQNm1+1XC6DjpGz4Xl5Qoqfb5ABC9BYsWKvE414qGqqry1NNPR3WMYq8FAClq8eLFsnz5ckvWdd9998mWLVssWRcQL6WlpcquXbu0rVu3ml5mypQpsnLlSi5kAQAQwuDB/yUL/vVvsvOVIXaXgjRxpP2f7S4BCTCzqEg2rFtv2frche6UC+CQ+pZXVigfvP++trOx0dY61jy5VpxOZ8r+7fr3MFoO7N+v/fbXj0tnZ6fdJaU0l8slP/rpT2TChAmWBc/OS5yWrCedZWVl2V1CSrjiyivtLiFj3Hf//crJEye0luYW22oI3iQV7RQAnNkBQIoaMmSIUlNTo1VXV8e8rq1bt8qjjz6qDRs2LGX/4EFm2LhxozJ+/HjNzA0YFRUVsnLlSoW5oAEACK2395+k6meq3WUASeUSJxfrwxk9erQiIpZ11Zoy9QarVgVE5LdPrFSuuPJKra62NuHbVlVV1r/wQtxa3CfaxEmTlImTJklXZ5f21Nq1Yne4n0pUVZXSsjK5Ydq0uHwebpn7r5beOJSqJk2+3vBnTqdTcRe6bQ38koW70G34s/Hu8WLH/jIVWB3QD3I45Pn165Uf3X2PLTdLBQPoWG6Soh03AKQwK+e5LSkpsWxdQLw4HA5ZtmyZcurUKZk3b57uc6ZMmSIdHR1SV1dHAA0AAICoDM7KSpo2vYk0dOhQ088d5HCIla/RzXNuNvW8SGpMN0a/OzdNnBMqNAllkMMhyysrlGfXPW9xRaG5XC5p2rM7bQLovnJduUptfZ1y7Pi7UllVJarKzW56VFWVyqoqadq9Ww6987ayvLJCidfnIdeVq/A+hD+GLL7ttgRVktxumjPH8GcjR45MYCWp5YZp0yxf5yCHQ2rr6xJ+XuoudEvzoTeVWLt0EEIDQAr7+2hoS9bV0dEhW7ZsYW5opIRhw4YpW7ZsUTRNUz755BM5deqUnDp1SjRNU/bu3auMGjUq7f6IBwAAQGItuX2J3SUklKqqkl9QENF5tFWvUWVVlek2j6NHj87YIOXvo88HGJyVlbGvSV8F11wb0/ITJ01SmnbvTkhgOru4WBp27Yz54n6yG5yVpSyvrFAOvfO20rR7N4G0nAt2qmtq5EDzwbgHz/3d+/P7E7GZpOUudIc9zk2YMCHj96fuQrcUl5QYvk6Ds7ISftNOKphdXBzXm4qWV1Yo23ZsT8g+tLqmRp5fv96S6QAUTSNvAIBU1tPTo33lK1+xZF3Z2dny0UcfMXo0xZ39L5FRt8fWFm/vr0WGfl1MnziNvC2x2wMAAJEbPuxyLgDANidPn0rJc71ev1/77W9+I6/sahKv12t3OXEzu7hYfvHL6qjaLfp8Pm1h6fyo54CtrKqSJbcviWiuQY/Ho93/s59JprRMDc4PO3HSJMPX6IUNG7W1a9ak9ec0FHehWx751a8kJycn5n3N2UBAmpqatMcefsTy13N2cbHc85MfW1JnKuvq7NLePnxYtm3dmtbzR6uqKt8dN04mTb5exuTnyzezsy2b4zlaPp9Pa9q5SzJtf1FZVSVLf7jU9Ovf1tqq1a9alTHHGZFzr1Ek7eC7Oru0P+zZI1s2bcqoz1J/7kK3VKxYEfGNfNEKHqPurlxh+bpjOR80QggNAGngwQcftGRuaJFz8+jW1dVl9B9D6eDGatG6PNEvf+wZUQZF0C+FEBoAAADpzufzaX6/3+4yLJeVlRXzxcazgYB83N0d8d8ElzidEYXP/Xk8noy4sBlJYJkpr0lfVnyG9ZwNBGTL5i2WhPuJDilSSa/frx0/flzebHlTWt95O2VDP5fLJSOuukomTb5ehg4dKiNHjoxp/5YImbC/iPU4k67H/v5ivUEiEz5LeuJ1/DGj1+/Xnn3mWUtuAojnDVKE0ACQBqwcDS0icurUKRk2bFhSnygjtEe3irZpX3TL5uaIvFwTWSBMCA0AAAAASFcej0fb/9rrEY3cnV1cLCU3fl/Gjh2b9GFksvF4PNrJEyfkow8/kiNtbfLWoUNJMdJydnGxiIiMyc+Xi792seTmumTIV4Zk/Mh2APaKZlT6osXlMrOoKO43zBBCA0CaWLNmjbZ8+XJL1pWXlydtbW205U5h73lE+36Ug+Pvny8y/3pCaAAAAAAA+us78v/kiRPy+eefi4icDyTtHBmX7oKjUv/S3S1nzpwREZE/n/6zfPD++zGt94orr5TLhl12/v+HDh0q/5KdLSKxj6QFgETq9fu1T30+ERE50tZ2/nG7jlGE0ACQJgKBgFx66aVad3e3JetbvXq1LFu2jJPsFBbNaOjcHJEd1ZG14hYhhAYAAAAAAAAA/EOEl5gBAMnK4XDIypUrLVvf8uXL5fTp09yplMJ+OleUr18c2TJrlotEGkADAAAAAAAAANAXl5kBII2UlpYqeXl5lq2vpKREAoGAZetDYg36J5E9j4lSNDb8c8eNFGlexWhkAAAAAAAAAEDsCKEBIM1s2rTJsnV1dHTIU089xWjoFDb4n0V+c4coT1WK6IXR40aemwP66SpRnF8lgAYAAAAAAAAAxI45oQEgDZWWlmpbt261bH0dHR0yatQoAso04fubaL3/Ye2oZ+aEBgAAAAAAAAAEMRIaANJQXV2dpeu74YYbaMudRpxfFYXAFwAAAAAAAAAQL4TQAJCGVFVVNm/ebNn6uru7ZeHChbTOAAAAAAAAAAAAYRFCA0CauuWWW5S8vDzL1rd161bZsmULQTQAAAAAAAAAAAiJEBoA0pTD4ZCGhgZL1zl//nw5ffo0QTQAAAAAAAAAADBECA0AaWzYsGFKRUWFpescN26c9PT0EEQDAAAAAAAAAABdhNAAkOZWrlypZGdnW7a+7u5u+f73vy+BQMCydQIAAAAAAAAAgPRBCA0Aac7hcMgf/vAHS9e5b98+efTRRxkNDQAAAAAAAAAABiCEBoAMMGrUKKWmpsbSdVZXV8srr7xCEA0AAAAAAAAAAC5ACA0AGeK+++5T8vLyLF1nUVGRtLS0EEQDAAAAAAAAAIDzCKEBIEM4HA5paGiwfL0333yzeL1egmgAAAAAAAAAACAihNAAkFGGDRumbN682dJ1dnd3S15eHkE0AAAAAAAAAAAQEUJoAMg4paWlyrx58yxdZ3d3t5SWlkogELB0vQAAAAAAAAAAIPUQQgNABtq4caOSnZ1t6Tr37dsnM2bM0AiiAQAAAAAAAADIbITQAJCBHA6HHDp0yPL1EkQDAAAAAAAAAACH3QUAAOzx9/mhtfnz51u63mAQ/eqrryoOB4cZAAAAiJwNBOTRRx7RfJ/6xOf7VFqaW87/rLKqSpZXVig2lgcAAJCRjM7RVFWV0rIyztEAxETRNM3uGgAANqqsrNTq6+stX29FRYWsXLmSIDpDjLxNYjqh2PtrkaFfF/6wAQAgDZ0NBOTW8nKtb/Dc37Yd2yW/oIBzAQAAgASx8hzN5/Npm1/YJCIi8xeUidPp5LwOAO24ASDTrVy5UpkyZYrl662vr6c1NwAAAOQ///M/tfe63gv5nFeamhJUDQAAAETMnaOdOXMm7HoeqqnRrh2TL3W1tVJXWyvXjsmXh2pqGP0IgJHQAAARr9er5eXlSXd3t+XrnjJlitCaO/0xEhoAAITS1tqqzb15juHPZxcXS219HecCYXg8Hu1IW5t89m+fyZG2Nt3nTJp8veTmuuRb37pUBmdl8ZpGqdfv1w4fPiwNL/9vcV7ilJlFRTJy5EheUwBR83g82skTJ+SjDz+6YB8+afL1ctFFF8nYsWPZxyDhwp2jPVG3SopLSgw/lz6fT7t2TL7uz44df5fPNJDhSAQAAKKqqnLo0CHt8ssvt3zdzBENAACQHLo6u7Sn1q6VnY2Ncd+Wy+WSH/30JzJx0iRFRCS/oEB5+0ib5vf7ZWLhhLhvP520tbZqrzQ1ySu7msTr9YZ9ft/3t7KqSlv6w6XKIM7DI6J3QX3DuvWiqqq8/sYBjQvqACLh8/m0h35ZY3j87b/fXnL7EluDu9V19VpdbW3Uy7sL3eJ0XiLOS5xyy9x/lVxXLvvMJBbrOVqwBbeeHdt3yIJFC2MpLyOFuzEgFu5Ct9z381/wvUTC0I4bACAiIsOGDVOam5vjsu5gEE1rbgAAAHucDQSkfMGChATQIiKdnZ2yZPGt4vF4zndLcTqdSk5ODhe8TPJ4PFpVRaU29+Y5smHdelMBdH91tbVSOG685vP5aINn0tlAQBaWztf9mdfrlTvvuCPBFQFIZS9s2KhdOybf9PG3rrZWRo38zgXHz0R6YcPGmAJoEZGW5hbZ2dgoG9atl6Lp02XW9BlaY0ODdpZrQkkrlnO0r33ta4Y/u/hrF0dbUsbq6uyKWwAtcu77WTR9uvT6/ZwbIiEIoQEA57ndbmX16tVxWXcwiO7p6eEkBwAAIMHa29u1aELMWL380u8Tvs10sLquXptYOMGSmwa8Xm/IUUq40JbNW7TOzk7Dn7c0t0hbayt/0wAI68D+/VpNdXVUy8658QdiR2hbNHuWqKpq6To7Ozvl7soVcmt5ecYF0T6fT1tUVqatrqtP2+NG0exZhj+bOnVqAitJD9/61qWWfwf1HD58OO7bQHydDQRkdV29tqisLKn3rYTQAIALLFu2TKmpqYnLuvft2yfDhw8Xr9ebtiffAAAAyejMmTO2bPeD99+3Zbup6mwgIIvKykyNQptdXCyzi4vlibpVUllVJe5Ct+Fzt2zaZEuYkYq2bd0a9jmvNDUloBIAqczn82lLFt+q+zNVVeWJulXStHu3zC4u1n2O1+uVW8vLE37txOl0KmueXBuXdbc0t8iP7r4nY64HtbW2akXTpktLc4vU1dbKCxs2puXv7nQ6lUWLywc8vmhxOfNBR2FwVpbStGd33Lfz+eefx30biB+fz6eVzJqt1dXWSktzS1Lf5MOkQACAAR544AGls7NT22riAkykuru7JS8vT/7whz9oo0aN4mQUAADARl0nT+jOF+zxeDS9eQGfqFslxSUluudwi8rKtJbmFuuLzBBnAwG5tbw85Gu4aHF52Pk1x11z7YBR716vVz7u7tZohx6az+cLOQo6aMO69XLf/fcLc20DMGLU1r//cbS2vk4e/dVj2p133CH99/8tzS3S6/cnfB76/IIC5eTpU+Lz+bSqiooBdYmIPLvueRk+YsQFjx1pa5Oj7e2yYd16w3XvbGyUMfn52oJFC9P+eLTsrqUXTKVxpK0tbedH/kV1tfKjH/9Y27F9h4iI3DznZgLoGDidzqi+g0bWPfdcyO8lUs/mFzZJ33PWluaWpD3XZyQ0AEDXxo0blSlTpsRl3cEguqWlJS3vAgUAAEgF7kK3pSHalKk3WLauTPSju+8JGUA/u+55+UV1tRIqgBYRKS0rs7y2TNG0c9eAx1wul+5z29vb+VsGgK6zgYAY3dBSVFQ0YB8+OCtLqVixQvf5H374kaW1RcLpdCpO5yW6Pxs+YoTk5OQoff8Vl5Qov6iuVo4df1cqq6oM12um40Sq6+rssmUaFDsNzspSFixaqCxYtFAhgLZGpN9Bo38zi4oSXDnibcum1JlqhxAaAKDL4XDIq6++GrcgWkSksLBQHnzwQS7eAAAAxFnhhIGjmh/51a8s3Ubp/FKl/xx2ZQsXWLqNdHVg/37NaP5nd6Fb3j7SJhMnTTJ1QXe8e7zu41lZWdEXmCH0gpGVq1bpPpeW3ACMfNzdrXudo7KqyvDmr9GjR+vu47u6wndnSDaDs7KU5ZUVilEQ3dnZmfZTRPxhzx67SwDOyy8oUJ5d9/wFjw0dOtSmahCrVLvJhRAaAGAoEUF0dXW1TJ06VQuk+R8gAAAAdnI6ncq2HdvF5XLJ7OJiadq9W6xu1zbI4ZCmPbulsqpKXC6XPFG3yvCiOv6h1+83nDd0dnGxPL9+veJ0Ok2/jvkFBUr/OUZdLpdEso5M5PF4BrTiXrS4XIYPv1L3dduwbn3ahygAonOkrU33caObhETOHUP15ofe/9rrltWVaEtuX2L4M6OgPh10dXZpqTRKEZlh4qRJyoHmgzK7uFieqFsl+QUFnBemIJ/Ppz368EN2lxERJq8BAIQUDKIvvfRSrbu7Oy7b2Ldvn+Tn52v79u0TVVU5CUpBRWNFmg5Hv/zQrwvvOwAAcZZfUKDs2v1qXLfhdDqV5ZUVsryyIqb1eDwe7Uhbm3z2b5+dv5jvvMQpV48eLUOHDpWRI0daMtegz+fTmg8elKPt7eL71HfBzyZNvl4KJ0yIe3j77DPP6j6uqqr89omVunN2h/PbJ1YqkyZfr720fbsUXHOtzF9grkW3z+fTOo4elYN//OOA10NE5Iorr5Tx7vERvf5tra3amTNnROTCMKXkxu8PGN3d6/drH374kbx9+LAcaWsT5yVOmfC978nYsWPjPrfkyy/9fsBjM4uKZJDDIYsWl+vOpdje3q5FchG372vR9zM3Jj9fSueXXvBe+3w+7dQHH8jxd49fEGhdceWVcsO0aSHnBe8r+F0SEfnz6T/LB++/f349S25fcsHrGnz9u7o6z79XV1x5pYzKGyV5V19t2Xehq7NL67uNvqz43gV/Z6PwbtLk62VMfr7pG3F6/X5t7969InLha+i8xCk/XL58QK0ej0c7eeLE+e9R8D0bPvzKkN/ns4GAnDz5vhb8/Ce69r7vf//P58Vfuzii7Zqp6/Dhw3Ks49j5moKC+/ox+fnyzezsiPeBybBfN3L83eOSX1Bg+PMT77034LFJk6+PZ0lxNTgrS1FVVXfE3pG2NsnJyYl4nUb7j1iPF2cDAWlvb9fOnDmj+9kZk58vl37r0pDr7+rs0u5ZscKwFbvP96l4PB7d8P0Sp/P8env9fu1T38BjsNHzjRhtK8iK77PRPuaKK6+UG2/6Qcht9D0+mT0mnjlz5oL3ftLk6+Wiiy6y5DzB4/Fof+nuHnDcDW5jwoQJuvsjn8+n+f1+6fmiR9RvqEl9019OTo5SW19n+PNwn5lwn7tQy/df9mwgIAcPHtQ+//xzEbnwHLFs4YIBIXnw2Nr/uGHlfj3UsSl4Djx69GhTxyWjz/cVV14pS3+49IJ1nA0E5OPu7gvOXcbk58ukydef/w75fD7toV/WiFHnJBGRkydOiIgMeA+ysrLCvj7B3/3zzz833AeO/M7IqP4GUzQtbW86AgBYyOv1anl5eRKvIDqoqalJZs6cmbQnbNC3+XXRHtkc3bLjRoo8dw8hNAAAycTj8WgTCwe28H6ibpUUl5TEdNwePuzyARciZhcXS219nRLuAm6Qqqry2OO/Nt2iuj+z2xE5N4p445bNcbmoeDYQkNzhI3QvzGzbsT1ho1S6Oru08gULxGxrP1VVZc2Ta8PWt7quXqurrTX8edPu3ZLrylV6/X7tzjvuEKM5sVVVlUPvvB3X12LcNdcOCEq6Tp5QBjkc0tbaqs29ec6AZRYtLpdfVFebDuP11hH07LrnZeKkSUqv36/d97N7Q15kFDH3Hvh8Pu3aMfmG66isqpLllRXK2UBAHn3kEU0vaO8vln1AW2urtuyupaY+Z+5Ctzz19NOmL3SeDQRk7e/Whvy89Te7uDjsjR69fr92/XUTDWt2uVyya/erikj438/otYtX7T6fTyuaNt2wHnehWzZs2qScDQSkqalJu7tyhantPvqrx6IOe3w+n7awdL6pfa/Iudd35apVpm668Hg82p1Lbrd9vx6sRe8Y2vfz0p/R9zW4b7C+SnOqKip1p4s40HzQVIhptHyk+5LGhgbtsYcfMbX/MPP9CAp+/s2uW+TcvrN/iBRufxuOqqrSfOhN5bPPPw/5ve37/KY9uw0/w+GOvyL/OAb0fUzvHC3UvuvW8nItmmN3uGNicJtmj4mh6gwnkn1HZVWV3HjTD+TkiROy7rnndM9bgvvWSOswEut30Cwzn5lQn7twy/df9qGampDnHceOvyuDs7IUs+eosezXzwYC8qO77zGcGqe/cPtlo2NAUN/v3gsbNmo11dWGzw2eKy8qKzP8rplh9HdFr9+vPfvMsxLJOUh1Tc2AG0VCoR03AMAUVVWVjo4Oyc7Ojut2ioqK5MEHH6Q9d4r5gVuUr18c3bKLplpbCwAASD0n3ntPqioqtaLp001dBPR6vbJk8a1SVVEZ8Z31jQ0Nprcjcm7uyqJp08OODolGU1OT7jpVVU1IAH02EJCHamq0ounhL3j35fV6Ze7Nc2R1Xb3ha9LV2RX2YmZXV6d4PB7t+usmGgbQwe21tbbGbRSF3tx67kL3+blbR44cqbuc2ZbcvX5/yIvtIiINL/9vObB/v3b9dRNNXWwPvgcvbNho+LosLJ0fch11tbXS1dmlFY4bbyqAFhG5u3KFPFRTo0Xainx1Xb029+Y5pj9nLc0tcv11E8Xn84V9330+n1Y4bnxEIa6IyM7GRikcN17r6uwy3MazzzwbsubOznOfYTO/39NPPpXQ2je/sClkPS3NLeLxeLSSWbNNBdDB7V5/3UQJtV0jB/bv164dk2963yvy9/3v9Olhv/8H9u/XJhZOiHi/Hs3vYUZOTo6iqqrudnv9ft1tdhw9qruu4SNGWFtcghntz8bkmwtsg8epuytXmN5/7GxslFvLy7Vw+4/g9y+SdYuc23f+6O57Llh3VUVsHWC8Xq/cWl6uLSydb6oWr9druI9va201tU+pq62N6di69ndrQ4ZiXq9X99zJzDFx/2uvS2NDg+ljosi549Os6TNMH596/X7toZqaiPYddbW1MrFwgixZfKvheUtw32pqhUniwP79pj4zXq9XHvplzYDHzXzm+n5m21pbw5537Ni+I6Jz1Gj368H9gNnPmYjIksW3hjwHvnPJ7SGX/+D996XX79cWlZWFDKBFRF7c9r+ksaEhpgBaRGTuzXMGnFN1dXZpo0Z+J6IAWkSkprpaHn3kEdOvMyE0AMA0VVWVkydPSjzniBY5N090fn6+5vV6U+qkLVVt2bJFKy0t1b75zW9qiqJoiqJopaWl2pYtW7Senh5T78HgfxZ5uDzybReNFfleHqOgAQDIdJ2dnaYvMva1s7HR9AXUvheyI+X1emVi4QTLg9CXtm/XfXzpsmVWbsZQe3u76fBRTzDE1PtZritXqayqCrn8S9u3y8TCCaYuLr7S1BRdkSb8Yc+eAY8tvu228/89OCtLcRe6dZdtb28P+5kYnJWlPFG3KuRzdjY2ypLFt0YUhIicuxBYVVGpe9G9xsScgZHegCByLny/tbxcMwrT+jobCMiisrKIQ1aRc9+7a8fkh/3eVVVURPw79N3GPStWGP58/oIy0QsT+5pz4w9MXcANBtZ9H7O79kjCF7Pb7S+4712y+NaIttNX/apVhuteXVcf1bq9Xq+pgDtaM2cV6T5+38/uHfDY2UBA1j333IDHXS6XpSMdEy3UPuISpzPs8j6fT7u1vDyq41RLc4sUTZtueCPL2UBAzIw4NrKzsfGC368igu+EkYoVK0ztt4OMnptfUKDozS/en7vQLaNHj47687X0h0sNj42hDM7KUrbt0D//CdrZ2CiR3hwgcm4/a3SDX19nAwGZ84ObdKfaCIrmd0tVEyZMMP1e3vOTHw94LL+gwNTyG7dsNv38murqkO+PnuB+vbGhwdR+va21Vbt2TH5U+4G62lpZVFame/610uCYFXTivfck3A2YQRvWrZfCCRPCHs/DqayqumCUuM/n08oXLIh6fRvWrQ+5j++LdtwAgIgFAgGZMWOGtm/fvrhvi/bc8XPs2DGtrKxMOjo6DJ+TnZ0tzz33nOn34NGtom0y+bHIzRHZUS3KIG6JAwAg6SS6Hbced6FbnM5L5MR774UMSUK1N+3LqI3dosXlMrOoSC6/4goRETn1wQdSv2qV4YWhYHtAM79DKKFacVvdYtGIXivEYPvbb33rUhmclaX0+v3a8ePHxajNcLiW1Af279c+//xziSb87yvYsj2mlRjQa8X99pG2Cy7WNTY06N7AoNfO1MiB/fu1jz78SNauWRP2gmfw8y9iPJLQTB3B+VOffvKpsGGjy+WSEVddJSIibx06FLbGcO/J2UBACseN150PtrKq6vz84r3//u8hv3fBNrV6bR97/X5t1Mjv6K6/73ykPp9P+93q1YYXtEN95/rOMRzLTRv9t5PI2v98+s+mgnJVVeW748aJSPjPgJkpA84GAlIya7Zm9NlbtLhcJnzvezJ8xAj5Zna28nF3t2FbXL19r5n9+uD/6/+S48ePyytNTYavoVX79b5CtRvueyz1+XxaVUWF7mc/UceCUGJpBWzUZtbMcTtUK/zqmhq5duxY+da3LpXef/936Th6VH7768d1PzdG2zL6vdyFbrlpzpzzc6AH53XV2//3PycK7m9FRHef63K55I677tT9fXNzXefbznd1dmlPrV1r+B0M1hjqfCzY5n/LpoEdEVwul4wd91350Y9/POBzH0k77uB2mpqaNKN9TKjPSVtrq3bmzBlTx6dg3SOuukp8vk/DhnfhvtNGraOD79HUqVNlcFaWEpy3OJIbXSKZqsOMRLXjDh5rXtnVZLjvD7aGNlre6MaO2cXFcufSpRcsG+6zo7eOc9sJ//6LhH99jM7rgp+BMfn5549L+197XYxGLBt9P4L7g5e2bzdVbygnT59SgsdzkXOdAvQ+E5VVVXLZsMsGPH7RRRcNaB9udPzU2wca/f5m/y4khAYARCWRQfS8efPkmWeekSFDhhBGWyAQCMhTTz2lLV++3PQyFRUVUldn7qLfHztE+/l6kb9+Zvyc++eL/OtEAmgAAJKVXSG0u9AtFStWyOjRoy8InMLNGRzqopiI8YWmUL+P0QXK6poaWbBoYcznpV2dXVrR9Om6Pzt5+lRCznv13guj3y9UaG4mwAl388Hs4mKZNPl6GZOfL3Nu/MGAi5hWX9QN0nsf9EILo/k+o5mv2uiC8uziYilbuEA32AsXRIqEfh9CXWz90U9/IhMmTBgQ8vb6/drevXtD3kAQ6iKvUQBlFF6Gmpva6Lt6YP9+3XDA6LWI5WaCcHM8ulwumTZjhox3j5fj7x7XvWDb9/VKptqra2pk0uTrB7yXoea5NhMkGs35qaqqbH/597qfHaPXpf9nzeh5ofbRRvv1SG4mMSvcfLnBkaBGr288aopGtAFYqGNcuGO2iP5nR1VVWf/CC7rLhnq99band0wyuuHF6PgX6hxC73WL9GYqo+98JOchejdZhXrvIg2hg4z2MWaCUqPPmMi59+Sxx38tY8eOvWC/GAzZjcLLUDUb3SAS6jtntMzs4uILRgZf4nRafkNLokLooFDzm0fzupq5YcnoHLH/TVl9dXV2aY8+/JDh3wahvm9GN7m4C93y/Pr1uje9eTweTe/8NNSNciLG3+O+25wy9Qa5duxYeWrtWt1wuf/fBUbrNPuZMLoJzuh3MXq+2b8LufQLAIiKw+GQV199VYl3a24Rka1bt8rw4cPllVde4c6pGHm9Xm3GjBkRBdAiIvX19aZf/+/libLnMVGeqhQpm3JuxPPXLz7XevvxO0T2/lpk/vUE0AAA4ELBCz/5BQUDLn4MzspSnl+/XnG5XLrLBkce6TkbCMhjDz8y4PHKqqqQF06WV1bozum5ds0aU/MAh2NUs5kWmlbp/3qqqio3z7lZ97mDHA4xaq/9qc8XdQ2qqsrbR9qktr5OKS4pUXJycpTX3zgw4HWYWaTf2jZWeq24586bN+Axp9Op+/nzer2WzStbW1+nGF2odTqdyi+qq5Vn1z1vuPzevXsj3uau3a8qEydN0r14OjgrSykuKVGadu82bAO58vHf6D7e6/frBtBP1K0yvBg9yOGQ++6/X/dnet9hEf35ciurqgxDgKlTp+qu54P339d93KzKqirZtftVZXllhZJfUKAsWLRQ2bZj+wXfsf6tlfVqr66pSXjtwUBL78J1fkGBsv3l3+suF27kYldnl24A7S50y+tvHDC8UD5hwoQB37X+r93ZQEDu/clPByxbWVUVMpxbXlmh+z2uq621ZL/e1yCHQ2rr6w2/O3NvniNG84hv27HdMAzzeDya0T+rf4do9Pr92uq6esMAenZxcdgA2uPx6H521jy51nDZQQ6HPPX007rre2rt2gHr13vevT+/X/T2hYMcDqmuGTgPrtl5raNl9J3ftnWrqeW7OrsGBNCp1OJdVVVp2rNbJk6apPTfLw5yOGR5ZYWyaHG57rJH29sN16vX3l9VVVn6w6WGr4tRi/OdjY1yidMpOTk5Sk5OzoA6U5HT6TQ817i7coXhPN/L7lo64PnVNTVhA2gjT9StkuWVFbrHJpFz0748v3694WdgZ2Oj4Xf92Wee1Q2TjQJoEZGcnBzl3p/fP+Bxr9crBw8ejOo8cNuO7bJh0yZlwaKFSq4rV/ntEyuVJ+pWXXDcCDe1TTQ+/PAj3ccfe/zXuvvAwVlZuq9z4QTjm9v64vIvACBqwSC6Rudk3Grd3d1SVFQkpaWlpucpxj8EAgHZsmWL9o1vfEOiHb1+2223SSRzRH8vT5T75onyco0of3xClN/cIcqssaIM/TpzQAMAgAupqipPPf207oWPoEEOh/zopz+JeN0HDx7UbQe85PYlYZe1+mJTX/tfe133cecl4efJtMrKVavOh2TuQrdsf/n3IUfw3HjTDyzdvsvlkqY9uy9oey1y7mJXbX2dcqD5oFRWVUnT7t1RX8QMZ8umTQMemzT5et3nTpsxQ/dxvSA7XiZOmqTohSEi54LaeIRQua5cZc2Ta3V/ZnSRd8f2HbrPNwpVgoxudvB6vbpz9+bk5Jyfe1xVVamsqgoZJAzOytINEk68917IukIxGj2XX1Cg7Nr9qvLsuueluqZGtv/+pbC1l84vTXjt4UZU5uTkGN4AFOrz1j/4C3rkV78KuZ8Z5HDIxi2bz9+I4nK5Bsx9297errtfN7OPMjqOWLFf78/pdCrrX3jB9PMXLS6Xt4+0GXYKqKqo1CYWThCjf7eWlyc8iO71+7XGhgbthQ0btaqKSm3UyO8YttZ1F7rlt0+sDLsvf/mlgTc+qKoa9jhg9B3Z2dh4wdzQJ0+c0F0+N1f/cy4ismDRQqWyqkpUVRVVVaW6pibuYa7R76M3v7wevWNTNOdRdtE7P+hv8W236T7u+9T45ji9kbNLly0LeQ4qoj8XsojI4cOHQy4XL/f/7GdSVVGphfu3uq5eM/N56WvipEmG4e6cG38wYN9/5x13DAh1ZxcXW9I5KJRBDof8orra8Bild6Pc2UBAdx9VWlYW9jNgdA7z218/bqLaC+mNEB/kcEhxSYnSfOhNpbqmRp5d93zIc5poGd0Im3f11YbL3Hf//cqixeUX7APDfT+DCKEBADFxOBzywAMPJCSIFmFUdDROnz6t5efna/Pnz49pPd3d3dLQ0GBRVQAAAP/w3XHjTLUvHDt2rO7jRoGuiMi6554b8Ji70G1qe0ajnD4yGEFghatHj47buvvLdeUqu3a/qpw8fUrZsGmT4WiTcP7S3R3V9kdcdVXIC1g5OTnK8soKJdyouWi1tbYOCLJUVTUMFm6YNk13PXpBdjwZjVa36gYJPfkFBYYXefUCI72ReqFGKPdlFCSeOXNG9/HllRXKydOnlEPvvK0sr6wwHMUUipn5SI2ECz4nTpqkLFi0UHeEXLLXHqTXHUBE5OPubt3Pm8fjMWw5b2Y/43Q6ldr6OuXk6VPKrt2vDugQsGnjwGDXXeg2tW69EegiIsc6joVbNCq5rlzDMCdodnGxHDv+rvyiulox2ieu/d1aw5bFQS3NLbL2d2sTdq3khQ0btVEjvyN3V66QmurqkPPXV9fUyIZNm8J+xo0CoqXLlpmqyegmIu8n/9jXf/WrX9V9zovb/lfIGyuWV1Yoh955W2k+9KYS73AtqGzhAt3H9fa7fRm9jkbnUcnITMBldJOM0c05RmHspd+6NGw9RvuXhpf/d9hl46GluUV2NjaG/VdXWytzboz8JsL77r9fcRe6Bzzu9XrlR3ffc/51fGHDxgFt8F0ul6kbTqzS/0aloJ2NjdLr91/wnre3t+t+BszcnBrqxpBIhbqpZpDDIQsWLTTsVBMvv1u92vBnwcA/mn0gITQAwBIPPPCA0tzcnJBtBUdFT506VfN6vYTRBgKBgDz44IPa5ZdfLh0dHZas0647PAEAAEQk4nn2zgYCuiNepky9wdTylzj1RyUfaWuLpIy0YfR6GIWDye6VpqYBj5WWlRk+P9eVq9ui3cqW3GYMzspSjNozxitIEzEeQdf6ztsX/L/P59P0LsheNuyymLYfqr1qJOLdQjee7Kr94q9dHNHzjW4MunPpwHat0dALOwuuudbUskZBUqxtzfX0+v1aVUWlbmvpvt46dEh6//3fQz5n6Q+X6u5/+lJVVeYvMN6HWekv3d2685735XK5pLqmRo4df9f0iEijGxtGfmekqbqMRjP3Hfl3+RVX6D5nw7r1cmt5udY/tOovkaFQfkGB7vse7uYnvaBt0eJyy+crTgYjrrpqwGNGoaDRKHijm1P6C/cdTFZer9fU6Pm+Qk0psLOxURobGjSPxzNg6g1VVWXjls1J8T0RGdh6Wu/cTyTyvzH669ttIdkZ7Sc3rFsvi8rKLN8HEkIDACzjdruVjo4Oyc7OTsj29u3bJ9/4xjdkzZo1WiAJ5j5KJq+88op26aWXatVh/iiM1IEDByxdHwAAQDwZXczWC1R6/f4L5tZsa23Voplj16xYWujaJZ0uXp8NBEQvGDIa7Rw0c5b+3NSJbMktYlxnPIK0IKM2jf1v9Dj1wQe6z9O76Nn/e3dg/37N6CaPUO1VIxFpoJpM7Kp96NChET3f6D20oquBUZCid5OD3n69saFBd3mr98ltra3aqJHfCTk6OMjr9UrRtOkhQ4xBDoc07dktwXao/QWnVDDbHjVW/5KdHXau0rnz5knp/NKI5sk1+uz8i851Jp/PN2D/YbQv/uzfPjv/306n0zCwamlukVEjvyOr6+qTYo5tEf2bo4ymKAjSC9pmFukfvzLJ559/rvu4UTjd33fHjRvwWCqcz0U7F7jT6TScjuPuyhW6I6zXPLk2YfuhvozOz/q3nj586K0Bz9Eb8S1y7ngT/NfV2aU1NjRoPt+nus/1+/0RVmyf4cOvNHx/Wppb5PrrJkpjQ4Nl+8DE3Y4AAMgIo0aNUjo6OrQpU6ZYNvo2nOXLl8sjjzyiPffcczJz5sy0uTAWjdOnT2u333571PM+h5Oo9xQAAMAKRhezX9q+XZ5+8ind0Zpm7GxslNr6ulhKS1o+n0/z+/3yl+7ulB3hbIZRO0YR45BLRGTYsMt1H9+yaZMsr6ywoDJzhnxliO7j8fxs/v2ictiRPkafm0cffkg+/eunUX/vIrnQH3wPT544MSB0CNW+PxkkY+16AWAoesGrVSMIjcKip598Kqb9eixtzftra23V5t48R/dnLpdLd1vBILppz27NKMBxOp3KL6qr5erRo7W7K1f0+9klcZ+juL+/z4WuGc0BXVNdLdu2btWeevYZ07UZdTxY+fhv5K1Dh3TnAjfjSFubLFi08Pz/r3lyrRi9RyIidbW1Uldbq1VWVcmS25fYehPW/AVluq21X2lqkvyCggGP9/r9A0bfm5lTOxNcdNFFuo8bhdP96e3bxo77bkw1Rctd6Ban85KwzxuTn284jYcZ+QUFSmVVle73vP/3sbqmxrbPmdnpbPT2v+91vSdVFZVhpzwI5S/d3ZKTkxP18ok0yOGQJ+pWSf/jSJDX65W7K1fIYw8/oi1dtkxunnNzTPtAQmgAgOVUVVXa2tpk4cKF2laducDiIdiie8qUKdozzzwjw4YNy6iT656eHm3lypVi9cjn/vLy8uK6fgAAgETQa9EdCaMRE5EYcdVVuhfCjra3S3FJSczrj4TP59Oadu6SbVu3WhrEJDOjdoxF06dHtb5gS+54zV/dn1FrdLt4PB4tGDIZBaWxfu9CXeg/GwhIe3u79kpTk+4I92SWyrXrMRrNqzeCMBpGYVGs+y6jOc8j5fF4DAPoyqoqWV5ZoayuqzcMdMIF0SLGrVTtsLyyQrls2GXaYw8/MiCQEjn3vkwsnCBNu3eb2j8adTyIJRwSGdjKPlSw1tffw2iprKrS7AqjnU6n4nK5BtxgsWHdernv/vsHtMbVm0bN7Jza6c6o7fZL27eHPfcyGhVqNvy02iO/+lXCbjxZ+sOlSus7bw+Y+7mv2cXFptvuJ9L+114//94a3WTo9Xpj3scYtflPVsUlJcr+114PGbx7vV6pqa6Wmupqqa6p0Urnl0Y1RzXtuAEAceFwOGTLli3K6tWrE7rdffv2yeWXXy6lpaVaT09PyszHEa1AICBr1qzRvvKVr8Q9gBYRmThxYty3AQAAYJW+7TetVLFiRVzWK2Jdy2FT2/L5tHHXXKtdOyZfaqqrMyaANmrFHatEtuS2a1Te7OJiOzYrIsatZF/YsFHLHT5Cm3vznJQLcVO5diNGLUmdlyTXjRP9Gc15HqmVj/9G9/En6lYFRw7L8soKw3ndvV6vLCydbxh4iRh3QrBLcUmJ8vobB2TR4nLD55QvWBDyd4q3otmzBjy2vLJCeXbd86aWr6utPd+i1urazDD6fOp19Vj33HMDnqf3+2eib2Zn67Zib2luCTtnclNTk+7P+9/gkI5CzQ8tcm6k/W+fWGlrAG3n++ByuWxpQR6r2vo65Ym6VaaeW1NdLYXjxmsH9u+PeB/ISGgAQFwtW7ZMue6667QbbrhBuru7E7bdrVu3ytatW6Wmpka75557ZMiQISl3MhBKIBCQF198UbvnnnsS+rrecsstCdsWAABArIzacZttYdjfFVdeKTfe9ANLRp6Myc/XHXWRqFbfPp9PK5o2XXfkWroL1Yo7FoluyZ1MsrKywj4nlu/d/AVluhd4jUaUpoJUrj0aRq3sI2V0c1G0ny/nJU65Ze6/WjZftd5+3V3oluKSkgvWH6qVdWdnp9xaXq49v3697qizni96Yi3VcoOzspRfVFfLhO99T1uy+NYBP/d6vdLU1KT1fx36M2q7H+0NMMFWxEY37kycNEl5+0ib9tAva8KOhAy2qN3/2uvab59YGdWIwGhNmDBBdzqE+lWrZMOmTef/3+fzDRiteu67kXoBWTwMcjhk6bJlUqMziOP+n/1Mnl+/fsDIcpFz32291sUul0u+mZ2dEa/txRddpFxyySW6LfG9Xq+0t7drydjy3cwNUKqqRt2to+TG7we/nympuKREGZOfr618/Dem9oFLFt8qixaXa/fdf7/pfSAhNAAg7oLzRJeWlsZtrmIj1dXVUl1dnTZhtF3hs8i5VtxutzulXz8AAACRxLYwNHLpty41/Fm82zqHC6BdLpfccdedMnTo0PNzwQZfr+HDLk/5bkNGrbhjlciW3L1+v+77YFVLYSNvHTqk+7iZgMPq7124ELeyqkouG3bZ+dFRWVlZ4nQ6lcaGBt0wIZFSufZo9Z+TN1oXf+1i3ccX33abTJw0ydb9ulEr+sW33ab7eKgWty3NLYZBdFfXwK4VkyZfH0XF1ps4aZIyu7hYN4x/7OFHpKioSDfkC6e2vi5u763T6VRq6+vknp/82FQQs7OxUXy+T7UNmzYl7PM2yOGQRYvLB3RMaGlukV6/XwuG7E07dw1Y1ujzl6lK55cqa9esGRCmBr9z9/38FzJ8+JWKiMjBgwe13/76cd1OMaqqysYtm6P6PKeiH919z4CW8H0tu2tp2KkE4unkiRO6j5tpl/7dcePiuo9Jdjk5Oef3gff/7Gdhp0/ZsG69+D71aWZfM9pxAwASQlVV5dVXX014e+6g6upq+cpXviIPPvhgSrbpDgQCsmXLFu3SSy/V5s+fn/AAWkSkoaEh4dsEAACIhVFrPqMLVYk0duxYw5/Fu61zVUWFbgCtqqocaD4ou3a/qhSXlCj5BQVKTk6OYndgbyWjVtzbdmyXk6dPKWb/GbWdTVRL7k99+m3bR1x1VVy3mywj5z0ej2GIW1lVJceOvyvLKyuU4pKS85/hZBkJmMq1x8Ln+zSu6zeaKzqRjLpvGO3vBzkc8vz69Yq70K3782Ao1r+N9dH29gHPHTp0aGTFxtGjv3pMt21vcDR0qGWN9mHhWiVb4e9BjPL2kTYxapce1NLcIi9s2JjQa0u3zP1X3cf7zgG9bevWAT9P5VGa8TDI4ZCmPbt1P6MtzS1SNH265A4foeUOH6EtWXyr4VQla55cmzEjzF/YsDHk3MEi577fVRUVtrXdT4ZjQKrLyclRNmzapBxoPhi2+8TOxkbT0xMQQgMAEsbhcMiyZcuUjo4Oyf77iIpES7UwOhnC5+zsbGlubpZhw4ZlxMk1AABIH0Yj5pLhQtXgrCzD4KGuttZwpGus9Fp1ipwLoJv27LZ9hHi8HTx4UPd1HT16dES/t9H8xFv6tEWNp78Y/F1wxZVXxm2bPp9P97Xr/zk2an1pFNBF4+WXfq/7+OziYlleWaHYNWe2GalceyzCjayKlVGb7kQy6hQQ6j2NNIju9fs1vRtpRo4cGUXF8TE4K0u59+f36/7ssYcfsXVuaDOcTqeyvLJCeftIW8ggpqa6OqG/S64rV3c+49/++nERORfU9w9MFy0uz5iRupFwOp3K9pd/P+D4ZYbL5ZKm3bslGVtPx0NXZ5fWv325qqq6r11Lc4us/d1aW6616t2cIyKSm/uPDjFGU4eEC9gzTfCGnHBhtNnOLITQAICEGzVqlHLy5EmZN2+ebTUEw+jS0lLt9OnTSRdG9/T0aA8++KD23/7bf7MtfBYRmTJlinR0dNCGGwAApKSLLrpI93GjC1WJNmXqDYY/++1vfhOXbZ764APdx2fOKsqIET3rnntuwGPRXKQ3CnyCLbmjKi4Cx989rvv4ePf4uG3T6LPT/3Ns1Pryz6f/bFktH7z/vu7j9/zkx5ZtI15SuXYzQt3IYsXNNUYjfvft/UOsq47ZJZfoz0kdbhRvJEH0s888O+Dns4uLQwbddigqKtINTL1er+HNQCLGN9JYeROLWX9v0608UbfK8DknT76f0OtJS5ctG/BYZ2en+Hw+Te8GF6PR0zi3r3p+/XrF7DQWLpdLtu3YLrt2v6okYtqNZODz+bTyBQsGPL7+hRfkqaef1h1NXldbK22trQm/znr40Fu6jwdbq4uEnjokXjd/prJgGB2qM4SZLhWE0AAAWwwZMkTZsmWL0tTUZNuoaBGRrVu3yuWXXy5Tp07VWlpatIDNd+QeO3ZMq6ys1L7yla9Idb87DRNt9erVsnfvXkVV1Yw4uQYAAOln+IgRuo9vWLc+KS423TznZt0LeCLnajywf7/lNZ45c0b3cTNz5qW6Xr9fdxS40ajmUEKNZI93S+6zgYCsXbNG92fxHA1Z/fNf6D5+bb9Ww31HHfVVV1tr2ahBoxGn38zOTvq/XU68957u46lQu1lG3w29ADVSl19xhe7jLc0thqP1E2XajBm6j5sJUM0G0Xqt3H/xS3uvHegZ5HDoBqYi/xi5q2dU3ijdx59+8ilL6opGcUmJUl1To/szvfm5jRjttyJRNHuW7uNNO3cN6MThcrkkU8LSaPh8Pu3W8vIBo8dnFxfL7OJieaJulTy77nk50HxQjh1/V3btflVJh9HPvX6/ZuYc+GwgoDt9S3VNjeS6cpXBWVnKY4//WnfZZXctTej+uK21VXe+anehe8BNhkb72B3bd8SltnSwvLLCcBoaM1McEUIDAGw1c+ZMpaOjQ6ZMmWJrHfv27ZPCwkK59NJLtTVr1iS0VXcgEJBXXnlFu/rqq7W8vDypr69P1KZ15eXlyalTp2TZsmUpf3INAAAyW6gReclwsSlUy1IRkSWLb40piI4kaLdylGqy6jtvZl+RtuIOWnzbbbqPx7sld1NTk6Y3N3M8R0MaXeBVVfWCUUYiIt/61qWG6wk3H6xZRnNTf9zdbfvNJeEYzS+aCrWbZdTlwYqpBpxOp+4IWxGRzS8kph2+EaMA1WwL6kEOh9TW1xvenKR3E82z655P2i4WN8+5Wffxzs5Ow5GSRjePhVomWh6PR2trbR0w57Yeo/A3Ekb7rUg4nU7dGxVqqqsHrH+ujd0Hk53H49GKpk0f8J1atLhcauvrlNr6OqW4pESZOGmSkpOTkzbTJLS1tmrXXzdRRo38Ttj5fB995JEBN+65C91SOr/0/GsxcdIk3XAyOD90ohjdJHfTnDkDHiu45lrd5xrd3JfOujq7TO8DjboqfPWrXw27LCE0AMB2qqoqe/fuVTZv3mzrqGgRke7ublm+fPn5Vt3xHB197Nix8y23i4qKpKOjIy7bicTq1aulra1NYf5nAACQLoxayK1ds8ZUC7l4Ky4pCdkKcsniW2VRWZkWyYiSttZWraqiUhs18juyuq7+guVCjVJNhtHh8aTXiltvlIxZY/uNAA7yer1xGwHU6/drjz38iO7PyhYObJlphbOBgOEF3nt/fv+A129wVpbhiJnHHn7EktfGaI5Co/mWk0kq126WUfgoInLnHXeYHhHv8/l0R+wZ3bxTV1ubkHb4RvKuvlr3ca/Xe8G8zqE4nU6lac9uwyC6r9nFxTJx0qSk/dt9cFaWYvR5X3bXUt3PQU5OjuEy9atWWXacqqqo1CYWTpC5N8+R3OEjtHCfG6PpCMbk50e0XSvqr1ixwtTzQn0PM93Kx38zILR3uVxy3/33J+33KVYvbNiozb15zvnf2+hcQkTkwP79A+aeV1VVauvrBxzz77v/ft0bg1qaW+SFDRvjvj8+sH+/7k1yIuemBej/2PwFZbrP9Xq9A86ZU42ZUclBVRWVWtH06ef3geH+JjLq+mDUnaQvQmgAQNIoLS21fa7ovrZu3Xp+dPSDDz6oHTt2LOaTEa/Xq61Zs+b8qGe7W24H9R397IjyIhwAAEAyWvrDpYbzUk4snBB2ZNXZQEAO7N+vLSor0+J1cWrjls0hA4eW5ha5dky+NDY0GF4k6vX7tbbWVm3W9Bna3JvnyM7GRhE5F8r0rVv9hvF29u7dG7LOZAjto2XUittoNLMZoVpyN+3cFfV6jXg8Hu366ybqjqZzF7olHm1CjdqVipy7ID116lTd5X70Y/35jb1erxRNmx72e9fr92uNDQ3aorIyTe+5RvPGhruZ4mwgYPuc8EahlZnaU6VjweCsLMM5JFuaW6Rw3HjDG2vOBgLS1tqqLSor064dky/XXzdxwI0LRvMNi4gUTZ8edoRfcBtVFZWW7tdDjdIOttM2sx81G0QnYxvu/ozmOvd6vfLoI4/o3mRgtExLc4tcf93EsMeiXr9fe2HDRm3W9Bm6+49ev18LHiODyhcsCPn9M7oRJ9I2+nodOYL7O7M3UJjp3uEudCfdPOHJQu/9Fzk32j7UfOWprqbf9Uejkfkej0dbsvjWAY+veXKtbteFQQ6HbH9Z/yaqmurquN4Y1NjQoFuryLm24Xo3GTqdTsPjU11trVRVVIa9Yairs0t7qKZGW1RWZurmIqsNHTpU9/GDf/zjgMeCx7u+NwT4fL4B34E7l9xueIPY2UDA8KYFM504uMoMAEgqf58rWn74wx9qN998s3R3d9tdknR3d0t1dbVUV1dLXl6edvvtt8vcuXPF7FzJPT092htvvCG1tbWyb9++eJcbsc2bN0tpaSl/nAAAAPH5fJrf7zcckbf/tdclN9elDfnKkJCtro0YXeD1+T41tbzRxRGf71M5GwjoXmwa5HDIvT+/X+6uXKG77Nyb54i70K0VXHOtjMobJcNHjJCeL3qkq6tT/nz6z9J3/s2W5hYZ7x6vWR32/T1w0IqmTQ/ZrrPP76C5XC4ZcdVV4vN9qtuita8P3n//gm2JiO77cHflCnlp+3Zt8W23Sd7VV8vFF12kfNzdrZ08cUJ+++vHDdsIhxPN+2Ylj8ej6Y2CDur1+7VoLtb7fD5t+IgRuq//tq1bZeR3RmojR440HQQc2L9fGzt27IDn+3w+rfngQcPPsIhIbZRT+rywYaN285ybB2yz1+/XDh8+LPf+5KeGn8k1T641/N3+HkLqzl/r9Xpl7s1zZHZxsXbFlVee/979pbtbzpw5o/u927Zj+wXfO6O2xyIi1183UUrLyrTx7vEyevRo5bPPPz+/X9uyaVPULXH/YvC36V+6uyUnJ8f0ei4N0a480bX3fNET0/KhfvelP1yqbNm0Sbd1vNfrlWvH5Iuqqtp3x42TSZOvl/2vva67P/N6vbKwdL7s2v3q+cfC7deD+7KCa66Vy4ZdJmPy8y/Yr/d/Lb/2ta9pCxYttGS/3rRntxjty1uaW2Ri4QSZXVyslS1cIP+SnT3gWBr8vj/95FNh3++qigqpra/X4tGO2+PxaH/p7jacw/zll34vN970A+0SpzPkPu7vI5t1Q78N69bLhnXr5Ym6VVpRUZESPBaEWiZ4A9ns4mJtTH6+XPqtSy/Yf+x/7XXpu9zcm+fIgeaDWt/X+VOfT3e9hw8flomTJg34WWNDg+n5ZoPG5OeLXv1LFt8q1TU12qTJ18tfurtl08YXzj9PVVVp2rM77Ps5yOGQyqoq0du/BpkdLd2X0TmamZtfjPYlZvaPRueAZs8PIl3+ww8/MlzXksW3nj8nvGzYZbrPueiii2T4iBGSlZUV11b44b6Dfx/1airgNTtC1ufzaXNu/MGAxxctLg95o1tOTo5SXVOj9Q+6Rc7d4LH95d9rkf7d8NL27TJ06FDdc26Px6OtfPw3ut8xkYFtw/tbcvsSw+/PzsZGOfHee9qIq66SSZOvl9xclwz5yhA50tYmn/3bZ7Jt69YLzodvLS/Xnl+/XjH6rBp9f6I99xQxHn3899HrWrB19h/27LngeDfyOyO1/IICxe/3D1i2s7NT2tvbdV/vLZu3GE4DY4aiaWl7cwcAIMUFAgF59NFHtWQZLdxfXl6eGAXSXq9X27ZtmzQ0NCRl8CwiMm/ePHnmmWdkyJAhBNAAAEDaWlu1uTcPnDvNSGVVlSyvrDB1HuHz+cIGrCIiT9StkuKSkgHrPBsIyK3l5bojWc3UdDYQkMJx43UvoETKqEYrdHV2aeULFlgyb2RfB5oPXhB0NDY0aKECzWjMLi6WX/yy+oILsj6fT1tYOj9seK2qqixdtkysCoH6emHDRt2Lon25C90S6gKiHrPfF711V1VU6oYrQX0v6oV6XtC2HdvDjoIO9567C93idF4iIiJvHToU9jNo5vvf6/cbjtyOVP/f8WwgICWzZhu24IyGy+WSaTNmDPi9zH5f3IVuqa2vDxtKmN2fRSKW2v8efOnW7fF4tDk3/iDkexhqeav2NUb73VnTZ1jyGYjkeGaGx+PRJhZOMP18VVVj+p6Eeg+iYWa/2Xfbr79xIGQQbeb16P87RPoahtK0e7fkunIvODZdO2ZgRwKXyyV33HWnDB06VDfQ7u/tI22Gr3m09fev1UhXZ5dWNH268c9PnjB9TDN7jqb3PTFzLFRVVba//PsLzkPM7gcXLS6XX1RX674eq+vqdW906svo+G7VvkNVVZk5q0humfuvpt43syI9J4/WydOnzn/fQu3r9d7Dvsycv4baTw0fdrlhSKmqqnx33DgREVM3XprdH5r5/Jjhcrlk1+5XB2zroZqaAS3N9SxaXC733X9/ROegIiLjrrk24r9rgt9ho32gu9AtN82ZIxdddJF89OFHsm/vHwxfbzP7/iBCaABA0vN6vVplZaVs3brV7lIMBQNpEZFnnnkmKeZ3NpKXlyebNm2SUaNGET4DAAARMb4gG46Z8CvSIEpvnWYv5Iica7+nF2b6fD6tqqIi7MWrUFwulzTs2hnxhaJI9Pr92n0/u9dU+BiOqqry2OO/1p0zdFFZWcQhmMvlChkoq6oqzYfeVAY5HFEFbWY+T5GI5CLu7OJiqa2vs/SmiqD+F9HDhdBmuVwueerZZ0x1JbAqDFRVVdY8udb0++TxeLQ7l9we9Sh6EeMQIdqQJ1zg1zdoiTQI6PsdCCXafW68atd7jSPZd4e6GB3rZ292cbH89omVuq+pVfv17b9/yfLWxYkKkYKiuZlGTzR1m9m22bCyb3hkxY1ZRvv2WPfDz657Pux83JGGRO5Ct2zYtMn059AoSI3kpopYztEi2Qf3f28jef31fp8D+/cbtmHuTy/Ijsf308xnwgwrb8AIJRiemv0MGB3fIjknMlpHqBA6EqGOF/2dDQRky+Ytpm+4MaJ37hppwB3JOWi02+h/nI7m74C+zN4wI8Kc0ACAFKCqqrJlyxalublZsrOz7S5HV0dHhyxfvlyWL1+etAF0dna2bN68Wdra2hQCaAAA0F+4uSejFartoZ7j7x4f8JjZNoIiIv/2b/+m+7jT6VQ2bNqkPFG3KqJ6ghYtLo97AC1yro1xbX2dsm3HdnG5XFGvZ3Zxsbz+xgHDC6JPPf206TZ6Iv/4/UN9Trxer5w8+b4mIvLZ559r73Xpt5A0ovfeJ4rRHMNW+NrX/rvl6wy+H9G0xY+Wu9Atr79xIKIbBXJycpSGXTuV6pqaqLZZWVUlGzZt0v3e5eTkKNt2bDe971JVVbbt2C6PPf7rkM9rfeft8/8dzWfys88/NzXnbzxq3/PqP1pWR1L7e13vDaj7ww8/Mh1Meb1ew319cUmJ8vaRtqj2Z0/UrZLa+jrD/W6s+/XZxcXSsGunEo+5c/MLCpRjx98Vo7lHzXK5XPLsuufl2XXPh/y8vNf1nvznf/5n0o42yy8oULbt2B7yOVflXiUXX3TR+fci15WrNB96U1m0uDyqbQY/P3o/u3Pp0qjOe1RVNR02rn/hBdPbmF1cLM+vXx/R53DuvHm6j99408B2ykZiOUczatOvx+v1iveTc/uTs4GA6WlYRC7cJwd9FEHdJ0+cGDAtSH5BgXKg+WDM38++liy+VfrOuxutrKysuJ2T9/Wjn/5ERCLb1+sd37yfeCO6UcTMMTIa4Y4X/Q1yOGTBooXKgeaDUR2fVFWVA80Hdc+J9D6zoQSnp4nE0h8uVdyFblPPDd4E0vdYd5/BPPfhuFwu2bZje0Qj/xkJDQBIKYFAQF588UXtnnvuSYr5olNFTU2N3HPPPbTeBgAAhnw+n/bQL80HRWULF5gOo8yue0x+vu4o5rOBgDz6yCOa79OB8ziaWV6vnt+tXi3hRlcH20QXzZ4V13n/QmlrbdX6zhkZisvlkrnz5kVUb1trq7bsrqWGFxBnFxfLpMnXn2+FG2rkRf+WuZF8psy+d5EKvn5WbzuWz7TRCLBtO7ZLuPd6dnGx3Ll0acRtP41Gox5oPijrnnsu5HfBXeiWxbfdFvMIr3BzOAYFv3d6c1XrORsIyNrfrTX8XAbbpf5w+XJxOp3K2UBAcoeP0L0gqtfG84UNG7UjbW3hyhARGdCSPlVqN6rbzPdHxNzxIPi77nn11ZAj410ul/zopz+RCRMmRHTTT3C//squprAtYUvLymT+grKE7dd7/X5t79698tjDj5geLahXY3A9R9vbpf/xMNLPXihm33cREeclzohbyXZ1dmlvHz4sfT+b4dbT1dmlPfrwQ2FHvQdbak+dOjXs/iPSkZBP1K2SvnNXmxFuWorZxcURnU/1X3f/jgpGrYHDrSfa41m0+wiz53WhPhdm9m96y/t8Pq1p5y450tYmJTd+X8aOHSsffviRdHV1ymf/9pn0X6eZFtBB0bz+eiI9J4+E8xKnzCwquuD9MPM+htrHmP0cGK1DbyR0dU2NXPy1i+XpJ58y/P70P0aGLcBAcF/Qf75nPWa+s2Y/3yLR7UP7budHd99j2FUguD802m/1+v3as888G3J++SBVVeXen98f8T5QhBAaAJCikn2+6GTBvM8AAACheTweTUTOX3S86KKLZPiIEZKVlWVb8Gykq7NL6+o6d3Hsz6f/LJcNu0xEzl0YjrXeXr9f+9TnOz/qfPiIESHn/uvq6pShQ4fKv2RnJ+VrlcyMQujg3Iw+n0/z+/3nP5PB1/mb2dlRj8Q3CqGD2+z7/n/++efnvweXOJ2WtykWGfi9C/6OsW7P5/Np3k+80tXVKbm5LvnWty7VXV+v368dPnxYPv/8cxmTfy7EidfvalYq1x4po8+4Vb9H//Un2349WF/w+yZizfc8E5wNBOTj7m6t54seCR4Prfj89Pr9WjCIDLLyPQnWHXzPx+Tnx/x512spbTR/Os7ROxYeaD5oaloLkXPHrp4veiTUDRHHjr+bUvvjZKAXQvf9LAdf9+D3MzfXJUO+MsT0+xaJ/udDInL+WJvI7jOR8ng82l+6u+XMmTOSm+sS9RtqRMe7vucgQVbtAwmhAQApraenR1u5cqUQRl9o3rx58uijj8qwYcOS9gQJAAAAyEThQuh4CBdCAwBSi96xhADUmNE80NG+ZkZz6urNEYzQwoXQSG3MCQ0ASGlDhgxRHnjgAeWLL76QmijnGUsn8+bNk1OnTsmWLVsUAmgAAAAAAID00uv3DwigZxcXE0AbOBsIyLK7lg543OVyRf2aLb7tNt3H//a3v0WzOiBtEUIDANJCpofRhM8AAAAAAADpb+/evQMeK1u4wIZKUsPH3d2a3nzsc+fNs3xbY8eOtXydQCojhAYApJVMC6MJnwEAAAAAADLD2UBAHnv4kQseU1WVFtAhBOeH7+/ir10c9TobXv7fAx6LZWQ1kK4IoQEAaalvGL1582bJzs62uyRL1dTUyBdffEH4DAAAAAAAkEZW19Vr4665Vps1fYbW2NBwwXy5TU1NA0b1lpaVJbS+VDN06FDdx/e/9npU6/P5fAPaoYuITJsxI6r1AemMEBoAkNaGDBmilJaWKh999JHS1NQkeXl5dpcUtezsbNm8ebN88cUX8sADDyhDhgwhfAYAAAAAAEgTba2tWl1trXi9Xuns7JS7K1dIW2urJnJuLuj+o6BFRJbcviThdaaS0aNH614/29nYeP61Ncvn82lF06br/uyGadOiqA5Ib4TQAICM4HA4ZObMmcrRo0eVjo4OqaiosLsk06ZMmSLNzc3y8ccfK6WlpYTPAAAAQIo6GwiIz/ep7s96/f6ILoRH4s+n/6z7uM/ni9s2AQCRO3PmzIDHqn/+CzkbCMh9P7tX+o+CrqyqogV0GIMcDnEXunV/NvfmOdLY0KCdDQRCrqPX79caGxq0omnTB7wHIiLbdmyXXFcu70OEjM59/nz6zxLuPUFqUDSNc00AQGbq6enR1q1bJ88884x0dHTYXc4FsrOz5a677pK77rpLVFXlJBYAAABIYWcDAbm1vFxraW4J+9xtO7ZbNrfnQzU12oZ168M+r7qmRhYsWsjfHQBgs8aGBu3uyhUDHne5XNLZ2XnBY6qqyutvHCCENqGrs0srmq4/gjmosqpKLht2mVx00UXyzW/+D+nqOvd673/tddFrvx1k5XE7U3g8Hm1i4YSwz1NVVZr27Ban08nrm6IIoQEAEJFjx45pzz77rNTX19tax7x58+SHP/yhjB07VnE4HLbWAgAAACB2kQTQQQeaD0pOTk5MF1xX19VrdbW1pp//7LrnZeKkSVzkBQAbmQ3nRETePtJGOBeBYCttvZHM0SKAjlyk74PL5ZKGXTuVQVwnTUm04wYAQERGjRql1NXVKV9++aXS1NQkU6ZMSdi28/LyZPXq1fLFF1/Ili1bFLfbTQANAAAApIn//M//1N7rei+iZf7S3R3zdlvfeTui5x/rOBbzNgEAscnJyVGMWkcHqaoq23ZsJ4COkNPpVJr27DZszR2JRYvL5djxdwmgo+D9xBvRjQCffvqpfPb554ymTVGMhAYAwEBPT4/2xhtvSG1trezbt8/Sdefl5cntt98uc+fOpd02AAAAkOYiGfVj1aiqSEZgV1ZVyfLKCv4uAYAk0NXZpZUvWKB7zFi0uFx+9OMf04I7Rj6fT2vauUvWrlljOhB1F7pl8W23ydixY3n9Y9TW2qrNvXlO2OfRjjv1EUIDAGBCMJDes2dP1C27p0yZIosXL5apU6cSPAMAAAAAAMCQz+fTOo4elc8//1zG5OfLN7OzaUkcB71+v/apzyciIkfa2i742Zj8fMnKyiIEBaJECA0AQBROnz6t7dq1SxoaGgxHSefl5clNN90kN954o3z729+mxTYAAAAAAAAAICMQQgMAEKOenh6tvb1dXnzxRfF6vVJWVibXXHMNo50BAAAAAAAAABmJEBoAAAAAAAAAAAAAYJl/srsAAAAAAAAAAAAAAED6IIQGAAAAAAAAAAAAAFiGEBoAAAAAAAAAAAAAYBlCaAAAAAAAAAAAAACAZQihAQAAAAAAAAAAAACWIYQGAAAAAAAAAAAAAFiGEBoAAAAAAAAAAAAAYBlCaAAAAAAAAAAAAACAZQihAQAAAAAAAAAAAACWIYQGAAAAAAAAAAAAAFiGEBoAAAAAAAAAAAAAYBlCaAAAAPz/27v/6CauO3/4n9nMnu8pSnbzpY941BPzRaRu45IjJS10KZb7EDbCKTbBZEudIzmlmw3sgWDLpd42X0hrIVrIZnddYpmEnBKWxEXSCSULJhharJTwYMG6CV2QN8TpemNTm1N9PU+92a1Fzx6Uc58/zKjy77mjGWlGer/OmYNtZkZ3ftyZ0Xzu/VwAAAAAAAAAAAAAzSAIDQAAAAAAAAAAAAAAAAAAmkEQGgAAAAAAAAAAAAAAAAAANIMgNAAAAAAAAAAAAAAAAAAAaAZBaAAAAAAAAAAAAAAAAAAA0AyC0AAAAAAAAAAAAAAAAAAAoBkEoQEAAAAAAAAAAAAAAAAAQDMIQgMAAAAAAAAAAAAAAAAAgGYQhAYAAAAAAAAAAAAAAAAAAM0gCA0AAAAAAAAAAAAAAAAAAJpBEBoAAAAAAAAAAAAAAAAAADSDIDQAAAAAAAAAAAAAAAAAAGgGQWgAAAAAAAAAAAAAAAAAANAMgtAAAAAAAAAAAAAAAAAAAKAZBKEBAAAAAAAAAAAAAAAAAEAzCEIDAAAAAAAAAAAAAAAAAIBmEIQGAAAAAAAAAAAAAAAAAADNIAgNAAAAAAAAAAAAAAAAAACaQRAaAAAAAAAAAAAAAAAAAAA0I+a7AAAAAAAAAAAAAAAAAGaVTCaZJEl07do1+uijj9J/7+/vp76+PiIiWrt27YRlHA4H3XXXXWS324VclhVyJ5VK0fDwMLtx4wZdv349/ffR0VG6ePEiERGVl5fT/Pnz0/93991305IlS6ikpEQQRYTwwNwExli+ywAAAAAAAAAAOTA4OGjIlwAWi4WsVitewKogv9zMdznyyWq1ksViMeX5I0kSSyaTc85XyAEKpedwIV0nUG+Lo96aeRthdslkkl25coXeeustunDhAkWj0azXabPZaNWqVVReXk5r164t6Ot+oUqlUvT++++z8+fP08WLFykSiWiyXo/HQ2VlZfTYY4/R5z73OQSmsyA3FlGi2OugVvsKQWgAAAAAAACAIiEIgmleAng8HiIa7zW0aNEi+uxnP1swASgtDQ4OssWLF+e7GHkVCoXI6/Wa8tzwer1MyUvq7u5ucrlcptzGuSg9hz0eD4XD4YLYB6i3xVFvzbyNMNXg4CBrb2+nN954g+LxeE4+0+Px0BNPPEErV65EgwaDSiaT7PDhw9TR0aFJYwQl3G431dTU0OOPP45nY07hcJjV1dUpmrezs5OqqqqKdv+uXr2aKT2nGWMz7ieMCQ0AAAAAAAAAhhOJRCgSiVBdXR1VVFTQggUL6FOf+hRrbGxksVjMNMF0AC1UVFSQJEk47wEAciiZTLJwOMweeOABtnjxYvL7/TkLQBONPwtVV1fTnXfeSXj+MY5UKkWxWIytXr2a3XnnndTQ0JCzADQRUTQapYaGBlqwYAGtXr2anT59mqVSqZx9frF46qmnKJlMFmWdC4fDigPQczFlv/3JKWsmj7Mgj6VAVFipegAAAIwuMy3Z7373O+rt7U3/36JFi+iee+5J/17saW0AAACAXyKRoGAwSMFgkGw2G9u6dStt3boV3/uhKDidThoaGiKk4QQA0FcymWQtLS3k9/vzXZS0zOeflpYWqq2tRVrmHEulUnT06FHW1NREiUQi38UhovGA9O1gIQsEAtTU1IRe8xpJJBK0efNmCofD+S5KTkmSpLi3uBKGv0pJksTeeecd+tnPfkaSJKnNo8+cTifdf//9tHbtWiovL8eLbwAAgCxMHufmvffeU9MamGWOebRy5UqMbQMAAACKJRIJ8vv95Pf7yel0siNHjpDD4cB3fShYiUSCNm7cyAolJTUAgNEYMfg8WSKRoLq6OmpqakIwOkeMGHyejvxcHAgEGILR2ohEIvTEE0+wYkrL7fV6tV0hY8xQ061bt6i7u5v5fD5ms9kYEek2eTwe1tnZycbGxli+t9sI08DAANf+GxgYMOx+492WfJdXyVRI28N7fMw0hUKhnO7/UCiU923We8r3+YrpD9PY2Bhra2tjbrdb12PudrtZKBTC/TmL6datW6Rm3/t8vqLd50a/nno8HhYIBFgoFDL0M5iWU6HdKzwez5zbYbPZ2MjIiCm2hzH+epPv8mIan/J9PcvF9bLYniEK+fuV0inX38O0nJTcHyZPbW1tpt3ebM5hj8dTMNuNelsc9dbM21hs061bt6itrS3v9ULN5HQ6WTwex7mm09TZ2al7nEqPyWaz4Ro0zaTm3Y/NZiua7xdq343Ntk7DjAnd29vLdu/ezRYuXMgqKiooGAzq3qokc0wFr9fLYrEYcucDAABkSKVSdPr06ZyOcxONRqmurm7C/VnXDyxAPT09qvZZMBgkPAsZUyQSIb/fT3V1dbR48WKMiVqgEomE9q2OAYpMJBKhO++8k8LhMK6PULAaGhoIzwAAANro7e1lS5cuZQ0NDfkuiirxeJycTic1NjayYh2/Vg+SJDGv18uqq6sN3ft5JnKP+dWrVzNJknBeZEFOy13otE7DLct7EDoWi7EHHniAOZ1O8vv9eavQkUiEKioqaOHChSwcDiMYDQAARS2VSlE4HGYLFy5k1dXVugeeZyLfnx944AEE2zjs2rVL9bJqA9iQW/KYqBUVFfSpT30Kz68FJBqN0v79+1EPAbIkv3TDtREK1YYNGwgvlQEA1EulUtTY2MicTqea4cUMJxgMUmlpKRopaSAcDrMFCxaoHRrWUKLRKC1YsADfMbMUiUTo9OnTBb0P9WoQn7cgtBx8rqioMNRFXm4hgmA0AAAUo8zgc11dnWFae8bj8XQwure3t6Af+rKVTCZZNo0GsglgQ35kPr8W+peiYtHQ0ECDg4M4lgBZikajtGbNGnyvh4IkZ8/A+Q0AwE+SJLZ06VIWDAZz8nlOpzMnn5NIJKiiooJ2796N7xIqpFIp8nq9uvQGnU6uzgui8e+YaKCZnaeeeooKNdtAOBzO6l3ibHIehB4cHGSrV682XPB5ssyXeWg9BAAAxUBOQWWk4PNkSDM1t46OjqyWj0ajBftQXegSiQRVV1fT6tWrUT8KwIoVKxBYANAAAtFQyKLRKDU1NeGeDwDAIRaLad772ePxUCgUou7ubhoYGKBbt24JjLH0dPXq1Qm/37p1SxgYGKDOzk5qa2sjt9utWVmIiPx+P74XcpIbJmjZ+9npdFJbWxuFQiEaGBigsbExmu28YIwJAwMD1N3dTaFQiHw+n2ZlIRp/bli4cCFDg2d1CjUtt15puGWibmueJJVK0d69e5nf78/VR2pCbj3k8XhYa2srWa1WId9lAgAA0FIqlaKmpqactQDWQjAYpKNHj9KxY8eYy+XCvTnD888/n/U6Ojo6MC6tiUWjUSotLaWzZ88yh8OB+mFSiUSCmpqaWGtrK44haGpgYCDfRZjTtWvX6MMPP6SLFy9qkgZRDkR3dXUVZH0qKSkRBgYGivplotVqzXcR8iYYDNLy5cuZ1+styPO7UKHeFne9hfzZvXu3JvEJm81GW7dupccee4w+97nPCaLIF2YRRZHsdrtgt9uJiKi+vp5SqRS9//777Pjx46RFGeXvhfF4nCGmMbtYLMY2bNigSYcMn89HtbW19OCDD5LFYuHe7/J54XK5yOv1UmtrKw0ODrJTp07RwYMHs248kUgkaPHixdTd3Y33aSpEIhF64oknWFVVVcHsO93f/zHGdJ9GRkaY0+lkRGTqyWazse7ubpaLfZaP6fbDr+JpYGDAsPuCd1vyXV4lUyFtD+/xMdMUCoVyuv9DoVDet1nvKd/na6FPhXCPDgQC7NatW3nfl0aYRkZGNNmnTqeT5Xtbcj0V6vXUyM9rc00825nvsiqZPB6PqmNo5O8fvPUm3+XFZN5pZGSEtbW1MZvNltU1sbOzk+V7WzBhmjypvT9MnuLxOMv3tqidlL4j8Hg8pt1GTIU1Ka23uX5HhGn2KRAIZH2t9Xg8OXk+v3XrFnV3dzO32511mW02GxsZGcG5OMPU3d2d9T52Op2ss7OTjY2N6b6f4/E40+rZwcjfNfWatHj3Y7PZcnKszbI/iGjWfaF7Om55EHcjp95WKnNMBaTyAgAAs4vFYgVxj/b7/Uizedvrr7+uyXri8ThJksQ0WRnk1YoVK3AsTW7Dhg1IkQ9Fz2q1CvX19cJvfvMbIR6Pq05ZWcjjuAFUVlbi/AYAmEG2PaA9Hg8NDAxQOBwWctF7VBRFcrlcQldXl9Dd3Z3V2MGJRIKcTie+F04jFouxiooK1cs7nU7q7u6mq1evClVVVYKans+8HA6HEA6HhYGBAfJ4PFmtq6KigjAULb9CScutdxpuma5B6N27d+dsEPdcwstuAAAwu927d2f1oG00cprNYv9StWfPHs3WpVVAG/IrkUiQ1+vF2MImlkgkaP369fkuBoBhOBwOoaurS+js7CSbzca1bKG8MAKYjny/wD0fAGCibALQTqczHXy22+15Sb/rcrmEq1evCt3d3dzPPjIEoqfKJgBts9mos7OTrl69mpNGCdOx2+3pYHQ2Y4ojEK1OJBKh06dPm3q/5WoYPl2C0KlUilavXq35+M82m408Hg+FQiHq7OykgYEBGhgYoFu3bk0ZvH1gYIDi8Xh6APdsWgtNRx7EHRduAAAwG63GQMrkdDrJ5/NRKBRK358n36Mz/67H/TkajRb1l6re3l6mxfhFMi0D2pBf0WiUNm7cWJT1olBEo1EKh8M4hgAZqqqqhHg8zv0yNhKJFO2zAhS+aDRKe/fuxfkNAHBbOBxW/f6jra2NLl++nLfg82Qul0sYGhoSfD6fquXlQDQaK433AN2wYYOqZT0eD/X395NRxgS22+1CV1eXEAqFVDdSqKiooMHBQTw/cDJzlqVwOMyi0WhOPkvUeoWpVIrWrFmj2QY4nU565plnaPXq1WS1WhVV7Mwbg8PhSEf0k8kku3LlCr344osUiUSyLpt84Y7H40xp2QCAqKSkRLg95lPBsVqtOf28mpoaGhgY0GXdmzdvJqXX8kAgQBs3btSlHKAtLQPQbrebtm/fTpWVlYIozv1IkXl/ttvtE+7P58+fpx07dmSdGjyRSJDb7abLly+TkjIVkuPHj2u6vkQiQb29vczhcOAZZxKPx0PhcFjX/ZJMJpkkSUREdPHiRTp16lRWz6+RSITWrl3LvF4vjqdJ1dXVUXl5OTPKSzAAI7BarcLQ0BD3O4jXX3+d6uvrdSwZQP74/X5atmwZM8rLcQCAfInFYqqytNpsNorH44pjEbkkiiK1trYKmzZtYpWVlcTbED2RSNCaNWvYmTNnFL3HKUTJZJI5nU7ufUdE1N3dTfnq+TwXr9crrF69mnm9XsXvczOtWLECcS5OcpalcDic76JwyVUa7jQtB7G+desWud1uTQayDgQCbGRkRLfBvcfGxlgoFGI2m02Tgcj1LGuupttBQcXTwMCAYbeZd1vyXV4lU6FtDybjTx6PR/E5FwqFWL7Li2nuKRAIaHLPC4VCbGxsTJdjPjIywnw+X9bldLvd7NatW3nf57mabt26RVo800z3PJbvbcvVFAqFFO8Xj8eTl/0yNjaWVf2w2WymqheF9uzDc1+daXI6nYY6hjz1xizHCZM5p7GxMa7v9k6nk+W7zJgwyZMW94fpJjO9p1L6Didfz2CYME2elNZbvCvJ3zQyMqLqvb+Z3iWMjY0xtbEYn8/H8l3+fExq41dmiv/cunVL9fs/o33f1GPi/Q6rZOrs7DTFuSFPWsVwM6fZPk/TdNxa9IAOBAI0NjZGzc3Ngp6tLiwWi+D1eoWhoaGsUhUQ/aHXFVJZAACAUcVisax6QNtsNgqFQjQ0NCR4vV7BYrHoco+2Wq1Ca2urMDAwkFWq7mg0Sk1NTUzDohlaT0+Ppqm4ZQcOHMDzjYFYLJZ0/fB4PNzLJxIJOnr0aNHUi0IUj8eL6toGoJTFYhEOHTqkeP54PE69vb2oS2AqvM/GSLkKAMUqlUqR1+vl7ukaCASoq6vLND2ELRaLcObMGSEQCHAvGwwGi3Ic4Jdffpk7fuV2u2loaEjXWJWWRFGk5uZmobOzk3tZfN9Ux0xpuXOZhlumWRB69+7dWRXe7XbTyMgINTc36/ZiezqiKJIcjG5ra1O9nng8TmvWrGF4wAcAAKMZHBxkFRUVqpf3+Xzp4HOuvozZ7Xbh6tWrqh6aZcFgkE6fPm2Kh8BsHT16VPG8PMHLRCJBPT09RbEPzcRutwvhcFjVs2tTU5MOJYJcKtYXRgBzqaqqEnjucb29vTqWBkB7R44cIbfbrXh+OeWqjkUCADAkNYHGQCBAzc3NpggyZpIDjmoC0Rs2bDBN4EwLvb29rKGhgWsZt9tNZk1dXlVVJXR3d3MvFwwG0ViT+Br/yWm5jY43DXc2nYMyaRKEPn36dFa9qzo7O6mrqyuvrUlEUaT6+nphYGCA66E+U7H1ugIAAONLpVK0YsUKVcvabDbq7Oyk1tbWvD1wV1VVCQMDA6ozllRXV5MkSQV9b06lUhQMBhXPv2PHDvL5fIrn5wlwQ27V19cLvM+t8ljfOhUJcqTYXhgBKLVt2zbF8/b09OhYEgDt3XXXXRQOh7mei6PRKO3fvx/3CwAoGoODg9yBRrMGoDOpCUSbJXCmhVQqRZWVlVzLmDkALXO5XKoC0ZWVlUX/ffOZZ57h6sQRiUQM3xHG6/Uqntdms9GRI0c0+dysg9CSJLHq6mpVy9psNhoZGaGqqirDXOTtdrtw5swZgeflbKZgMEjhcNjQJxsAABSPpqYmVWma3W43xeNxQ9yj7Xa70N/fr7qRWGNjo8YlMpazZ88qfu6w2WzkcDiETZs2KV5/MBhEKkcDO3HiBHcjjePHj+tUGsiVRCJB69evz3cxAAxn+fLlip9bJEnSsygAurBarcKxY8e4lmloaEAGDQAoCqlUimpqariWcbvdpg9Ay5qbm7ljGpFIpCjuEXv37uV6N2az2UwfgJa5XC7uLIOJRIJaWlp0KpF5HDx4kOt9i5HTcvOm4T579izdddddmnx2VkHoVCql+oWwkXPpi6JIra2tQigUUrV8XV1dwfe6AgAA4zt9+jTj6SErk1t7GukeLY91pCYVTCQSKeien/v27VM879atW4mIyOFwCDwP0jyBbsgti8UinD17lmuZvr4+nUoDuRSNRtH4FWASURQV91h47733dC4NgD5cLhf3kBwbNmzAeyoAKHhHjx5l8Xhc8fzyuw8di5RzLS0t3Nmynn766YJueD44OMiVxddms1E8HqdCCEDLqqqquHvK+/1+GhwcLOpnB4vFwtX4z6jZBXjTcPt8PnI4HJpdG7MKQu/du5frwi4zSyoDr9erKl3B7WU1Lg0AAIByqVSKnnrqKe7ljHyPFkWRotGoqtTcTzzxhA4lyr9kMsnVkvGxxx5L/ywHpJXgCXRD7jkcDq4GGpFIRMfSQC6h8SvAVGvXrlU0n5p3GQBGUV9fzzUGeiKRILfbXdBBBgAobqlUipqamriWCYfDBRVoJBp/b8KbLSsej9PRo0cL9jvFzp07ueY/dOgQGalThlaam5u5Gyjw7rtC5HK5uDIMGDEtN0+s0ul0UktLi6bnv+ogtCRJqsaBNvLL7emozZuPngkAAJBPvKmGiMxxj7ZarYKal8bxeLwge0N3dHQonldOxS3/nhmQnks0GjVsSiEYx9vaFoHLwoGgAgBAcWpvb+fKbBOPx6mpqQn3fwAoSLzvQDo7Owsy0EjE33uTiKipqakgv/PHYjHG0wjb4/EYYlg6vfA2UCiWdO1zaWlp4XrmMlJabt403B0dHZo3zlEdhFYzvqLT6TT8y+3puFwu7nQFRETPP/+8DqUBAACYXTKZ5G4oZrPZTNMK2Gq1co9nQ0T03HPP6VCa/OJ51pjc85k3JTdPwBtyb+XKlVzzJ5NJnUoCuRaPx2nv3r2G+IILYAR33313vosAkBOiKHL36A8Gg+gwAQAFh/cdSKEHGon4e28mEomC/M7/9NNPK57XZrNRe3t7QZ8XFotFOHToENcyu3bt0qcwJiKKIvEMg2aUtNy8abjb2trIbrdrXgdUBaF5W5AQjVfiaDRqipfb02lublac6sjj8VB3dzddvXq1oC9aAABgTGoedM6ePWuqVsBVVVVcKQidTidt27ZNxxLlniRJXMOibNy4ccrfeFJyo3Gdsd111135LgLkkd/vL8hsDwBqfPTRR4rmUzO8B4DRWK1W7ux9dXV1uGcAQEE5fPgw1/wHDx7UqSTGwtt7s6mpqaAyLA0ODnK9Mzl06JBpY1c8eN+nRaPRoh8bmmi8I4fZ0nLzpuHesmWLLu+FVQWheVqQyI4dO2aql9vTaW9vn3W8PZ/PRwMDAxQOhwWXy2XqbQUAAHOSJIm7oVgoFJqQptkslHxx9Hg8FI/H6erVqwV3bz5w4IDieZ1O57StGacLTM8kHo8jhXMBuXHjRr6LABqrrKw0TMovADNYtWpVvosAoAk12ftwzwCAQpFKpWjPnj2K5w8EAmSxWArq3cBMRFGklpYWxfMnEgnq6ekpmHsDz3jGTqez4HvHZ9q7dy/X/O3t7TqVxFzUpOXO13s0I6ThlnEHoWOxGFcLEqLx4GwhvPgVRXHatBSBQIDGxsaotbVV0KO7OgAAgFI8gUmi8Qft2tpaU967LBbLjC/cAoFAumGYGQPsSvAc65l6x9vt9lkb2GXzmWBsf/Inf5LvIsAs2trauHtpGiXlF0C+9fT05LsIADnX3NwsuN1uxfMnEglav359QfV4A4DidPbsWcVjQdtsNtq5c2dBvh+YSW1tLdd3fjWdD42It4PGkSNHdCyN8djtdq4GbH6/H43XaDw+eOnSJcXzJxIJrt7IWjFKGm4ZdxD6xRdf5JrfZrNRS0tLwVzc7Xa7IL8UCoVCdOvWLaG5uVkolhZUAABgXKlUinjHgj5y5Iip0w01NTWlf7bZbOmGYc3NzQXdMKy3t1fxF20ioscff3zG/+MJWiEIXTiQvtvY5s+fzzXmlCwSiWCsTyh6165dUzTf2rVrdS4JQG6dOHGCqwFTNBqlvXv34p4BAKa2b98+xfM+++yzpn7/oYYoivTSSy8pnr9QMqC9/vrriud1Op2mzA6Yrcz3aUqcP39ep5KYixwfVCoajeb8O7pR0nDLuILQg4OD3Ck+CzGX/pYtW4Tf/OY3gtfrFQpt2wAAwLyOHj3K9VDj8XhM/6BtsViEUChEoVCIhoaGiqZh2PHjxxXP63Q6Zx0SZbYA9WSJRAJjCBoU0msXHofDwfXlVlZXV1cQL44A1Egmk4rTzpWXl+tcGoDcslgsAk/vHKLxnk35Hq8QAEAtSZK40s0++eSTOpbGuJYvX86VQpgngGtUPON+8wTpC4nFYuEa45inwUeh27JlC1eGgVx+R+dNwx2NRnWP33IFoXlzvxdqLn0EngEAwIief/55rvl5x4AxKq/XW1QNw3h7vM/V09lqtXI9PPMEwCF33nrrLa75rVarTiUBLW3ZsoUrvarM7XYjxSoUJZ4eGoWcMQWKl91uFzo7O7mWqa6uRuMlADAlnmCpz+crmrGgJ+MdG5ongGtEg4ODioeTtdlsBTGMrFrbt29XPG80GkVK7ttmGrZ3NrlIy82bhjsUCs3aaUUrXEFo3hSMxdqKBAAAINckSVL8kE003lAML1/Nqaenh+uhX0lrb56U3H6/H8EtA+J5Tnc6nUX7AsZsRFGkcDjMvVw8HqeXX34ZLwig6OzYsUPRfDxj4AGYTVVVFVfPJqLxZwM83wGA2fAESzdt2qRjSYyvpqZG8bxmT8nN05Hy2Wef1bEkxme327k6JSAl9x8YMS03T6Db7XaT1+vNyXshxUFo3rEHnU5nUbciydTb28saGxtZY2OjaS/eAABgbLzpktBQzLyOHj2qeF63260o2MiTkpuIPxAO+gqHw1zP6Q899JB+hQHNWa1WIRQKcS/X0NCA9PlQVMLhsOIGeRs3btS5NAD51dLSwpVJI5FI0Jo1a3DPAADT4GmIb7PZTD8UWbYsFgvXfaGrq0vH0ujrjTfeUDwv77uQQsTTKeHIkSM6lsR8eDOX6ZmWmzcNt5rG7mopDkLzpl587rnnuAtTSJLJJAuHw+yBBx5gTqeTgsEg10tjAAAAHjxpYIo93ZCZJZNJFgwGFc+vNLWS1WrlenDGM41x8KZbIiKqra3VqTSgF6/XK3g8Hu7lKisr0bMNigLPtdDj8SAbDBQ8OZMGzxig0WiU9u/fj0A0AJjCr371K8Xzbt26VceSmAdP6uVTp07pWBL9JJNJxY0TnE5nTlIRGx1PID4SiehYEvNRk7lMj7TcRk3DLVMchOZNxV1ZWVmUFVju9XznnXdSXV0dZV70EokEeiMAAIDmUqkU8bR2wxcw8+JNfbRy5UrF8/J8IQ0GgxgLyCDUfIFZvnx5UT6nm93Bgwe5gglE498/Nm7ciLoKBS2VSnFdC/fu3atjaQCMw2q1CmfPnuVapqGhgWKxGO4bAGB4b731luJ5H3vsMR1LYh487wfOnTunY0n0c+XKFcXz8vQALmRWq5UrJffg4CCeEzLwZi7TIy23UdNwyxQFoSVJ4krx5/P5SBRF1YUym+l6Pc8EefMBAEBr77//PtfDy8MPP6xXUUBn+/btUzyv0lTcMp4vpER4pjEC3nRLRMX3nF5ILBaLcOzYMe7lIpEInT59Gi8KoCBJksQWLlyo+FrY1taGXtBQVBwOB9d4hUREGzZsMPVYoABQHHhSLhd7Km4ZT0ruRCJhynsBT+OEtWvX6lgSc+EJyF+7dk3HkpiT1+vNW1punvdCNpstp2m4ZYqC0DzpLYiKL8XfdL2eZ3Lx4sUclAgAAIpJb28v1/zoBWlOyWSSK+DI07OZiH+MKJ6AOGgrlUpRY2MjdxpuIqLvfve7OpQIcsXlcgk+n497uerqalO+RAKYTW9vL3M6naS0wbzT6aQtW7bgGQiKTn19PdeQDolEgtxuN4ZzAADD4km5zPMdtxh8+ctfVjwvb0zICC5cuKB43pKSEjwX3vb5z39e8bw/+9nPdCyJeeUjLTdvGu5Dhw7lJQW9oiA0TwsSouJ7uc1zM0PefAAA0BrPWD1utxu9IE3q8OHDXPPz9mwm4gtcR6NRpOTOg9OnT7OFCxdyjQ0uCwQCGPOqALS0tAi8abmJxr/kIqAAhSCZTDKv18sVgLbZbBSNRvEMBEWrvb2dK9VmPB6npqYmPOcBgCFJkqR43pqaGh1LYj48mfGuX7+uY0n0obThPt6NTfTggw8qnpen/hWTfKTl5glkezweqqqqysv7IEVB6L6+PsUrLMYKzNOCiAh58wEAQFs8Y/U8+eSTOpYE9HTw4EHF8/p8Pq5U3DLewDVvYBzUSSaTLBaLsdWrV7Pq6mrFQZdMNpuNmpqadCgd5JooinTp0iXu5aLRKL388sv4HgKm1dvby3bv3s3uvPNOrsbdNpuN4vE4GuFAURNFkaLRKPE0YgoGg5qPWQgAoIUbN24onpenh2cx+OxnP6t43p6eHh1Loj2eBre88ZxCZ7FYFDd0RifLmXm9Xq7sM9mk5eZNw83zTlFriqLFPCdWMbYuevjhh8nv9yue/9q1a2S32/UrEAAAFBWegNTdd9+tX0FAN5IkKU43RqR+aBSLxSJ4PB6m9Nnv4MGDVF9fr+qzzOzcuXPk9Xpz8lL2vffeUzTky1zOnj2rqmECGJPdbhfa2tpYQ0MD13INDQ20cuVKhnHxwAySyST78MMP6fz583Tw4EFV10IEoAH+wGq1CseOHWMVFRWKl6mrqyOHw4H7BgAYCk8P3XvuuUfHkpjP7WciRd9lzdbjdXh4WPF39NLSUj2LYkqrVq1SHAdMpVJF1xFVqYMHD9K5c+cUv6v1er3U1dXF9Rlq0nDn833QnGcKb8o2NakfzY6nBRER0UcffaRPQQAAoOjwtphbsmSJXkUBHR04cIBr/myGRtm2bZviLx7xeJwkSWLF9nI/kUiYqvVvKBQivDwuPPX19UJHRwfXWPFERJWVlTQ0NISXBkXsxv+n7MXjPf8XzXndSCaTrKOjI/tC3dbT00OSJHG9uJmJ2+2mcDhcFAForY+DkS1atIhcLlfBH1O9uFwuIRAIMJ6OFJWVldTf38/QmE1bqLcA6vH00MW4v1PZbDZFz1mRSIR7nNt84ukh73A4dCyJOZWVlSmed3h4mNntdtStaVgsFuHQoUOsurpa0fxyWm6v16t4f5olDbdszjcPPC1IiIjuuusu9aUxKZ4WRETjN0otBh4HMKtUKsV9bTE6q9WKHmaQF8lkkmt+fAEzJ54gtM/nyyq4dDuArfgafeDAAWpublb9eaCvQCBAPF9mwFzC4TAtWLCAa5lEIkFNTU2stbUV50WRWv2MsvmuHZp7HkmSiKcVfq60tbXRli1bhGJpbGHU46AHj8dDLpcr38UwtebmZuHChQuKGzElEglav349nTlzBg2YNIR6C6AeTw9dXLem4unxaiY8PeSLMYY1F/QO105VVRVXlsG6ujpavXq1og4eZkrDLdP8KlysLSA8Ho/ii7fZUlkAaG14eJgtXrw438XQVCgUQuMSyItr165xzY8vYObT29vLeHqDqU3FLRNFkXw+HwWDQUXzIwhtXLfvTUX5bF4srFar0NnZqbiVtSwYDNIjjzzC8t0iGkBrbrebDh48WLTvJQCUOnPmjLBw4ULFz5jRaJT27t3LmpubUbcAAMD0LBZLvosABU6PtNy8abiNMizbH801w8WLF3NRDgAAAFCBZ4gHm82mX0FAN6+88grX/Nmk4pbxBLITiQT19vYWVHaLQtDZ2YkAdJG43cqae7mnnnqKe0gHAKPyeDzU3d1NXV1dAgLQAHMTRZEuXbrEtYzf76fTp0/jvgEApqHmGbkY8KRdLlTFMFwLr0WLFime93e/+52OJSkMt9NyK55fTss92zw8HeB8Pp9hhmWbMwjNw+l0arm6glWI6S4AAMD4Vq1ale8iAKdUKqW4RzLReOplLXq78wayjx8/nvVngrZ27NiBxgFF5ODBg9wNjRKJBLK4QME4d+4cvfXWWzQ4OIjrHoBCdrtd6Ozs5FqmuroaDZgAIO/OnTuX7yKYGk/a5VQqpWNJwEjuuecexfP29vbqWJLCUVVVJfh8PsXz19XVzficxZuGu6WlxRABaCKNg9D333+/lqszFbQgAgAAAK319PRwveR77LHHNPlcOSW3Un6/H19ODSYej5PT6aTdu3czHJvCZ7FYhLNnz3IvF41Gaf/+/QgmgOklEgny+/20ePFieuCBB1g4HMa1D0CBqqoqIRAIcC3jdDrx3AcAecUzXBVkZ3h42DTfFU6dOpXvIgBM0dLSIvA0GJ+uobiaNNxGGo5R0yB0McPA7QAAAKC1F198UfG8NptN01Q7vGNL8wbMITf8fj+tWbMGwZgi4HA4uAMJREQNDQ3oPQoFJR6PU11dHS1cuJCFw2GWTCZxfgPMYufOnYLb7VY8fyKRoDVr1qBeAQAUATMNc1JeXp7vIgBMIYoi8TQYny4tt1nTcMsQhAYAAAAwoGQyyXiG8Ni6daumn+9yubhaa/IEzCG3otEoLV26FIHoIrBz505BzRBJK1asQK82KDiJRILq6uqotLQU49gCzEIURTpx4gTXsA7IpAEA+aR0rGdJknQuiTn19/fnuwi6mD9/fr6LYGo84zwj4M/H4XCoTstt5jTcMgShAQAAAAzo/PnzXPNrlYo7E09gOxKJEHqbGVc8HkeP6CIgiiJ1dHRwL5dIJKipqQn1FwpSIpGg6upqWr16NcNYtgDTUzOsQ0NDA8ViMdQpADAspYGbYtPX15fvIuQdMkFNhXGe9aUmLTdvGu5Lly4ZKg23TNMSnTt3TsvVmQpPCyKekw0AAACK0759+xTPq3Uqbtljjz1Gfr9f8fznz5+nqqoqrYthOE6nk5555hndP2d0dJQuXrxIROPP2dmOfRaNRqmpqYm1trYarmUsaMdutwuhUIjryyoRUTAYpEceeYRVVVXh/ADFLBaL4t5IvN577z2Kx+OarS8ajdKCBQuou7ubuVyuoj3P3W43Wa3WfBdDNfS80Y/D4eC+f2zYsIHi8TizWq1FW6dyAfUWAADA3OS03Eozl0WjUcXzEhG1tbUZNn3+nEHou+++W/HKsn0xZmY8LYhWrVqlY0kAAACm99577+W7CKCQJEmK0+0QET377LO6lMPhcAg2m40pfcbbt29fUQSh77//fvJ6vTl5uK+vr0//LEkSe+edd2jHjh2qAzPBYJA+85nPsPr6ekN+OQFteL1e4fDhw1zXESKip556ivr7+5nFYsH5AYpYrVYhHA7r+hnJZJJJkkTXrl2jDz/8kDo6OrLq2VRRUUFtbW1Fex08ePCgYV9QQf55vV6hp6eHBYNBRfMnEglyu910+fJlQ/a8KRSotwDqJZNJPNtOovTdkJphfvKJJ45148YNstvtupXFjEZHRxXPa7FYdCxJ4XI4HEJbWxtraGhQNL/Sd3FOp5O2bNli2OvcnOm4lyxZwrVCpPgDAAAwJi17E4G+Xn/9da75H3/8cZ1KwpeSOxqNElKd6sdqtQpVVVXC1atXhYGBAdW9DxsaGnCcikA4HObOwJRIJGj9+vX6FAhAJYvFItjtdqGqqkqor68Xurq6hLGxMeru7iaesdUyNTQ00O7du3EdBJhGS0uLwBN4iMfjGNIBAHJq7dq1iufFuNBTKX03dP/99+tcEm3xxLGuX7+uY0nMSc7CpgQyoKi3ZcsWrucsJTo6OgzdGFDzMaGHh4eL8sEzEokontfMKXQA8oExJhh9ylWPOIDJeFObobGYORw8eFDxvE6nU9cvALxjTfMG0EEdu90uhMNhobOzU9XyjY2NGpcIjMZqtQqHDh3iXi4ajVI4HC7K73RgHhaLRXC5XEJra6swNjZGgUCAex1+v59Onz6Ncx1gElEUKRqNcjVkCgaDuHcAgCFdu3Yt30UwlGQyqfhaXVZWpmdRNMfTO5dnaNViobSHPIaazY4oitTR0aHZ+oychls2ZxC6pKSEawNu3LihvjQmxftCf/ny5TqVBAAAig1vCpxibSxmJoODg4yn1/rmzZt1LM14uiCeVpo8AXTIXlVVlTAyMsL9RTASidDg4CCuBwWuqqpKUNNjvq6uDucHmIbFYhGam5uFsbEx7p7R1dXVONcBpmG1WoVjx45xLVNXV0e9vb2oTwCgO57G+O+++66OJTGfDz/8UPG8paWlOpZEezyN89944w09i2I6qVRKcQ95DDWbPbvdLrS1tWW9HqOn4ZbNGYTm7cb9L//yL6oLY1bvv/8+10P2okWL9CoKAAAUGd4esGgFbHzt7e1c8+uZilvGE+iOx+N4oZ9jVqtViMfj3IHompoanUoERtLe3i6oaa1eU1OD7BlgKhaLRWhtbeXOELFixQqc6wDTcLlc3C9IKysruXrZAQCowdMYH8HGic6fP694XofDoWNJ9KG0AX08HsfzXwae+JbZesgblRZpuaPRqKHTcMsUpePmaT2vZVfymezevZt5vV7F0/79+3V9AO7t7eWa/5577tGpJAAAUIx4ggsfffSRfgUBTRw4cEDxvHqn4pbxBrp5A+mQPavVKpw9e5ZrmXg8jrGhi4AoisR7bhBhjE8wr6qqKqG7u1vx81EikaCjR4/iXAeYRn19PVdGjUQiQevXr8eLfQDQldVqVdzIEsHGiXjG/b333nt1LIk+HnroIcXz8nYsLGQ88a2HH35Yx5IUD3n4E7VCoZBpxuZWFITmad0QjUZ1v7Bv3LiRIpGI4qmhoUHXlECnTp3imp83xTkAAMBseFLhHD58WMeSQLZ6e3tZIpFQPP8zzzyjY2n+wGq1crXQ5Amkg3YcDofAOy5qV1eXTqUBI3E4HKrSfQWDQYrFYng5A6bjcrm4Ugk3NTXhBTXADHgzakSjUdq7dy/uHQCgK573ID09Pbgm0XjK5Ugkomhep9NJFovFdDGMRx55RPG8x48f17Ek5sLzrvDBBx/UryBFxmq1CqFQiHs5t9tNXq/XNPVTURCat3WD3hd2NTnTKysrdflSyXPxJho/QczQRR4AAMxj7dq1iufNRWMxUO+VV17hmj+X6ZR5UnInEgmMCZgnTU1NXPOjYUrxUJvua8OGDUitCqbkcrkEpWNEJxIJevnll3GeA0xDFEXF40TK/H4/nT59GnUKAHTD8x7k6NGjOpbEPHhiNl/96lf1LIpulixZonheNJ4fl0wmmdIeuWZtnGBkXq9XcLvdXMuEw2GdSqMPRUFo3tYNubiwb9myhaslZiKR0CWdHG/AHWPvAQCA1njH6UErYGNKpVIUDAYVz+92u3P68M+bkps3oA7asFgsXL2ho9EoAoxFQm26Lzm1KoAZtbS0KH5vcPDgQZ1LA2BeVqtV6O7u5lqmuroaw34AgG7Ky8sVzxsMBtEYn/hiNmZNuWy32xW/I0Hj+XE844TzpDsH5XiCymZKwy1TFIS2WCxcreZzcWFXM7ZZMBikwcFBTS8svAH3lStXavnxAAAA9LnPfY7r4eOtt97SqyiQBd7GAdFolARBYLmaFixYwLU9+KKfP7wvDCRJ0qkkYDRq031Fo1EKh8NF/4IGzEcURdq6dauieePxOBrlAMzC5XJxD/vhdDrxPAgAurDb7Vwd1Iq9MT5vo3czp1xWmgmHCCm5iYj27duneN7a2lodS1K8lH5PN1sabpmiIDQRfwqGo0eP6n5hdzgcitNryWpqajR7AE4mk4zn4k3EHygAAACYiyiKxJO6BSmHjGnXrl35LoLmiv2Lfr4sX76c63nz4sWLehUFDEhNui8iorq6OvRoA1NSGoQm4usJAlCMdu7cyXUPSSQStGbNGtw7AEAXPPf4F198UceSGN/Zs2cVX4tznXVNazyB0gMHDhR1YylJkhSn4ibif9cAys31Pd1ms5kuDbdMcRD6scce41rx888/z10YNXjSaxGNt27WaqynlpYWrvl9Pp+hx4O2WCz5LgIAAKi0fft2xfMmEgmKxWJ4GWQgPGPwmEmxf9HPF1EUSc3Yv1A8Tpw4QTzfoWRut7uoX9KAOVmtVsWZ3X72s5/pXBoAcxNFkfseEo1Gaffu3fjuAQCa44lXRCKRom5QuWPHDsXz8rxfMiKeQGkikeAK0Bcank4qRo9tFYLZnrEOHTpkujTcMsVBaIfDwZWSOx6P5+QFt5q03A0NDVmn5U6lUtw9yYyeroD3JP7d736nV1GyduPGjXwXAQAgp3iHeyjEXrdmVqg9ryKRCFKb5sn999+veN7+/n4dSwJGZLFYhGPHjnEvF4/Hae/evajTYDpKr4kYngBgbhaLRbh06RLXMn6/H41gAUBzDoeDq3NasWaFi8ViLB6PK56/srLSlIEumSiKXCm5eQL0hSSVSpHf71c8v9FjW4XAYrEIhw4dmvJ3j8dDVVVVpq2XioPQRESbN2/mWvnTTz/NNb9a+UjLffToUZZIJBTPb7PZyOVymfZEmU5vb2++izCj69evK54XPYUAoBBYLBau1HjRaDTrBlmgnUL+0lOoAfZC0tfXl+8iQB64XC7u71BE44GE3t5e3D/AVMrLy/NdBICCYrfbhc7OTq5lNmzYUNS9EAFAHzwpuf1+f1E2kubphFAovV15Aqa56kxpNDzZgm02G1Jx50hVVZXg8XjSv9tsNjp48GAeS5Q9riD0448/zrXyeDxO4XA4JxU4l2m5k8kka2pq4lqG54ZoFj09Pfkuwox4ysbTUwgAwMh4Uybt3LlTp5LkVjgcZrFYjJk1RawkSVytks2mkAPsAGbH+x1KVllZWZQv8MC85s+fr2i+SCSic0kACkdVVRVXY6ZEIoFhHQBAc7zv3Hk72ZldLBbjGvrL7Km4ZS6Xiyur74YNG4rq/pRMJllDQ4Pi+VtaWgqicYJZHDx4MJ2W+9ChQ6Yeo52IMwhttVonROGVaGpqyskLClEUiTelnNq03Js3byaeXtBE4/vBDHh60V27dk3HkmTHyGUDANALb8qkSCRi+t5syWSS1dXVUUVFBS1cuJCFw2HTBaNff/31fBdBV/F4HL1eAAxKFEXiTalKNB5IKLYXeAAAMFVLSwtXNqZ4PE4bN27EcyEAaIY3XhGJRIoqKxxPplqPx0N2u93Uwa5MzzzzjOJ5E4kEHT16tGjOi5aWFq75a2trC+a8MAN5+KxAIGDqNNwyriA0EdHevXu55s/lCwqXy8UdJOdNy93b28t4W0cHAgHTtFb48pe/rHjeaDRqyB4QkiRxtfBau3atjqUBAMgdURQpEAhwLfPEE0+YurVn5oNzIpGguro6+uM//mO2e/duZsR71HTMnlZHiUIPtBsRxjUFpex2u9DW1sa9XCQSMU1DW4DR0VFF86nJDABQzERRpHA4zFV3IpFIzrImAkBx4M2+le0wnWYRDoe5sq5t27ZNx9LkXm1tLVfWp7q6uqJoQD84OMh4xoIOBALoBZ0HLpdLaG5uNkVMcS7cQWi73c4d6I1EInT69OmcVODMrupK8KTlTiaTrLKykrtMGzdu5F4mX0pLS7nmP3z4sE4lUe/AgQNc8zscDp1KAgCQe7wBgXg8btrWnslkcsYHZ7/fT3feeSc1NjYyI7dy7u3tLehU3LJiCLQbDRrkAY8tW7Zw9WST8WaHAsiXixcvKppv1apVOpcEoPBYrVbh7NmzXMvU1dWZPiMTABiHw+HgSr2czTCdZiFJEqurq1M8v9vtJpfLVRABL5koivTss89yLeP1enUqjTGkUimqqanhWgYNjyFb3EFoIv7e0ERETz31VE5aklgsFuHQoUNcyzQ0NMxZtlQqRevXr+d+0RIIBEyVxqK8vJxr/j179uhUEnVSqRR3EPree+/VqTQAALlnsVgE3t7QdXV1pkxHpSTTSjAYpMWLF5PX62WxWMxw23j8+PF8FyEn4vE4XjTmEPY18JJ7sgEUKmSHANCXw+HgzqpRWVlZFD3OACA3Ojo6uOZvaGgo2O9NqVSKa8hNosJtOL5lyxau3tDRaJT2799fkOcFEVFTUxNXR4hQKGSaDL9gXKr60dvtdsHn87FgMKh4mUQiQU6nk4aGhnTvvl9VVSV4PB6utNler5e6urqm/b9UKkVr1qzhSvEsM1tLkdsBc8UX2kQiQbFYjBmlpdTZs2cZT0MBp9OJCykAFJympibiSa1DRLRixQrq7+9nZrkmnj59mus+L8/rcrn0KpIqPA2nbDabqrFb9XLjxg2qqKhQPP/x48eRfSRHzp8/zzU/byNEKExWq1UIhUJcPSYAzCCZTCr+Lo/rIYB69fX1wsWLFxU/oycSCfJ6vXTmzBmdSwYAxeB29lau9wSVlZUUj8eZ1Wo1xXsQpfbu3csVaPT5fKbqRMdDFEU6dOgQVVdXK16moaGBPv/5zxsm3qGVWCzGFc+z2WwYCxo0oaonNJG63tCJRILWrFnDcjHmAm9a7mg0Ou2YNMlkkqkNQJu1pYjP5+Oa/8UXX9SpJPx4xwDJ1XjlAAC5ZLFYuHsiJBIJWr9+vSnGRZIkifF8gZAZbXyjWCzG1XBq69atZLfbBaNMLpeLK+UZb6YSUCeVSnFnqikpKTHd8yrow+v1cg+9BGB0PENIzZ8/X8eSABS+9vZ2rufDaDRKe/fuLdgeZwCQW62trVzzy53mzPAeRKlwOMw13i+RujiPmVRVVXHdm4iIKioqCipbx+DgIOPpREBEdOjQIYwFDZpQHYS2WCxCKBTiXi4ajeYkEK0mLffkwecHBwdZaWkp15h6MrfbTV6v15Qv9Gpra7nmj0Qi0wbwc2337t3c42o+/vjjOpUGACC/eFMOEeXuHp0NSZIY75cHovHMF0ZrxXr06FGu+R977DGdSqIeT2MuOXuKjsUBIjp69ChX4wa3240vljABb2NeAKPjSS+JjB0A2RFFkaLRKNd9xO/30759+3QsFQAUC6vVqqpBvtHfgygVi8W4sxqZtRMdL9507UTj75EKIRAtSRJbsWIF1zIej4eqqqoK/ryA3FAdhCYabynPO74A0R9ecieTSV0r8e203FzLeL1eSqVStHv3brZ48WLuMaBlZh5Tbfny5dyBi7q6uryOoxGLxbhbeTmdTiq0dCsAADJRFOns2bPcyxk5EJ1KpcjpdKq6Nx85ckSHEqmXSqWINw2Sw+Ew3D2LtzEXb+Ad+KRSKe6hYJ588kmdSgNmZbFYBDX3DwAjCofDihsqG/VeC2A2VqtVOHbsGNcyPM/FAACzqa+v545XGPk9iFKxWIy7p6vH4zFtJzpedrtdVQMFswei5Y4cPO/RbDZbwY4RDvmRVRCaiOjEiROqWspHo1EqLS2lwcFBXSsxbxqOaDRKf/zHf8wd0MzU2dlp6uCmKIrU0tLCvVxlZSXp3bBgOpIksQ0bNnAv99JLL+lQGgAA43A4HALvEAtEuWssxkOSJLZmzRquHp4yj8djuJfKPT09XPt269atehUlK1arlSutVTAYLKhUZ0aSSqVITR1ZvXq1TiUCM1N7/wAwEkmSuHoDGfVeC2BGLpdLCAQC+S4GABQpNZ3DjPgeRCk1AehiDDSqaaAgB6L1jmHpQU0Amojo2LFjRdE7HnIn6yB0Ni3lE4kELV68WNdUzlarVVXacLUCgUBBpCqora3l7g2dj/FEk8kkc7vd3BdTI6ZlBQDQQ0tLC/f1nOgPjcWMkD65t7eXOZ1OVcNj2Gw27gZpubBr1y6u+Y38YpwnJTcRfwAe5iYHoHnrCLLCwGxaWlq4x04DMIpUKkVer5drGSPfawHMqLm5WVX2RACAbFmtVqGzs5N7uVx1mtPS/v37uQPQRMUbaAyHw9wdKuUY1unTp01zXsRiMVUB6EAggJgJaC7rIDTReEt53nQGmerq6mj16tVMrwu82rThvNxuN+3cubMgKqna3tDRaJQWLlyo27HM1Nvby0pLS4l3HGgioueee06HEgEAGI8oiqquk0TjD9oVFRXU2NiYt7RU4XBY1YOz7NChQ4YLsiWTSa5godEDhbzpnHkD8DA7OUuAmkYayAoDsxFFUdXYaQD5pua6aPR7LYBZnTlzRlWDWACAbFVVVanKyGCWgGMqlaLVq1ezhoYG7mXb2tqKNtCoZsgIWXV1Ne3evdvwadt3797NKioquN+jFVJsC4xFkyA00Xg6g2xS7USjUVq8eDHt3r1bl7QXeo/RbLPZ6MyZM4Ioirp+Ti6p6Q1NpH8P91QqRfv371cdlHC73QXRWx0AQCmr1Sp0d3erXj4YDNLChQtZOBzO2cP24OAge+CBB7jSaE7m8/kMeb3nDerw9jTONYvFwtXYLxqN5mX4jkKTSqUoHA6zBQsWqMoSgKwwoISasdMA8mlwcFBV9hQ0UgbQhyiKdOnSpXwXAwCKVHNzs+DxeFQtW11dTV6v15DpuWOxGFu4cKGqhsiBQIDq6+uL+nugy+VS1VOeiMjv99PSpUtZb2+v4c6LwcFBtnr1alXDzDqdzoKLbYFxaBaEJhq/sGc7dpjf76c777yTdu/erWll1jMtt81mo3g8ToVWSUVRJLWp1onGe7h7vV5Nj2Nvby9bs2aNqlZeMr0bJAAAGJHL5crqPphIJKiuri4djNbri1hvby/zer1s8eLFqntwE403OGppaTHkF6vnn3+ea/7HH39cp5JoZ/v27Vzznz9/XqeSFD5Jktju3bvZwoULs2qkgR6uoJSasdMAci2VStHu3bvZ4sWLuRsqezweQzZaAygUdrtd9ct+AIBstbe3q36WjUQidOedd1IuG+TPJplMMq/Xq6qXKxF6umZS21OeiCgej5PT6aTGxkZDNFKQO+wtXrxY9TB20Wi04GJbYByan1ktLS3CJz/5SVUtLjL5/X7y+/3kdDrZ5s2bae3atWS327O6SHq9XuHw4cOqWgnNRG5lXaipuxwOh+Dz+VgwGFS1fCQSoUgkQk6nkz3zzDNUU1PDPd5EMplkhw8fpj179qhOxyoLhUIFe6wKmZnGYrFarUU5pgqYg9frFfr7+7O6R8vBaCIit9vNtm/fTitXrszqvE8mk6yjo4Oef/75rALPMrfbbdgWnJIkMZ5tNEt60JUrV3LNv2PHDqqqqtKpNPqTJCkn96aLFy+mfz516hRFIhFN1uvxeLJ+robiEg6HKZuhEQD0Ij9DNDU1qTo/bTYbHTx4UIeSAUCm2y/7s35XCADASxRFOnPmjKB2CCOi8Y5WTU1NrKWlhWpra3P+riGZTLKWlhbK5hpq5Pck+dLc3CwQkep7UzAYpGAwSIFAgDU1NeX8fXAqlaKjR48ytc/BRH/oXGmG905gXppfdURRzLoCZ4rH49TQ0EC3e74yj8dD5eXlNH/+fCovL0/PJwd+kskkm63CHzx4kBYvXpx1uYiK5+Ld0tIiXLt2LavgfTweTwctPB4PW7t2LS1atIjuueceIiIqKSkR/vu//5tJkkRERDdu3KDr16/T4cOHVbXgmY7b7Sav14sLqglpVWdzIRQKkdfrzXcxAGak5T06Go2mr9E2m42tWrWK1q5dSw6Hg+666670fHa7XZAkiSWTSSIi+t3vfke9vb106tQpOnfunKZBDZvNRuFw2LAtOF9//XWu+c2SHvR2Sm7FzwrxeJwkSWJm/aIjDyNjRm63m9rb20253yF/rFarcOjQIVZdXZ3vogCQJEnsV7/6Fb344otZN845dOgQGpAC5MjOnTuFCxcuaNoxBABACS0C0XKDfDkYraajFa/e3l52/PjxrILPRMUTw1BDi3dkcmfKQCDAtm7dqntAV6sOewhAQ67oduVpbm4W5s+fn1Xa5OnIPWtnwGw2Gw0NDc348vn2uGZZl8vj8VB7e3tRXLzlG/XChQuZFoGCGY6hrr2J5Jutnp8BAGAWWgaiZYlEYrZ7dE6yGZjhi9WePXu45uftYZxP27dv52o49vrrr1N9fb2OJYLJjN5IA4ytqqpK8Hg8TKse+QBzkRuwyVkhenp66OjRo5o1XgsEAkWZhvvatWtEOXo2yzVk+TA2URSRWUOlQq63JSUlhv7+lq1Tp04RFcCxW7RoEblcLlNfY7UIRBNNzA7n8XjYtm3b6MEHH9QsID04OMhOnTpFBw8eLPhMcUah1TuyzMy+zz33HH3xi1/ULMArSRJ75513aN++fZp02EMAGnJJ16tPfX29sHLlSlZZWZmzB8xEIkFNTU2stbV1xgq0ZcsW4eDBg1zpMDN1dnYW3ZdVURTT4x2Y7cuC0+nEzRYAYJLm5mbh4YcfZhs2bDDddX06Zvhi1dvby9WYy+12m6p3Fm/AfM+ePQhC5xC+ZIIW2tvbhXPnzmnSMBWMb8lT+rw0/7u/Jlq7nOa8FjU2Nmo2DMFkgUBAfuFYdAo5owFjpo/zFDyr1SqcPXuWOZ3OfBfFVAq53g4MDLBCbkAyR2cq0/B4PORyufJdjKzJgei9e/dq0ig/8/g6nU721a9+lUpLS6m8vFzRcH2Dg4NMzgaq5fBLsra2Nqqvry/Y+qWl5uZmYdmyZZpkforH4+nrts1mY7W1tbR8+fJ01sC5rnmSJLFEIkG9vb3U399PBw4c0PS9XTF1rgRj0P1MczgcQn9/P1u/fr1maZXnEgwGafv27TM+xIiiSB0dHdxpFAt9/Oe5WK1WIR6PM7fbrUlLrFxwu9104sQJ9PgBAJiGy+Uy3XV9Omb5YnX8+HGu+bdv365TSfTBm5L79pcq5nA4DH/szA4BaNCKKIp09uxZQvAAzOz28Dm4HgLkicPhEEKhEJN7EgIA5JI8lOjDDz/MKioqNFtvPB6f7r1KXlpH2Ww2OnbsmOl7r+daVVWVMDIywrTshJdIJCgYDE7+c95azZnl/RkUlj/KxYdYLBahq6tLCIVCZLPZcvGRVFNTQ6lUasb/v52Wm2udIyMjNG/evGyLZmpWq1W4fPmy4Ha7812UOfl8Pjpz5oxgpl5kAAC5Jl/XA4FAvovCTQ6smeEBOpVK0YEDB7iWMVMqbhlv4Jw3MA/8PB4PDQ0NCQhAg1YcDocp7xkARETd3d0IQAMYgNfrFXw+X76LAQBFzOVyCSMjIwXXuFLuZIAAtDpWq1UYGhoSPB5PvouiKTO9P4PCk5MgtMzr9Qr9/f2UiwfNeDxOL7/88qytSrZs2SLw3GgSiQRt3rw567KZnSiK1NXVxR3Ez6W2tjZqbW1FWgkAAAXklsADAwOm+QLm8/loaGhIMEsv2p6eHq70tR6Px1SpuGWVlZVcZT5w4MCsjQYhO52dnRQOh/E8BJrbuXMn1/cogHzzeDw0NjaGF7IABtLS0oJ7CQDkldVqFa5evSqEQqF8FyVrNpuNQqEQdXV1oQFylkRRpHA4LHR3d+esQ6WeAoGAqd6fQeHJaRCaaLxXdGtrqzAwMEB6tyhpaGggSZJmDETLabl5RCIROn36NAYaovExv40WsHC73TQyMoJWPQAAKtjt9vQXMKM+aDudThoYGDBdQ6OjR49yzb9t2zadSqIvURS5GhsmEgnq6enBc5XGAoEAjYyMUFVVFZ6HQBeiKOZsqCWAbMjPDeFwGBmyAAxGvpcY9XsHABQPr9crjI2N6R6r0IvH46H+/n5ke9GYy+UShoaGTJsFSn4Obm5uNtX7Myg8OQ9Cy+x2uxAOh3UPRnu93jnLwXsheeqppyiZTOKFKRknYIHWXgAA2vF6vcLQ0FDer+2ZnE4ndXd309WrVwW73W6q63wqlZpuDKBZLV++3FTbmKm2tpZrft4APUzPZrNRW1sbjY2NUXNzM56HQHdWq7Ugeo1AYXI6nRQKhUz53ABQTKxWq3Ds2LF8FwMAgCwWS05iFVryeDxobKezzMyBZjkvzPz+DApT3oLQMjkYPTIyQm1tbZq/7I5GoxQOh2cNGO/cuVPg+dxEIkE7d+7MumyFRA5YdHZ25rRntHxRHRoaEtDaCwBAO6Iopq/t3d3deXvY9vl86Ydns6bQPHv2LFfDNZ/PR2ZupcobQA8Gg0jJrZLNZkvXkaGhIaG+vh4vHyCnvF6v4Ha7810MgDSfz0fxeJyuXr2K74cAJuFyuQw93BsAFJdcdZzLRmbwGUHG3JDPi7GxMTJqz+jM4LNZ359BYcp7EFpmtVqF+vp64Te/+Y0Qj8cpEAhoFsxsamqateeyKIp09uxZrnUGg0Hq7e1Fb+gMoihSVVWVcPXq1fQx1KMHnc1mo0AgkH654HK5kFICAEAnoiiSy+VKP2x3dnbq/kXM7XZTZ2cnjY2NUWtrq+kfnvft28c1P29PYqPhTclNxB+oL0Yej4c8Hg+1tbVRd3c3DQwM0G9+8xtBriN4FoJ8OXHihGGyZkDxcbvd1NbWRvF4nBhjQmtrK8a7AzCh+vp6NGoCAEPJ7Din1ztuHvL78JGREQSf88hisQjNzc3C2NgYhUIhQwxTmtkI0+zvz6AwCYwZ+51fMplkV65cobfeeov6+vro3LlzlEgkuNcTCoXmHBehsbGR8aTLtNlsNDQ0hJd+cxgcHGQXL16knp4eevvttykej3Mt73a7acmSJbR8+XJavXo1Ib0kAIAxyNf3U6dOkSRJqsYHdTqddP/991N5eTmtXLmSPve5z+G+CgAAoKMlT1FeXwL83V8TrV1Oc36n83q9LBKJpJ8ViIjKy8vp3nvvpSVLlhBevv7B4OAgW7x4cb6LkXeMMVOeE/K5PpeBgYGCPu9TqRQtXLiQzfbOz+PxUDgcLoh9gHo7zqzntdJ6WygKqe5lIxaLsaNHj9LRo0dVxSd42Ww2qq2tpdraWkJw0bgGBwdZe3s7vfHGG9xxD7U8Hg898cQTVFlZiXdonMLhMKurq5tzPiXxxELH86wy23O44YPQMxkcHJxQ8GvXrtFHH31EDoeD7rrrrvTfeR5klDzwTubz+ai1tbWoT0Y1Jh+/ixcv0t13301LlixJ/81isSDgDABgMslkkkmSlP79xo0bdP36dVzjAQAADOLG/5ffIPT8u0j4xP/IZwkKTyqVouHhYXO+3NGQGQNZRESSJLFkMjnnfCUlJQX/onnyd4nJCuk7BOrtOLOe10rrbaEopLqnFUmS2DvvvEM/+9nPVHW6mo7T6aSHHnqIHnnkEfriF7+IfW5CmR0qL1y4oKqzxmQ2m41WrVpFa9eupfLyctM+7xjFXM8aMqvVSsU+3BnPs8ps56Vpg9B66e3tZbxpFOLxOCHlFwAAAAAAAAAAAABA8ZEbJ1y8eHHC33t6ekiSJLJarbR8+fIJ/1deXo4gf4GTg55yJ0pZf38/9fX1ERHR2rVrJywjd7REwBkKAYLQ00BabgAAAAAAAAAAAAAAAAAAdf4o3wUwopaWFsFmsymeP5FIUFNTE6L5AAAAAAAAAAAAAAAAAFD00BN6BqdPn2bV1dVcyyAtNwAAAAAAAAAAAAAAAAAUO/SEnkFVVZXg8Xi4lnniiScolUrpVCIAAAAAAAAAAAAAAAAAAONDEHoWBw8eJJ603PF4nF5++WV0LQcAAAAAAAAAAAAAAACAooV03HNQk5Z7YGCA7HY70nIDAAAAAAAAAAAAAAAAQNFBT+g5qEnLXVNTg7TcAAAAAAAAAAAAAAAAAFCU0BNagVQqRcPDw1w7qqSkRBBFUa8iAQAAAAAAAAAAAAAAAAAYEoLQAAAAAAAAAAAAAAAAAACgGaTjBgAAAAAAAAAAAAAAAAAAzSAIDQAAAAAAAAAAAAAAAAAAmkEQGgAAAAAAAAAAAAAAAAAANIMgNAAAAAAAAAAAAAAAAAAAaAZBaAAAAAAAAAAAAAAAAAAA0AyC0AAAAAAAAAAAAAAAAAAAoBkEoQEAAAAAAAAAAAAAAAAAQDMIQgMAAAAAAAAAAAAAAAAAgGYQhAYAAAAAAAAAAAAAAAAAAM0gCA0AAAAAAAAAAAAAAAAAAJoR810AKF6SJLFkMkkXL14kIqK7776blixZQlarlSwWi6DHZyaTSSZJUvp3u92e9efI26FWSUmJIIrTV8XMdc8230wyt9disZDValW1valUioaHhxkRpY9XeXk5d5ky16OWFsdsNoODg4yI6Nq1a/TRRx+Rw+Gge++9l/uclNczFz22Z/J+VnPuyJRux0wyPzvbdcmmO5cn120t1injOW/1vH7J9NyPs5GvR3LdkK/Z2VxbeOhdp4xwDmVz/uhVfj33y2zkz71x4wZdv349fb4pOb75qiO8Jt9vtKhTmeea2vVk7r9s7h8AAAAAAAAAAFDkGGOYMOV0CoVCzOl0MiKadQoEAmxsbIzNtb7MZZR8Ns/8SiaPxzPntsw2DQwMzFiOzHV7PB7u8mZur5rlR0ZGWCAQYDabbcby22w25vF4WDwen3P9AwMDWe0rrY7Z5GlsbIy1tbXNup3yPgyFQorKwLNN8j7s7u7WZPsCgcCE9Xd2dqpeb7bHK/P8znZds53Lk+u2FuvM9rwNBAKK6kWujwnPNWFsbIwpuWY7nU4WCoUUXbNzsd1ynVJaX412DjmdTubz+Wa9P+Sq/Hrul+mm7u5uNtd9Vd4/IyMj065b7zqSOQ/vecxTpzo7O9mtW7e41j/5XOM5h6bbPjXLY8KECRMmTJgwYcKECRMmTJgwYcLEGEM6bsidVCpFjY2NrK6ujuLx+Jzz+/1+uvPOO8nr9bIcFM/wIpEI7d+/Pyf7Qj5WCxYsIL/fT4lEYsZ5E4kERSIRcjqd1NjYyFKpVC6KqJn9+/ezO++8kxoaGmbdTqLxY1BXV0der5clk0nNjoW8DysqKuiBBx5gsVhM9bqTySTz+/0T/rZjx46sywj8/H4/OZ1O+tSnPsV6e3tNdx07ffo0u/POO0nJNTsej1NdXR3deeeddPr06bxvq1yn6urqsq5T+RCPxykYDNLixYvJ6/UySZJMVX41JEliDzzwAKuoqKBIJDLrvPL+cTqdhjjflAqHw1x1qrq6mhYuXMiy2cYVK1aQlvcrAAAAAAAAAAAApZBfD3IimUyy9evXUzQanfB3j8dDZWVlVFpaSv39/dTX10fnzp2bEAwsKyvLdXFVs9lstGrVKq5lLBaL4nkbGhro85//PHO5XLqlB5Ukibnd7hlfkLvdbrJarfTee+9NmScYDNLbb7/NOjo6FKVMldeVDzOdkzKn00n3338/SZI0ZZ5IJELnzp2jY8eOKToW8romm3yuE40HHioqKqi7u1vVcT58+PCUv8XjcYrFYlmfNzNtx2wyz2+PxzPjfJP382zzlpeXz/m5sy2vdp2ymc7b6c4VovGAqNPpJJ/Px1paWrJObTvbtk2ul2r2YyqVoqamJhYMBqf9f/k8mO4aQERUXV1NHo+Htbe365bGV02d6uzsZFVVVYrrgJ7n0Ezrni74Kl9v+vv7GU+qbr3Kr8d6w+Ewq6urm/MzJx/fRCJB1dXVU+pWLq81SqRSKdq4cSObKbg+W52aaRuVSiQStH79ejpz5gwhrTYAAAAAAAAAAORUvrtiYyqOqbOzc0qKy9nStmam45wrFSRxpMXUOx23mpTXStedOc2UgnS27VWaendySmqbzcba2tpYPB6fkhb01q1bFI/HmdvtnrBMW1vbtJ+lRZpQLaZbt27R5DITjadP7u7unvbcHBgYmJIi1u12z1j+zPnmSgk83bptNpvi45y5XZnHLzPd62xlnW3i2Y5spsnnBu/yetTtmco213l769atGVMKa32N0GM/TFfumerG2NgY6+7uZpNTwOuxrTzn4tjY2LRlmq1O5fIcmmv+7u7uKema56rDepVfz/0ib+vk4ySnd5+uro2NjbHOzs4J9yqe62W215rJ56KS+XnuN7PVKZ/PN+fnzZT6PRAIKN5WI9ynMWHChAkTJkyYMGHChAkTJkyYMJl/ynsBMBXH5PP5JrwMVTpuqJKXysUYhLbZbIrGieQJQk8XmFX6Yv/WrVvU1tY254tuowShp3u5r3Q8ZrlBRSAQmPUYqAneTg7GKAk4zHS8bTYb03psUASh+ffj5AY4RDM30tBiynY/yPVYTd2YLpio5baqORfj8fiU4KYRziGly02+d842vrsZg9AjIyNTzhm3263o/jYyMsLcbjd3g51cB6Gzud9MV6eUNGqa7rlhrvNnpu1DEBoTJkyYMGHChAkTJkyYMGHChAmT2gljQkNOZKZ1bWtrI6UpRa1Wq25pp80skUjQmjVrmJbrPHr0KMtMUWqz2Sgejys6BqIoUn19vTAyMkLNzc2GPma9vb1Txkzu7u4mpamqq6qqhLGxMWpubtY81bDL5RJ8Pl/695nSIc/k+eefT//c0tJCdrtdyEw1u3PnzuwLCVyqqqqE7u7uCX9raGigwcFBTeuvFiRJYg0NDRP+xlM3XC7XtNuaz/GMHQ6H0NbWlv59rnF4jaalpUVwOp3p39999908lkZ7brd7wu8ej4fOnDmj6NpqtVqFrq4uob+/37DPCoODg1ndb6arU3V1darHeK6urjbktQcAAAAAAAAAAAoTgtAAJuF2uye8sI9Go7R7927NXiZnBjB5AtCZjBoIyPTKK69M+J0nICDjGZeVV21t7YTflQbwYrEYywyw1dTUEBHRtm3b0n+LRCKqgxeg3nSBpPb29jyVZmYHDhyY8LuaujHdtk5eb66tXbt2wu9mCsKJokhf/epX079fuHAhj6XR1uDg4IRrls/no3A4zN24R8/rcbYm13Ot6tThw4cVLx8IBCb8vmLFCtwHAAAAAAAAAAAgJxCEhpzI7N25Z88evABVwWq1UjgcJpvNlv6b3++nWCyW9b7s7e2dEAx49tlnTRFQ5pVMJllm72KPx8MdENDbPffcM+H3ZDKpaLldu3alfw4EAunAjMvlmtCTsqWlRYNSAi+XyyVkNiLx+/2USqXyWKKJUqnUhGCx0+lUXTcmn3MHDhzI67aWlJRM2I5r167lqyiqlJaWpn/OzFZhdpMDtNu3b89TSfSRTCYn9IJ2u91Z1anMe/+ePXsUL7tx48YJgehEIkHr16831PUHAAAAAAAAAAAKE4LQkBOZvTsTiQSVlpZSOBxmeAnKx2q1CmfPnp3wt4qKiqzT3fb29k74feXKldmszrCuXLky4ffJPSTNanBwcEIq9Y0bN074/+eeey79s9/vRyOQPJF7p8uGh4cNcxyGh4dZIpFI/57Z+1aNzOUTiURet/U//uM/Jnz2woUL81UUVUZHR/NdBF288cYb6Z9tNhvZ7XZDNQjKliRJE36fXP95TX6O4unR39zcLEzOpNLU1GSY6w8AAAAAAAAAABQmbQc0BZjB8uXLBafTme5tm0gkqK6ujurq6pjb7aYnn3ySysvLTf8S+r333qNwOKz4xa7X6+XeXofDIXR2drLq6ur035xOJw0NDZHaMYpPnTo14ffPfe5zOTkO7e3tVFpaqmh/aXF+XL9+fco6jebixYsTfrdYLHMukznWs8fjmbKfKisrBZvNlg4ydnR0kNfr1aK4hsVTD2tqanKS0ndy446LFy+S3W7X+2MVmdw7+LHHHstqfQ8//DBl9gK9ceNG3rb1V7/61YTf7733XkXLGeUc6ujoSP+cOcZ7vmi1XzKzb0wehqAQTL6WZ9voqba2ljIzefA6c+aMsHDhwvR9IBgM0vLly5ma5xAAAAAAAAAAAAAlEISGnBBFkS5fviw0NTWxyS9Ro9FoOsWozWZjtbW1VFtbS8uXL+ceGzLf4vE41dXVKZ5fbSCwqqpKCAQC6VSfiUSC1qxZw7q6urJ+mex2u1UHs3llBqnmEgqFsg5i9ff3T/jdaI0ekskka2pqSv/udDrnTIueTCZZJBJJ/545BrRMFEV69tlnqaGhgYiImpqaqLa2lvs4326soCgAtWjRorymOuephwMDA4qC/dm63bjDkL0PP/roowm/Z9sQ5cEHH5zw+/Xr18nlcmWzSlVSqRRt2LAh/bvNZlMcLDbCORSLxSZkOSgrK1O8rF5BdC32y+RsDI888ojidZrF5B7s2d5vJtcp3kYsoihSPB6nBQsWpP9WV1dHDoeDORwOQ90LAQAAAAAAAACgMJgrwgemJooitba2Cps2bWLf+ta3ph3bMpFIUDAYpGAwSG63m4XD4YIcm1gLO3fuFC5cuJAOUESjUdq9ezdrbm7Oan9ZrVZNymdEv/3tb9M/Z46vaQSDg4Ns8+bNlJkS+Zlnnplzucwxnmcbx/fJJ59MB6ETiQSdPXuWVVVVcZ0rkUiEMgPes7k93jbP6guemRrVZFvW//E//kfeA+7T1SkzjYkei8VYZgCdaLwBiVJGCKLP5ObNmxN+/9M//dOcfXauZAahtbjfaFGnrFar0N3dzSoqKtJ/q6yspHg8zvCsBQAAAAAAAAAAWjPPG3EoGA6HQ+jq6qJkMsmuXLlCb731Fr3xxhsTUnMSjQdVFyxYQJ2dndzBsnxxOp2KAodaEEWRTpw4QaWlpekgi9/vp4cffphl0wM1EolQOBzWrJyzCQQCVFpaqmheLVJnL1++PP1zIpEgSZJy8uK9v79/2vE75XSthw8fntIow+fzUW1t7Zy9oDN7k2eO/TyZxWIRfD5fOhPBjh07qKqqimMrzCUUCimeN1cNL3jGcM23wcFBlk3Pzffff3/Ctt59991ZlynTdHXqd7/7XXp8++nqlMfj4RoCQc9zaLpzQS7/6OgoHTx4cMo9sbu7Oydp4+eixX65fd1N74O33nqr4BqtZN7btLjfTK5TDodD1XpcLteUTCper5fOnDljqoYyAAAAAAAAAABgfHjbBHljsVgEl8tFLpeLmpubSZIk9s4779COHTsmvHyvrq6mW7dumeLl6P33369qnGe1LBaLcOnSJbZ48eL03yoqKmhkZITrZXd5efmEHq7ZBqCU2rhxY05TYk8OhL3zzjs5CcT6/X7FqcdtNhsdOnSIlDS8yBwr1mazUWVl5azLbN++PT2maDwep1gsxtVgwePxKB7XdNGiRUpXqwsjjnM6eYxYtUEkPUxu5HHq1Cmqr69Xvb7z589P+H3JkiWq1zUdnjpFND7MQHt7O9c5oec5lHnNnovT6aRoNMqdFUSvILpW+8Vms6UbUL3xxhvU3NysxWoNY3L9zvZ+c/z48Qm/33XXXarX1dzcPCWTSlNTE2ttbTXcdRMAAAAAAAAAAMzL+FE9KBpWq1WoqqqiyspKevnll5mcOpiIqKenJ6vevYXMbrcLnZ2drLq6Ov03p9NJQ0NDitfx+c9/fsLvvGNNmsUXv/jFCb//7Gc/M1RvYLfbTUpT0KdSqQmpeROJBP3xH/8xV0/bXbt2UVdXl+L5165da8jgrlncHlM77d57781TSaaaHITs6OjIKgid2UBiuvXnitPppJdeeimv45Nnw+fzUUtLi6CmEZbR62ptbe2ERjHJZJIZoae3Vian4D5y5EhW95s33nhjwu8lJSVZ7aszZ84IS5cuZXKjv2AwSMuXL2dGP28AAAAAAAAAAMA8EIQGwxFFkerr64U9e/YwuZfU0aNHCy5Vp5aqqqqmpNdcs2YNe/LJJxUtv3z5csFms6X39/PPP0+1tbWm6H3Ow2q1Cm63O9376+jRo/Td735X95TcTqeT7r///il/Lysrm5CK/l//9V/pf/7P/6moLGfPnmWZY92qEY1Gc9brvdhJksQysw14PB5DpFaWTU7XHo1GVacPliSJZabC9vl8mm/rbHWqtLSUHA4H3XXXXTnNtMDD4/FM+/fy8nLKbIBFZK6xxHlkBqGJxhsueL3ePJZIW1arVfB4POl6H4lEqLW1VXWdyswQEwgEsj4vRFGkaDRKTqcz3SO9rq6OHA6HaYYNAAAAAAAAAAAAYyvMN5tQEDJfUL/99tv5LYwJ7Ny5c0p6zX/9139VtKwoirR169Z0ett4PE5r1qxhZ86cUdUDz8h27dqVHis2kUiQ0+mkeDyuayD6mWeembFX4saNG9Pp1BOJhOKUqDt27Ej/PFNAbibnzp1LBx127tyZszHAi5UkSczpdE7427Zt2/JUmplt2rRpQlBQTd2Ybls3bdqkXSFvm61OmUE4HJ6x7PPnz2d1dXVENN479ZFHHmFK0vObjcvlmtD46fY2F1RP3G3btk0Y6kKrOrVx40ZNyme1WoVjx46xioqK9N8qKys1WTcAAAAAAAAAAMAf5bsAUBzC4TA7ffq04t41kiSxzGDI5s2bdSlXIRFFkU6cODEhBShPT9mmpqYJy0ajUVqzZg1LpVKKlo/FYuxTn/oUi8Vihu5FtXz5csHtdqd/lwPRkiQpKvfg4CB74IEH2O7duzXZTrvdLmSO3RoMBmmuuhKLxSb0iuvo6KBwOCwonVpaWtLLRiIRSiaThj5mZiYHkDLrosfjMWR6aIfDIWT20OWtGzNtq8PhMNy2GpnX651wjXrqqacKto4eO3Zswu91dXWk9NqaSqVo//79bPXq1YrvU7nmcrmyut9MV6d8Pp+mPfxdLpfQ1tY2oYwAAAAAAAAAAABaQBAadJdMJlldXR1VV1fTAw88wAYHB+d8+drY2Djh97Vr1+pWvkJisViEzOAk77KXLl2a8Dc5EB2LxdhMQZBUKkWNjY2soqKCEokEVVRUkJED0TMF651OJ822nUTjjSkWL15M8Xic/H6/4mDJXHiDTi+++GL6Z7fbzR2QqK2tnTB/ZlAatJFMJlk4HGYLFiyYENRxOp3U3t5u2KBse3u7kNnrUkndSCaTLBaLTQmWGX1bjSwcDqevUYlEgtavX5/fAunE5XIJgUBgwt/8fj81NjbO+qwgSRJbunQpa2hooGg0SgsXLmRKA7u5dubMGYH3fiNJEjt9+vSUOuV2u6mlpUXzOlVfXy/MlCIeAAAAAAAAAABArcLKswuGlBngisfjtHjxYnI6nez++++ntWvX0qJFi+iee+6hGzdu0L/8y7/Qnj17prx01Wtcz3A4zPXSuqamZtaxTd977z3udS5atEjTXpFWq1Xo7u6ekF5TKbvdPmXZaDSaTl/tdDrZV7/6VSotLaX+/n66cOECZY79yqu9vZ1KS0s1PQZK3A64sxUrVqTPNTmATjRxO0dHR+nixYsTUqrK5s+fn00xJjhx4gSVlpZSIpFIB526urqmzDc4ODhhbOFdu3Zxf5YoihQIBNLp1/1+PzU1NTEjjVGcLd56SKT83JrpvJXPFUmSpq0XTqeTotGoocf4lceJdbvd6bHKZ6ob/f39E8Y0z2Sz2Qy/rXNRcw5plUraarUKhw4dYtXV1UQ0fh0Oh8OGSFWtdd1qbm4W+vr6JlzXgsGgnBqeeTyedEO0np4eevvtt6eccwsWLOAtUs6IokjxeHzC2Msz1amenh46evTotL2RnU4nhcNh3epUe3u78N577zG1DdkAAAAAAAAAAAAmM+/bYTCNnTt3CqWlpekxLonGg9HxeHzawF4mn8+nS68fWWaZlBgYGCCLxTLj/8fjce513k7Ny7XMXG73LmNykJF32ZGREZYZhJLJx20mbrebwuEwKR3vUk355joGStntdqG/v5+tX79+SsBwru202Wx09uxZTdMMWywWRUGnffv2pX92Op2qGzA0NTVN2P8dHR3k9XpVld2IeOshkfJzS81529bWRlu2bDHFGOtWq1W4fPkyNTU1TRgWgWjuukH0h+u2GbZ1NmrOIS3rUFVVleDxeNLB2bq6Olq9erWu49croUfdCofDwhNPPJG+/mWKRCKzPiuYoW5ZrVZhaGiINm7cyCZvi1HqlNwAZXLvawAAAAAAmGp4eFhVJqZP2WzCHXM818vr/uT8+fSJefNUf/8bHh5m/yeRoBs3btB995WRdYGV5s+fP+f61Hz+6Ogou3nzJs2bN0/RZ/AYHh5m/f/2b/Rf//Vf9IWlSxXtw0y/v3mT/XZ0lLtsH6dS9JtEghERlZSUcG+T/Llql59LNuVTe7yy2abM40hEdN99ZVRa+uk5j6Xaz1S7jVrVP9nvb95kv/71EH3wQR8REf3Jn/wJlX7mM4q2Rd4GXmrKruc1jegP5+svL1/m2geZlOwP3uuDWqOjo2zgww/pxo0bRER0zz330JIlS1SfM5n1We01bjbZnM9q7yWZjPvGDgqGKIrk9XqFmpoa1tLSojiAEwqFNOtVVoyam5uFCxcuMDU9leUg1NmzZ9mOHTvmfEFONB4IqK+vN9XxslgsQldXF8ViMbZr1y5FvboDgQDt3LlTpIrw+QAAHqtJREFUl2BAVVWV4PP50oG/uro6Ki8vZ3ImgGQyOSEo+Mwzz6j+LIvFMiHA1dTURLW1tabuuWo0TqeTNm/eTI8//rjihhlGIYoitba2CrW1tezFF1+cs8EQ0XiDmm3bthlyvGuzam9vF86dO8fkoKDb7abLly8XZD2tqqoSxsbGWEtLCx04cGDOQKjT6aQjR46YZsxxURQpHA4L27ZtU1ynfD4fbd++XbdsMJNZrVbh2LFjqjKpAAAAAAAUk4cqvqxqube7L7DZAi/Dw8NMXrerwkWvHTnC/xnnzrEd33mGJEma7r/Zo+vW0d6/fW7GgIT8+T9sfYHW1dQo+szv7wrQmydP0qPr1tG+YOuU/y+1L2ZERP2DA4q+21x+910WfOEFinXHpt2GsrIyetzjIW+dd85gTVdXF32r8ZtERNT505+y+8ruU1SG3yQS6WPRPzigZJEZP1fN8nN56cWXWOvtjiqvH/sJW7psmeLvjfLxIiL6xS8vM6UBJd5tmuM4Et0+H5u+8+0ZA5Jq9+Nc5+R0MutfWVkZnfrpGcWfl+njVIpeevElFj5yZKZ6SFarle347rNUXV094zmceZx48NRdmR7XtI9TKQqHwuz1SIT6+vqmm4W5Klz05FNP0UOrVs15DircH4yI6NF162jL00+T0vquxOjoKHuxrY1eO/zqjPO4Klxs53e/x/25nZ2dTD7Pf9j6AltXU6N4+cw6MgfmqnDRV7/2tVnPO9nld99l9VufnvVe8r1dfkUB6cJ7iwmGZbFYhObmZmpubqbBwUF248YNun79OvX09JAkSWS1Wmn58uXkcDjoc5/7nOIgH2NMcaUsLy+nUCikehusVuuUv23bti2rMasXLVo04/9lrnu2+WZy5swZ4ejRo0zN8qIoUlVVlVBVVUWDg4Ps4sWLRER06tQpIhofp9vhcNC9996rOD221WrNav/L69Cay+USurq6SJIkJqfAls9LOWX8Zz/7Wa5AYuZ2lpeXKy5LS0uLsHz58nTrsxs3bpDdbiciIkmSJqx38tjOvFpbWyecu//93//NRFGcsE6128Er23Mj27otl2Gmvytdtzy8gMViyUvgWYv9kMnlcgkul4sOHjzIzp8/Tx999NGUa/bdd99NK1euzDpN/lz0Phe13neZ1J7foijSpUuXSL7+EhH9x3/8x7S9ofUqv551azL5OWHnzp3U09PDrl+/Tv39/dTX10dlZWVUWlpK5eXlVFJSorohkBb3IZ7njsn0rlOTt4/3nulyuYTu7m52/fp1VcsDAAAAAIB6hw8dSv8c647R8PDwrEHryb4fCLDMAImrwkXz53+S/vnSpXQg4c2TJ+nNkyfJHwgwJUHcXPo4laK9e/awyUGesrIy+uT/9cl0MLOvr48Cfj+9Homw9nBIca+8v/z61+nn599mWvRwzaff37yZDkATEfm/+z3VAdPqR75C3ZcukpbngRyEzSwj0fhx/MxnP0v/9qtfpYOS8vn4jSf/ku189tm8no/H3/in9M99fX3c9Y9oPJD9tcf+Ykrg7tF164iI0kFUSZLoW43fpOd+sIe9+uMfaxosNYLR0VG23eeb0gDBVeGiX33wq/T+iXXHKNYd0/z4y+fVo+vWsX/4YUvW63373Dm26cm/mvA3q9VKX1qxYkJgPNYdo+qvfIXrcz9Opei5H+xJ//7cD/ZQdXW1pnUys3yx7hj96MDLs14721qDE+rvbPeSxu3b2dPbnp59WxljmDBhwoQJEyZMmDBhwoQJEyZMmDBhwoQJE6Y5pk8vsrNPL7KzjhMnmFbrvJlMMnm98rR71y7F6+84cWLCcqlbtyb8f+rWLeo4cYJ9adkX2acX2Vn1I1+ZMo/abftmg499epGdfbPBN+0y8jpnW8dvf/vbdNk+vcjONtbVsaGhoQllTN26RUNDQ0z+PHl69513Zlx35n6R1zvddk+ehoaGmJJyK/lcrc+/9ldfm3Ku9L3fx328MveJVtuUunWLqh/5yoR1973fN2Wf30wmWeb5+OlFdvbb3/52ynrV7se5zsnJ03T1T+my8nTu5z+fsHzHiRPTblPf+30TzuGZPod3G7KZtLymvfvOOxP2Q/CFVjY0NDRhvTeTSdb3fh/LPFe+tOyL0+6vyftjpjLeTCbZu++8w4IvtE44r4IvtGa1TZnH6kvLvsjefecddjOZnLDOoaGhKedz9SNfUfS5k8+bua5pkycldaTv/T7W/uprU/b3dNfCzOO3e9euKduaunWLzv385+lt/dKyL06ZZ/L0R9rG0gEAAAAAAAAAAAAAQKlXDr5CROO9RX/Y+gIREb12+FX6/c2bisZqfeMnPyEiom88+Zf0Pb9/Sq+0O0SR1tXUCD8//zY1bt9O7eGQLj3t1Pr+rkC6h50/EKDXjhwRSkpKJmzHHaJIJSUlwr5gq/DK4X9MZ26q3/q04v0U647RSy++pGr8WyP4OJWil/bvJ6LxtMtlZWVERPTySy+pXmesO0Y/fq1dk32yd88eJvdybty+nf7x1VeF+8rum3I+fmLePGFdTY3Qfemi8Oi6dfT6sZ9oPp44j8z69/qx8br05smTNDo6qmi/jI6OpnvKWq1Werv7Aq2rqRGm26b7yu4T9gVbhdeP/YQeXbeO/uGHLQXTC/r3N2+y+q1PE9H4fuj86U+podEnTO5R/ol584T7yu4TOk69KTRu305E473Dv78roPqzPzFvnrB02TKhodEnXHrnF4JcN1r37VN8HCd7+9w5Jvd0fnTdOvr5+bdp6bJlwuRsCiUlJYJ8fXVVuIiIKPCD7yv6jH94/u+IaLy+fOPJvySi8ewGWrqv7D7h69/YKJz66RlBvr9IkkThUHjKfjnS/mMiGt/e7/n9U7b1DlGkh1atErovXRQat2+nnxz/pznHm0YQGgAAAAAAAAAAAAAgDz5OpUhOfRr4wfepurpakAOscnBsLnLa26rq6lnn+8S8eUJDo2/a4Fi+ZAZ6ftj6An39GxvnLNtDq1YJr/54PFgiSRLt/N87Zp3/0XXrSA52te7bR5fffdeUgejOzk4mD+dUXV0tyIGuN0+epOHhYa5tenTdunSa6IDfn/U+GR4eTqdSb9y+nRoafXOmI75DFGlfsFXgGdNaax+nUhS+Pf76X2/dQg8++GC6/oV+rGxc9szg6c/Pvz3jGNeZli5bJuwLthoqJX62dv7vHenGJD85/k9zphm/QxSpodGXDkS/efIkvX3unCZ1MzMI3H3hAvfyv795k+34zjNENJ6Oel+wdUpAdrJPzJsnvHbkiPB29wVSck5ffvfddKONTZs30ZNPPUVE4+ng9bpGZd5fol1np/y/fC1e9fCfz7oe+dgpOdcRhAYAAAAAAAAAAAAAyIPOzk5GNN5z8MEHHxTuEEXyPvEEEY0HTD9OpRSv68aNG/oUUicfp1IkB3rKyspoXU2N4mDkfWX3CXLPwTdPnqQP+j6YNWjz9LanBbmX4uMbvqa6d2Q+/ejAy0RE5H3iCbpDFCcETDPHNFbqH37YImT2KM9mn2zZtJmIxs/jp7c9bZhGDnOZHNi/QxRpx3efJaLx+jdXL/vL776bbkThDwTm7BVaqCbvB57xtJ/e9nT6PNzxnWe4rnkzWbpsWbo39NUrV7iX/4e///t0QH3P3/4t17JKtz34wgtENN4g5BPz5gklJSXpa5TcI1lrmfeXyWN26wVBaAAAAAAAAAAAAACAHPs4laLnfrCHiIh2fPfZdIrsTZs3peeRg9SzkQMXz/1gj6mCq79JJJgc6Gm5HZDh8Tff/nb651/09Mw67x2iSC//6EfpNN7Vj3xFk2BXrkzuNUk0vk08AdPJ7hBF6vzZT4lovEf5Rm+dqn0yOjqaLtv+Ay8ZKtX7XOT6Jwf2icZ7i8r/f+wnx2Zd/nRnJxGNB9+9dd6iDEATEV2MXUz/zLsf7hBF2n9gPKW8JEn0m0RCk2vYb3/7WyIistsXcy97+tT4cW3cvp0roK7U8PAwk4PATd/5w3XM981vEpG67AZK3X333URE6WthJjk7gpb3EgShAQAAAAAAAAAAAABy7MqVK+kg7OrVq9N//8S8eelevs/9YM+cgcGvfu1rRDQewKl+5Ct0sqODmSEY/cvLl9M/z5W6dzqfmDcv3XMwc12zzZ+ZxvtvvtVk+H0kk8eJ/caTfzmhty1PwHQ68+fPF+RxkPv6+mjvnj3c+2Tgww/TPy++917uMuTL5XffTde/zIYfd4hiOn37S/v3z1r/+v/t34iI6EsrVpgq+K61D//934loPIipZj8sWbIk/bOSujyX4eHh9LFdcv+SOeae6Pc3b6aXdTgdWZdlOi1/9/dENJ4BIjPIndmD+/ChQ5p/7sepFL0eiRDR+Dk72RMbv05E49fHP/vCUmprDWZ9LyneWgEAAAAAAAAAAAAAoML1weuKe6rN1JNODiw2bt8+JY3vk089Ra8dfpUkSaIrV66w2cYYXVdTI1wfvM5a9+0jSZLoW43fJCKisrIy9siaNVT5yCNUWvppxePP/ujAy3TurZ8r2rZ/vnRJ0TqnI6fJlYMuapR+5jMU644pLsd9ZfcJP2x9gX2r8Zv05smT9IWlS5mScajzaXh4ON3TWB43ViYHTFv37aOX9u8nb52XOwi4dNkyoXH7dta6bx+9dvhVeuDBBxlPavTMNPCzjTc+V335lM2W0zGSZwrsE40HpeX6dOHCBfbQqlXTbpfcm3W2MXR/f/Mm++3o6Iz/P2/evBn32z9fukTbfY2K6uL3dvln3f9zyeaaJqfi/sLSpao++/b+Z3I5sjE8PMy+9thfENH4teXBBx/k2ie//vVQ+ufSz3wmq7JM5/c3b6ZTl2eOXS37661b6FuN36TXDr9Kf/PtbzOtUrx/nErR3j170teSLU8/PWWezGsB0XiGhdZ9+8hqtbKqtdVUVV2dHjZCKQShAQAAAAAAAAAAAAA4yC/nlegfHJjyt8z0ynVff2LK/98eH5TFumPk/+736NRPz8z6GQ2NPuGxr/4F27JpM8nr7evro76+PrmcrHH7dtq0edOc49bKy+lt9LfjgbnPfPazqtfxwIMPEhGlx29VYl1NjXD1yhX22uFXKeD305L7l8wa5M83udekq8I1bYOGzIBpZ2cnVwBZ1tDoE9595xcs1h2jbzV+k76wdClTmob43Fs/J6K5GxM8VPHlWf//7e4Lij8zWx/0fTBjYJ9oPCj66Lp17M2TJ+kfnv87emjVqinzZAZs/+RP/mTGz+rq6ko3DJnOo+vW0b5g67T/J0lSOsA7l6bvfJvmz5+vaN7pqL2mZfYU/9O7/1T15z+6bh29efJkulf1dGYKlP+fRIJu3LhB5976eXp/Wa1WevmVg9yNMj744A/XPj3Ox1cOvkJE4+Wb7rpTXV0tPPeDPUySJHrl4CvU0OhTtN6ZGhD88vJl+s+P/pNe2r8/fZ1s3L59xuwT8r2k5e/+Pr0vJUmi1w6/Sq8dfpWIiH3jyb+kv/n2txWNgY4gNAAAAAAAAAAAAABADgVvj4H86Lp1M/Ze9H3zmxTrjlFfXx9dfvfdOQOlJSUlwqmfnqHf37zJenp66ML/+//KQQMi+kOQqfOnP2Wzpb8uKytTHBj+50uXuALAmeZ/cjxgNjr6W1XLE6nvNbnz2WeFnkv/zPr6+qh+69PU+bOfsmx6kepldHQ03WtSHi92stvp29lrh1+lHx14mdbV1Kj6rJd/9CP685UPkSRJ9LXH/oJ+fv5tRb0wv7B0Kb158mROGi5o5eWXxscgnimwTzQe1JW3a7r69ymbLd1797/+6790KWdZWRn99dYtiub9ZBYB6GxkBnn/86P/VL0eOZvBvZ/+9IzzKA2UP7puHe392+cUBUknu+eee9I/Dw8Pa9ow4uNUKl1+eTz3ye4QRfI+8UR6W5/e9rSiQPpcjTyIxgPf+w+8NG3wO1NJSYmwL9hKe//2OXbt2jU63dlJp091pq/1ckB6rnsJEYLQAAAAAAAAAAAAAABcftj6AqnpcUo0HtiQ0/hOlxJVdnt8UNbX10dH2n9MS5ctU7T+T8ybJzy0ahU9tGoVfc/vp+HhYXb40KF0QHrvD75Prx05MuPyf711i+Jt2+5rZEp7ak4m92KW94Ua777zCyIaDzrxuEMUqT0coupHvkKSJNF2n4/+8dVXDTeub+jH48eprKxs1sCRnL5daYOF6Xxi3jzhJ8f/iT1U8WWSJIm2/PVfK9onC//XwvTPv795c8bAdf/gwJS/Dw8PMyXBMy0NDw/PGdgnmpiNIPjCC1PqzB2iSFarlSRJoqtXrswY/F9XUyNM939K6s5nPvtZ1dcZXtlc01wVLop1x+iXly/T17+xkXv5j1OpdIBzkX3RjPPN1EBG3o9lZWX0k396Q1XwWZY5rnn/v/0blZSUqF3VFJ2dneneypnjuU8mZzeQl1FyXKa7BmY2Enq7+wJ3z+5PzJsnLF22jJYuW5a+lxx/45/SZWv65jfnzNJhrCsqAAAAAAAAAAAAAEABk9MrExFVf+UrRLd7U87mzZMnqek731bVK6+kpET4nt9PVdXV7PENX6NYd0zzHn5q3HffH9I3f9D3wZw96ib7OJVKB7DVjEU7f/58Yf+Bl9L7ZO+ePex7fr9hekP//ubN9NisfX19VGpfrGi8XiXp22dSUlIivHL4H9mmJ/+KYt0xeunFl1hDo2/WfZI5bu6vfz1E95Xdp+qzJ8s8P2YLbk8m96yf6Zw4/sY/pX9+fMPXiBTUv5nqzJdWrKA3T56knkv/rKRoBStzbPaPUynuxhz9/f+ePgaz1eWZGsjc++lPs9Z9+6ivr496enqmTZ+u1O2MCIyIqDfem9W6Mn2cStFzP9iT/v2+0s8oqs/P/WAPVVdXz7lP9wVbp+yXD/o+YLfvMdTyd38/Y9p3pUpKSoSGRh899tW/YA9VfJn6+vrmvHb/UVafCAAAAAAAAAAAAAAAivz+5k3VPYcPHzqU1WcvXbZMkHvLZQbi8uV/ZfSg3fuD73MvHw6F00GcJfcvUVWGpcuWCf5AgIjGU8ye7OhQFBjKhWM/OaZqub6+vhnHh1XioVWrhMbt24loPP3x5XffnXVdmYFZNcdxJtYF1vTPv/71kOLl5IYJmT20ZZmBfV6ZjUdkNY+tJyJK90BXteIC8OX/5/8hIkqPS867fNPtHulWq1VVWvGntz0tuCpcRES06cm/otHR0ayOxTee/EsiGj//s12X7MqVK0zN0AWSJNGVK1dUleG+svvS17c3T57U7PpWUlIiyPtITm0/EwShAQAAAAAAAAAAAABy4JWDrxDReLDl7e4LiiY5IPja4Vfp9zdvTgki8ARJ5F6iH/77v2uyPdn4xLx5wg9bXyCi8cAhT4BkdHSUBfx+IhpPQ6sm/bTs69/YmA5gfavxm/TLy5fVrkozH6dS9NL+/URE1Lh9u+JzxWodD9xOFzDlkRnUe3zD1+jqlSuzzp95HN8+d06TQFfmGN1zBbpkmZ+d2UNbpqb+ZQbxJte/L3/5y4K8z+u3Pk0fp1Lc21kIHlq1akId4rkmnezoYPJ44ju++6yqVNp3iCLtCwbT5/9Gb11Wx+LJp55K//z9XQGuZWfadv93v0dE49crpeeevE/lZdWYfH2brYHKdPeXmYz+dnT839v3lJkgCA0AAAAAAAAAAAAAoLPMXpg7vvsslZSUCEqmTZs3pdchB9Fko6OjrPqRr9B2XyObK4CQORb1qof/XOvNU6W6ulooKxtPu/ytxm8qCmAODw+zjd46IhoPJu792+eyLsc/vvpqOpj4rcZvZr2+bHV2dqZ7TW7avEnxubLju88S0XjANJsenJODevJ44jNZV1OTPo47vvMMfdD3gaLP/j+JxKz/nxkAnuvc+DiVoh3feYaIxgN9k1Nnf5xKUfj2uM5P19cr3qfeOm96PZPr3x2iSPsPjAfIJUmivXv2MCXBz49TqTmDd2az52//Nv3zRm+dot74b587x+T65qpwZTX+9e30+kQ03jN97549qs//kpKSCT2Ivx8IzHlcP06l6PuBAPuzLyylttbghM++/O676UB703e+rfjck8csz7an/cs/+lG6Ln/tsb+YNkA/OjrK/nzlQ/SNJ55gc107MjN6LPvin8362QhCAwAAAAAAAAAAAADorKurK/3z6tWrFS/3iXnzJqRHzgwghH58hCRJojdPnqQ/X/kQvX3u3LTBkuHhYfbs//7f6d/VjKGshztEkV5+5WD6901P/hVt9zVOGwT5OJWikx0d6bFIiYie+7vnVfWcnK4cnT/7abar0cyPDrxMROO9oHm2r7q6Oj1v6MdHsirD/PnzhVd//GPF88vHUZIkqv7KV6itNThj4G54eJht9zWy22MyExHRvHnzpsznrfOmGwdsevKv6MevtU+7zg/6PmAVK8rTgfvv7fJPmSczsL/haxsUb9cdokiZ9W9yY4/MNPevHX6VKlaUs5mC8PI5XLGiPN0gZP4n+dNPG1Fm4Lavr48eqvgynezomLZxzO9v3mTbfY1s05N/RUTjjUn2BYNZl2HpsmXpNNGvHX41q1753jpvugfxa4dfpZq1j7LpAusfp1L0Qd8HrGbto0xurPHuO7+YcJ0+0j5ej1wVrimNI+baHrlxR/CFF9RuCn1i3rx0XZYkif7mW01TtkO+l8S6Y/RnX1g647EbHR1lO//3jvTvlY88Mutn840ODgAAAAAAAAAAAAAAXD5Opei5H+whIv7AIhHRY1/9C5J7UXd2djK5x2BDo09wOB1sx3eeIUmS6HZQh5WVldHyFV+iu+/+nxQ+Mh5ckP2w9QWuQIjeSkpKhF/88jLb7vNRrDtGb548Sbd72bFH162j+Z+cTz2X/jkdeCYiKisro5dfOajpdsyfP194/dhPJgRGs1VqX6woCPbounW0L9gqEE3sNfnYV/+C6/PkgGnrvn3Uum8fbdq8iWUTpL+v7D7hh60vMCW9wycfx9tlSJ+Ldvti+uXly/TPly5NOB8fXbeO9v7tc9PWiTtEkV798Y/pL7/+dZIkiQJ+PwX8fuaqcFHpZz5Do78dnbK+H7a+MCGVtyyb+rdp86Z0/evq6qJ1NTUT/n9fsFVY9fCfs281fjMdhKfb5+8Xli6lwcEB6v+3f0uPV000Hnjd8d1nZ+39e7suKA6kZp5H+fD1b2wUlty/hNVvfZokSUpnFSgrK2PLV3xp2uM12/FXY+ezzwo9l/6Z9fX10aYn/4p+8cvLbLrzYS53iCL946uvCnv37GGvHX41HVinWa5L8vb8ww9bhDvE8fDr8PBwutew3LOZx9888x3a9ORfUaw7RsPDw0ztNe/2+NAs4PfTmydP0qqH/5xlnnsNjT6h3FU+5dhZrVb2pRUr6N5Pf3rKvcQfCNB9ZffNWh70hAYAAAAAAAAAAAAA0NGFCxfSvTDrvv4E9/IlJSXp3pbP/WDPhF52D61aJfz8/Nsk9wAkGu+J+NrhV6l137500KCsrIxeP/aTrFLe6mX+/PnCP776aronpezNkydJDgDJGrdvp45Tbwp6BNKXLluW7nWeL5ljx6rZxsz07cd+cizr8qyrqREyz63ZTHcc5XNRDn5NPh/3BVuF2QKQ95XdJ3RfujihDLHuGL12+NUJ63NVuOgXv7w87fl9+d130/WPN7BPNN6TdKb6J1tXUyP84peX0+P4Eo2fvwG/n147/OqEAHTj9u308/NvG7IuZmvpsmXCz8+/TfL+IvrDOZB5vKxWK71y+B/nPP687hBFag+H0r9nMz70HaJI3/P7hc6f/jSdzppo+utSWVkZdf70p7Qv2JoOQBMRHT50KP3/asauzxx3PNux3ucaH3rpsmVT6pqcaSPzXmK1WumHrS/Q17+xcc7tERjTZIx4AAAAAAAAAAAAAICCJr+0/+T8+Vw990ZHR9nNmzeJiFT33v39zZvst6OjRET0KZttQqBj8mcNfPgh3bhxg/7zo/+kP737T+kLS5fOugyRum2Tt2vevHnT9j5VS96Ga+9do48++ogcTgc5H3iA6zPk/cVbto9TKfpNIsGI1B2rzOOkVGYZ1Z5jmWY6LmqPl9p9knkcBwcH6IEHH1R0Ls62PmlEog8+6Euf2/fccw/93zbbrOXKZf0j+sP++uXly3T1yhWy2xfTkvuX0OJ771W03zPLy0NNPdTifJtJ5n64Pnid7r77bvqz5cvpf/2vhaqun2quTURzHy+lfn/zJvv1r4fogw/66NxbP6dVD/85ERFVfPnLM+53Lesz0cTzN/OcVHpeZ9bluc6XzPp2ffA6LbIvovvuK6PS0k8r3p8IQgMAAAAAAAAAAAAAAAAAgGaQjhsAAAAAAAAAAAAAAAAAADSDIDQAAAAAAAAAAAAAAAAAAGgGQWgAAAAAAAAAAAAAAAAAANAMgtAAAAAAAAAAAAAAAAAAAKAZBKEBAAAAAAAAAAAAAAAAAEAzCEIDAAAAAAAAAAAAAAAAAIBm/n/GDB01AZxObgAAAABJRU5ErkJggg==";
@@ -532,6 +649,44 @@ function writeCache(path, data) {
 // Whether the server then accepts or rejects a replayed write, the
 // round-trip happened, so it's removed either way — a rejected write
 // was never going to succeed by itself retrying again unattended.
+//
+// The server's answer is checked, not assumed: a queued write the server
+// then REJECTS (validation failure, a table/PIN guard, an expired
+// deployment) used to be dropped from the queue with nothing shown, while
+// the person who made the change had already been told it saved. Those
+// are now kept in a "rejected" list that the dashboard surfaces until
+// someone dismisses it. A server hiccup (5xx / timeout / rate limit) is
+// retried a few times before it's treated the same way, so one bad
+// request can never block every change queued behind it forever.
+const REJECTED_KEY = "mrcap_rejected_writes";
+const MAX_QUEUE_ATTEMPTS = 5;
+function getRejectedWrites() {
+  try { return JSON.parse(window.localStorage.getItem(REJECTED_KEY) || "[]"); } catch { return []; }
+}
+function setRejectedWrites(list) {
+  try { window.localStorage.setItem(REJECTED_KEY, JSON.stringify(list.slice(-20))); } catch { /* ignore */ }
+  try { window.dispatchEvent(new CustomEvent("mrcap-rejected-changed")); } catch { /* ignore */ }
+}
+const WRITE_TABLE_LABELS = { jobs: "Job update", quotes: "Quote update", customers: "Customer update", vehicles: "Vehicle update", announcements: "Announcement", issue_reports: "Issue report", app_settings: "Settings change", team_members: "Team change" };
+const WRITE_FIELD_LABELS = { stage_index: "stage", service_done: "service done", service_step: "service step", assigned_to: "assignee", assigned_team: "assignees", history: "notes", on_hold: "hold", photos: "photos", invoice_amount: "invoice", parts: "parts", service_notes: "service note", customer_notify: "customer message", followup_date: "follow-up" };
+// A readable one-liner for "which change was it" — the raw path/method
+// ("PATCH jobs") tells nobody anything.
+function describeQueuedWrite(env) {
+  const table = String(env.path || "").split("?")[0];
+  const base = env.summary || WRITE_TABLE_LABELS[table] || `${env.method || "Change"} to ${table || "the server"}`;
+  const body = Array.isArray(env.body) ? env.body[0] : env.body;
+  const fields = body && typeof body === "object" ? Object.keys(body).filter((k) => k !== "updated_at" && k !== "id").map((k) => WRITE_FIELD_LABELS[k]).filter(Boolean) : [];
+  const who = env.actor?.name ? ` by ${env.actor.name}` : "";
+  return `${base}${fields.length ? ` (${[...new Set(fields)].slice(0, 3).join(", ")})` : ""}${who}`;
+}
+function recordRejectedWrite(item, status, detail) {
+  const env = item.envelope || {};
+  setRejectedWrites([...getRejectedWrites(), {
+    id: item.id, at: Date.now(), status,
+    what: describeQueuedWrite(env),
+    detail: String(detail || "").slice(0, 160),
+  }]);
+}
 let flushingOfflineQueue = false;
 async function flushOfflineQueue() {
   if (flushingOfflineQueue) return;
@@ -540,14 +695,26 @@ async function flushOfflineQueue() {
     let q = getOfflineQueue();
     while (q.length) {
       const item = q[0];
+      let res;
       try {
-        await fetch(GATEKEEPER_URL, {
+        res = await fetch(GATEKEEPER_URL, {
           method: "POST",
           headers: { apikey: SUPABASE_KEY, Authorization: `Bearer ${SUPABASE_KEY}`, "Content-Type": "application/json" },
           body: JSON.stringify(item.envelope),
         });
       } catch {
         break; // still offline — leave this and everything after it queued
+      }
+      if (!res.ok) {
+        const transient = res.status >= 500 || res.status === 408 || res.status === 429;
+        const attempts = (item.attempts || 0) + 1;
+        if (transient && attempts < MAX_QUEUE_ATTEMPTS) {
+          q = [{ ...item, attempts }, ...q.slice(1)];
+          setOfflineQueue(q);
+          break; // try again on the next poll, keep order
+        }
+        const detail = await res.text().catch(() => "");
+        recordRejectedWrite(item, res.status, detail);
       }
       q = q.slice(1);
       setOfflineQueue(q);
@@ -599,6 +766,11 @@ async function sbFetch(path, options = {}) {
         // the caller it "succeeded" so the existing optimistic-update code
         // in every screen keeps working unchanged; the pending-sync badge
         // is what tells the truth about it not being on the server yet.
+        // Callers that pass noQueue (e.g. Dispatch Board writes that must
+        // re-read fresh state before applying) opt out of this — an
+        // offline/failed write comes back as a plain failure instead of
+        // silently queuing a replay of possibly-stale data.
+        if (options.noQueue) return { ok: false, data: null };
         queueOfflineWrite(envelope);
         return { ok: true, data: null, queued: true };
       }
@@ -698,19 +870,19 @@ async function loadTeam() {
     });
     return DEFAULT_TEAM;
   }
-  // Table already has real data (PINs already set, etc.) — only add
-  // brand-new default members that don't exist yet (e.g. Fakher, added
-  // after go-live), never overwrite or duplicate existing ones.
-  const existingIds = new Set(data.map((m) => m.id));
-  const missing = DEFAULT_TEAM.filter((m) => !existingIds.has(m.id));
-  if (missing.length) {
-    await sbFetch("team_members", {
-      method: "POST",
-      headers: { Prefer: "resolution=merge-duplicates,return=minimal" },
-      body: JSON.stringify(missing.map((m) => ({ id: m.id, name: m.name, role: m.role, pin: m.pin, permissions: m.permissions }))),
-    });
-    return [...data.map((m) => ({ id: m.id, name: m.name, role: m.role, hasPin: !!m.has_pin, locked: !!m.pin_locked_at, failedAttempts: m.failed_pin_attempts || 0, specialty: m.specialty || null, permissions: m.permissions || {}, dashboardMode: m.dashboard_mode || "auto" })), ...missing];
-  }
+  // The table has real data: it IS the roster. (This used to re-insert any
+  // built-in default person missing from the table on every app start — fine
+  // for adding a late default like Fakher, but it meant nobody in that
+  // built-in list could ever actually be removed: they came straight back,
+  // with no PIN, the next time the app opened.)
+  return data.map((m) => ({ id: m.id, name: m.name, role: m.role, hasPin: !!m.has_pin, locked: !!m.pin_locked_at, failedAttempts: m.failed_pin_attempts || 0, specialty: m.specialty || null, permissions: m.permissions || {}, dashboardMode: m.dashboard_mode || "auto" }));
+}
+// Fresh roster from the server, or null if it can't be read — unlike
+// loadTeam, a failure never falls back to the built-in default list (which
+// would hide anyone added since).
+async function refreshTeam() {
+  const { ok, data } = await sbFetch("team_members?select=id,name,role,specialty,permissions,has_pin,failed_pin_attempts,pin_locked_at,dashboard_mode,created_at,updated_at&order=created_at.asc");
+  if (!ok || !data || !data.length) return null;
   return data.map((m) => ({ id: m.id, name: m.name, role: m.role, hasPin: !!m.has_pin, locked: !!m.pin_locked_at, failedAttempts: m.failed_pin_attempts || 0, specialty: m.specialty || null, permissions: m.permissions || {}, dashboardMode: m.dashboard_mode || "auto" }));
 }
 async function saveTeam(team) {
@@ -734,6 +906,56 @@ async function saveTeam(team) {
     })),
   });
   return ok;
+}
+
+// Registers this device for push notifications and upserts its token
+// against the logged-in member — a no-op on the web version (only the
+// APK actually has a native push channel), and never lets a permission
+// denial or missing Firebase setup interrupt login, since push is a
+// nice-to-have on top of the app, not something login should ever be
+// blocked by.
+async function registerForPush(memberId) {
+  if (!Capacitor.isNativePlatform()) return;
+  try {
+    let perm = await PushNotifications.checkPermissions();
+    if (perm.receive === "prompt" || perm.receive === "prompt-with-rationale") {
+      perm = await PushNotifications.requestPermissions();
+    }
+    if (perm.receive !== "granted") return;
+    await PushNotifications.removeAllListeners();
+    PushNotifications.addListener("registration", async (token) => {
+      await sbFetch("device_push_tokens?on_conflict=token", {
+        method: "POST",
+        headers: { Prefer: "resolution=merge-duplicates,return=minimal" },
+        body: JSON.stringify([{ member_id: memberId, token: token.value, platform: "android", updated_at: new Date().toISOString() }]),
+      });
+    });
+    PushNotifications.addListener("registrationError", () => { /* best-effort — nothing for the user to act on */ });
+    await PushNotifications.register();
+  } catch {
+    // Push is best-effort — a device that can't register for it should
+    // never be blocked from using the rest of the app.
+  }
+}
+
+// Sends a push via the send-push-notification edge function — targeting
+// specific employees (targetMemberIds) or, when omitted/empty, blasting
+// every registered device. Uses the same direct-fetch pattern as
+// verify-pin (a dedicated function, not the general gatekeeper) since
+// this isn't a table write.
+async function sendPushNotification({ senderId, title, body, targetMemberIds }) {
+  try {
+    const res = await fetch(`${SUPABASE_URL}/functions/v1/send-push-notification`, {
+      method: "POST",
+      headers: { apikey: SUPABASE_KEY, Authorization: `Bearer ${SUPABASE_KEY}`, "Content-Type": "application/json" },
+      body: JSON.stringify({ senderId, title, body, targetMemberIds: targetMemberIds && targetMemberIds.length ? targetMemberIds : undefined }),
+    });
+    const data = await res.json().catch(() => ({}));
+    if (!res.ok) return { ok: false, error: data?.error || `Failed (${res.status})` };
+    return { ok: true, ...data };
+  } catch (e) {
+    return { ok: false, error: String(e && e.message || e) };
+  }
 }
 
 /* ---------------- Services & Roles (admin-editable, DB-backed) ----------------
@@ -768,7 +990,7 @@ async function loadDynamicServicesAndRoles() {
 
   const treatsByCategory = {};
   for (const t of treatsRes.data || []) {
-    (treatsByCategory[t.category_key] ||= []).push({ name: t.name, retail: t.retail, b2b: t.b2b, active: t.active !== false, id: t.id });
+    (treatsByCategory[t.category_key] ||= []).push({ name: t.name, retail: t.retail, b2b: t.b2b, active: t.active !== false, id: t.id, perPiece: !!t.per_piece });
   }
 
   const nextServices = catsRes.data.map((c) => ({
@@ -827,9 +1049,9 @@ function stepsForCategory(key) {
 // component (e.g. the wa.me link deep inside JobDetail) can read the
 // current value without prop-drilling it through the whole tree.
 const DEFAULT_WHATSAPP_TEMPLATES = {
-  ready_for_collection: "Hi {customerName}, your {makeModel} ({plate}) is ready for collection at Mr.CAP. Thank you! Track it anytime: {trackingLink}",
-  job_started: "Hi {customerName}, we've received your {makeModel} ({plate}) at Mr.CAP. and work is underway. Track progress here: {trackingLink}",
-  quote_sent: "Hi {customerName}, here's your quote from Mr.CAP. for your {makeModel} ({plate}): AED {total}. View and accept it here: {quoteLink}",
+  ready_for_collection: "Hi {customerName}, your {makeModel} ({plate}) is ready for collection at Mr.CAP. Thank you!",
+  job_started: "Hi {customerName}, we've received your {makeModel} ({plate}) at Mr.CAP. and work is underway.",
+  quote_sent: "Hi {customerName}, here's your quote from Mr.CAP. for your {makeModel} ({plate}): AED {total}. View it here: {quoteLink} — reply here or call us to accept.",
   follow_up: "Hi {customerName}, just checking in on your {makeModel} ({plate}) — {reason}. Let us know if you'd like to book it in with Mr.CAP.",
   warranty_reminder: "Hi {customerName}, a friendly reminder that the warranty on your {makeModel} ({plate}) work with Mr.CAP. expires on {expiryDate}. Reach out if you'd like it looked at before then.",
   google_review: "Hi {customerName}, thank you for trusting Mr.CAP. with your {makeModel}! If you had a great experience, we'd really appreciate a quick Google review: {reviewLink}",
@@ -879,9 +1101,9 @@ async function loadAppSettings() {
 }
 
 // Who covers for whom, from the scope-of-work doc — Ahmed/Lani are each
-// other's backup on intake & updates, Noel/Regan are each other's backup
-// on detailing/QC. Lowercased, matching how names are compared elsewhere.
-const BACKUP_MAP = { ahmed: "laani", laani: "ahmed", noel: "regan", regan: "noel" };
+// other's backup on intake & updates, Noel/Reagen are each other's backup
+// on detailing/QC. Lowercased, matching the CORE_FOUR keys.
+const BACKUP_MAP = { ahmed: "laani", laani: "ahmed", noel: "reagen", reagen: "noel" };
 
 // "Who's out today" — persisted to app_settings like the other shop-wide
 // settings above, keyed by today's date so it auto-resets without anyone
@@ -948,6 +1170,38 @@ async function saveGoogleReviewLink(link, session) {
   return ok;
 }
 
+// Dispatch Board state colours, set by Mr.CAP from the board's Colours
+// pop-up. Stored as { "new": "#3FD37A", ... } with ONLY the states that
+// differ from the defaults (DISPATCH_THEME), so a later change to a
+// default still reaches every state nobody customised. Read on its own
+// (not via loadAppSettings) because the board re-reads it every minute —
+// that's how the shop TV picks up a change without anyone reloading it.
+// Returns null when the read fails, so a dropped request keeps whatever
+// colours the board already has instead of snapping back to defaults.
+async function loadDispatchColors() {
+  const { ok, data } = await sbFetch("app_settings?key=eq.dispatch_colors&select=value");
+  if (!ok || !Array.isArray(data)) return null;
+  if (!data[0]?.value) return {};
+  let parsed;
+  try { parsed = JSON.parse(data[0].value); } catch { return {}; }
+  const out = {};
+  if (parsed && typeof parsed === "object") {
+    for (const t of DISPATCH_THEME) {
+      const v = parsed[t.key];
+      if (typeof v === "string" && DISPATCH_HEX_RE.test(v)) out[t.key] = v.toUpperCase();
+    }
+  }
+  return out;
+}
+async function saveDispatchColors(colors, session) {
+  const { ok } = await sbFetch("app_settings?on_conflict=key", {
+    method: "POST",
+    headers: { Prefer: "resolution=merge-duplicates,return=minimal" },
+    body: JSON.stringify([{ key: "dispatch_colors", value: JSON.stringify(colors), updated_by: session?.id || null, updated_at: new Date().toISOString() }]),
+  });
+  return ok;
+}
+
 // {token} substitution — unknown tokens resolve to empty string rather
 // than being left in the message, so a typo'd token silently disappears
 // instead of getting sent to a real customer verbatim.
@@ -983,7 +1237,7 @@ function WhatsAppSendButton({ phone, templateKey, vars, label, small }) {
 // the ones that get skipped sometimes) also shows a "not needed for
 // this job" toggle that hides the checkbox once flipped on. Works for
 // both jobs and quotes — caller passes its own save function.
-function CustomerNotifyControl({ record, templateKey, session, onSave, skippable = false }) {
+function CustomerNotifyControl({ record, templateKey, session, onSave, skippable = false, label = "Customer informed" }) {
   const notify = (record.customerNotify || {})[templateKey] || {};
 
   const patch = async (fields) => {
@@ -1016,7 +1270,7 @@ function CustomerNotifyControl({ record, templateKey, session, onSave, skippable
           style={boxStyle}
           onChange={(e) => e.target.checked ? patch({ informedBy: session.name, informedAt: Date.now() }) : patch({ informedBy: null, informedAt: null })}
         />
-        {notify.informedBy ? `Customer informed by ${notify.informedBy} · ${fmtTime(notify.informedAt)}` : "Customer informed"}
+        {notify.informedBy ? `${label} by ${notify.informedBy} · ${fmtTime(notify.informedAt)}` : label}
       </label>
       {skippable && (
         <label style={{ ...rowStyle, marginTop: -6 }}>
@@ -1061,14 +1315,14 @@ async function setServiceCategoryActive(id, active) {
 }
 
 async function saveServiceTreatment(treatment) {
-  // treatment: { id?, category_key, name, retail, b2b, sort_order, active }
+  // treatment: { id?, category_key, name, retail, b2b, sort_order, active, perPiece }
   const isNew = !treatment.id;
   const { ok } = await sbFetch(isNew ? "service_treatments" : `service_treatments?id=eq.${encodeURIComponent(treatment.id)}`, {
     method: isNew ? "POST" : "PATCH",
     headers: { Prefer: "return=minimal" },
     body: JSON.stringify(isNew
-      ? [{ category_key: treatment.category_key, name: treatment.name, retail: treatment.retail, b2b: treatment.b2b, sort_order: treatment.sort_order ?? 0, active: true }]
-      : { name: treatment.name, retail: treatment.retail, b2b: treatment.b2b, updated_at: new Date().toISOString() }),
+      ? [{ category_key: treatment.category_key, name: treatment.name, retail: treatment.retail, b2b: treatment.b2b, sort_order: treatment.sort_order ?? 0, active: true, per_piece: !!treatment.perPiece }]
+      : { name: treatment.name, retail: treatment.retail, b2b: treatment.b2b, per_piece: !!treatment.perPiece, updated_at: new Date().toISOString() }),
   });
   if (ok) await loadDynamicServicesAndRoles();
   return ok;
@@ -1166,19 +1420,35 @@ async function findOrCreateCustomer(name, phone, customerType) {
   });
   return created && data ? data[0] : null;
 }
-async function findOrCreateVehicle(customerId, plate, makeModel) {
+async function findOrCreateVehicle(customerId, plate, makeModel, vehicleDetails = {}) {
+  const { make, model, modelYear, color, bodyType } = vehicleDetails;
+  const detailFields = {
+    ...(make ? { make } : {}), ...(model ? { model } : {}), ...(modelYear ? { model_year: modelYear } : {}),
+    ...(color ? { color } : {}), ...(bodyType ? { body_type: bodyType } : {}),
+  };
   const { ok, data } = await sbFetch(`vehicles?plate=eq.${encodeURIComponent(plate)}&select=*&limit=1`);
   if (ok && data && data.length) {
     // Ownership is only ever changed when the person at intake has
     // explicitly confirmed it (via the "different owner now" choice in the
     // form) — never silently, since a typo'd plate could otherwise
     // reassign someone else's car without anyone noticing.
+    //
+    // Vehicle details (make/model/year/colour/body type) DO get kept
+    // current here, though — intake is the one place these are actually
+    // entered, so the next lookup of this plate should see the latest.
+    if (Object.keys(detailFields).length) {
+      const { ok: patched } = await sbFetch(`vehicles?id=eq.${data[0].id}`, {
+        method: "PATCH",
+        body: JSON.stringify({ ...detailFields, updated_at: new Date().toISOString() }),
+      });
+      if (patched) return { ...data[0], ...detailFields };
+    }
     return data[0];
   }
   const { ok: created, data: createdData } = await sbFetch("vehicles", {
     method: "POST",
     headers: { Prefer: "return=representation" },
-    body: JSON.stringify([{ customer_id: customerId, plate, make_model: makeModel }]),
+    body: JSON.stringify([{ customer_id: customerId, plate, make_model: makeModel, ...detailFields }]),
   });
   return created && createdData ? createdData[0] : null;
 }
@@ -1209,9 +1479,18 @@ async function loadCustomerHistory(customerId) {
 // Converts a Supabase row (snake_case, flat) into the app's job shape
 // (camelCase, nested photos/history) so the rest of the app is unchanged.
 function rowToJob(r) {
-  return {
+  const job = {
     id: r.id, customerId: r.customer_id, vehicleId: r.vehicle_id,
     plate: r.plate, makeModel: r.make_model, customerName: r.customer_name, customerPhone: r.customer_phone,
+    // Structured vehicle fields, layered on top of the legacy makeModel
+    // combined string (see composeMakeModel) — every existing reader
+    // that only knows makeModel keeps working untouched.
+    make: r.make || "", model: r.model || "", modelYear: r.model_year || "", color: r.color || "", bodyType: r.body_type || "",
+    // PPF Room feature: ppfScope is Ahmed's scope (set on the job card),
+    // ppfProgress is the tablet's tap progress — both just round-tripped
+    // here so any other save on this job never clobbers them.
+    ppfScope: r.ppf_scope || null,
+    ppfProgress: r.ppf_progress || null,
     description: r.description, damageNotes: r.damage_notes, priority: r.priority, location: r.location,
     serviceTypes: r.service_types || [], serviceDone: r.service_done || {}, assignedTo: r.assigned_to || {},
     assignedTeam: r.assigned_team || {}, serviceStep: r.service_step || {},
@@ -1221,6 +1500,16 @@ function rowToJob(r) {
     serviceNotes: r.service_notes || {}, serviceReviewed: r.service_reviewed || {}, treatments: r.treatments || {},
     treatmentPrices: r.treatment_prices || {}, discountPercent: r.discount_percent || 0, priceHistory: r.price_history || [],
     parts: r.parts || [], markupEntries: r.markup_entries || [],
+    // Physical DB column is still jobish_purchases (renaming it is real
+    // migration churn for zero benefit — it's an internal detail nobody
+    // sees); the app-facing name is smartechPurchases everywhere else.
+    smartechPurchases: r.jobish_purchases || [],
+    smartechFlag: !!r.smartech_flag, smartechDescription: r.smartech_description || "",
+    smartechPhotos: r.smartech_photos || [], smartechPieces: r.smartech_pieces || {},
+    smartechStatus: r.smartech_status || null,
+    smartechStatusNote: r.smartech_status_note || null,
+    smartechStatusAt: r.smartech_status_at ? new Date(r.smartech_status_at).getTime() : null,
+    smartechStartedAt: r.smartech_started_at ? new Date(r.smartech_started_at).getTime() : null,
     stageIndex: r.stage_index, photos: r.photos || { intake: [], parts_removal: [], service: {} },
     startTime: r.start_time ? new Date(r.start_time).getTime() : null,
     stopTime: r.stop_time ? new Date(r.stop_time).getTime() : null,
@@ -1232,11 +1521,33 @@ function rowToJob(r) {
     customerNotify: r.customer_notify || {},
     createdBy: r.created_by, createdAt: new Date(r.created_at).getTime(), updatedAt: new Date(r.updated_at).getTime(),
   };
+  // Snapshot of what the server held when this job was loaded — saveJob
+  // diffs against it so a save only writes the fields actually changed
+  // (see saveJob). Enumerable on purpose: every screen updates a job by
+  // spreading it into a new object, and the snapshot has to ride along.
+  job._base = rowSnapshot(job);
+  learnVehicle(job.make, job.model);
+  return job;
+}
+function rowSnapshot(job) {
+  const row = jobToRow(job);
+  delete row.updated_at;
+  return row;
 }
 function jobToRow(job) {
   return {
     id: job.id, customer_id: job.customerId || null, vehicle_id: job.vehicleId || null,
-    plate: job.plate, make_model: job.makeModel, customer_name: job.customerName, customer_phone: job.customerPhone,
+    plate: job.plate,
+    // makeModel stays the combined display string every other screen
+    // reads — recomputed from make/model on every save when a
+    // structured make is set; legacy jobs with no make keep whatever
+    // makeModel they already had.
+    make_model: composeMakeModel(job.make, job.model, job.makeModel),
+    make: job.make || null, model: job.model || null, model_year: job.modelYear || null,
+    color: job.color || null, body_type: job.bodyType || null,
+    ppf_scope: job.ppfScope || null,
+    ppf_progress: job.ppfProgress || null,
+    customer_name: job.customerName, customer_phone: job.customerPhone,
     description: job.description, damage_notes: job.damageNotes, priority: job.priority, location: job.location,
     service_types: job.serviceTypes || [], service_done: job.serviceDone || {}, assigned_to: job.assignedTo || {},
     assigned_team: job.assignedTeam || {}, service_step: job.serviceStep || {},
@@ -1246,6 +1557,13 @@ function jobToRow(job) {
     service_notes: job.serviceNotes || {}, service_reviewed: job.serviceReviewed || {}, treatments: job.treatments || {},
     treatment_prices: job.treatmentPrices || {}, discount_percent: job.discountPercent || 0, price_history: job.priceHistory || [],
     parts: job.parts || [], markup_entries: job.markupEntries || [],
+    jobish_purchases: job.smartechPurchases || [],
+    smartech_flag: !!job.smartechFlag, smartech_description: job.smartechDescription || null,
+    smartech_photos: job.smartechPhotos || [], smartech_pieces: job.smartechPieces || {},
+    smartech_status: job.smartechStatus || null,
+    smartech_status_note: job.smartechStatusNote || null,
+    smartech_status_at: job.smartechStatusAt ? new Date(job.smartechStatusAt).toISOString() : null,
+    smartech_started_at: job.smartechStartedAt ? new Date(job.smartechStartedAt).toISOString() : null,
     stage_index: job.stageIndex, photos: job.photos,
     start_time: job.startTime ? new Date(job.startTime).toISOString() : null,
     stop_time: job.stopTime ? new Date(job.stopTime).toISOString() : null,
@@ -1259,6 +1577,41 @@ function jobToRow(job) {
     created_by: job.createdBy, updated_at: new Date().toISOString(),
   };
 }
+// Combined "Make Model" display string every existing screen reads.
+// Structured make/model win once set; a legacy job with no make keeps
+// whatever makeModel it already had (nothing here ever blanks it out).
+function composeMakeModel(make, model, fallbackMakeModel) {
+  const m = (make || "").trim();
+  if (!m) return fallbackMakeModel || "";
+  return [m, (model || "").trim()].filter(Boolean).join(" ");
+}
+
+/* ---------------- Learned vehicle make/model catalog ----------------
+   The Make/Model combo boxes (VehicleDetailsFields) suggest the built-in
+   VEHICLE_CATALOG plus anything staff have actually typed before, so a
+   one-off make/model entered once is offered again next time. Kept as
+   plain module state — not React state — since it only ever grows and
+   dozens of unrelated screens would otherwise need it prop-drilled in;
+   same reasoning as the WHATSAPP_TEMPLATES/SERVICES caches elsewhere in
+   this file. Fed by every job row that comes back from the server
+   (rowToJob) and by the job list index (loadIndex).
+*/
+const learnedMakeModels = new Map(); // lowercase make -> { canonical, models: Map(lowercase model -> canonical model) }
+function learnVehicle(make, model) {
+  const m = (make || "").trim();
+  if (!m) return;
+  const key = m.toLowerCase();
+  let entry = learnedMakeModels.get(key);
+  if (!entry) { entry = { canonical: m, models: new Map() }; learnedMakeModels.set(key, entry); }
+  const mod = (model || "").trim();
+  if (mod) entry.models.set(mod.toLowerCase(), mod);
+}
+function getLearnedMakes() { return Array.from(learnedMakeModels.values()).map((e) => e.canonical); }
+function getLearnedModels(make) {
+  const entry = learnedMakeModels.get((make || "").trim().toLowerCase());
+  return entry ? Array.from(entry.models.values()) : [];
+}
+
 /* ---------------- device-local session (which login this phone remembers) ---------------- */
 // Not shared/business data — just "who's logged in on this device" — so a
 // plain localStorage read/write is the right tool, not a Supabase round-trip.
@@ -1309,7 +1662,11 @@ function localDateKey(d = new Date()) {
 //     that's proof a night has passed, regardless of what hour it
 //     currently reads.
 const AUTO_LOGOUT_HOUR = 21; // 9pm
-function checkAutoLogout(keyPrefix, hasSession, clearSessionFn) {
+function checkAutoLogout(keyPrefix, hasSession, clearSessionFn, exemptDashboardMode) {
+  // The PPF Room kiosk stays logged in overnight like the Dispatch/QC
+  // kiosks already do — it has no customer data on screen and is meant
+  // to be walked up to and tapped all day without re-authenticating.
+  if (exemptDashboardMode === "ppfroom") return;
   if (!hasSession) return;
   const now = new Date();
   const todayKey = localDateKey(now);
@@ -1342,11 +1699,11 @@ function dismissMorningReminder(keyPrefix) {
 // nightly auto-logout, prompting a physical reconcile of the board.
 function MorningReminderBanner({ onDismiss }) {
   return (
-    <div className="mrcap-fade" style={{ background: "#1a1408", border: `2px solid ${COLORS.gold}`, borderRadius: 12, padding: "14px 16px", margin: "12px 16px 0", display: "flex", alignItems: "flex-start", justifyContent: "space-between", gap: 12 }}>
+    <div className="mrcap-fade" style={{ background: "linear-gradient(160deg, rgba(201,162,39,0.16), rgba(201,162,39,0.05))", border: "1px solid rgba(201,162,39,0.6)", borderRadius: 16, padding: "14px 8px 14px 16px", margin: "12px 18px 0", display: "flex", alignItems: "flex-start", justifyContent: "space-between", gap: 10, boxShadow: "0 12px 28px -18px rgba(0,0,0,0.9)" }}>
       <div style={{ fontWeight: 700, fontSize: 14.5, color: COLORS.ink, lineHeight: 1.4 }}>
         Please update the app — remove any cars that aren't currently here and put the new ones that aren't on the app.
       </div>
-      <button onClick={onDismiss} className="mrcap-press" style={{ background: "none", border: "none", cursor: "pointer", padding: 4, flexShrink: 0 }}>
+      <button onClick={onDismiss} className="mrcap-press" aria-label="Dismiss" style={{ background: "none", border: "none", cursor: "pointer", width: 40, height: 40, marginTop: -8, display: "flex", alignItems: "center", justifyContent: "center", flexShrink: 0 }}>
         <X size={18} color={COLORS.muted} />
       </button>
     </div>
@@ -1404,14 +1761,14 @@ function AnnouncementBanner({ session }) {
         const aud = a.audience || { type: "all" };
         const prefix = aud.type === "location" ? `📍 ${aud.location}: ` : "";
         return (
-          <div key={a.id} className="mrcap-fade" style={{ background: "#1a1408", border: `2px solid ${COLORS.gold}`, borderRadius: 12, padding: "14px 16px", margin: "12px 16px 0", display: "flex", alignItems: "flex-start", justifyContent: "space-between", gap: 12 }}>
+          <div key={a.id} className="mrcap-fade" style={{ background: "linear-gradient(160deg, rgba(201,162,39,0.16), rgba(201,162,39,0.05))", border: "1px solid rgba(201,162,39,0.6)", borderRadius: 16, padding: "14px 8px 14px 16px", margin: "12px 18px 0", display: "flex", alignItems: "flex-start", justifyContent: "space-between", gap: 10, boxShadow: "0 12px 28px -18px rgba(0,0,0,0.9)" }}>
             <div style={{ fontWeight: 700, fontSize: 14.5, color: COLORS.ink, lineHeight: 1.4 }}>
               {prefix}{a.message}
               <div style={{ fontWeight: 400, fontSize: 11, color: COLORS.muted, marginTop: 4 }}>— {a.created_by}</div>
             </div>
             <button
               onClick={() => { dismissAnnouncement(a.id); setItems((prev) => prev.filter((x) => x.id !== a.id)); }}
-              className="mrcap-press" style={{ background: "none", border: "none", cursor: "pointer", padding: 4, flexShrink: 0 }}
+              className="mrcap-press" aria-label="Dismiss" style={{ background: "none", border: "none", cursor: "pointer", width: 40, height: 40, marginTop: -8, display: "flex", alignItems: "center", justifyContent: "center", flexShrink: 0 }}
             >
               <X size={18} color={COLORS.muted} />
             </button>
@@ -1459,16 +1816,13 @@ const INVOICE_ISSUER = {
 };
 const VAT_RATE = 0.05;
 
-// Head Office / Branch / General — which manager (if any) gets commission
-// credit for a job. Separate concept from the job's physical `location`:
-// a car can be sitting at any site and still be a Head Office or Branch
-// job commission-wise. Codes match First Bit's own ZH/ZB/ZG prefixes, so
-// Mr.CAP's invoice numbers stay conceptually aligned with the real
-// accounting system even before any direct integration exists.
+// Single-branch operation now — every job's invoice series runs under
+// "Branch" (code ZB, matching First Bit's own prefix so Mr.CAP's invoice
+// numbers stay conceptually aligned with the real accounting system).
+// Kept as a lookup array (not a bare constant) because
+// finalizeInvoiceNumber below still does a COMMISSION_ENTITIES.find().
 const COMMISSION_ENTITIES = [
-  { code: "ZH", key: "head_office", label: "Head Office" },
   { code: "ZB", key: "branch", label: "Branch" },
-  { code: "ZG", key: "general", label: "General (no commission)" },
 ];
 
 // Builds this job's real, permanent invoice number the first time it's
@@ -1481,8 +1835,10 @@ const COMMISSION_ENTITIES = [
 // are never confused with each other, until a real integration exists.
 async function finalizeInvoiceNumber(job, session) {
   if (job.invoiceNo) return { ok: true, invoiceNo: job.invoiceNo, alreadyFinalized: true };
-  const entity = COMMISSION_ENTITIES.find((e) => e.key === job.commissionEntity);
-  if (!entity) return { ok: false, error: "Pick a commission entity (Head Office / Branch / General) before finalizing." };
+  // Single-branch operation now (see COMMISSION_ENTITIES) — fall back to
+  // the only entity that exists rather than hard-failing if some future
+  // job ever ends up with an unset/stale commissionEntity value.
+  const entity = COMMISSION_ENTITIES.find((e) => e.key === job.commissionEntity) || COMMISSION_ENTITIES[0];
 
   const year = new Date().getFullYear();
   const { ok, data } = await sbFetch("rpc/next_invoice_number", {
@@ -1547,12 +1903,13 @@ function buildInvoiceLineItems(job) {
     const picks = (job.treatments || {})[s.key] || [];
     picks.forEach((name) => {
       const priceKey = `${s.key}::${name}`;
-      const price = Number((job.treatmentPrices || {})[priceKey]) || 0;
+      const unitPrice = Number((job.treatmentPrices || {})[priceKey]) || 0;
+      const qty = isPerPieceTreatment(s.key, name) ? Math.max(1, Number((job.smartechPieces || {})[priceKey]) || 1) : 1;
       const discountPct = job.discountPercent || 0;
-      const excl = price;
+      const excl = unitPrice * qty;
       const amountExcl = excl * (1 - discountPct / 100);
       const vatAmount = amountExcl * VAT_RATE;
-      rows.push({ desc: name, qty: 1, price: excl, discount: discountPct, amountExcl, vatAmount, amountIncl: amountExcl + vatAmount });
+      rows.push({ desc: name, qty, price: unitPrice, discount: discountPct, amountExcl, vatAmount, amountIncl: amountExcl + vatAmount });
     });
   });
   (job.parts || []).forEach((p) => {
@@ -1623,7 +1980,18 @@ function generateJobCardPDF(job) {
   y += headerH + 4;
 
   // ---- Bill To / Car Info block ----
-  const billH = 90;
+  // Structured make/model win when present; legacy jobs (no job.make)
+  // fall back to the old "split the combined string on the first space"
+  // guess, exactly as before.
+  const legacyMake = (job.makeModel || "").split(" ")[0] || "";
+  const legacyModel = (job.makeModel || "").split(" ").slice(1).join(" ") || "";
+  const carRows = [["Make:", job.make || legacyMake], ["Model:", job.model || legacyModel], ["Plate:", job.plate], ["Job Card:", job.id ? job.id.slice(0, 8).toUpperCase() : ""]];
+  if (job.modelYear) carRows.push(["Year:", String(job.modelYear)]);
+  // Colour only if it still fits inside the box without overflowing —
+  // 6 rows is the most this layout can hold before the text runs past
+  // the box's bottom edge.
+  if (job.color && carRows.length < 6) carRows.push(["Colour:", job.color]);
+  const billH = 90 + Math.max(0, carRows.length - 4) * 14;
   box(margin, pageW - margin * 2, billH);
   doc.line(midX, y, midX, y + billH);
 
@@ -1635,7 +2003,6 @@ function generateJobCardPDF(job) {
 
   doc.setFont("helvetica", "bold"); doc.setFontSize(9); doc.setTextColor(...DARK);
   doc.text("Car Info", midX + 8, y + 14);
-  const carRows = [["Make:", (job.makeModel || "").split(" ")[0] || ""], ["Model:", (job.makeModel || "").split(" ").slice(1).join(" ") || ""], ["Plate:", job.plate], ["Job Card:", job.id ? job.id.slice(0, 8).toUpperCase() : ""]];
   carRows.forEach((row, i) => { label(row[0], midX + 8, y + 30 + i * 14); value(row[1], midX + 60, y + 30 + i * 14, 8.5); });
 
   y += billH + 14;
@@ -1675,7 +2042,12 @@ function generateJobCardPDF(job) {
     doc.text("5", margin + 452, y + 12);
     doc.text(r.amountIncl.toFixed(2), margin + 470, y + 12);
     subtotal += r.amountExcl;
-    totalDiscount += r.price - r.amountExcl;
+    // r.price is the UNIT price (qty lives separately in r.qty since
+    // per-piece treatments were added) — the pre-discount extended
+    // amount is price x qty, not price alone, or this goes negative for
+    // any qty > 1 line (was already subtly wrong for multi-qty parts
+    // rows too, before per-piece treatments existed).
+    totalDiscount += r.price * (r.qty || 1) - r.amountExcl;
     totalVat += r.vatAmount;
     y += rowH;
   });
@@ -1883,6 +2255,7 @@ function generateQuotePDF(quote) {
 
 function summaryOf(job) {
   const stage = STAGES[job.stageIndex];
+  learnVehicle(job.make, job.model);
   return {
     id: job.id, plate: job.plate, makeModel: job.makeModel, customerName: job.customerName, customerPhone: job.customerPhone,
     priority: job.priority, location: job.location, stageKey: stage.key, stageLabel: stage.label,
@@ -1899,14 +2272,16 @@ async function loadIndex() {
   // pilot where job volume keeps climbing. Still ordered newest-first,
   // so the jobs that actually matter for the working list are never
   // the ones that would get dropped if this cap is ever hit.
-  const { ok, data } = await sbFetch(`jobs?select=id,plate,make_model,customer_name,customer_phone,priority,location,stage_index,service_types,service_done,service_reviewed,history,on_hold,on_hold_note,on_hold_since,followup_date,followup_note,warranty_expiry,customer_notify,created_at,updated_at&created_at=gte.${DEFAULT_VIEW_CUTOFF}&order=updated_at.desc&limit=900`);
+  const { ok, data } = await sbFetch(`jobs?select=id,plate,make_model,make,model,body_type,customer_name,customer_phone,priority,location,stage_index,service_types,service_done,service_reviewed,ppf_scope,ppf_progress,history,on_hold,on_hold_note,on_hold_since,followup_date,followup_note,warranty_expiry,customer_notify,created_at,updated_at&created_at=gte.${DEFAULT_VIEW_CUTOFF}&order=updated_at.desc&limit=900`);
   if (!ok || !data) return [];
   return data.map((r) => {
     const stage = STAGES[r.stage_index] || STAGES[0];
+    learnVehicle(r.make, r.model);
     return {
-      id: r.id, plate: r.plate, makeModel: r.make_model, customerName: r.customer_name, customerPhone: r.customer_phone,
+      id: r.id, plate: r.plate, makeModel: r.make_model, make: r.make || "", model: r.model || "", bodyType: r.body_type || "", customerName: r.customer_name, customerPhone: r.customer_phone,
       priority: r.priority, location: r.location, stageKey: stage.key, stageLabel: stage.label,
       serviceTypes: r.service_types || [], serviceDone: r.service_done || {}, serviceReviewed: r.service_reviewed || {},
+      ppfScope: r.ppf_scope || null, ppfProgress: r.ppf_progress || null,
       history: r.history || [],
       onHold: !!r.on_hold, onHoldNote: r.on_hold_note || null, onHoldSince: r.on_hold_since ? new Date(r.on_hold_since).getTime() : null,
       followupDate: r.followup_date || null, followupNote: r.followup_note || null, warrantyExpiry: r.warranty_expiry || null,
@@ -1918,7 +2293,18 @@ async function loadIndex() {
 async function loadJob(id) {
   const { ok, data } = await sbFetch(`jobs?id=eq.${id}&select=*&limit=1`);
   if (!ok || !data || !data.length) return null;
-  return rowToJob(data[0]);
+  const job = rowToJob(data[0]);
+  // Re-sign Smartech photo URLs — see refreshSmartechPhotoUrls. Signed
+  // URLs always differ from what's in the DB row (a fresh token every
+  // time), so job._base (set inside rowToJob, used by saveJob's diff)
+  // has to be recomputed AFTER this or every save of this job would
+  // spuriously "change" smartechPhotos and overwrite any concurrent
+  // photo Smartech just added from their own portal.
+  if ((job.smartechPhotos || []).length) {
+    job.smartechPhotos = await refreshSmartechPhotoUrls(job.smartechPhotos);
+    job._base = rowSnapshot(job);
+  }
+  return job;
 }
 // Creates a job: links/creates the customer + vehicle records first (this
 // is what powers CRM history), then inserts the job with real foreign
@@ -2032,6 +2418,7 @@ function rowToQuote(r) {
     serviceTypes: r.service_types || [], treatments: r.treatments || {}, treatmentPrices: r.treatment_prices || {},
     discountPercent: r.discount_percent || 0, parts: r.parts || [],
     status: r.status || "draft", convertedJobId: r.converted_job_id,
+    customerNotify: r.customer_notify || {},
     acceptedAt: r.accepted_at ? new Date(r.accepted_at).getTime() : null,
     createdBy: r.created_by, createdAt: new Date(r.created_at).getTime(), updatedAt: new Date(r.updated_at).getTime(),
   };
@@ -2044,6 +2431,7 @@ function quoteToRow(q) {
     service_types: q.serviceTypes || [], treatments: q.treatments || {}, treatment_prices: q.treatmentPrices || {},
     discount_percent: q.discountPercent || 0, parts: q.parts || [],
     status: q.status || "draft", converted_job_id: q.convertedJobId || null,
+    customer_notify: q.customerNotify || {},
     accepted_at: q.acceptedAt ? new Date(q.acceptedAt).toISOString() : null,
     created_by: q.createdBy, updated_at: new Date().toISOString(),
   };
@@ -2129,6 +2517,7 @@ async function findActiveJobByPlate(plate) {
 }
 
 async function createJob(job, { reassignVehicle = false, customerType = null } = {}) {
+  job = { ...job, commissionEntity: job.commissionEntity || "branch" };
   const dupe = await findActiveJobByPlate(job.plate);
   if (dupe) {
     return {
@@ -2138,7 +2527,9 @@ async function createJob(job, { reassignVehicle = false, customerType = null } =
     };
   }
   const customer = await findOrCreateCustomer(job.customerName, job.customerPhone, customerType);
-  const vehicle = customer ? await findOrCreateVehicle(customer.id, job.plate, job.makeModel) : null;
+  const vehicle = customer ? await findOrCreateVehicle(customer.id, job.plate, job.makeModel, {
+    make: job.make, model: job.model, modelYear: job.modelYear, color: job.color, bodyType: job.bodyType,
+  }) : null;
   // Ownership only changes here, explicitly, when intake staff confirmed
   // via the "New owner now" choice — never inferred automatically.
   if (vehicle && reassignVehicle && customer && vehicle.customer_id !== customer.id) {
@@ -2157,13 +2548,65 @@ async function createJob(job, { reassignVehicle = false, customerType = null } =
   }
   return { ok: false, job: withLinks };
 }
+function sameValue(a, b) {
+  if (a === b) return true;
+  if (a == null || b == null || typeof a !== "object" || typeof b !== "object") return false;
+  return JSON.stringify(a) === JSON.stringify(b);
+}
+const historyKey = (h) => `${h?.at}|${h?.by}|${h?.stage}|${h?.label || ""}|${h?.note || ""}`;
+
 // Updates an existing job in place (stage advances, reassignment, etc).
+//
+// Only the fields this screen actually changed are written — not the whole
+// row rebuilt from whatever copy of the job this device happened to have
+// in memory. Two people on the same job (shop floor + dispatch + intake is
+// the normal case) used to silently overwrite each other: the second save
+// re-sent the first person's stale service_done/assigned_to/etc. along with
+// its own change. It also stops every tap re-uploading the job's photos
+// (base64, often megabytes) when only a status flag changed.
+//
+// history is the one exception to "send what changed": it's an audit trail
+// that must never lose entries, so it's merged — the server's current
+// entries plus the ones added locally — instead of replaced.
+//
+// Jobs with no snapshot (built by hand rather than loaded) fall back to the
+// old whole-row write, exactly as before.
 async function saveJob(job) {
+  const full = jobToRow(job);
+  const base = job._base;
+  let body = full;
+  let mergedHistory = null;
+
+  if (base) {
+    body = { updated_at: full.updated_at };
+    for (const k of Object.keys(full)) {
+      if (k === "updated_at" || k === "id") continue;
+      if (!sameValue(full[k], base[k])) body[k] = full[k];
+    }
+    if (body.history) {
+      const baseKeys = new Set((base.history || []).map(historyKey));
+      const mine = (full.history || []).filter((h) => !baseKeys.has(historyKey(h)));
+      const res = await sbFetch(`jobs?id=eq.${job.id}&select=history`);
+      if (res.ok && !res.stale && res.data && res.data[0]) {
+        const server = res.data[0].history || [];
+        const have = new Set(server.map(historyKey));
+        mergedHistory = [...server, ...mine.filter((h) => !have.has(historyKey(h)))];
+        body.history = mergedHistory;
+      }
+    }
+  }
+
   const { ok } = await sbFetch(`jobs?id=eq.${job.id}`, {
     method: "PATCH",
     headers: { Prefer: "return=minimal" },
-    body: JSON.stringify(jobToRow(job)),
+    body: JSON.stringify(body),
   });
+  if (ok && base) {
+    if (mergedHistory) job.history = mergedHistory;
+    const snap = { ...full, history: mergedHistory || full.history };
+    delete snap.updated_at;
+    job._base = snap;
+  }
   return ok;
 }
 
@@ -2184,6 +2627,504 @@ async function deleteJob(job, deletedBy) {
   return ok;
 }
 
+/* ---------------- Billing: proformas, payments, First Bit reconciliation ----------------
+   Proformas are issued from here, with their own number series (ZBPI26-…),
+   and paid in cash, cheque or bank transfer. After a handful of jobs the
+   accountant enters them into First Bit and marks them reconciled.
+
+   Billing data lives in three tables that the public key cannot read
+   (proformas, proforma_payments, billing_reconciliation), so — unlike every
+   other screen — it reads AND writes through the db-gatekeeper. It also never
+   uses the offline queue: a number that is issued must be issued right now,
+   not replayed later, so billing needs a live connection and says so. */
+
+const PROFORMA_ISSUERS = {
+  ZB: { label: "Branch", name: "Z Cars Technologies", trn: INVOICE_ISSUER.trn, address: "Shed No#4, MrCap, 24 A Street, PO Box:390822, Behind Grand Supermarket, Al Quoz 1, UAE", tel: "+971 (04) 3469559", email: "" },
+  ZH: { label: "Head Office · Nad Al Hamar", name: "Z Cars Technologies", trn: INVOICE_ISSUER.trn, address: INVOICE_ISSUER.address, tel: INVOICE_ISSUER.tel, email: "" },
+};
+const PAYMENT_TERMS_PRESETS = ["Cash on delivery", "Cheque on delivery", "Bank transfer before release", "50% advance, balance on delivery"];
+const RECONCILE_NUDGE_AT = 5; // "reconcile after 5-6 jobs"
+
+// Billing access: admins always, accountants always, everyone else only when
+// "Billing" is switched on for them (Team screen, or Billing → Access).
+function canUseBilling(session, team) {
+  return hasPermission(session, team, "billing");
+}
+
+// Every billing call goes straight to the gatekeeper and is never queued.
+async function gkCall(envelope) {
+  try {
+    const res = await fetch(GATEKEEPER_URL, {
+      method: "POST",
+      headers: { apikey: SUPABASE_KEY, Authorization: `Bearer ${SUPABASE_KEY}`, "Content-Type": "application/json" },
+      body: JSON.stringify({ headers: {}, actor: currentActor, ...envelope }),
+    });
+    const text = await res.text();
+    if (!res.ok) return { ok: false, status: res.status, error: text.slice(0, 200) || `Failed (${res.status})` };
+    return { ok: true, data: text ? JSON.parse(text) : null };
+  } catch {
+    return { ok: false, offline: true, error: "You're offline. Billing needs a connection so numbers and payments are never duplicated." };
+  }
+}
+async function gkGet(path) {
+  const res = await gkCall({ path, method: "GET" });
+  if (res.ok) { writeCache(`gk:${path}`, res.data); return res; }
+  if (res.offline) {
+    const cached = readCache(`gk:${path}`);
+    if (cached) return { ok: true, data: cached.data, stale: true, cachedAt: cached.at };
+  }
+  return res;
+}
+const nowIso = () => new Date().toISOString();
+
+// Totals for a document: the snapshot taken at issue time when there is one,
+// otherwise worked out live from the lines.
+function docTotals(p) {
+  const live = computeTotals(p.lines, Number(p.vat_rate));
+  if (p.status !== "draft" && p.totals && typeof p.totals.totalIncl === "number") return { ...live, ...p.totals };
+  return live;
+}
+const totalsSnapshot = (t) => ({ subtotalExcl: t.subtotalExcl, totalVat: t.totalVat, totalIncl: t.totalIncl, totalDiscount: t.totalDiscount, hasDiscount: t.hasDiscount });
+
+function blankProforma() {
+  const d = new Date(); d.setDate(d.getDate() + 7);
+  return {
+    id: null, number: null, entity: "ZB", status: "draft", job_id: null, quote_id: null, customer_id: null,
+    bill_to: { name: "", phone: "", trn: "", address: "", email: "" },
+    car: { makeModel: "", color: "", plate: "", vin: "", year: "" },
+    lines: [blankLine()], vat_rate: VAT_RATE, payment_terms: "Cash on delivery", delivery_terms: "", notes: "",
+    valid_until: localDateKey(d), supersedes: null,
+  };
+}
+// Starting point for a proforma raised from a job: the same line items the
+// tax invoice would print, the customer's details, and the vehicle.
+function proformaSeedFromJob(job) {
+  const { rows } = buildInvoiceLineItems(job);
+  return {
+    ...blankProforma(),
+    job_id: job.id, customer_id: job.customerId || null,
+    entity: job.commissionEntity === "head_office" ? "ZH" : "ZB",
+    bill_to: { name: job.customerName || "", phone: job.customerPhone || "", trn: "", address: "", email: "" },
+    car: { makeModel: job.makeModel || "", color: job.color || "", plate: job.plate || "", vin: "", year: job.modelYear || "" },
+    lines: rows.length ? linesFromInvoiceRows(rows) : [blankLine()],
+  };
+}
+// A revision is a new draft that will replace (void) the issued original.
+function proformaRevisionSeed(p) {
+  return { ...blankProforma(), ...p, id: null, number: null, status: "draft", totals: null, supersedes: p.id, issued_at: null, issued_by: null, voided_at: null, voided_by: null, void_reason: null, valid_until: blankProforma().valid_until };
+}
+
+async function loadProformaList() {
+  const [pr, pay] = await Promise.all([
+    gkGet("proformas?select=id,number,entity,status,bill_to,car,lines,vat_rate,totals,issued_at,created_at,updated_at,job_id,supersedes,valid_until,void_reason,created_by&order=created_at.desc&limit=500"),
+    gkGet("proforma_payments?select=id,proforma_id,method,amount,cheque_status,cheque_no,cheque_date,paid_on&limit=3000"),
+  ]);
+  if (!pr.ok) return { ok: false, error: pr.error, proformas: [], payments: [] };
+  return { ok: true, stale: !!pr.stale, proformas: pr.data || [], payments: pay.ok ? pay.data || [] : [] };
+}
+async function loadProformaFull(id) {
+  const [pr, pay, rec] = await Promise.all([
+    gkGet(`proformas?id=eq.${encodeURIComponent(id)}&select=*&limit=1`),
+    gkGet(`proforma_payments?proforma_id=eq.${encodeURIComponent(id)}&select=*&order=created_at.asc`),
+    gkGet(`billing_reconciliation?doc_type=eq.proforma&doc_id=eq.${encodeURIComponent(id)}&select=*&limit=1`),
+  ]);
+  if (!pr.ok) return { ok: false, error: pr.error };
+  const proforma = (pr.data || [])[0] || null;
+  return { ok: true, stale: !!pr.stale, proforma, payments: pay.ok ? pay.data || [] : [], reconciliation: rec.ok ? (rec.data || [])[0] || null : null };
+}
+
+function proformaBody(p) {
+  return {
+    entity: p.entity, job_id: p.job_id || null, quote_id: p.quote_id || null, customer_id: p.customer_id || null,
+    bill_to: p.bill_to, car: p.car, lines: p.lines, vat_rate: Number(p.vat_rate),
+    payment_terms: p.payment_terms || null, delivery_terms: p.delivery_terms || null, notes: p.notes || null,
+    valid_until: p.valid_until || null, supersedes: p.supersedes || null, updated_at: nowIso(),
+  };
+}
+async function saveProformaDraft(p, session) {
+  if (p.id) {
+    const res = await gkCall({ path: `proformas?id=eq.${p.id}&status=eq.draft`, method: "PATCH", body: proformaBody(p), headers: { Prefer: "return=representation" }, summary: "Saved a proforma draft" });
+    if (!res.ok) return { ok: false, error: res.error };
+    if (!Array.isArray(res.data) || !res.data.length) return { ok: false, error: "This proforma has already been issued, so it can't be edited. Use Revise to make a new version." };
+    return { ok: true, row: res.data[0] };
+  }
+  const res = await gkCall({ path: "proformas", method: "POST", body: [{ ...proformaBody(p), status: "draft", created_by: session.name }], headers: { Prefer: "return=representation" }, summary: "Started a proforma draft" });
+  if (!res.ok) return { ok: false, error: res.error };
+  if (!Array.isArray(res.data) || !res.data.length) return { ok: false, error: "Couldn't save the proforma." };
+  return { ok: true, row: res.data[0] };
+}
+// Saves, takes the next number, and locks the document. If the number was
+// reserved but the lock failed, `reserved` lets the caller retry with the SAME
+// number instead of burning another one.
+async function issueProforma(p, session, reserved) {
+  const problems = issueProblems(p);
+  if (problems.length) return { ok: false, error: problems.join(" ") };
+  const saved = await saveProformaDraft(p, session);
+  if (!saved.ok) return { ok: false, error: saved.error };
+  const id = saved.row.id;
+  let seq = reserved && reserved.seq;
+  let year = reserved && reserved.year;
+  if (!seq) {
+    year = new Date().getFullYear();
+    const r = await gkCall({ path: "rpc/next_invoice_number", method: "POST", body: { p_entity: proformaCounterKey(p.entity), p_year: year }, summary: "Reserved a proforma number" });
+    if (!r.ok || typeof r.data !== "number") return { ok: false, error: r.offline ? r.error : "Couldn't get the next proforma number. Try again.", id };
+    seq = r.data;
+  }
+  const number = proformaNumber(p.entity, year, seq);
+  const totals = totalsSnapshot(computeTotals(p.lines, Number(p.vat_rate)));
+  const issued = await gkCall({
+    path: `proformas?id=eq.${id}&status=eq.draft`, method: "PATCH",
+    body: { number, status: "issued", totals, issued_at: nowIso(), issued_by: session.name, updated_at: nowIso() },
+    headers: { Prefer: "return=representation" }, summary: `Issued proforma ${number}`,
+  });
+  let row = issued.ok && Array.isArray(issued.data) ? issued.data[0] : null;
+  if (!row) {
+    // The lock may have gone through even though the answer never made it back.
+    const check = await gkCall({ path: `proformas?id=eq.${id}&select=*&limit=1`, method: "GET" });
+    const found = check.ok && Array.isArray(check.data) ? check.data[0] : null;
+    if (found && found.status === "issued" && found.number === number) row = found;
+  }
+  if (!row) return { ok: false, id, reserved: { seq, year }, error: `Number ${number} is reserved but couldn't be saved. Tap Issue again to retry with the same number.` };
+  if (p.supersedes) {
+    await gkCall({ path: `proformas?id=eq.${p.supersedes}&status=eq.issued`, method: "PATCH", body: { status: "void", voided_at: nowIso(), voided_by: session.name, void_reason: `Replaced by ${number}`, updated_at: nowIso() }, headers: { Prefer: "return=minimal" }, summary: `Voided proforma replaced by ${number}` });
+  }
+  return { ok: true, row };
+}
+async function voidProforma(p, reason, session) {
+  const res = await gkCall({ path: `proformas?id=eq.${p.id}&status=eq.issued`, method: "PATCH", body: { status: "void", voided_at: nowIso(), voided_by: session.name, void_reason: reason, updated_at: nowIso() }, headers: { Prefer: "return=representation" }, summary: `Voided proforma ${p.number}` });
+  if (!res.ok) return { ok: false, error: res.error };
+  return Array.isArray(res.data) && res.data.length ? { ok: true, row: res.data[0] } : { ok: false, error: "That proforma can't be voided (it may already be void)." };
+}
+async function deleteProformaDraft(p) {
+  const res = await gkCall({ path: `proformas?id=eq.${p.id}&status=eq.draft`, method: "DELETE", summary: "Deleted a proforma draft" });
+  return res.ok;
+}
+
+async function nextReceiptNumber() {
+  const year = new Date().getFullYear();
+  const r = await gkCall({ path: "rpc/next_invoice_number", method: "POST", body: { p_entity: "RC", p_year: year }, summary: "Reserved a receipt number" });
+  if (!r.ok || typeof r.data !== "number") return { ok: false, error: r.error || "Couldn't get a receipt number." };
+  return { ok: true, number: receiptNumber(year, r.data) };
+}
+async function recordPayment(p, pay, session) {
+  let receipt_no = null;
+  if (pay.method !== "cheque") {
+    const r = await nextReceiptNumber();
+    if (!r.ok) return { ok: false, error: r.error };
+    receipt_no = r.number;
+  }
+  const res = await gkCall({
+    path: "proforma_payments", method: "POST", headers: { Prefer: "return=representation" },
+    body: [{
+      proforma_id: p.id, method: pay.method, amount: Number(pay.amount), paid_on: pay.paid_on || localDateKey(),
+      cheque_no: pay.method === "cheque" ? pay.cheque_no || null : null,
+      cheque_bank: pay.method === "cheque" ? pay.cheque_bank || null : null,
+      cheque_date: pay.method === "cheque" ? pay.cheque_date || null : null,
+      cheque_status: pay.method === "cheque" ? "received" : null,
+      receipt_no, note: pay.note || null, recorded_by: session.name,
+    }],
+    summary: `Recorded ${pay.method} payment of AED ${fmtMoney(pay.amount)} on ${p.number}`,
+  });
+  if (!res.ok) return { ok: false, error: res.error };
+  return { ok: true, row: (res.data || [])[0] };
+}
+async function setChequeStatus(payment, status, p) {
+  let receipt_no = payment.receipt_no || null;
+  if (status === "cleared" && !receipt_no) {
+    const r = await nextReceiptNumber();
+    if (!r.ok) return { ok: false, error: r.error };
+    receipt_no = r.number;
+  }
+  const res = await gkCall({ path: `proforma_payments?id=eq.${payment.id}`, method: "PATCH", body: { cheque_status: status, receipt_no, updated_at: nowIso() }, headers: { Prefer: "return=representation" }, summary: `Cheque ${payment.cheque_no || ""} marked ${status} on ${p.number}` });
+  if (!res.ok) return { ok: false, error: res.error };
+  return { ok: true, row: (res.data || [])[0] };
+}
+async function deletePayment(payment, p) {
+  const res = await gkCall({ path: `proforma_payments?id=eq.${payment.id}`, method: "DELETE", summary: `Removed a payment of AED ${fmtMoney(payment.amount)} from ${p.number}` });
+  return res.ok;
+}
+// A client's TRN / address / email are remembered from their most recent
+// issued proforma. They deliberately do NOT live on the customers table,
+// which the public key can read; proformas are not publicly readable.
+async function loadLastBillTo(customerId) {
+  if (!customerId) return null;
+  const res = await gkGet(`proformas?customer_id=eq.${encodeURIComponent(customerId)}&status=neq.draft&select=bill_to&order=created_at.desc&limit=1`);
+  return res.ok && Array.isArray(res.data) && res.data[0] ? res.data[0].bill_to || null : null;
+}
+
+// Everything that has been issued but not yet entered in First Bit: issued
+// proformas, plus tax invoices finalised from jobs.
+async function loadReconciliationData() {
+  const [pf, rec, jobs, pay] = await Promise.all([
+    gkGet("proformas?status=eq.issued&select=id,number,entity,bill_to,car,lines,vat_rate,totals,issued_at,job_id&order=issued_at.asc&limit=1000"),
+    gkGet("billing_reconciliation?select=*&order=entered_at.desc&limit=1000"),
+    sbFetch("jobs?invoice_no=not.is.null&select=id,plate,customer_name,invoice_no,invoice_amount,invoice_finalized_at,commission_entity&order=invoice_finalized_at.asc&limit=1000"),
+    gkGet("proforma_payments?select=proforma_id,method,amount,cheque_status&limit=3000"),
+  ]);
+  if (!pf.ok || !rec.ok) return { ok: false, error: (pf.ok ? rec.error : pf.error) || "Couldn't load billing records.", items: [], entered: [] };
+  const paysBy = {};
+  for (const x of pay.ok ? pay.data || [] : []) (paysBy[x.proforma_id] ||= []).push(x);
+  const done = new Set((rec.data || []).map((r) => `${r.doc_type}:${r.doc_id}`));
+  const items = [];
+  for (const p of pf.data || []) {
+    const t = docTotals({ ...p, status: "issued" });
+    const s = paymentSummary(t.totalIncl, paysBy[p.id]);
+    const methods = [...new Set((paysBy[p.id] || []).map((x) => (PAYMENT_METHODS.find((m) => m.key === x.method) || {}).label))].join(" + ");
+    items.push({
+      key: `proforma:${p.id}`, docType: "proforma", docId: p.id, type: "Proforma", number: p.number, date: (p.issued_at || "").slice(0, 10),
+      client: p.bill_to?.name || "", trn: p.bill_to?.trn || "", plate: p.car?.plate || p.car?.vin || "",
+      excl: fmtMoney(t.subtotalExcl), vat: fmtMoney(t.totalVat), incl: fmtMoney(t.totalIncl), inclNum: t.totalIncl,
+      collected: fmtMoney(s.collected), payment: methods || "Unpaid", ref: p.job_id ? `Job ${String(p.job_id).slice(0, 8).toUpperCase()}` : "",
+    });
+  }
+  for (const j of jobs.ok ? jobs.data || [] : []) {
+    if (!j.invoice_finalized_at) continue;
+    const incl = Number(j.invoice_amount) || 0;
+    const excl = r2(incl / (1 + VAT_RATE));
+    items.push({
+      key: `tax_invoice:${j.id}`, docType: "tax_invoice", docId: j.id, type: "Tax invoice", number: j.invoice_no, date: (j.invoice_finalized_at || "").slice(0, 10),
+      client: j.customer_name || "", trn: "", plate: j.plate || "",
+      excl: fmtMoney(excl), vat: fmtMoney(r2(incl - excl)), incl: fmtMoney(incl), inclNum: incl,
+      collected: "", payment: "", ref: `Job ${String(j.id).slice(0, 8).toUpperCase()}`,
+    });
+  }
+  items.sort((a, b) => String(a.date).localeCompare(String(b.date)));
+  const recByKey = new Map((rec.data || []).map((r) => [`${r.doc_type}:${r.doc_id}`, r]));
+  return {
+    ok: true,
+    items: items.filter((i) => !done.has(i.key)),
+    entered: (rec.data || []).slice(0, 30).map((r) => ({ ...r, key: `${r.doc_type}:${r.doc_id}` })),
+    recByKey,
+  };
+}
+async function markReconciled(items, ref, session) {
+  const res = await gkCall({
+    path: "billing_reconciliation?on_conflict=doc_type,doc_id", method: "POST", headers: { Prefer: "resolution=ignore-duplicates,return=minimal" },
+    body: items.map((i) => ({ doc_type: i.docType, doc_id: i.docId, doc_number: i.number, amount: i.inclNum, first_bit_ref: ref || null, entered_by: session.name })),
+    summary: `Marked ${items.length} document${items.length === 1 ? "" : "s"} as entered in First Bit`,
+  });
+  return res.ok ? { ok: true } : { ok: false, error: res.error };
+}
+async function unmarkReconciled(row) {
+  const res = await gkCall({ path: `billing_reconciliation?id=eq.${row.id}`, method: "DELETE", summary: `Un-marked ${row.doc_number || "a document"} as entered in First Bit` });
+  return res.ok;
+}
+function downloadTextFile(name, text, mime = "text/csv;charset=utf-8") {
+  const url = URL.createObjectURL(new Blob([text], { type: mime }));
+  const a = document.createElement("a");
+  a.href = url; a.download = name;
+  document.body.appendChild(a); a.click(); a.remove();
+  setTimeout(() => URL.revokeObjectURL(url), 4000); // revoking straight away cancels the download in Safari and WebViews
+}
+
+// ---- PDFs -----------------------------------------------------------------
+// Laid out like the proformas the shop already issues from First Bit
+// (ZBPI26-…): Issued By / Bill To, bank details, terms, a VAT line table that
+// only shows the Discount column when a line has one, totals, amount in
+// words, notes and a "Released By" line.
+function generateProformaPDF(p) {
+  const doc = new jsPDF({ unit: "pt", format: "a4" });
+  const pageW = doc.internal.pageSize.getWidth();
+  const margin = 36;
+  const right = pageW - margin;
+  const DARK = [20, 20, 20], GREY = [110, 110, 110], LINE = [175, 175, 175];
+  const issuer = PROFORMA_ISSUERS[p.entity] || PROFORMA_ISSUERS.ZB;
+  const bill = p.bill_to || {};
+  const car = p.car || {};
+  const totals = docTotals(p);
+  const disc = totals.hasDiscount;
+
+  const watermark = () => {
+    if (p.status !== "void" && p.status !== "draft") return;
+    doc.setFont("helvetica", "bold"); doc.setFontSize(96); doc.setTextColor(232, 232, 232);
+    doc.text(p.status === "void" ? "VOID" : "DRAFT", pageW / 2, 470, { align: "center", angle: 35 });
+  };
+  watermark();
+
+  const label = (t, x, y) => { doc.setFont("helvetica", "bold"); doc.setFontSize(8); doc.setTextColor(...GREY); doc.text(t, x, y); };
+  const value = (t, x, y, size = 8.5, bold = false) => { doc.setFont("helvetica", bold ? "bold" : "normal"); doc.setFontSize(size); doc.setTextColor(...DARK); doc.text(String(t || ""), x, y); };
+
+  doc.setFont("helvetica", "bold"); doc.setFontSize(15); doc.setTextColor(...DARK);
+  doc.text("PROFORMA INVOICE", margin, 52);
+  doc.setFont("helvetica", "normal"); doc.setFontSize(9.5);
+  doc.text(`# ${p.number || "DRAFT (not yet issued)"}`, margin, 68);
+  doc.text(formatLongDate(p.issued_at || new Date()), margin, 82);
+
+  // Issued By | Bill To
+  let y = 96;
+  const midX = margin + (right - margin) / 2;
+  const boxH = 92;
+  doc.setDrawColor(...LINE); doc.rect(margin, y, right - margin, boxH); doc.line(midX, y, midX, y + boxH);
+  doc.setFont("helvetica", "bold"); doc.setFontSize(9); doc.setTextColor(...DARK);
+  doc.text("Issued By:", (margin + midX) / 2, y + 14, { align: "center" });
+  doc.text("Bill To:", (midX + right) / 2, y + 14, { align: "center" });
+  const block = (x0, rows, nameText) => {
+    let ty = y + 30;
+    value(nameText, x0, ty, 9, true); ty += 13;
+    rows.forEach(([k, v]) => {
+      label(k, x0, ty);
+      const lines = doc.splitTextToSize(String(v || ""), midX - margin - 74);
+      doc.setFont("helvetica", "normal"); doc.setFontSize(8); doc.setTextColor(...DARK);
+      doc.text(lines.length ? lines : [""], x0 + 46, ty);
+      ty += Math.max(lines.length, 1) * 10 + 2;
+    });
+  };
+  block(margin + 8, [["TRN:", issuer.trn], ["Address:", issuer.address], ["Tel.:", issuer.tel], ["E-mail:", issuer.email]], issuer.name);
+  block(midX + 8, [["TRN:", bill.trn], ["Address:", bill.address], ["Tel.:", bill.phone], ["E-mail:", bill.email]], bill.name || "");
+
+  // Bank Details | Terms
+  y += boxH + 6;
+  const box2H = 62;
+  doc.setDrawColor(...LINE); doc.rect(margin, y, right - margin, box2H); doc.line(midX, y, midX, y + box2H);
+  doc.setFont("helvetica", "bold"); doc.setFontSize(9); doc.setTextColor(...DARK);
+  doc.text("Bank Details:", (margin + midX) / 2, y + 13, { align: "center" });
+  doc.text("Terms and Conditions", (midX + right) / 2, y + 13, { align: "center" });
+  value(INVOICE_ISSUER.bankName, margin + 8, y + 26, 8.5, true);
+  label("IBAN:", margin + 8, y + 37); value(INVOICE_ISSUER.iban, margin + 46, y + 37, 8);
+  label("SWIFT:", margin + 8, y + 47); value(INVOICE_ISSUER.swift, margin + 46, y + 47, 8);
+  label("Beneficiary:", margin + 8, y + 57); value(INVOICE_ISSUER.beneficiary, margin + 62, y + 57, 8);
+  label("Payment Terms:", midX + 8, y + 26); value(p.payment_terms, midX + 78, y + 26, 8);
+  label("Delivery Terms:", midX + 8, y + 37); value(p.delivery_terms, midX + 78, y + 37, 8);
+  if (p.valid_until) { label("Valid Until:", midX + 8, y + 48); value(formatLongDate(`${p.valid_until}T12:00:00`), midX + 78, y + 48, 8); }
+
+  // Line table
+  y += box2H + 12;
+  const C = disc
+    ? { idx: margin + 5, desc: margin + 22, descW: 150, qtyR: margin + 218, uom: margin + 226, priceR: margin + 296, discR: margin + 338, vatPctR: margin + 372, vatAmtR: margin + 432, amtR: right - 4 }
+    : { idx: margin + 5, desc: margin + 22, descW: 210, qtyR: margin + 268, uom: margin + 278, priceR: margin + 350, discR: 0, vatPctR: margin + 392, vatAmtR: margin + 450, amtR: right - 4 };
+  const drawHead = () => {
+    const h = 36;
+    doc.setFillColor(238, 238, 238); doc.rect(margin, y, right - margin, h, "F");
+    doc.setDrawColor(...LINE); doc.rect(margin, y, right - margin, h);
+    doc.setFont("helvetica", "bold"); doc.setFontSize(7); doc.setTextColor(...DARK);
+    doc.text("#", C.idx, y + 12);
+    doc.text("Description", C.desc, y + 12);
+    doc.text("Quantity", C.qtyR, y + 12, { align: "right" });
+    doc.text("UOM", C.uom, y + 12);
+    doc.text(["Price", "(Excl. VAT)", "(AED)"], C.priceR, y + 12, { align: "right" });
+    if (disc) doc.text(["Discount,", "%"], C.discR, y + 12, { align: "right" });
+    doc.text(["VAT,", "%"], C.vatPctR, y + 12, { align: "right" });
+    doc.text(["VAT Amount", "(AED)"], C.vatAmtR, y + 12, { align: "right" });
+    doc.text(["Amount,", "(AED)"], C.amtR, y + 12, { align: "right" });
+    y += h;
+  };
+  drawHead();
+  doc.setFont("helvetica", "normal"); doc.setFontSize(8.5);
+  totals.rows.forEach((r, i) => {
+    const descLines = doc.splitTextToSize(String(r.desc || ""), C.descW);
+    const rowH = Math.max(18, descLines.length * 10 + 8);
+    if (y + rowH > 760) { doc.addPage(); watermark(); y = 40; drawHead(); doc.setFont("helvetica", "normal"); doc.setFontSize(8.5); }
+    doc.setDrawColor(...LINE); doc.rect(margin, y, right - margin, rowH);
+    doc.setTextColor(...DARK); doc.setFont("helvetica", "normal"); doc.setFontSize(8.5);
+    const ty = y + 12;
+    doc.text(String(i + 1), C.idx, ty);
+    doc.text(descLines, C.desc, ty);
+    doc.text(Number(r.qty).toFixed(3), C.qtyR, ty, { align: "right" });
+    doc.text(String(r.uom || "Pcs"), C.uom, ty);
+    doc.text(fmtMoney(r.price), C.priceR, ty, { align: "right" });
+    if (disc) doc.text(fmtPct(r.discountPct), C.discR, ty, { align: "right" });
+    doc.text(String(Math.round(Number(p.vat_rate) * 100 * 100) / 100), C.vatPctR, ty, { align: "right" });
+    doc.text(fmtMoney(r.vat), C.vatAmtR, ty, { align: "right" });
+    doc.text(fmtMoney(r.incl), C.amtR, ty, { align: "right" });
+    y += rowH;
+  });
+
+  // Amount in words + totals
+  y += 16;
+  if (y > 700) { doc.addPage(); watermark(); y = 50; }
+  doc.setFont("helvetica", "bold"); doc.setFontSize(8.5); doc.setTextColor(...DARK);
+  doc.text("Amount in Words:", margin, y);
+  doc.setFont("helvetica", "normal");
+  const words = doc.splitTextToSize(amountInWords(totals.totalIncl), 250);
+  doc.text(words, margin + 82, y);
+  const totalsLabelX = right - 190;
+  let ty = y;
+  const totalLine = (lbl, val, bold) => {
+    doc.setFont("helvetica", bold ? "bold" : "normal"); doc.setFontSize(bold ? 9.5 : 9); doc.setTextColor(...DARK);
+    doc.text(lbl, totalsLabelX, ty);
+    doc.text(val, right - 4, ty, { align: "right" });
+    ty += 16;
+  };
+  if (disc) totalLine("Total Discount, (AED):", fmtMoney(totals.totalDiscount));
+  totalLine("Total (Excl. VAT), (AED):", fmtMoney(totals.subtotalExcl));
+  totalLine("Total VAT, (AED):", fmtMoney(totals.totalVat));
+  totalLine("Total (Incl. VAT), (AED):", fmtMoney(totals.totalIncl), true);
+  y = Math.max(ty, y + words.length * 11) + 14;
+
+  // Notes
+  doc.setFont("helvetica", "bold"); doc.setFontSize(9); doc.setTextColor(...DARK);
+  doc.text("Terms and Conditions:", margin - 6, y);
+  y += 16;
+  doc.setFont("helvetica", "normal"); doc.setFontSize(8.5);
+  const noteLines = [];
+  if (car.makeModel) noteLines.push(`MAKE/MODEL: ${car.makeModel}`);
+  if (car.year) noteLines.push(`YEAR: ${car.year}`);
+  if (car.color) noteLines.push(`COLOR: ${car.color}`);
+  if (car.plate) noteLines.push(`PLATE NO: ${car.plate}`);
+  if (car.vin) noteLines.push(`VIN: ${car.vin}`);
+  if (p.notes) doc.splitTextToSize(p.notes, right - margin).forEach((l) => noteLines.push(l));
+  noteLines.forEach((l) => { if (y > 790) { doc.addPage(); watermark(); y = 50; } doc.text(l, margin - 6, y); y += 10.5; });
+
+  y = Math.max(y + 50, 470);
+  if (y > 780) { doc.addPage(); watermark(); y = 120; }
+  doc.setDrawColor(...LINE); doc.line(margin + 20, y, margin + 150, y);
+  doc.setFont("helvetica", "bold"); doc.setFontSize(8.5); doc.setTextColor(...DARK);
+  doc.text("Released By", margin + 52, y + 13);
+  if (p.status === "void") {
+    doc.setFont("helvetica", "bold"); doc.setFontSize(9); doc.setTextColor(168, 64, 47);
+    doc.text(`VOID${p.void_reason ? `: ${p.void_reason}` : ""}`, margin + 20, y + 40);
+  }
+  return doc;
+}
+
+function generateReceiptPDF(p, payment, summary) {
+  const doc = new jsPDF({ unit: "pt", format: "a5" });
+  const pageW = doc.internal.pageSize.getWidth();
+  const margin = 32;
+  const right = pageW - margin;
+  const DARK = [20, 20, 20], GREY = [110, 110, 110], LINE = [175, 175, 175];
+  const issuer = PROFORMA_ISSUERS[p.entity] || PROFORMA_ISSUERS.ZB;
+  const method = (PAYMENT_METHODS.find((m) => m.key === payment.method) || {}).label || payment.method;
+  doc.setFont("helvetica", "bold"); doc.setFontSize(15); doc.setTextColor(...DARK);
+  doc.text("PAYMENT RECEIPT", margin, 48);
+  doc.setFont("helvetica", "normal"); doc.setFontSize(9.5);
+  doc.text(`# ${payment.receipt_no || "-"}`, margin, 63);
+  doc.text(formatLongDate(`${payment.paid_on || localDateKey()}T12:00:00`), margin, 76);
+  doc.setFontSize(8.5); doc.setTextColor(...GREY);
+  doc.text([issuer.name, `TRN: ${issuer.trn}`, issuer.address, `Tel.: ${issuer.tel}`], right, 48, { align: "right" });
+  doc.setDrawColor(...LINE); doc.line(margin, 100, right, 100);
+
+  let y = 124;
+  const row = (k, v) => {
+    doc.setFont("helvetica", "bold"); doc.setFontSize(8.5); doc.setTextColor(...GREY); doc.text(k, margin, y);
+    doc.setFont("helvetica", "normal"); doc.setFontSize(10); doc.setTextColor(...DARK);
+    const lines = doc.splitTextToSize(String(v || "-"), right - margin - 110);
+    doc.text(lines, margin + 110, y);
+    y += Math.max(lines.length, 1) * 13 + 5;
+  };
+  row("Received from", p.bill_to?.name);
+  row("Amount", `AED ${fmtMoney(payment.amount)}`);
+  row("In words", amountInWords(payment.amount));
+  row("Payment method", method);
+  if (payment.method === "cheque") {
+    row("Cheque no.", payment.cheque_no);
+    row("Bank", payment.cheque_bank);
+    row("Cheque date", payment.cheque_date ? formatLongDate(`${payment.cheque_date}T12:00:00`) : "");
+  }
+  row("Against", `Proforma ${p.number}${p.car?.plate ? ` · ${p.car.plate}` : ""}`);
+  if (summary) {
+    row("Proforma total", `AED ${fmtMoney(docTotals(p).totalIncl)}`);
+    row("Balance after this", `AED ${fmtMoney(summary.balance)}`);
+  }
+  y = Math.max(y + 40, 380);
+  doc.setDrawColor(...LINE); doc.line(margin, y, margin + 150, y); doc.line(right - 150, y, right, y);
+  doc.setFont("helvetica", "bold"); doc.setFontSize(8.5); doc.setTextColor(...DARK);
+  doc.text("Received By (Mr.CAP)", margin, y + 13);
+  doc.text("Paid By", right - 150, y + 13);
+  if (payment.recorded_by) { doc.setFont("helvetica", "normal"); doc.setFontSize(8); doc.setTextColor(...GREY); doc.text(`Recorded by ${payment.recorded_by}`, margin, y + 26); }
+  return doc;
+}
+
 /* ---------------- UI atoms ---------------- */
 // A handful of pulsing placeholder rows, shaped like the real list item
 // they'll be replaced by — used wherever a screen used to just say
@@ -2201,14 +3142,14 @@ function Pill({ children, tone = "default", bg, fg }) {
   const tones = {
     default: { bg: COLORS.panel2, fg: COLORS.ink },
     yellow: { bg: "rgba(201,162,39,0.18)", fg: COLORS.gold },
-    green: { bg: "rgba(74,122,87,0.22)", fg: "#7BC494" },
-    red: { bg: "rgba(168,64,47,0.22)", fg: "#E08A78" },
+    green: { bg: "rgba(74,122,87,0.22)", fg: COLORS.successText },
+    red: { bg: "rgba(168,64,47,0.22)", fg: COLORS.dangerText },
     blue: { bg: "rgba(74,100,120,0.28)", fg: "#8FB4CC" },
     purple: { bg: "rgba(154,122,201,0.2)", fg: "#B79EE0" },
   };
   const t = bg ? { bg, fg } : (tones[tone] || tones.default);
   return (
-    <span style={{ background: t.bg, color: t.fg, fontFamily: "Inter, sans-serif", fontWeight: 600, fontSize: 11, letterSpacing: 0.3, padding: "4px 9px", borderRadius: 999, textTransform: "uppercase", whiteSpace: "nowrap", display: "inline-block" }}>
+    <span style={{ background: t.bg, color: t.fg, fontFamily: BODY_FONT, fontWeight: 600, fontSize: 11, letterSpacing: 0.3, padding: "4px 9px", borderRadius: 999, textTransform: "uppercase", whiteSpace: "nowrap", display: "inline-block" }}>
       {children}
     </span>
   );
@@ -2248,12 +3189,12 @@ function ServiceStepPills({ steps, currentKey, onSelect, disabled, size = "norma
               padding: pad, borderRadius: 999,
               border: `1.5px solid ${isCurrent ? COLORS.gold : isPast ? COLORS.green : COLORS.line}`,
               background: isCurrent ? "rgba(201,162,39,0.18)" : isPast ? "rgba(74,122,87,0.15)" : COLORS.panel2,
-              color: isCurrent ? COLORS.gold : isPast ? "#7BC494" : COLORS.muted,
+              color: isCurrent ? COLORS.gold : isPast ? COLORS.successText : COLORS.muted,
               fontSize, fontWeight: 700, cursor: disabled ? "not-allowed" : "pointer",
               opacity: disabled ? 0.6 : 1, whiteSpace: "nowrap",
             }}
           >
-            {isPast && <CheckCircle2 size={12} color="#7BC494" />}
+            {isPast && <CheckCircle2 size={12} color={COLORS.successText} />}
             {st.label}
           </button>
         );
@@ -2262,19 +3203,158 @@ function ServiceStepPills({ steps, currentKey, onSelect, disabled, size = "norma
   );
 }
 
-const labelStyle = { fontSize: 12, fontWeight: 600, color: COLORS.muted, textTransform: "uppercase", letterSpacing: 0.4 };
-const inputStyle = { width: "100%", marginTop: 8, padding: "11px 12px", borderRadius: 10, border: `1.5px solid ${COLORS.line}`, background: COLORS.panel2, fontSize: 15, fontFamily: "Inter, sans-serif", boxSizing: "border-box", color: COLORS.ink };
-const textareaStyle = { ...inputStyle, minHeight: 72, resize: "vertical" };
-const primaryBtnStyle = { padding: "13px", borderRadius: 10, border: "none", background: COLORS.gold, color: COLORS.darkText, fontWeight: 700, fontSize: 14.5, cursor: "pointer" };
-const secondaryBtnStyle = { padding: "13px", borderRadius: 10, border: `1.5px solid ${COLORS.line}`, background: COLORS.panel2, color: COLORS.ink, fontWeight: 600, fontSize: 14.5, cursor: "pointer" };
-const cameraBtnStyle = { display: "flex", alignItems: "center", gap: 7, padding: "9px 14px", borderRadius: 9, border: `1.5px dashed ${COLORS.muted}`, background: "transparent", color: COLORS.ink, fontSize: 13, fontWeight: 600, cursor: "pointer", marginTop: 8 };
-const iconBtnStyle = { width: 36, height: 36, borderRadius: 10, border: `1px solid ${COLORS.line}`, background: COLORS.panel2, display: "flex", alignItems: "center", justifyContent: "center", cursor: "pointer" };
+const labelStyle = { fontSize: 11, fontWeight: 600, color: COLORS.muted, textTransform: "uppercase", letterSpacing: 1 };
+const inputStyle = { width: "100%", marginTop: 8, minHeight: 46, padding: "11px 14px", borderRadius: 12, border: `1px solid ${COLORS.line}`, background: COLORS.panel2, fontSize: 15, fontFamily: BODY_FONT, boxSizing: "border-box", color: COLORS.ink };
+const textareaStyle = { ...inputStyle, minHeight: 76, resize: "vertical", lineHeight: 1.45 };
+const primaryBtnStyle = { minHeight: 48, padding: "13px 16px", borderRadius: 12, border: "none", background: COLORS.gold, color: COLORS.darkText, fontWeight: 700, fontSize: 15, fontFamily: BODY_FONT, cursor: "pointer", boxShadow: "0 8px 22px -12px rgba(201,162,39,0.55)" };
+const secondaryBtnStyle = { minHeight: 48, padding: "13px 16px", borderRadius: 12, border: `1px solid ${COLORS.line}`, background: COLORS.panel2, color: COLORS.ink, fontWeight: 600, fontSize: 15, fontFamily: BODY_FONT, cursor: "pointer" };
+const dangerBtnStyle = { minHeight: 48, padding: "13px 16px", borderRadius: 12, border: "none", background: COLORS.red, color: "#fff", fontWeight: 700, fontSize: 15, fontFamily: BODY_FONT, cursor: "pointer" };
+const cameraBtnStyle = { display: "flex", alignItems: "center", justifyContent: "center", gap: 8, minHeight: 48, padding: "10px 16px", borderRadius: 12, border: "1.5px dashed #3A3526", background: "transparent", color: COLORS.ink, fontSize: 13.5, fontWeight: 600, cursor: "pointer", marginTop: 8 };
+const iconBtnStyle = { width: 38, height: 38, flexShrink: 0, borderRadius: 12, border: `1px solid ${COLORS.line}`, background: COLORS.panel, display: "flex", alignItems: "center", justifyContent: "center", cursor: "pointer", position: "relative" };
+// Card surface used by every section on the redesigned screens.
+const cardStyle = { background: COLORS.panel, border: `1px solid ${COLORS.line}`, borderRadius: 16, padding: 16 };
+// Small uppercase section heading ("WORK", "PHOTOS · 8") from the design comps.
+const eyebrowStyle = { fontSize: 11, fontWeight: 600, color: COLORS.muted, textTransform: "uppercase", letterSpacing: 1 };
+// Selectable chip: gold outline + tinted fill when picked (design comps).
+const selectChipStyle = (on) => ({
+  minHeight: 40, padding: "0 14px", borderRadius: 999, cursor: "pointer", fontFamily: BODY_FONT,
+  display: "inline-flex", alignItems: "center", justifyContent: "center", gap: 6, whiteSpace: "nowrap",
+  border: on ? `1.5px solid ${COLORS.gold}` : `1px solid ${COLORS.line}`,
+  background: on ? "rgba(201,162,39,0.16)" : COLORS.panel,
+  color: on ? COLORS.goldBright : COLORS.ink, fontSize: 13, fontWeight: on ? 600 : 500,
+});
+// Filter chip: solid gold when active (dashboard filters in the comps).
+const filterChipStyle = (on) => ({
+  height: 36, padding: "0 14px", borderRadius: 999, cursor: "pointer", fontFamily: BODY_FONT, flexShrink: 0,
+  display: "inline-flex", alignItems: "center", gap: 6, whiteSpace: "nowrap",
+  border: on ? `1px solid ${COLORS.gold}` : `1px solid ${COLORS.line}`,
+  background: on ? COLORS.gold : COLORS.panel, color: on ? COLORS.darkText : COLORS.ink,
+  fontSize: 12.5, fontWeight: on ? 700 : 500,
+});
+
+// ---- UAE number plate ------------------------------------------------------
+// Plates are stored as one string ("DXB A 51234", "SHJ 3 77120", a VIN…).
+// When the first token is a known emirate code it gets the dark emirate
+// segment; anything else (VINs, odd imports) shows whole on the plate face.
+const PLATE_EMIRATE_CODES = ["DXB", "AUH", "SHJ", "AJM", "UAQ", "RAK", "FUJ"];
+function parsePlate(plate) {
+  const raw = String(plate || "").trim();
+  const m = raw.match(/^([A-Za-z]{3})\s+(.+)$/);
+  if (m && PLATE_EMIRATE_CODES.includes(m[1].toUpperCase())) return { code: m[1].toUpperCase(), rest: m[2] };
+  return { code: null, rest: raw };
+}
+// size: "sm" (lists), "md" (cards), "lg" (job hero). The whitespace text
+// node between the two segments keeps the element's text exactly the
+// stored plate ("DXB A 51234"), so search/copy/find-by-text still work.
+function PlateChip({ plate, size = "md", style }) {
+  const { code, rest } = parsePlate(plate);
+  const s = size === "lg" ? { fs: 22, cfs: 13, pad: "5px 14px", cpad: "6px 9px", r: 8 } : size === "sm" ? { fs: 12, cfs: 9.5, pad: "2px 7px", cpad: "3px 5px", r: 5 } : { fs: 13, cfs: 10, pad: "3px 8px", cpad: "4px 6px", r: 6 };
+  return (
+    <span style={{ display: "inline-flex", alignItems: "stretch", borderRadius: s.r, overflow: "hidden", border: `1px solid ${COLORS.plateEdge}`, fontFamily: MONO_FONT, fontWeight: 600, fontSize: s.fs, lineHeight: 1.25, flexShrink: 0, maxWidth: "100%", whiteSpace: "nowrap", verticalAlign: "middle", ...style }}>
+      {code && <span style={{ background: COLORS.darkText, color: COLORS.ink, padding: s.cpad, fontSize: s.cfs, display: "flex", alignItems: "center", letterSpacing: 0.5 }}>{code}</span>}
+      {code ? " " : null}
+      <span style={{ background: COLORS.plate, color: COLORS.darkText, padding: s.pad, overflow: "hidden", textOverflow: "ellipsis", letterSpacing: 0.4 }}>{rest || "—"}</span>
+    </span>
+  );
+}
+
+// ---- stage helpers (read-only, derived from existing job fields) ----------
+// When did the job enter the stage it's in now? advance() logs the stage
+// being LEFT ({stage: <key>, label: <that stage's label>}), and a send-back
+// logs {stage: "reversed"} — so the most recent of those two is the moment
+// the current stage began. Intake with neither falls back to creation.
+function stageEnteredAt(job) {
+  const idx = typeof job.stageIndex === "number" ? job.stageIndex : STAGES.findIndex((s) => s.key === job.stageKey);
+  if (idx < 0) return null;
+  const prev = STAGES[idx - 1];
+  let at = null;
+  for (const h of job.history || []) {
+    if (!h || !h.at) continue;
+    const isChange = h.stage === "reversed" || (prev && h.stage === prev.key && h.label === prev.label);
+    if (isChange && (at == null || h.at > at)) at = h.at;
+  }
+  if (at == null && idx === 0) at = job.createdAt || null;
+  return at;
+}
+// Business-hours time in the current stage, using the same open-hours clock
+// and the same age tiers the Dispatch Board already colours cards with
+// (dispatchAgeTier: <4h calm, 4-8h warm, 8h+ hot).
+function stageTimeInfo(job, now = Date.now()) {
+  const from = stageEnteredAt(job);
+  if (!from) return null;
+  const raw = formatDispatchElapsed(from, now);
+  const label = raw === "0m" ? "Just in" : raw;
+  const hours = businessMsElapsed(from, now) / 3600000;
+  const tone = hours >= 8 ? "hot" : hours >= 4 ? "warm" : "calm";
+  return { label, tone, color: tone === "hot" ? COLORS.dangerText : tone === "warm" ? COLORS.gold : COLORS.muted };
+}
+// Who's on it — from the "Assigned to X" history lines assignService writes
+// (the dashboard index doesn't carry assigned_to).
+function assigneesFromHistory(history) {
+  const byLabel = {};
+  for (const h of history || []) {
+    if (!h || h.stage !== "service" || typeof h.note !== "string") continue;
+    if (h.note.startsWith("Assigned to ")) byLabel[h.label] = h.note.slice(12);
+    else if (h.note === "Unassigned") delete byLabel[h.label];
+  }
+  return [...new Set(Object.values(byLabel))];
+}
+function StageProgress({ index, total = STAGES.length, height = 4 }) {
+  return (
+    <div style={{ display: "flex", gap: 3 }} aria-label={`Stage ${index + 1} of ${total}`}>
+      {Array.from({ length: total }).map((_, i) => (
+        <div key={i} style={{ flex: 1, height, borderRadius: height / 2, background: i < index ? COLORS.gold : i === index ? COLORS.goldBright : COLORS.line }} />
+      ))}
+    </div>
+  );
+}
+function EmptyState({ icon: Icon = Car, title, sub }) {
+  return (
+    <div className="mrcap-fade" style={{ textAlign: "center", padding: "44px 16px", color: COLORS.muted }}>
+      <div style={{ width: 56, height: 56, borderRadius: 18, margin: "0 auto 12px", display: "flex", alignItems: "center", justifyContent: "center", background: COLORS.panel, border: `1px solid ${COLORS.line}` }}>
+        <Icon size={24} color={COLORS.gold} style={{ opacity: 0.85 }} />
+      </div>
+      <div style={{ fontSize: 14.5, fontWeight: 600, color: COLORS.ink }}>{title}</div>
+      {sub && <div style={{ fontSize: 12.5, marginTop: 4, lineHeight: 1.45 }}>{sub}</div>}
+    </div>
+  );
+}
+// Screens with a pinned bottom action bar lift the floating Report-issue
+// and Live buttons above it (they read --mrcap-fab-lift).
+function useFabLift(active, px = 84) {
+  useEffect(() => {
+    if (!active) return undefined;
+    const root = document.documentElement;
+    root.style.setProperty("--mrcap-fab-lift", `${px}px`);
+    return () => root.style.removeProperty("--mrcap-fab-lift");
+  }, [active, px]);
+}
+// Pinned bottom action bar. position:sticky (not fixed) so it works inside
+// the animated screen containers and simply rests at the end of the page
+// once you've scrolled all the way down.
+function StickyActionBar({ children }) {
+  useFabLift(true);
+  return (
+    <div style={{ position: "sticky", bottom: 0, zIndex: 40, margin: "18px -18px 0", padding: "12px 18px", paddingBottom: "max(14px, calc(env(safe-area-inset-bottom) + 10px))", background: "rgba(10,10,9,0.94)", backdropFilter: "blur(12px)", WebkitBackdropFilter: "blur(12px)", borderTop: `1px solid ${COLORS.line}`, display: "flex", alignItems: "center", gap: 10 }}>
+      {children}
+    </div>
+  );
+}
 
 const GLOBAL_STYLES = `
 ${FONT_IMPORT}
 @keyframes mrcapFadeUp {
   from { opacity: 0; transform: translateY(10px); }
   to { opacity: 1; transform: translateY(0); }
+}
+/* Every screen root already uses .mrcap-view, and each one is a real
+   mount (React swaps the whole branch on a view change, it doesn't
+   morph one in place) — so giving this animation a horizontal
+   component instead of a vertical one is enough to read as an iOS-style
+   "push" without building an actual layered navigation stack. */
+@keyframes mrcapSlideIn {
+  from { opacity: 0; transform: translateX(26px); }
+  to { opacity: 1; transform: translateX(0); }
 }
 @keyframes mrcapFadeIn {
   from { opacity: 0; }
@@ -2297,16 +3377,55 @@ ${FONT_IMPORT}
   40% { background: rgba(201,162,39,0.28); }
   100% { background: ${COLORS.panel2}; }
 }
-.mrcap-view { animation: mrcapFadeUp 0.32s cubic-bezier(0.22,0.61,0.36,1) both; }
+@keyframes mrcapRise {
+  from { opacity: 0; transform: translateY(8px); }
+  to { opacity: 1; transform: translateY(0); }
+}
+/* ---- base ---- */
+html, body { background: ${COLORS.paper}; }
+body { margin: 0; color: ${COLORS.ink}; font-family: ${BODY_FONT}; -webkit-font-smoothing: antialiased; -moz-osx-font-smoothing: grayscale; text-rendering: optimizeLegibility; }
+* { -webkit-tap-highlight-color: transparent; }
+button, input, textarea, select { font-family: inherit; }
+::selection { background: rgba(201,162,39,0.35); color: ${COLORS.ink}; }
+input::placeholder, textarea::placeholder { color: #6F695A; opacity: 1; }
+input, textarea, select { transition: border-color 0.15s ease, box-shadow 0.15s ease; }
+input:focus, textarea:focus, select:focus { outline: none; border-color: ${COLORS.gold} !important; box-shadow: 0 0 0 3px rgba(201,162,39,0.18); }
+/* Keyboard focus: a visible gold ring on anything tappable. */
+button:focus-visible, a:focus-visible, [role="button"]:focus-visible, [role="menuitem"]:focus-visible, [tabindex]:focus-visible {
+  outline: 2px solid ${COLORS.goldBright}; outline-offset: 2px;
+}
+button:focus:not(:focus-visible) { outline: none; }
+button:disabled { cursor: not-allowed; }
+a { color: ${COLORS.gold}; }
+a:hover { color: ${COLORS.goldBright}; }
+.mrcap-scroll-x { scrollbar-width: none; }
+.mrcap-scroll-x::-webkit-scrollbar { display: none; }
+input[type=number]::-webkit-inner-spin-button, input[type=number]::-webkit-outer-spin-button { opacity: 0.35; }
+/* "backwards", not "both": both kept the final transform: translateX(0)
+   applied forever after the slide-in, and ANY transform on an ancestor
+   makes position:fixed children pin to that ancestor instead of the
+   screen (pop-ups and floating buttons ended up in the wrong place).
+   backwards still holds the start frame during the delay/first paint,
+   then leaves no transform behind — the end frame equals the defaults. */
+.mrcap-view { animation: mrcapSlideIn 0.32s cubic-bezier(0.22,0.61,0.36,1) backwards; }
 .mrcap-fade { animation: mrcapFadeIn 0.4s ease both; }
+.mrcap-rise { animation: mrcapRise 0.36s cubic-bezier(0.22,0.61,0.36,1) backwards; }
+@media (prefers-reduced-motion: reduce) {
+  .mrcap-view, .mrcap-fade, .mrcap-rise, .mrcap-sweep, .mrcap-skeleton { animation: none !important; }
+  .mrcap-press, .mrcap-card, input, textarea, select { transition: none !important; }
+  .mrcap-press:active { transform: none !important; }
+}
 .mrcap-skeleton {
   background: linear-gradient(90deg, ${COLORS.panel} 25%, ${COLORS.panel2} 50%, ${COLORS.panel} 75%);
   background-size: 200% 100%;
   animation: mrcapGoldSweep 1.4s ease-in-out infinite;
-  border-radius: 8px;
+  border-radius: 14px;
 }
-.mrcap-press { transition: transform 0.12s ease, background 0.12s ease, border-color 0.12s ease; }
-.mrcap-press:active { transform: scale(0.96); }
+.mrcap-press { transition: transform 0.14s cubic-bezier(0.22,0.61,0.36,1), background 0.14s ease, border-color 0.14s ease, box-shadow 0.14s ease, opacity 0.14s ease; }
+.mrcap-press:active { transform: scale(0.97); }
+.mrcap-press:disabled:active { transform: none; }
+/* 38px header icons get an invisible 44px hit area. */
+.mrcap-hit::after { content: ""; position: absolute; inset: -3px; }
 .mrcap-sweep {
   background: linear-gradient(100deg, transparent 40%, rgba(232,195,74,0.5) 50%, transparent 60%);
   background-size: 250% 100%;
@@ -2324,8 +3443,14 @@ ${FONT_IMPORT}
 
 function Shell({ children }) {
   return (
-    <div style={{ fontFamily: "Inter, sans-serif", background: COLORS.paper, minHeight: "100vh", maxWidth: 480, margin: "0 auto", position: "relative", paddingTop: "env(safe-area-inset-top)", paddingBottom: 24 }}>
+    <div style={{ fontFamily: BODY_FONT, color: COLORS.ink, background: COLORS.paper, minHeight: "100vh", maxWidth: 480, margin: "0 auto", position: "relative", paddingTop: "env(safe-area-inset-top)", paddingBottom: 24 }}>
       <style>{GLOBAL_STYLES}</style>
+      {/* Solid strip over the status-bar / Dynamic Island area. The app runs
+          edge-to-edge (viewport-fit=cover, translucent status bar), so
+          without this, pinned headers stop below the inset but scrolled
+          content still slides underneath the clock and the island. Zero
+          height on anything without a notch. */}
+      <div aria-hidden="true" style={{ position: "fixed", top: 0, left: 0, right: 0, height: "env(safe-area-inset-top)", background: COLORS.paper, zIndex: 70, pointerEvents: "none" }} />
       {children}
     </div>
   );
@@ -2347,11 +3472,12 @@ function DesktopShell({ session, team, view, setView, onLogout, canArchive, chil
         onClick={onClick}
         className="mrcap-press"
         style={{
-          display: "flex", alignItems: "center", gap: 11, width: "100%",
-          padding: "11px 14px", borderRadius: 9, border: "none", cursor: "pointer",
+          display: "flex", alignItems: "center", gap: 11, width: "100%", minHeight: 42,
+          padding: "10px 14px", borderRadius: 12, border: "none", cursor: "pointer", position: "relative",
           background: active ? "rgba(201,162,39,0.14)" : "transparent",
-          color: active ? COLORS.gold : "#B9BFC7",
-          fontSize: 13.5, fontWeight: active ? 700 : 500, textAlign: "left",
+          boxShadow: active ? `inset 3px 0 0 ${COLORS.gold}` : "none",
+          color: active ? COLORS.goldBright : "#BDB6A4",
+          fontSize: 13.5, fontWeight: active ? 600 : 500, textAlign: "left",
         }}
       >
         <Icon size={16} />
@@ -2361,17 +3487,23 @@ function DesktopShell({ session, team, view, setView, onLogout, canArchive, chil
   };
 
   return (
-    <div style={{ fontFamily: "Inter, sans-serif", background: COLORS.paper, minHeight: "100vh", display: "flex" }}>
+    <div style={{ fontFamily: BODY_FONT, color: COLORS.ink, background: COLORS.paper, minHeight: "100vh", display: "flex" }}>
       <style>{GLOBAL_STYLES}</style>
-      <div style={{ width: 232, flexShrink: 0, background: "#15181C", minHeight: "100vh", display: "flex", flexDirection: "column", padding: "20px 12px", position: "sticky", top: 0, alignSelf: "flex-start" }}>
-        <div style={{ padding: "6px 10px 22px" }}>
-          <div style={{ fontFamily: DISPLAY_FONT, fontWeight: 700, fontSize: 18, color: COLORS.gold, letterSpacing: 0.5 }}>Mr.CAP.</div>
-          <div style={{ fontSize: 10, color: "#7A828C", marginTop: 2, textTransform: "uppercase", letterSpacing: 0.5 }}>Back Office</div>
+      <div style={{ width: 232, flexShrink: 0, background: COLORS.panel, borderRight: `1px solid ${COLORS.line}`, height: "100vh", overflowY: "auto", boxSizing: "border-box", display: "flex", flexDirection: "column", padding: "20px 12px", position: "sticky", top: 0, alignSelf: "flex-start" }}>
+        <div style={{ padding: "6px 10px 22px", display: "flex", alignItems: "center", gap: 10 }}>
+          <div style={{ width: 34, height: 34, borderRadius: 10, background: "#fff", display: "flex", alignItems: "center", justifyContent: "center", padding: 4, boxSizing: "border-box", flexShrink: 0 }}>
+            <img src={LOGO_SRC} alt="" style={{ width: "100%", height: "100%", objectFit: "contain" }} />
+          </div>
+          <div>
+            <div style={{ fontFamily: DISPLAY_FONT, fontWeight: 700, fontSize: 19, color: COLORS.gold, letterSpacing: 0.3, lineHeight: 1.1 }}>Mr.CAP.</div>
+            <div style={{ fontSize: 10, color: COLORS.muted, marginTop: 2, textTransform: "uppercase", letterSpacing: 1.2 }}>Back Office</div>
+          </div>
         </div>
         <div style={{ display: "flex", flexDirection: "column", gap: 3, flex: 1 }}>
           {navItem("list", "Dashboard", LayoutDashboard, () => setView("list"))}
           {navItem("customers", "Customers", Users, () => setView("customers"), hasPermission(session, team, "customers"))}
           {navItem("quotes", "Quotations", FileText, () => setView("quotes"), hasPermission(session, team, "quotations"))}
+          {navItem("billing", "Billing", Receipt, () => setView("billing"), canUseBilling(session, team))}
           {navItem("reports", "Reports", BarChart3, () => setView("reports"), hasPermission(session, team, "reports"))}
           {navItem("archive", "Archive", Archive, () => setView("archive"), canArchive)}
           {navItem("team", "Team", ShieldCheck, () => setView("team"), hasPermission(session, team, "team"))}
@@ -2382,16 +3514,23 @@ function DesktopShell({ session, team, view, setView, onLogout, canArchive, chil
           {navItem("msgtemplates", "WhatsApp Messages", MessageSquare, () => setView("msgtemplates"), isSuperAdmin(session))}
           {navItem("announcements", "Post Announcement", Send, () => setView("announcements"), isSuperAdmin(session))}
           {navItem("issues", "Issue Reports", AlertCircle, () => setView("issues"), isSuperAdmin(session))}
+          {navItem("smartechapprovals", "Smartech Approvals", Receipt, () => setView("smartechapprovals"), canApproveSmartech(session))}
         </div>
-        <div style={{ borderTop: "1px solid #262A30", paddingTop: 12, marginTop: 12 }}>
-          <div style={{ padding: "0 10px 10px", fontSize: 11.5, color: "#8A919B" }}>{session.name} · {ROLE_DEFS[session.role]?.label || session.role}</div>
-          <button onClick={onLogout} className="mrcap-press" style={{ display: "flex", alignItems: "center", gap: 10, width: "100%", padding: "9px 10px", borderRadius: 8, border: "none", background: "transparent", color: "#B9BFC7", fontSize: 13, cursor: "pointer" }}>
+        <div style={{ borderTop: `1px solid ${COLORS.line}`, paddingTop: 12, marginTop: 12 }}>
+          <div style={{ display: "flex", alignItems: "center", gap: 10, padding: "0 10px 10px" }}>
+            <div style={{ width: 32, height: 32, borderRadius: "50%", border: `1px solid ${COLORS.gold}`, background: COLORS.panel2, color: COLORS.gold, fontWeight: 700, fontSize: 13, display: "flex", alignItems: "center", justifyContent: "center", flexShrink: 0 }}>{(session.name || "?").charAt(0).toUpperCase()}</div>
+            <div style={{ minWidth: 0 }}>
+              <div style={{ fontSize: 13, color: COLORS.ink, fontWeight: 600, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{session.name}</div>
+              <div style={{ fontSize: 11, color: COLORS.muted, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{ROLE_DEFS[session.role]?.label || session.role}</div>
+            </div>
+          </div>
+          <button onClick={onLogout} className="mrcap-press" style={{ display: "flex", alignItems: "center", gap: 10, width: "100%", minHeight: 40, padding: "9px 12px", borderRadius: 12, border: "none", background: "transparent", color: "#BDB6A4", fontSize: 13, cursor: "pointer" }}>
             <Lock size={14} /> Log out
           </button>
         </div>
       </div>
       <div style={{ flex: 1, minWidth: 0 }}>
-        <div style={{ maxWidth: 900, margin: "0 auto", padding: "28px 32px 60px" }}>
+        <div style={{ maxWidth: 960, margin: "0 auto", padding: "28px 36px 60px" }}>
           {children}
         </div>
       </div>
@@ -2403,28 +3542,32 @@ function DesktopShell({ session, team, view, setView, onLogout, canArchive, chil
 // Fixed, thumb-reachable "New Job" button — replaces the old small
 // top-corner icon. Sits above the safe-area on mobile, large enough to
 // hit reliably on a work-floor phone.
-function FloatingNewJobButton({ onClick, label = "New Job" }) {
-  return (
+// Portaled to document.body: the Quotes screen renders this inside its own
+// animated container, and a transformed ancestor turns position:fixed into
+// "fixed to that container" — the New Quote button ended up parked at the
+// bottom of the list instead of floating over it.
+function FloatingNewJobButton({ onClick, label = "New Job", shiftX = 0 }) {
+  return createPortal(
     <button
       onClick={onClick}
       className="mrcap-press"
       style={{
-        position: "fixed", left: "50%", bottom: "max(22px, env(safe-area-inset-bottom))",
+        position: "fixed", left: shiftX ? `calc(50% + ${shiftX}px)` : "50%", bottom: "max(22px, env(safe-area-inset-bottom))",
         transform: "translateX(-50%)", zIndex: 50,
-        display: "flex", alignItems: "center", gap: 10,
-        padding: "16px 28px", borderRadius: 999, border: "none",
+        display: "flex", alignItems: "center", gap: 10, height: 56,
+        padding: "0 26px 0 20px", borderRadius: 999, border: `3px solid ${COLORS.paper}`,
         background: `linear-gradient(135deg, ${COLORS.goldBright}, ${COLORS.gold} 55%, ${COLORS.goldDeep})`, color: COLORS.darkText,
-        fontSize: 15.5, fontWeight: 700, cursor: "pointer",
-        boxShadow: "0 10px 30px -8px rgba(201,162,39,0.55), 0 2px 8px rgba(0,0,0,0.4)",
+        fontSize: 15.5, fontWeight: 700, fontFamily: BODY_FONT, cursor: "pointer", whiteSpace: "nowrap",
+        boxShadow: "0 10px 30px -6px rgba(201,162,39,0.45), 0 2px 10px rgba(0,0,0,0.5)",
       }}
     >
       <Plus size={22} strokeWidth={2.6} /> {label}
-    </button>
+    </button>,
+    document.body
   );
-
 }
 function SectionTitle({ children }) {
-  return <div style={{ fontFamily: DISPLAY_FONT, fontWeight: 600, fontSize: 19, color: COLORS.ink, margin: "12px 0 16px" }}>{children}</div>;
+  return <div style={{ fontFamily: DISPLAY_FONT, fontWeight: 700, fontSize: 24, color: COLORS.ink, margin: "10px 0 16px", lineHeight: 1.15, letterSpacing: 0.2 }}>{children}</div>;
 }
 // Location picker for the New/Edit Job forms. Starts from the fixed
 // in-house locations (BASE_LOCATIONS) plus whatever external
@@ -2455,7 +3598,7 @@ function LocationPicker({ location, setLocation, session }) {
   return (
     <div style={{ display: "flex", flexDirection: "column", gap: 8 }}>
       {locations.map((l) => (
-        <button key={l} onClick={() => setLocation(l)} className="mrcap-press" style={{ padding: "10px", borderRadius: 9, border: `1.5px solid ${location === l ? COLORS.gold : COLORS.line}`, background: location === l ? COLORS.gold : COLORS.panel2, color: location === l ? COLORS.darkText : COLORS.ink, fontWeight: 600, fontSize: 13, cursor: "pointer", textAlign: "left" }}>{l}</button>
+        <button key={l} onClick={() => setLocation(l)} className="mrcap-press" style={{ display: "flex", alignItems: "center", justifyContent: "space-between", gap: 8, minHeight: 46, padding: "10px 14px", borderRadius: 12, border: location === l ? `1.5px solid ${COLORS.gold}` : `1px solid ${COLORS.line}`, background: location === l ? "rgba(201,162,39,0.14)" : COLORS.panel, color: location === l ? COLORS.goldBright : COLORS.ink, fontWeight: location === l ? 600 : 500, fontSize: 13.5, cursor: "pointer", textAlign: "left" }}><span>{l}</span>{location === l && <Check size={16} color={COLORS.gold} />}</button>
       ))}
       {adding ? (
         <div style={{ display: "flex", gap: 6 }}>
@@ -2477,7 +3620,338 @@ function LocationPicker({ location, setLocation, session }) {
 }
 
 function Field({ label, children }) {
-  return <div style={{ marginBottom: 14 }}><label style={labelStyle}>{label}</label><div style={{ marginTop: 6 }}>{children}</div></div>;
+  return <div style={{ marginBottom: 18 }}><label style={labelStyle}>{label}</label><div style={{ marginTop: 8 }}>{children}</div></div>;
+}
+
+/* ---------------- Structured vehicle details (make/model/year/colour/body type) ----------------
+   Shared by Quick Intake, New Job Card and Edit Job Card. Make/Model are
+   searchable combo boxes seeded from VEHICLE_CATALOG plus whatever's been
+   learned from real jobs (see learnVehicle in the data layer above);
+   Year/Colour are chip pickers; Body type is 4 big picture buttons. */
+const VEHICLE_CATALOG = {
+  "Nissan": ["Patrol", "Patrol Nismo", "Armada", "X-Trail", "Altima"],
+  "Toyota": ["Land Cruiser", "Land Cruiser 250", "Prado", "FJ Cruiser", "Corolla Cross", "Camry", "Fortuner", "Hilux", "Sequoia"],
+  "Lexus": ["LX 570", "LX 600", "LX 700", "RX 450h", "NX 300", "LS 460L", "LS 500", "GX"],
+  "Mercedes-Benz": ["G 63", "GLS 63", "GLS", "GLE", "S 500", "S 580", "Maybach S", "C 300", "E 300", "SL 500", "S-Class Coupe", "V 250", "EQS"],
+  "BMW": ["7 Series", "750Li", "X3", "X5", "X7", "XM", "iX", "M3", "M5"],
+  "Audi": ["Q7", "Q8", "RS Q8", "R8", "S8", "A8"],
+  "Porsche": ["911 GT3 RS", "911 Carrera GTS", "911 Turbo S", "Cayenne", "Macan", "Taycan"],
+  "Land Rover": ["Defender 90", "Defender 110", "Defender 130", "Range Rover", "Range Rover Sport", "Range Rover Vogue", "Range Rover Velar"],
+  "Rolls-Royce": ["Cullinan", "Spectre", "Ghost", "Phantom"],
+  "Bentley": ["Bentayga", "Continental GT"],
+  "Ferrari": ["812 Superfast", "Purosangue", "SF90", "Roma"],
+  "Lamborghini": ["Revuelto", "Urus", "Huracán"],
+  "McLaren": [],
+  "Aston Martin": ["DBX"],
+  "Cadillac": ["Escalade"],
+  "Chevrolet": ["Tahoe", "Silverado", "Blazer", "Suburban"],
+  "GMC": ["Sierra", "Yukon"],
+  "Ford": ["Raptor", "F-150", "Expedition", "Mustang", "Bronco"],
+  "Jeep": ["Wrangler", "Gladiator", "Grand Cherokee", "Wrangler 392"],
+  "Dodge": [],
+  "RAM": ["1500 TRX"],
+  "Tesla": ["Model 3", "Model Y", "Model S", "Model X", "Cybertruck"],
+  "BYD": [],
+  "Denza": ["B8"],
+  "Zeekr": ["9X", "8X", "001"],
+  "Lotus": ["Eletre"],
+  "Genesis": [],
+  "Hyundai": [],
+  "Kia": [],
+  "Changan": ["X5 Plus", "UNI-K"],
+  "Jetour": ["X70", "T2"],
+  "Geely": [],
+  "Rox": ["01", "Adamas"],
+  "Tank": ["700", "500"],
+  "GAC": ["Emkoo"],
+  "Hongqi": [],
+  "Lucid": [],
+  "Maserati": [],
+  "Mini": ["Cooper"],
+  "Volkswagen": [],
+  "Volvo": ["S90", "XC90"],
+  "Suzuki": ["Jimny", "Grand Vitara"],
+  "Mitsubishi": [],
+  "Infiniti": ["QX80"],
+  "Xiaomi": ["SU7"],
+};
+const VEHICLE_COLORS = ["White", "Black", "Silver", "Grey", "Blue", "Red", "Green", "Beige", "Gold", "Other"];
+const BODY_TYPES = [
+  { key: "suv", label: "SUV" },
+  { key: "sedan", label: "Sedan" },
+  { key: "coupe", label: "Coupe" },
+  { key: "pickup", label: "Pickup" },
+];
+const BODY_TYPE_LABEL = Object.fromEntries(BODY_TYPES.map((b) => [b.key, b.label]));
+
+// Suggests a body type from make/model keywords (staff always still has
+// to tap it, this is just a head start). Checked pickup/coupe first since
+// those are the categories most likely to be masked by a looser SUV/sedan
+// match ("Wrangler" vs "Gladiator", "S 500" vs "SL 500", etc).
+const BODY_TYPE_HINTS_PICKUP = ["raptor", "f-150", "f150", "sierra", "silverado", "gladiator", "hilux", "ram 1500", "1500 trx", "cybertruck"];
+const BODY_TYPE_HINTS_COUPE = ["911", "812", "r8", "revuelto", "huracán", "huracan", "mustang", "sl 500", "s-class coupe", "spectre", "continental gt", "roma", "sf90"];
+const BODY_TYPE_HINTS_SUV = ["patrol", "land cruiser", "lx 570", "lx 600", "lx 700", "gx", "g 63", "gls", "escalade", "tahoe", "range rover", "defender", "cullinan", "urus", "x5", "x7", "q7", "wrangler", "jimny", "tank 700", "tank 500", "zeekr 9x", "denza b8", "v 250"];
+const BODY_TYPE_HINTS_SEDAN = ["s 500", "s 580", "7 series", "750li", "s8", "a8", "ls 460l", "ls 500", "model 3", "c 300", "e 300", "s90", "ghost", "phantom", "eqs", "taycan", "mini cooper"];
+function suggestBodyType(make, model) {
+  const s = `${make || ""} ${model || ""}`.trim().toLowerCase();
+  if (!s) return null;
+  if (BODY_TYPE_HINTS_PICKUP.some((k) => s.includes(k))) return "pickup";
+  if (BODY_TYPE_HINTS_COUPE.some((k) => s.includes(k))) return "coupe";
+  if (BODY_TYPE_HINTS_SUV.some((k) => s.includes(k))) return "suv";
+  if (BODY_TYPE_HINTS_SEDAN.some((k) => s.includes(k))) return "sedan";
+  return null;
+}
+// "2025 · White · SUV" — whatever's actually set, skipping the rest.
+function vehicleSubline(job) {
+  return [job.modelYear || "", job.color || "", job.bodyType ? BODY_TYPE_LABEL[job.bodyType] || "" : ""].filter(Boolean).join(" · ");
+}
+
+function catalogModelsFor(make) {
+  const key = Object.keys(VEHICLE_CATALOG).find((k) => k.toLowerCase() === (make || "").trim().toLowerCase());
+  return key ? VEHICLE_CATALOG[key] : [];
+}
+function makeOptions() {
+  const merged = new Map();
+  Object.keys(VEHICLE_CATALOG).forEach((m) => merged.set(m.toLowerCase(), m));
+  getLearnedMakes().forEach((m) => merged.set(m.toLowerCase(), m));
+  return Array.from(merged.values()).sort((a, b) => a.localeCompare(b));
+}
+function modelOptionsFor(make) {
+  const merged = new Map();
+  catalogModelsFor(make).forEach((m) => merged.set(m.toLowerCase(), m));
+  getLearnedModels(make).forEach((m) => merged.set(m.toLowerCase(), m));
+  return Array.from(merged.values()).sort((a, b) => a.localeCompare(b));
+}
+
+// Best-effort split of a legacy combined makeModel string into structured
+// fields, for pre-filling Edit Job Card on an old job that only has
+// makeModel. Nothing is saved from this until the user actually saves —
+// see EditJobScreen.
+function prefillFromLegacyMakeModel(makeModel) {
+  const text = String(makeModel || "").replace(/\//g, " ").replace(/\s+/g, " ").trim();
+  if (!text) return { make: "", model: "", color: "", modelYear: "" };
+  const words = text.split(" ");
+  const catalogMakes = Object.keys(VEHICLE_CATALOG).concat(getLearnedMakes());
+  let matchedMake = "";
+  let rest = words;
+  for (let n = Math.min(3, words.length); n >= 1; n--) {
+    const candidate = words.slice(0, n).join(" ");
+    const found = catalogMakes.find((m) => m.toLowerCase() === candidate.toLowerCase());
+    if (found) { matchedMake = found; rest = words.slice(n); break; }
+  }
+  let modelYear = "";
+  let color = "";
+  const remaining = [];
+  rest.forEach((w) => {
+    const clean = w.replace(/[^\w-]/g, "");
+    if (!modelYear && /^(19|20)\d{2}$/.test(clean) && Number(clean) >= 1950 && Number(clean) <= 2100) { modelYear = clean; return; }
+    const colorMatch = !color && VEHICLE_COLORS.find((c) => c.toLowerCase() === clean.toLowerCase() && c !== "Other");
+    if (colorMatch) { color = colorMatch; return; }
+    remaining.push(w);
+  });
+  return { make: matchedMake, model: remaining.join(" ").trim(), color, modelYear };
+}
+
+// Small side-profile silhouettes for the body-type picture buttons —
+// rough on purpose, just enough to read as "tall boxy SUV" vs "low sleek
+// sedan" vs "raked coupe" vs "cab + bed pickup" at a glance.
+function BodyTypeIcon({ type, color }) {
+  const common = { width: 40, height: 20, viewBox: "0 0 64 32", fill: "none", stroke: color, strokeWidth: 2.2, strokeLinejoin: "round", strokeLinecap: "round" };
+  if (type === "suv") return (
+    <svg {...common}>
+      <path d="M3 24 L3 15 Q3 11 8 11 L15 11 L19 5 Q21 3 25 3 L42 3 Q46 3 48 6 L52 11 L57 11 Q61 11 61 16 L61 24 Z" />
+      <circle cx="16" cy="25" r="4" fill={color} stroke="none" />
+      <circle cx="48" cy="25" r="4" fill={color} stroke="none" />
+    </svg>
+  );
+  if (type === "coupe") return (
+    <svg {...common}>
+      <path d="M3 24 L3 20 Q6 20 9 16 L20 7 Q24 4 29 4 L38 4 Q43 4 46 9 L53 17 Q58 18 60 20 L60 24 Z" />
+      <circle cx="15" cy="25" r="4" fill={color} stroke="none" />
+      <circle cx="47" cy="25" r="4" fill={color} stroke="none" />
+    </svg>
+  );
+  if (type === "pickup") return (
+    <svg {...common}>
+      <path d="M3 24 L3 16 Q3 12 7 12 L13 12 L17 6 Q19 4 23 4 L31 4 L31 13 L37 13 L37 24" />
+      <path d="M37 16 L58 16 Q61 16 61 19 L61 24 L37 24 Z" />
+      <circle cx="14" cy="25" r="4" fill={color} stroke="none" />
+      <circle cx="50" cy="25" r="4" fill={color} stroke="none" />
+    </svg>
+  );
+  // sedan (default)
+  return (
+    <svg {...common}>
+      <path d="M3 24 L3 19 Q5 19 7 16 L15 8 Q18 5 23 5 L40 5 Q44 5 46 9 L52 17 Q57 18 60 19 L60 24 Z" />
+      <circle cx="15" cy="25" r="4" fill={color} stroke="none" />
+      <circle cx="47" cy="25" r="4" fill={color} stroke="none" />
+    </svg>
+  );
+}
+
+// Searchable combo box used for both Make and Model — a plain text input
+// plus a big-touch-row dropdown filtered as you type, with a "+ Use as
+// new…" row when nothing matches exactly. Fully controlled: `value` is
+// the source of truth (typing calls onChangeText on every keystroke, so
+// free text staff never picks from the list still gets saved).
+function VehicleComboBox({ value, onChangeText, options, placeholder, inputRef, kind }) {
+  const [open, setOpen] = useState(false);
+  const wrapRef = useRef(null);
+  const localRef = useRef(null);
+  const setRef = (el) => { localRef.current = el; if (inputRef) inputRef.current = el; };
+  useEffect(() => {
+    if (!open) return undefined;
+    const onDoc = (e) => { if (wrapRef.current && !wrapRef.current.contains(e.target)) setOpen(false); };
+    document.addEventListener("mousedown", onDoc);
+    return () => document.removeEventListener("mousedown", onDoc);
+  }, [open]);
+  const q = (value || "").trim().toLowerCase();
+  const filtered = q ? options.filter((o) => o.toLowerCase().includes(q)) : options;
+  const exact = options.some((o) => o.toLowerCase() === q);
+  return (
+    <div ref={wrapRef} style={{ position: "relative" }}>
+      <input
+        ref={setRef}
+        style={inputStyle}
+        value={value || ""}
+        placeholder={placeholder}
+        onFocus={() => setOpen(true)}
+        onChange={(e) => { onChangeText(e.target.value); setOpen(true); }}
+        onKeyDown={(e) => { if (e.key === "Escape" || e.key === "Enter") { setOpen(false); e.currentTarget.blur(); } }}
+      />
+      {open && (filtered.length > 0 || q) && (
+        <div style={{ position: "absolute", zIndex: 30, top: "100%", left: 0, right: 0, marginTop: 4, background: COLORS.panel, border: `1px solid ${COLORS.line}`, borderRadius: 12, maxHeight: 260, overflowY: "auto", boxShadow: "0 12px 30px rgba(0,0,0,0.5)" }}>
+          {filtered.slice(0, 60).map((o) => (
+            <button key={o} type="button" onMouseDown={(e) => e.preventDefault()} onClick={() => { onChangeText(o); setOpen(false); }} className="mrcap-press" style={{ display: "block", width: "100%", textAlign: "left", padding: "12px 14px", minHeight: 44, background: "none", border: "none", borderBottom: `1px solid ${COLORS.line}`, color: COLORS.ink, fontSize: 14, cursor: "pointer" }}>
+              {o}
+            </button>
+          ))}
+          {q && !exact && (
+            <button type="button" onMouseDown={(e) => e.preventDefault()} onClick={() => { onChangeText(value.trim()); setOpen(false); }} className="mrcap-press" style={{ display: "block", width: "100%", textAlign: "left", padding: "12px 14px", minHeight: 44, background: "none", border: "none", color: COLORS.gold, fontSize: 13.5, fontWeight: 600, cursor: "pointer" }}>
+              + Use "{value.trim()}" as a new {kind}
+            </button>
+          )}
+        </div>
+      )}
+    </div>
+  );
+}
+
+const YEAR_RECENT_CHIPS = [2027, 2026, 2025, 2024, 2023];
+const YEAR_OLDER = Array.from({ length: 2022 - 1990 + 1 }, (_, i) => 2022 - i);
+
+// Reusable Make/Model/Year/Colour/Body-type block for Quick Intake, New
+// Job Card and Edit Job Card. Fully controlled — `values` is the current
+// {make, model, modelYear, color, bodyType}, and onChange(patch) merges
+// a partial update into the caller's own state.
+function VehicleDetailsFields({ values, onChange, bodyTypeRequired, showBodyTypeMissing }) {
+  const { make = "", model = "", modelYear = "", color = "", bodyType = "" } = values || {};
+  const modelInputRef = useRef(null);
+  const [showOlderYears, setShowOlderYears] = useState(false);
+  const isCustomColor = !!color && !VEHICLE_COLORS.slice(0, -1).includes(color);
+  const [showOtherColor, setShowOtherColor] = useState(isCustomColor);
+
+  const suggestedBodyType = !bodyType ? suggestBodyType(make, model) : null;
+
+  const setMake = (v) => {
+    const hadSlash = v.includes("/");
+    onChange({ make: v.replace(/\//g, "") });
+    if (hadSlash) modelInputRef.current?.focus();
+  };
+  const setModel = (v) => onChange({ model: v.replace(/\//g, "") });
+
+  return (
+    <div>
+      <Field label="Make">
+        <VehicleComboBox value={make} onChangeText={setMake} options={makeOptions()} placeholder="e.g. Nissan" kind="make" />
+      </Field>
+      <Field label="Model (optional)">
+        <VehicleComboBox inputRef={modelInputRef} value={model} onChangeText={setModel} options={modelOptionsFor(make)} placeholder="e.g. Patrol" kind="model" />
+        <div style={{ fontSize: 11, color: COLORS.muted, marginTop: 6 }}>Leave blank if the car is just one name (e.g. Defender, Jimny)</div>
+      </Field>
+
+      <Field label="Year (optional)">
+        <div style={{ display: "flex", gap: 7, flexWrap: "wrap" }}>
+          {YEAR_RECENT_CHIPS.map((y) => (
+            <button key={y} type="button" onClick={() => onChange({ modelYear: Number(modelYear) === y ? "" : y })} className="mrcap-press" aria-pressed={Number(modelYear) === y} style={{ ...selectChipStyle(Number(modelYear) === y), minHeight: 44, minWidth: 58 }}>{y}</button>
+          ))}
+          <button
+            type="button"
+            onClick={() => {
+              if (modelYear && !YEAR_RECENT_CHIPS.includes(Number(modelYear))) { onChange({ modelYear: "" }); setShowOlderYears(false); }
+              else setShowOlderYears((v) => !v);
+            }}
+            className="mrcap-press"
+            aria-pressed={showOlderYears || (!!modelYear && !YEAR_RECENT_CHIPS.includes(Number(modelYear)))}
+            style={{ ...selectChipStyle(showOlderYears || (!!modelYear && !YEAR_RECENT_CHIPS.includes(Number(modelYear)))), minHeight: 44 }}
+          >
+            {modelYear && !YEAR_RECENT_CHIPS.includes(Number(modelYear)) ? modelYear : "Older…"}
+          </button>
+        </div>
+        {showOlderYears && (
+          <div style={{ display: "grid", gridTemplateColumns: "repeat(4, 1fr)", gap: 6, marginTop: 8 }}>
+            {YEAR_OLDER.map((y) => (
+              <button key={y} type="button" onClick={() => onChange({ modelYear: Number(modelYear) === y ? "" : y })} className="mrcap-press" aria-pressed={Number(modelYear) === y} style={{ ...selectChipStyle(Number(modelYear) === y), minHeight: 44, padding: "0 4px", fontSize: 12 }}>{y}</button>
+            ))}
+          </div>
+        )}
+      </Field>
+
+      <Field label="Colour (optional)">
+        <div style={{ display: "flex", gap: 7, flexWrap: "wrap" }}>
+          {VEHICLE_COLORS.map((c) => {
+            const on = c === "Other" ? showOtherColor : color === c;
+            return (
+              <button
+                key={c}
+                type="button"
+                onClick={() => {
+                  if (c === "Other") { setShowOtherColor(true); if (!isCustomColor) onChange({ color: "" }); }
+                  else { setShowOtherColor(false); onChange({ color: color === c ? "" : c }); }
+                }}
+                className="mrcap-press"
+                aria-pressed={on}
+                style={{ ...selectChipStyle(on), minHeight: 44 }}
+              >
+                {c}
+              </button>
+            );
+          })}
+        </div>
+        {showOtherColor && (
+          <input style={{ ...inputStyle, maxWidth: 240 }} value={isCustomColor ? color : ""} onChange={(e) => onChange({ color: e.target.value })} placeholder="e.g. Matte Grey" />
+        )}
+      </Field>
+
+      <Field label={bodyTypeRequired ? "Body type" : "Body type (optional)"}>
+        {suggestedBodyType && <div style={{ fontSize: 11.5, color: COLORS.gold, marginBottom: 8, fontWeight: 600 }}>Suggested — tap to confirm</div>}
+        <div style={{ display: "grid", gridTemplateColumns: "repeat(4, 1fr)", gap: 8 }}>
+          {BODY_TYPES.map((bt) => {
+            const on = bodyType === bt.key;
+            const suggested = !on && suggestedBodyType === bt.key;
+            return (
+              <button
+                key={bt.key}
+                type="button"
+                onClick={() => onChange({ bodyType: on ? "" : bt.key })}
+                className="mrcap-press"
+                aria-pressed={on}
+                style={{
+                  display: "flex", flexDirection: "column", alignItems: "center", gap: 6, padding: "12px 6px", borderRadius: 12, minHeight: 60,
+                  border: on ? `1.5px solid ${COLORS.gold}` : suggested ? `1.5px dashed ${COLORS.gold}` : `1px solid ${COLORS.line}`,
+                  background: on ? "rgba(201,162,39,0.16)" : COLORS.panel, cursor: "pointer",
+                }}
+              >
+                <BodyTypeIcon type={bt.key} color={on ? COLORS.goldBright : COLORS.muted} />
+                <span style={{ fontSize: 11.5, fontWeight: on ? 700 : 500, color: on ? COLORS.goldBright : COLORS.ink }}>{bt.label}</span>
+              </button>
+            );
+          })}
+        </div>
+        {showBodyTypeMissing && <div style={{ fontSize: 12, color: COLORS.dangerText, marginTop: 8, fontWeight: 600 }}>Pick the car type</div>}
+      </Field>
+    </div>
+  );
 }
 
 // "Didn't find the pricing module? Add one here" — sits at the end of
@@ -2567,15 +4041,26 @@ function PhotoViewer({ photos, index, onClose, onNavigate }) {
     document.body.removeChild(a);
   };
 
-  return (
+  // Rendered through a portal into document.body, like every other overlay
+  // in the app. It used to render inline inside the job screen, whose
+  // entrance animation leaves a transform on it — and a transformed
+  // ancestor becomes the containing block for position:fixed, so the
+  // "full-screen" viewer was really sized to the whole (scrolled) job
+  // page: its header, and the Close button in it, sat at the top of that
+  // page, off-screen whenever you'd scrolled down to the photos. That's
+  // the "can't reach the X sometimes" on iPhone.
+  return createPortal(
     <div className="mrcap-fade" style={{ position: "fixed", inset: 0, background: "rgba(6,6,5,0.96)", zIndex: 1000, display: "flex", flexDirection: "column" }} onClick={onClose}>
-      <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", padding: "16px 18px", paddingTop: "max(16px, env(safe-area-inset-top))" }} onClick={(e) => e.stopPropagation()}>
+      {/* Clearance below the status bar / Dynamic Island, and Close sits
+          before Download so it isn't the button jammed into the far
+          corner. Tapping anywhere on the dimmed area below also closes. */}
+      <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", padding: "16px 12px 16px 18px", paddingTop: "max(24px, calc(env(safe-area-inset-top) + 14px))" }} onClick={(e) => e.stopPropagation()}>
         <div style={{ color: COLORS.muted, fontSize: 12.5 }}>{photo.label} · {index + 1} of {photos.length}</div>
-        <div style={{ display: "flex", gap: 8 }}>
+        <div style={{ display: "flex", gap: 10 }}>
+          <button onClick={onClose} className="mrcap-press" style={iconBtnStyle}><X size={18} color={COLORS.ink} /></button>
           <button onClick={download} className="mrcap-press" style={{ ...iconBtnStyle, background: COLORS.gold, border: "none" }} title="Save to device">
             <Download size={17} color={COLORS.darkText} />
           </button>
-          <button onClick={onClose} className="mrcap-press" style={iconBtnStyle}><X size={18} color={COLORS.ink} /></button>
         </div>
       </div>
       <div style={{ flex: 1, display: "flex", alignItems: "center", justifyContent: "center", padding: "0 12px", position: "relative" }} onClick={(e) => e.stopPropagation()}>
@@ -2587,7 +4072,8 @@ function PhotoViewer({ photos, index, onClose, onNavigate }) {
           <button onClick={() => onNavigate(index + 1)} className="mrcap-press" style={{ ...iconBtnStyle, position: "absolute", right: 10 }}><ChevronLeft size={20} color={COLORS.ink} style={{ transform: "rotate(180deg)" }} /></button>
         )}
       </div>
-    </div>
+    </div>,
+    document.body
   );
 }
 
@@ -2992,17 +4478,20 @@ function PlatePicker({ value, onChange, onModeChange, onVinPhotosChange }) {
 
   const reset = () => { setEmirate(null); setCategory(null); setManualCategory(false); setIsClassic(false); setNumber(""); };
 
+  const segBtn = (on) => ({ flex: 1, minHeight: 40, padding: "8px", borderRadius: 10, border: "none", background: on ? COLORS.gold : "transparent", color: on ? COLORS.darkText : COLORS.muted, fontSize: 13, fontWeight: 700, cursor: "pointer" });
+  const linkBtn = { fontSize: 12, color: COLORS.gold, background: "none", border: "none", cursor: "pointer", padding: "6px 0", minHeight: 32, fontWeight: 600 };
+
   return (
     <div>
-      <div style={{ display: "flex", gap: 8, marginBottom: 10 }}>
-        <button onClick={() => setMode("plate")} className="mrcap-press" style={{ flex: 1, padding: "8px", borderRadius: 8, border: `1.5px solid ${mode === "plate" ? COLORS.gold : COLORS.line}`, background: mode === "plate" ? COLORS.gold : COLORS.panel2, color: mode === "plate" ? COLORS.darkText : COLORS.ink, fontSize: 12.5, fontWeight: 600, cursor: "pointer" }}>Plate</button>
-        <button onClick={() => setMode("vin")} className="mrcap-press" style={{ flex: 1, padding: "8px", borderRadius: 8, border: `1.5px solid ${mode === "vin" ? COLORS.gold : COLORS.line}`, background: mode === "vin" ? COLORS.gold : COLORS.panel2, color: mode === "vin" ? COLORS.darkText : COLORS.ink, fontSize: 12.5, fontWeight: 600, cursor: "pointer" }}>No plate — use VIN</button>
+      <div style={{ display: "flex", gap: 4, marginBottom: 12, padding: 4, background: COLORS.panel, border: `1px solid ${COLORS.line}`, borderRadius: 13 }}>
+        <button onClick={() => setMode("plate")} className="mrcap-press" aria-pressed={mode === "plate"} style={segBtn(mode === "plate")}>Plate</button>
+        <button onClick={() => setMode("vin")} className="mrcap-press" aria-pressed={mode === "vin"} style={segBtn(mode === "vin")}>No plate — use VIN</button>
       </div>
 
       {mode === "vin" ? (
         <div>
-          <input style={{ ...inputStyle, marginTop: 0, fontFamily: MONO_FONT, letterSpacing: 0.5 }} value={vin} onChange={(e) => setVin(e.target.value)} placeholder="Chassis / VIN number" />
-          <div style={{ fontSize: 11, color: COLORS.muted, marginTop: 6, marginBottom: 10 }}>
+          <input style={{ ...inputStyle, marginTop: 0, minHeight: 56, fontFamily: MONO_FONT, fontSize: 17, letterSpacing: 1, background: COLORS.plate, color: COLORS.darkText, border: `1px solid ${COLORS.plateEdge}` }} value={vin} onChange={(e) => setVin(e.target.value)} placeholder="Chassis / VIN number" />
+          <div style={{ fontSize: 11.5, color: COLORS.muted, marginTop: 8, marginBottom: 10, lineHeight: 1.45 }}>
             VINs can occasionally repeat or be entered inconsistently — a photo of the chassis plate is the real record here.
           </div>
           {onVinPhotosChange && (
@@ -3012,66 +4501,83 @@ function PlatePicker({ value, onChange, onModeChange, onVinPhotosChange }) {
               <button
                 onClick={() => vinFileRef.current.click()}
                 className="mrcap-press"
-                style={{ display: "flex", alignItems: "center", justifyContent: "center", gap: 7, width: "100%", padding: "9px", borderRadius: 9, border: `1.5px dashed ${COLORS.line}`, background: "transparent", color: COLORS.muted, fontWeight: 600, fontSize: 12, cursor: "pointer" }}
+                style={{ ...cameraBtnStyle, width: "100%", color: COLORS.muted }}
               >
-                <Camera size={13} /> {uploadingVinPhoto ? "Uploading…" : vinPhotos.length ? "Add Another Photo" : "Attach Chassis / VIN Photo"}
+                <Camera size={15} /> {uploadingVinPhoto ? "Uploading…" : vinPhotos.length ? "Add Another Photo" : "Attach Chassis / VIN Photo"}
               </button>
             </>
           )}
         </div>
       ) : (
-        <div style={{ background: COLORS.panel2, borderRadius: 10, padding: 12, border: `1px solid ${COLORS.line}` }}>
+        <div style={{ background: COLORS.panel, borderRadius: 16, padding: 12, border: `1px solid ${COLORS.line}` }}>
           {/* Step 1: emirate */}
           {!emirate && (
-            <div style={{ display: "grid", gridTemplateColumns: "repeat(3, 1fr)", gap: 7 }}>
-              {EMIRATES.map((em) => (
-                <button key={em.code} onClick={() => setEmirate(em)} className="mrcap-press" style={{ padding: "10px 4px", borderRadius: 8, border: `1px solid ${COLORS.line}`, background: COLORS.panel, color: COLORS.ink, fontFamily: MONO_FONT, fontSize: 12.5, fontWeight: 600, cursor: "pointer" }}>{em.code}</button>
-              ))}
-            </div>
+            <>
+              <div style={{ fontSize: 12, color: COLORS.muted, marginBottom: 8 }}>Which emirate?</div>
+              <div style={{ display: "grid", gridTemplateColumns: "repeat(3, minmax(0, 1fr))", gap: 7 }}>
+                {EMIRATES.map((em) => (
+                  <button key={em.code} onClick={() => setEmirate(em)} className="mrcap-press" style={{ minHeight: 56, padding: "6px 4px", borderRadius: 12, border: `1px solid ${COLORS.line}`, background: COLORS.panel2, color: COLORS.ink, cursor: "pointer", display: "flex", flexDirection: "column", alignItems: "center", justifyContent: "center", gap: 2 }}>
+                    <span style={{ fontFamily: MONO_FONT, fontSize: 14, fontWeight: 700, letterSpacing: 0.6 }}>{em.code}</span>
+                    <span style={{ fontSize: 10, color: COLORS.muted, whiteSpace: "nowrap", overflow: "hidden", textOverflow: "ellipsis", maxWidth: "100%" }}>{em.name}</span>
+                  </button>
+                ))}
+              </div>
+            </>
           )}
 
           {/* Step 2: category — skipped entirely for classic plates, which are emirate + number only */}
           {emirate && !category && !isClassic && (
             <div>
               <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", marginBottom: 8 }}>
-                <span style={{ fontSize: 11.5, color: COLORS.muted }}>{emirate.name} · category</span>
-                <button onClick={reset} className="mrcap-press" style={{ fontSize: 11, color: COLORS.gold, background: "none", border: "none", cursor: "pointer" }}>Change emirate</button>
+                <span style={{ fontSize: 12, color: COLORS.muted, display: "flex", alignItems: "center", gap: 8 }}><PlateChip plate={`${emirate.code} ?`} size="sm" /> {emirate.name} · category</span>
+                <button onClick={reset} className="mrcap-press" style={linkBtn}>Change emirate</button>
               </div>
               {!manualCategory ? (
                 <>
-                  <div style={{ display: "grid", gridTemplateColumns: "repeat(6, 1fr)", gap: 6, maxHeight: 180, overflowY: "auto" }}>
+                  <div style={{ display: "grid", gridTemplateColumns: "repeat(6, minmax(0, 1fr))", gap: 6, maxHeight: 200, overflowY: "auto" }}>
                     {emirate.categories.map((c) => (
-                      <button key={c} onClick={() => setCategory(c)} className="mrcap-press" style={{ padding: "8px 2px", borderRadius: 7, border: `1px solid ${COLORS.line}`, background: COLORS.panel, color: COLORS.ink, fontFamily: MONO_FONT, fontSize: 12, fontWeight: 600, cursor: "pointer" }}>{c}</button>
+                      <button key={c} onClick={() => setCategory(c)} className="mrcap-press" style={{ minHeight: 44, padding: "6px 2px", borderRadius: 10, border: `1px solid ${COLORS.line}`, background: COLORS.panel2, color: COLORS.ink, fontFamily: MONO_FONT, fontSize: 14, fontWeight: 600, cursor: "pointer" }}>{c}</button>
                     ))}
                   </div>
-                  <div style={{ display: "flex", gap: 14, marginTop: 8 }}>
-                    <button onClick={() => setManualCategory(true)} className="mrcap-press" style={{ fontSize: 11.5, color: COLORS.gold, background: "none", border: "none", cursor: "pointer", padding: 0 }}>Type it manually instead</button>
-                    <button onClick={() => setIsClassic(true)} className="mrcap-press" style={{ fontSize: 11.5, color: COLORS.gold, background: "none", border: "none", cursor: "pointer", padding: 0 }}>Classic plate — no letters</button>
+                  <div style={{ display: "flex", gap: 16, marginTop: 6, flexWrap: "wrap" }}>
+                    <button onClick={() => setManualCategory(true)} className="mrcap-press" style={linkBtn}>Type it manually instead</button>
+                    <button onClick={() => setIsClassic(true)} className="mrcap-press" style={linkBtn}>Classic plate — no letters</button>
                   </div>
                 </>
               ) : (
                 <div style={{ display: "flex", gap: 8 }}>
-                  <input autoFocus style={{ ...inputStyle, marginTop: 0, flex: 1 }} placeholder="e.g. 7 or C" onChange={(e) => setCategory(e.target.value.toUpperCase())} onKeyDown={(e) => { if (e.key === "Enter" && e.target.value) setCategory(e.target.value.toUpperCase()); }} />
-                  <button onClick={() => setManualCategory(false)} className="mrcap-press" style={{ ...secondaryBtnStyle, padding: "0 12px", fontSize: 12 }}>Back</button>
+                  <input autoFocus style={{ ...inputStyle, marginTop: 0, flex: 1, fontFamily: MONO_FONT }} placeholder="e.g. 7 or C" onChange={(e) => setCategory(e.target.value.toUpperCase())} onKeyDown={(e) => { if (e.key === "Enter" && e.target.value) setCategory(e.target.value.toUpperCase()); }} />
+                  <button onClick={() => setManualCategory(false)} className="mrcap-press" style={{ ...secondaryBtnStyle, minHeight: 46, padding: "0 14px", fontSize: 13 }}>Back</button>
                 </div>
               )}
             </div>
           )}
 
-          {/* Step 3: number */}
+          {/* Step 3: number — typed straight onto a plate */}
           {emirate && (category || isClassic) && (
             <div>
               <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", marginBottom: 8 }}>
-                <span style={{ fontSize: 11.5, color: COLORS.muted, fontFamily: MONO_FONT }}>{emirate.code} {isClassic ? "(classic)" : category} · number</span>
-                <button onClick={() => { setCategory(null); setManualCategory(false); setIsClassic(false); }} className="mrcap-press" style={{ fontSize: 11, color: COLORS.gold, background: "none", border: "none", cursor: "pointer" }}>{isClassic ? "Not classic — pick a category" : "Change category"}</button>
+                <span style={{ fontSize: 12, color: COLORS.muted }}>{emirate.name} · number</span>
+                <button onClick={() => { setCategory(null); setManualCategory(false); setIsClassic(false); }} className="mrcap-press" style={linkBtn}>{isClassic ? "Not classic — pick a category" : "Change category"}</button>
               </div>
-              <input autoFocus inputMode="numeric" style={{ ...inputStyle, marginTop: 0, fontFamily: MONO_FONT, fontSize: 18, letterSpacing: 1, textAlign: "center" }} value={number} onChange={(e) => setNumber(e.target.value.replace(/[^0-9]/g, "").slice(0, 5))} placeholder="12345" />
+              <div style={{ display: "flex", alignItems: "stretch", borderRadius: 12, overflow: "hidden", border: `1px solid ${COLORS.plateEdge}`, boxShadow: "0 10px 24px -16px rgba(0,0,0,0.9)" }}>
+                <button onClick={reset} className="mrcap-press" title="Change emirate" style={{ background: COLORS.darkText, color: COLORS.ink, border: "none", padding: "0 12px", minHeight: 58, display: "flex", alignItems: "center", fontFamily: MONO_FONT, fontSize: 14, fontWeight: 700, cursor: "pointer", flexShrink: 0, letterSpacing: 0.6 }}>{emirate.code}</button>
+                {!isClassic && (
+                  <span style={{ background: COLORS.plate, color: COLORS.darkText, display: "flex", alignItems: "center", padding: "0 4px 0 14px", fontFamily: MONO_FONT, fontSize: 24, fontWeight: 600, flexShrink: 0 }}>{category}</span>
+                )}
+                <input autoFocus inputMode="numeric" aria-label="Plate number" style={{ flex: 1, minWidth: 0, border: "none", borderRadius: 0, background: COLORS.plate, color: COLORS.darkText, fontFamily: MONO_FONT, fontSize: 24, fontWeight: 600, letterSpacing: 2, padding: "0 12px", minHeight: 58, boxShadow: "none" }} value={number} onChange={(e) => setNumber(e.target.value.replace(/[^0-9]/g, "").slice(0, 5))} placeholder="12345" />
+              </div>
             </div>
           )}
         </div>
       )}
 
-      {value && <div style={{ marginTop: 8, fontFamily: MONO_FONT, fontSize: 13, color: COLORS.gold, textAlign: "center" }}>{value}</div>}
+      {value && mode !== "vin" && (
+        <div className="mrcap-fade" style={{ marginTop: 10, display: "flex", alignItems: "center", justifyContent: "center", gap: 8, fontSize: 12, color: COLORS.successText }}>
+          <CheckCircle2 size={14} /> <PlateChip plate={value} />
+        </div>
+      )}
+      {value && mode === "vin" && <div style={{ marginTop: 8, fontFamily: MONO_FONT, fontSize: 13, color: COLORS.gold, textAlign: "center" }}>{value}</div>}
     </div>
   );
 }
@@ -3109,6 +4615,9 @@ export default function GarageApp() {
       }
       if (state.mrcapView === "quotedetail" && state.activeQuoteId) {
         setActiveQuoteId(state.activeQuoteId);
+      }
+      if (state.mrcapView === "proformadetail" && state.activeProformaId) {
+        setActiveProformaId(state.activeProformaId);
       }
     };
     window.addEventListener("popstate", onPopState);
@@ -3154,14 +4663,28 @@ export default function GarageApp() {
       const [t] = await Promise.all([loadTeam(), loadDynamicServicesAndRoles(), loadAppSettings(), loadWorkflowStepsMap()]);
       setTeam(t);
       const raw = loadLocalSession();
+      let restoredSession = null;
       if (raw) {
         const s = raw;
-        if (t.find((m) => m.id === s.id)) {
-          setSession(s); setCurrentActor(s);
+        const fresh = t.find((m) => m.id === s.id);
+        if (fresh) {
+          // Merge in whatever an admin may have changed since this device
+          // last logged in (role, dashboardMode) — a session restored from
+          // localStorage used to keep whatever it was stamped with at
+          // login until the next logout, so a mode change (e.g. someone
+          // switched to Smartech Portal) silently didn't take effect
+          // on a device that was already signed in.
+          const s2 = { ...s, role: fresh.role, dashboardMode: fresh.dashboardMode || "auto" };
+          setSession(s2); setCurrentActor(s2);
+          restoredSession = s2;
           if (shouldShowMorningReminder("mrcap")) setShowMorningReminder(true);
+          registerForPush(s2.id);
         }
       }
-      await refreshIndex();
+      // A Smartech portal session never needs the shop-wide job index —
+      // it fetches its own scoped list instead (see SmartechPortal), so
+      // skip the shared fetch entirely for it.
+      if (!isSmartechPortal(restoredSession) && !isPPFRoomKiosk(restoredSession)) await refreshIndex();
       setReady(true);
     })();
   }, [refreshIndex]);
@@ -3175,7 +4698,7 @@ export default function GarageApp() {
         setSession(null);
         setCurrentActor(null);
         saveLocalSession(null);
-      });
+      }, session?.dashboardMode);
     };
     check();
     const t = setInterval(check, 5 * 60 * 1000);
@@ -3190,7 +4713,7 @@ export default function GarageApp() {
   // dashboard list, not whatever job someone might be mid-edit on, so it
   // can't clobber in-progress work.
   useEffect(() => {
-    if (!ready || !session) return;
+    if (!ready || !session || isSmartechPortal(session) || isPPFRoomKiosk(session)) return;
     const interval = setInterval(() => { refreshIndex(); }, 45000);
     const onVisible = () => { if (document.visibilityState === "visible") refreshIndex(); };
     const onFocus = () => { refreshIndex(); };
@@ -3210,6 +4733,7 @@ export default function GarageApp() {
     setCurrentActor(s);
     logEvent("login", `${member.name} logged in`, s);
     if (shouldShowMorningReminder("mrcap")) setShowMorningReminder(true);
+    registerForPush(s.id);
   };
   const onLogout = () => {
     if (session) logEvent("login", `${session.name} logged out`);
@@ -3221,12 +4745,71 @@ export default function GarageApp() {
   const openJob = (id, job) => { setActiveId(id); setActiveJob(job || null); setView("detail", { activeId: id }); logEvent("view", `Viewed job${job?.plate ? ` ${job.plate}` : ""} (${id.slice(0, 8)})`); };
   const [activeQuoteId, setActiveQuoteId] = useState(null);
   const openQuote = (id) => { setActiveQuoteId(id); setView("quotedetail", { activeQuoteId: id }); logEvent("view", `Viewed quote (${id.slice(0, 8)})`); };
+  // Billing. The editor is a screen of its own; when it finishes it REPLACES
+  // its history entry with the proforma's page, so Back from there goes to the
+  // list rather than back into an editor whose draft has just been issued.
+  const [activeProformaId, setActiveProformaId] = useState(null);
+  const [proformaSeed, setProformaSeed] = useState(null);
+  const openProforma = (id) => { setActiveProformaId(id); setView("proformadetail", { activeProformaId: id }); };
+  const newProforma = (seed) => { setProformaSeed(seed || null); setView("proformaedit"); };
+  const finishProformaEdit = (row) => {
+    setActiveProformaId(row.id);
+    setViewRaw("proformadetail");
+    window.history.replaceState({ mrcapView: "proformadetail", activeProformaId: row.id }, "");
+  };
+  const canBilling = canUseBilling(session, team);
   const canArchive = hasPermission(session, team, "archive");
 
-  if (!ready) return <Shell><div style={{ padding: 40, textAlign: "center", color: COLORS.muted }}>Loading…</div></Shell>;
+  if (!ready) return (
+    <Shell>
+      <div className="mrcap-fade" style={{ minHeight: "70vh", display: "flex", flexDirection: "column", alignItems: "center", justifyContent: "center", gap: 14 }}>
+        <div style={{ width: 56, height: 56, borderRadius: 16, background: "#fff", padding: 6, boxSizing: "border-box", boxShadow: "0 0 0 1px rgba(201,162,39,0.45), 0 0 0 6px rgba(201,162,39,0.08)" }}>
+          <img src={LOGO_SRC} alt="" style={{ width: "100%", height: "100%", objectFit: "contain" }} />
+        </div>
+        <div style={{ fontFamily: DISPLAY_FONT, fontWeight: 700, fontSize: 20, color: COLORS.gold }}>Mr.CAP.</div>
+        <div style={{ width: 120, height: 3, borderRadius: 2, overflow: "hidden", background: COLORS.line }}><div className="mrcap-sweep" style={{ width: "100%", height: "100%" }} /></div>
+        <div style={{ fontSize: 12.5, color: COLORS.muted }}>Loading…</div>
+      </div>
+    </Shell>
+  );
 
   if (!session) {
     return <Shell><LoginScreen team={team} setTeam={setTeam} onLogin={onLogin} /></Shell>;
+  }
+
+  // ?track=<jobId> used to be a pre-login public link (see main.jsx); it
+  // now requires a real staff/Smartech session, so it's handled right here,
+  // right after the login gate, before the normal Shell/TopBar/router.
+  const trackJobId = new URLSearchParams(window.location.search).get("track");
+  if (trackJobId) {
+    return (
+      <Shell>
+        <div style={{ maxWidth: 440, margin: "0 auto", padding: "14px 18px 0" }}>
+          <button
+            onClick={() => { window.location.href = window.location.origin + window.location.pathname; }}
+            className="mrcap-press"
+            style={{ display: "flex", alignItems: "center", gap: 6, padding: "7px 0", background: "none", border: "none", color: COLORS.muted, fontSize: 12.5, cursor: "pointer" }}
+          >
+            <ChevronLeft size={16} /> Back to Dashboard
+          </button>
+        </div>
+        <PublicJobTracker jobId={trackJobId} />
+      </Shell>
+    );
+  }
+
+  // Smartech portal: a job-only view, scoped to this person's own
+  // assignments — never mounts the normal Shell/TopBar/nav or the
+  // shop-wide job index.
+  if (isSmartechPortal(session)) {
+    return <Shell><SmartechPortal session={session} onLogout={onLogout} /></Shell>;
+  }
+
+  // PPF Room kiosk: a team member with dashboardMode "ppfroom" sees only
+  // this screen — no nav, no menus, no prices, no customer name/phone
+  // anywhere, same routing pattern as the Smartech portal above.
+  if (isPPFRoomKiosk(session)) {
+    return <Shell><PPFRoomKiosk session={session} onLogout={onLogout} /></Shell>;
   }
 
   // Desktop back-office mode: only offered at login to admin/intake (see
@@ -3235,44 +4818,47 @@ export default function GarageApp() {
   const isDesktop = session.viewMode === "pc" && isFullDashboardRole(session);
   const ActiveShell = isDesktop ? DesktopShell : Shell;
 
-  // Same "attention needed" definition as the Follow-ups Due banner and
-  // Warranty Expiring Soon banner on the dashboard itself — the egg's
-  // badge is just a glanceable preview of those two counts from
-  // anywhere in the app, not a separate source of truth.
-  const eggTodayStr = new Date().toISOString().slice(0, 10);
-  const eggIn30DaysStr = new Date(Date.now() + 30 * 24 * 60 * 60 * 1000).toISOString().slice(0, 10);
-  const eggAttentionCount = index.filter((j) => j.followupDate && j.followupDate <= eggTodayStr).length
-    + index.filter((j) => j.warrantyExpiry && j.warrantyExpiry >= eggTodayStr && j.warrantyExpiry <= eggIn30DaysStr).length;
-
   return (
     <ActiveShell session={session} team={team} view={view} setView={setView} onLogout={onLogout} canArchive={canArchive}>
-      {isSuperAdmin(session) && <DraggablePorscheEgg badgeCount={eggAttentionCount} onTap={() => setView("admindash")} />}
       <ReportIssueButton session={session} view={view} />
-      <TopBar session={session} team={team} onLogout={onLogout} onNew={() => setView("new")} view={view} onBack={() => window.history.back()} onTeam={() => setView("team")} onArchive={() => setView("archive")} onCustomers={() => setView("customers")} onReports={() => setView("reports")} onQuotes={() => setView("quotes")} canArchive={canArchive} onAdminDash={() => setView("admindash")} onMsgTemplates={() => setView("msgtemplates")} onIssues={() => setView("issues")} onDispatch={() => setView("dispatch")} onLiveUpdates={() => setView("liveupdates")} onAnnouncements={() => setView("announcements")} />
+      <TopBar session={session} team={team} onLogout={onLogout} onNew={() => setView("new")} view={view} onBack={() => window.history.back()} onTeam={() => setView("team")} onArchive={() => setView("archive")} onCustomers={() => setView("customers")} onReports={() => setView("reports")} onQuotes={() => setView("quotes")} canArchive={canArchive} onAdminDash={() => setView("admindash")} onMsgTemplates={() => setView("msgtemplates")} onIssues={() => setView("issues")} onDispatch={() => setView("dispatch")} onLiveUpdates={() => setView("liveupdates")} onAnnouncements={() => setView("announcements")} onBilling={() => setView("billing")} onSmartechApprovals={() => setView("smartechapprovals")} />
       {showMorningReminder && <MorningReminderBanner onDismiss={() => { setShowMorningReminder(false); dismissMorningReminder("mrcap"); }} />}
       <AnnouncementBanner session={session} />
       <LiveUpdateBroadcaster onOpenJob={(id) => openJob(id)} />
-      {canSeeLiveUpdates(session) && <InternalUpdatesWidget team={team} session={session} index={index} onOpenJob={(id) => openJob(id)} />}
+      {canUseSmartechChat(session) && <SmartechChatBroadcaster session={session} onOpen={() => setView("liveupdates")} />}
+      {canSeeLiveUpdates(session) && view !== "liveupdates" && view !== "smartechchat" && <InternalUpdatesWidget team={team} session={session} index={index} onOpenJob={(id) => openJob(id)} />}
       {view === "list" && (
         isSimplifiedRole(session)
           ? <SimplifiedDashboard index={index} session={session} onOpen={openJob} onRefresh={refreshIndex} syncState={syncState} lastSyncedAt={lastSyncedAt} />
-          : <Dashboard index={index} session={session} onOpen={openJob} canArchive={canArchive} onRefresh={refreshIndex} syncState={syncState} lastSyncedAt={lastSyncedAt} />
+          : <Dashboard index={index} session={session} team={team} onOpen={openJob} onJobDeleted={removeFromIndex} canArchive={canArchive} onRefresh={refreshIndex} syncState={syncState} lastSyncedAt={lastSyncedAt} />
+      )}
+      {/* Desktop has no fade (below), so without this the last row of the
+          dashboard sat permanently under the floating New Job / Park a
+          Vehicle buttons (bottom 22px + 56px tall, and 86px + 36px tall).
+          This spacer lets the page scroll far enough for the last card to
+          clear them. The buttons themselves are unchanged. */}
+      {view === "list" && isDesktop && (hasPermission(session, team, "newJob") || isFullDashboardRole(session)) && (
+        <div aria-hidden="true" style={{ height: 110 }} />
+      )}
+      {/* Soft fade under the floating buttons so cards slide away beneath them. */}
+      {view === "list" && !isDesktop && (
+        <div aria-hidden="true" style={{ position: "fixed", left: 0, right: 0, bottom: 0, height: 150, zIndex: 45, pointerEvents: "none", background: "linear-gradient(to bottom, rgba(10,10,9,0), rgba(10,10,9,0.82) 55%, rgba(10,10,9,0.96))" }} />
       )}
       {view === "list" && hasPermission(session, team, "newJob") && (
-        <FloatingNewJobButton onClick={() => setView("quickintake")} />
+        <FloatingNewJobButton onClick={() => setView("quickintake")} shiftX={isDesktop ? 116 : 0} />
       )}
       {view === "list" && isFullDashboardRole(session) && (
         <button
           onClick={() => setView("park")}
           className="mrcap-press"
           style={{
-            position: "fixed", left: "50%", bottom: "max(78px, calc(env(safe-area-inset-bottom) + 78px))",
+            position: "fixed", left: isDesktop ? "calc(50% + 116px)" : "50%", bottom: "max(86px, calc(env(safe-area-inset-bottom) + 86px))",
             transform: "translateX(-50%)", zIndex: 50,
-            display: "flex", alignItems: "center", gap: 7,
-            padding: "9px 18px", borderRadius: 999, border: `1.5px solid ${COLORS.gold}`,
-            background: COLORS.paper, color: COLORS.gold,
+            display: "flex", alignItems: "center", gap: 7, height: 36,
+            padding: "0 16px", borderRadius: 999, border: "1px solid rgba(201,162,39,0.6)",
+            background: "rgba(20,19,17,0.94)", color: COLORS.gold, whiteSpace: "nowrap",
             fontSize: 12.5, fontWeight: 600, cursor: "pointer",
-            boxShadow: "0 4px 14px rgba(0,0,0,0.3)",
+            boxShadow: "0 6px 18px -6px rgba(0,0,0,0.7)",
           }}
         >
           <PauseCircle size={14} /> Park a Vehicle
@@ -3291,10 +4877,10 @@ export default function GarageApp() {
       )}
       {view === "park" && !isFullDashboardRole(session) && <AccessDenied onBack={() => window.history.back()} />}
       {view === "detail" && activeId && (
-        <JobDetail id={activeId} initialJob={activeJob} session={session} team={team} onChanged={(job, saved) => { upsertIndex(job); setActiveJob(job); setSyncState(saved ? "ok" : "failed"); if (saved) setLastSyncedAt(Date.now()); }} onBack={() => window.history.back()} canArchive={canArchive} onDeleted={(jobId) => { removeFromIndex(jobId); window.history.back(); }} />
+        <JobDetail id={activeId} initialJob={activeJob} session={session} team={team} onChanged={(job, saved) => { upsertIndex(job); setActiveJob(job); setSyncState(saved ? "ok" : "failed"); if (saved) setLastSyncedAt(Date.now()); }} onBack={() => window.history.back()} canArchive={canArchive} onDeleted={(jobId) => { removeFromIndex(jobId); window.history.back(); }} onCreateProforma={(job) => newProforma(proformaSeedFromJob(job))} />
       )}
       {view === "team" && hasPermission(session, team, "team") && (
-        <TeamScreen team={team} setTeam={setTeam} session={session} onBack={() => window.history.back()} onImport={() => setView("import")} onServices={() => setView("services")} canServices={hasPermission(session, team, "services")} onActivityLog={() => setView("activitylog")} />
+        <TeamScreen team={team} setTeam={setTeam} session={session} onBack={() => window.history.back()} onImport={() => setView("import")} onServices={() => setView("services")} canServices={hasPermission(session, team, "services")} onActivityLog={() => setView("activitylog")} onNotify={() => setView("notify")} />
       )}
       {view === "team" && !hasPermission(session, team, "team") && <AccessDenied onBack={() => window.history.back()} />}
       {view === "services" && hasPermission(session, team, "services") && (
@@ -3305,6 +4891,10 @@ export default function GarageApp() {
         <ActivityLogScreen onBack={() => window.history.back()} />
       )}
       {view === "activitylog" && session.id !== "owner" && <AccessDenied onBack={() => window.history.back()} />}
+      {view === "notify" && session.role === "admin" && (
+        <SendNotificationScreen team={team} session={session} onBack={() => window.history.back()} />
+      )}
+      {view === "notify" && session.role !== "admin" && <AccessDenied onBack={() => window.history.back()} />}
       {view === "archive" && canArchive && (
         <ArchiveScreen index={index} onOpen={openJob} onBack={() => window.history.back()} />
       )}
@@ -3314,7 +4904,17 @@ export default function GarageApp() {
       )}
       {view === "customers" && !hasPermission(session, team, "customers") && <AccessDenied onBack={() => window.history.back()} />}
       {view === "reports" && hasPermission(session, team, "reports") && (
-        <ReportsScreen onBack={() => window.history.back()} />
+        // The top bar already has Back, so no onBack here (avoids a second arrow).
+        // Money (AED) figures: MR.CAP login only, by the owner's choice.
+        <ReportsDashboard
+          session={session} team={team}
+          onOpenJob={(id) => openJob(id)}
+          canSeeBilling={hasPermission(session, team, "billing")}
+          canSeeRevenue={isSuperAdmin(session)}
+          api={{ sbFetch, gkGet }}
+          ui={{ COLORS, DISPLAY_FONT, MONO_FONT, inputStyle }}
+          catalog={{ STAGES, getServices: () => SERVICES }}
+        />
       )}
       {view === "reports" && !hasPermission(session, team, "reports") && <AccessDenied onBack={() => window.history.back()} />}
       {view === "dispatch" && <DispatchBoard team={team} session={session} />}
@@ -3351,6 +4951,23 @@ export default function GarageApp() {
         <QuoteDetail id={activeQuoteId} session={session} team={team} onBack={() => window.history.back()} onConverted={(job) => { upsertIndex(job); openJob(job.id, job); }} />
       )}
       {view === "quotedetail" && !hasPermission(session, team, "quotations") && <AccessDenied onBack={() => window.history.back()} />}
+      {view === "billing" && canBilling && (
+        <BillingScreen session={session} team={team} setTeam={setTeam} onBack={() => window.history.back()} onOpen={openProforma} onNew={() => newProforma(null)} />
+      )}
+      {view === "proformaedit" && canBilling && (
+        <ProformaEditor key={(proformaSeed && (proformaSeed.id || proformaSeed.supersedes || proformaSeed.job_id)) || "new"} seed={proformaSeed} session={session} onCancel={() => window.history.back()} onDone={finishProformaEdit} />
+      )}
+      {view === "proformadetail" && activeProformaId && canBilling && (
+        <ProformaDetail id={activeProformaId} session={session} team={team} onBack={() => window.history.back()} onEditDraft={(p) => newProforma(p)} onRevise={(seed) => newProforma(seed)} onOpenJob={(jobId) => openJob(jobId)} onDeleted={() => window.history.back()} />
+      )}
+      {(view === "billing" || view === "proformaedit" || view === "proformadetail") && !canBilling && <AccessDenied onBack={() => window.history.back()} />}
+      {view === "smartechapprovals" && canApproveSmartech(session) && (
+        <SmartechApprovalQueue session={session} onBack={() => window.history.back()} />
+      )}
+      {view === "smartechapprovals" && !canApproveSmartech(session) && <AccessDenied onBack={() => window.history.back()} />}
+      {/* Old "smartechchat" view (bookmarks/history) now lands on the merged Live feed. */}
+      {view === "smartechchat" && canSeeLiveUpdates(session) && <LiveUpdatesBoard team={team} session={session} index={index} onOpenJob={(id) => openJob(id)} />}
+      {view === "smartechchat" && !canSeeLiveUpdates(session) && <AccessDenied onBack={() => window.history.back()} />}
     </ActiveShell>
   );
 }
@@ -3369,6 +4986,24 @@ function LoginScreen({ team, setTeam, onLogin }) {
   // shop phone and the office computer on different days.
   const [viewMode, setViewMode] = useState("phone");
 
+  // The roster on this screen was loaded once when the app opened, so a
+  // phone or tablet that had been open since before a new person was added
+  // never showed them — they simply weren't in the list until someone
+  // force-quit the app. Re-read it whenever this screen appears and whenever
+  // the app comes back to the foreground.
+  useEffect(() => {
+    let alive = true;
+    const refresh = async () => {
+      const fresh = await refreshTeam();
+      if (alive && fresh) setTeam(fresh);
+    };
+    refresh();
+    const onVisible = () => { if (document.visibilityState === "visible") refresh(); };
+    document.addEventListener("visibilitychange", onVisible);
+    return () => { alive = false; document.removeEventListener("visibilitychange", onVisible); };
+    // eslint-disable-next-line
+  }, []);
+
   const pick = (member) => {
     setPicked(member);
     setPin("");
@@ -3386,8 +5021,17 @@ function LoginScreen({ team, setTeam, onLogin }) {
     (async () => {
       if (mode === "set") {
         const next = team.map((m) => (m.id === picked.id ? { ...m, pin } : m));
+        // Log in only once the PIN is actually saved. This used to show
+        // "Access granted" whether or not the save worked, so a new hire whose
+        // PIN never reached the server was let in once, then found their PIN
+        // "didn't work" the next morning.
+        const saved = await saveTeam(next);
+        if (!saved) {
+          setError("Couldn't save your PIN — check the connection");
+          setTimeout(() => setPin(""), 260);
+          return;
+        }
         setTeam(next);
-        await saveTeam(next);
         setFlash(true);
         setTimeout(() => onLogin({ ...picked, hasPin: true }, viewMode), 420);
       } else {
@@ -3410,8 +5054,10 @@ function LoginScreen({ team, setTeam, onLogin }) {
 
   if (picked) {
     return (
-      <div className="mrcap-view" style={{ padding: "48px 22px", textAlign: "center" }}>
-        <button onClick={() => setPicked(null)} style={{ ...iconBtnStyle, marginBottom: 24 }} className="mrcap-press"><ChevronLeft size={18} color={COLORS.ink} /></button>
+      <div className="mrcap-view" style={{ padding: "28px 22px 40px", textAlign: "center" }}>
+        <div style={{ display: "flex", justifyContent: "flex-start", marginBottom: 16 }}>
+          <button onClick={() => setPicked(null)} style={{ ...iconBtnStyle, width: 44, height: 44 }} className="mrcap-press" aria-label="Back to names"><ChevronLeft size={22} color={COLORS.ink} /></button>
+        </div>
 
         {/* Signature element: a mechanical vault dial. Each digit rotates the
             ring a quarter-turn — a locking-into-place gesture rather than a
@@ -3449,7 +5095,7 @@ function LoginScreen({ team, setTeam, onLogin }) {
 
         {error && <div className="mrcap-fade" style={{ color: COLORS.red, fontSize: 12.5, marginBottom: 12, letterSpacing: 0.3, textTransform: "uppercase" }}>{error}</div>}
 
-        <div style={{ display: "grid", gridTemplateColumns: "repeat(3, 1fr)", gap: 12, maxWidth: 240, margin: "0 auto", opacity: locked ? 0.35 : 1, pointerEvents: locked ? "none" : "auto" }}>
+        <div style={{ display: "grid", gridTemplateColumns: "repeat(3, 1fr)", gap: 12, maxWidth: 276, margin: "0 auto", opacity: locked ? 0.35 : 1, pointerEvents: locked ? "none" : "auto" }}>
           {[1, 2, 3, 4, 5, 6, 7, 8, 9].map((n) => (
             <button key={n} onClick={() => press(String(n))} style={keyBtnStyle} className="mrcap-press">{n}</button>
           ))}
@@ -3482,27 +5128,36 @@ function LoginScreen({ team, setTeam, onLogin }) {
   }
 
   return (
-    <div className="mrcap-view" style={{ padding: "44px 22px" }}>
-      <div style={{ textAlign: "center", marginBottom: 34 }}>
-        <div style={{ width: 260, height: 78, borderRadius: 14, background: "#fff", margin: "0 auto 18px", display: "flex", alignItems: "center", justifyContent: "center", padding: "12px 16px", boxSizing: "border-box", border: `1px solid ${COLORS.line}`, boxShadow: `0 0 0 1px rgba(201,162,39,0.15), 0 12px 30px -12px rgba(0,0,0,0.6)` }}>
+    <div className="mrcap-view" style={{ padding: "40px 20px 32px", position: "relative" }}>
+      <div aria-hidden="true" style={{ position: "absolute", top: 0, left: 0, right: 0, height: 320, background: "radial-gradient(ellipse at 50% 0%, rgba(201,162,39,0.16), transparent 70%)", pointerEvents: "none" }} />
+      <div style={{ position: "relative", textAlign: "center", marginBottom: 30 }}>
+        <div style={{ width: 250, height: 76, borderRadius: 16, background: "#fff", margin: "0 auto 22px", display: "flex", alignItems: "center", justifyContent: "center", padding: "12px 16px", boxSizing: "border-box", boxShadow: `0 0 0 1px rgba(201,162,39,0.45), 0 0 0 5px rgba(201,162,39,0.08), 0 18px 40px -16px rgba(0,0,0,0.8)` }}>
           <img src={LOGO_HEADER_SRC} alt="Mr.CAP." style={{ width: "100%", height: "100%", objectFit: "contain" }} />
         </div>
-        <div style={{ fontSize: 10.5, color: COLORS.gold, letterSpacing: 3, textTransform: "uppercase", marginBottom: 6 }}>Field Access</div>
-        <div style={{ fontFamily: DISPLAY_FONT, fontWeight: 600, fontSize: 25, color: COLORS.ink }}>Who's this?</div>
-        <div style={{ fontSize: 12.5, color: COLORS.muted, marginTop: 6, letterSpacing: 0.2 }}>Mr.CAP. — Al Hammar, Dubai</div>
+        <div style={{ display: "flex", alignItems: "center", justifyContent: "center", gap: 10, marginBottom: 8 }}>
+          <span style={{ height: 1, width: 28, background: "linear-gradient(90deg, transparent, rgba(201,162,39,0.7))" }} />
+          <span style={{ fontSize: 10.5, color: COLORS.gold, letterSpacing: 3, textTransform: "uppercase" }}>Field Access</span>
+          <span style={{ height: 1, width: 28, background: "linear-gradient(90deg, rgba(201,162,39,0.7), transparent)" }} />
+        </div>
+        <div style={{ fontFamily: DISPLAY_FONT, fontWeight: 700, fontSize: 30, color: COLORS.ink, lineHeight: 1.1 }}>Who's this?</div>
+        <div style={{ fontSize: 13, color: COLORS.muted, marginTop: 8, letterSpacing: 0.2 }}>Mr.CAP. — Al Hammar, Dubai</div>
       </div>
-      <div style={{ display: "flex", flexDirection: "column", gap: 8 }}>
+      <div style={{ position: "relative", display: "flex", flexDirection: "column", gap: 8 }}>
         {team.map((m, i) => (
           <button
             key={m.id}
             onClick={() => pick(m)}
             className="mrcap-press mrcap-fade"
-            style={{ animationDelay: `${i * 40}ms`, display: "flex", alignItems: "center", justifyContent: "space-between", gap: 10, width: "100%", boxSizing: "border-box", padding: "14px 15px", borderRadius: 10, border: `1px solid ${COLORS.line}`, background: COLORS.panel, cursor: "pointer" }}
+            style={{ animationDelay: `${i * 40}ms`, display: "flex", alignItems: "center", justifyContent: "space-between", gap: 12, width: "100%", minHeight: 60, boxSizing: "border-box", padding: "10px 14px 10px 10px", borderRadius: 16, border: `1px solid ${COLORS.line}`, background: COLORS.panel, cursor: "pointer" }}
           >
-            <span style={{ fontFamily: MONO_FONT, fontWeight: 500, fontSize: 14, color: COLORS.ink, flex: 1, minWidth: 0, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap", textAlign: "left" }}>{m.name}</span>
-            <span style={{ display: "flex", alignItems: "center", gap: 8, flexShrink: 0 }}>
-              <Pill bg={`${ROLE_DEFS[m.role].color}33`} fg={ROLE_DEFS[m.role].color}>{ROLE_DEFS[m.role].label}</Pill>
-              <Lock size={12} color={COLORS.muted} />
+            <span aria-hidden="true" style={{ width: 40, height: 40, borderRadius: "50%", flexShrink: 0, display: "flex", alignItems: "center", justifyContent: "center", background: `${(ROLE_DEFS[m.role] || {}).color || COLORS.gold}26`, border: `1px solid ${(ROLE_DEFS[m.role] || {}).color || COLORS.gold}88`, color: COLORS.ink, fontFamily: DISPLAY_FONT, fontWeight: 700, fontSize: 16 }}>{(m.name || "?").charAt(0).toUpperCase()}</span>
+            <span style={{ display: "flex", flexDirection: "column", flex: 1, minWidth: 0, textAlign: "left", gap: 2 }}>
+              <span style={{ fontWeight: 600, fontSize: 15, color: COLORS.ink, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{m.name}</span>
+              <span style={{ fontSize: 11.5, color: (ROLE_DEFS[m.role] || {}).color || COLORS.muted, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{(ROLE_DEFS[m.role] || {}).label || m.role}</span>
+            </span>
+            <span style={{ display: "flex", alignItems: "center", gap: 6, flexShrink: 0, color: COLORS.muted }}>
+              <Lock size={13} />
+              <ChevronLeft size={16} style={{ transform: "rotate(180deg)" }} />
             </span>
           </button>
         ))}
@@ -3510,75 +5165,157 @@ function LoginScreen({ team, setTeam, onLogin }) {
     </div>
   );
 }
-const keyBtnStyle = { height: 54, borderRadius: 12, border: `1px solid ${COLORS.line}`, background: COLORS.panel2, fontFamily: MONO_FONT, fontSize: 18, fontWeight: 500, color: COLORS.ink, cursor: "pointer", display: "flex", alignItems: "center", justifyContent: "center" };
+const keyBtnStyle = { height: 60, borderRadius: 16, border: `1px solid ${COLORS.line}`, background: `linear-gradient(180deg, ${COLORS.panel2}, ${COLORS.panel})`, fontFamily: MONO_FONT, fontSize: 22, fontWeight: 500, color: COLORS.ink, cursor: "pointer", display: "flex", alignItems: "center", justifyContent: "center", boxShadow: "inset 0 1px 0 rgba(255,255,255,0.03)" };
 
 
 /* ---------------- Top bar ---------------- */
 
-function TopBar({ session, team, onLogout, onNew, view, onBack, onTeam, onArchive, onCustomers, onReports, onQuotes, canArchive, onAdminDash, onMsgTemplates, onIssues, onDispatch, onLiveUpdates, onAnnouncements }) {
-  const isSimplified = isSimplifiedRole(session);
+// Overflow menu for the TopBar's less-frequently-used destinations.
+// The dropdown is absolutely positioned inside the bar (no portal), and
+// "tap outside to close" is a document-level listener rather than a
+// full-screen fixed backdrop: the bar carries an animation transform and
+// a backdrop-filter, and per spec either one makes it the containing
+// block for position:fixed descendants — so a fixed backdrop in here
+// would only cover the bar itself, not the screen, and taps elsewhere
+// would never close the menu.
+function TopBarMoreMenu({ items }) {
+  const [open, setOpen] = useState(false);
+  const wrapRef = useRef(null);
+  useEffect(() => {
+    if (!open) return undefined;
+    const onDown = (e) => { if (wrapRef.current && !wrapRef.current.contains(e.target)) setOpen(false); };
+    const onKey = (e) => { if (e.key === "Escape") setOpen(false); };
+    document.addEventListener("pointerdown", onDown);
+    document.addEventListener("keydown", onKey);
+    return () => { document.removeEventListener("pointerdown", onDown); document.removeEventListener("keydown", onKey); };
+  }, [open]);
+  if (!items.length) return null;
   return (
-    <div className="mrcap-view">
-      <div style={{ height: 2, background: `linear-gradient(90deg, transparent, ${COLORS.gold}, transparent)` }} />
-      <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", padding: "16px 18px 10px" }}>
-        <div style={{ display: "flex", alignItems: "center", gap: 10 }}>
+    <div ref={wrapRef} style={{ position: "relative" }}>
+      <button onClick={() => setOpen((o) => !o)} style={{ ...iconBtnStyle, border: `1px solid ${open ? COLORS.gold : COLORS.line}` }} className="mrcap-press mrcap-hit" title="More" aria-label="More" aria-haspopup="menu" aria-expanded={open}>
+        <MoreVertical size={17} color={open ? COLORS.gold : COLORS.ink} />
+      </button>
+      {open && (
+        <div role="menu" className="mrcap-rise" style={{ position: "absolute", top: "calc(100% + 8px)", right: 0, background: COLORS.panel, border: `1px solid ${COLORS.line}`, borderRadius: 14, boxShadow: "0 18px 40px -10px rgba(0,0,0,0.7)", minWidth: 220, maxWidth: "calc(100vw - 36px)", zIndex: 401, overflow: "hidden", padding: 0 }}>
+          {items.map((it, i) => (
+            <button
+              key={it.label}
+              role="menuitem"
+              onClick={() => { setOpen(false); it.onClick(); }}
+              className="mrcap-press"
+              style={{ display: "flex", alignItems: "center", gap: 12, width: "100%", minHeight: 46, padding: "10px 16px", background: "none", border: "none", borderRadius: 0, borderBottom: i < items.length - 1 ? `1px solid rgba(44,42,36,0.6)` : "none", color: COLORS.ink, fontSize: 13.5, fontWeight: 500, cursor: "pointer", textAlign: "left", boxSizing: "border-box" }}
+            >
+              {it.icon} {it.label}
+            </button>
+          ))}
+        </div>
+      )}
+    </div>
+  );
+}
+
+// Window width, tracked so the header can decide how many icons fit in
+// one row instead of letting them wrap into a second line.
+function useViewportWidth() {
+  const [w, setW] = useState(() => (typeof window !== "undefined" ? window.innerWidth : 390));
+  useEffect(() => {
+    const onResize = () => setW(window.innerWidth);
+    window.addEventListener("resize", onResize);
+    return () => window.removeEventListener("resize", onResize);
+  }, []);
+  return w;
+}
+
+function TopBar({ session, team, onLogout, onNew, view, onBack, onTeam, onArchive, onCustomers, onReports, onQuotes, canArchive, onAdminDash, onMsgTemplates, onIssues, onDispatch, onLiveUpdates, onAnnouncements, onBilling, onSmartechApprovals }) {
+  const isSimplified = isSimplifiedRole(session);
+  const viewportW = useViewportWidth();
+  // Every destination this login can reach, in the order they've always
+  // appeared. Only as many as physically fit beside the logo stay as
+  // direct taps (4 on a normal phone, 3 on a very narrow one) — measured
+  // so the row never wraps into a second line. Whatever doesn't fit
+  // folds into "More", lowest-traffic first (Team, then Archive, then
+  // Reports), so the daily ones stay one tap away.
+  const navAll = view === "list" ? [
+    { key: "customers", title: "Customers", Icon: Users, onClick: onCustomers, allowed: hasPermission(session, team, "customers") },
+    { key: "quotes", title: "Quotations", Icon: FileText, onClick: onQuotes, allowed: hasPermission(session, team, "quotations") },
+    { key: "archive", title: "Archive", Icon: Archive, onClick: onArchive, allowed: hasPermission(session, team, "archive") },
+    { key: "reports", title: "Reports", Icon: BarChart3, onClick: onReports, allowed: hasPermission(session, team, "reports") },
+    { key: "team", title: "Team", Icon: ShieldCheck, onClick: onTeam, allowed: hasPermission(session, team, "team") },
+    { key: "dispatch", title: "Dispatch Board", Icon: ListChecks, onClick: onDispatch, allowed: true },
+    { key: "billing", title: "Billing", Icon: Receipt, onClick: onBilling, allowed: canUseBilling(session, team) },
+  ].filter((n) => n.allowed) : [];
+  const maxDirect = viewportW >= 370 ? 4 : 3;
+  const demoteOrder = ["team", "archive", "billing", "reports", "customers", "quotes"];
+  const directKeys = new Set(navAll.map((n) => n.key));
+  for (const k of demoteOrder) { if (directKeys.size <= maxDirect) break; directKeys.delete(k); }
+  const directNav = navAll.filter((n) => directKeys.has(n.key));
+  const moreItems = navAll
+    .filter((n) => !directKeys.has(n.key))
+    .map((n) => ({ label: n.key === "dispatch" ? "Dispatch Board" : n.title, icon: <n.Icon size={15} color={COLORS.ink} />, onClick: n.onClick }));
+  if (view === "list" && canSeeLiveUpdates(session)) moreItems.push({ label: "Live Updates", icon: <MessageSquare size={15} color={COLORS.ink} />, onClick: onLiveUpdates });
+  if (view === "list" && isSuperAdmin(session)) {
+    moreItems.push({ label: "Admin Dashboard", icon: <LayoutDashboard size={15} color={COLORS.ink} />, onClick: onAdminDash });
+    moreItems.push({ label: "WhatsApp Messages", icon: <MessageSquare size={15} color={COLORS.ink} />, onClick: onMsgTemplates });
+    moreItems.push({ label: "Post Announcement", icon: <Send size={15} color={COLORS.ink} />, onClick: onAnnouncements });
+    moreItems.push({ label: "Issue Reports", icon: <AlertCircle size={15} color={COLORS.ink} />, onClick: onIssues });
+  }
+  if (view === "list" && canApproveSmartech(session)) {
+    moreItems.push({ label: "Smartech Approvals", icon: <Receipt size={15} color={COLORS.ink} />, onClick: onSmartechApprovals });
+  }
+  return (
+    <>
+    <div
+      className="mrcap-view"
+      style={{
+        // Pinned only on the board itself. Detail screens (Job Detail,
+        // Quote Detail…) carry their own pinned strip with the plate and
+        // stage, and two things stuck to the top would stack and hide it.
+        position: view === "list" ? "sticky" : "static", top: "env(safe-area-inset-top)", zIndex: 60,
+        background: "rgba(10,10,9,0.72)",
+        backdropFilter: "blur(16px) saturate(150%)", WebkitBackdropFilter: "blur(16px) saturate(150%)",
+        borderBottom: view === "list" ? "1px solid rgba(44,42,36,0.7)" : "none",
+      }}
+    >
+      <div style={{ height: 2, background: `linear-gradient(90deg, transparent, ${COLORS.gold}, transparent)`, opacity: 0.8 }} />
+      <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", gap: 10, padding: view === "list" ? "12px 18px 10px" : "4px 8px 0" }}>
+        <div style={{ display: "flex", alignItems: "center", gap: 10, minWidth: 0 }}>
           {view !== "list" ? (
-            <button onClick={onBack} style={iconBtnStyle} className="mrcap-press"><ChevronLeft size={20} color={COLORS.ink} /></button>
+            <button onClick={onBack} style={{ ...iconBtnStyle, width: 44, height: 44, border: "none", background: "transparent" }} className="mrcap-press" aria-label="Back" title="Back"><ChevronLeft size={24} color={COLORS.ink} /></button>
           ) : (
-            <div style={{ display: "flex", alignItems: "center", gap: 10 }}>
-              <div style={{ width: 28, height: 28, borderRadius: 7, background: "#fff", display: "flex", alignItems: "center", justifyContent: "center", padding: 3, boxSizing: "border-box", flexShrink: 0, border: `1px solid ${COLORS.line}` }}>
+            <div style={{ display: "flex", alignItems: "center", gap: 10, flexShrink: 0 }}>
+              <div style={{ width: 32, height: 32, borderRadius: 9, background: "#fff", display: "flex", alignItems: "center", justifyContent: "center", padding: 3, boxSizing: "border-box", flexShrink: 0, boxShadow: "0 0 0 1px rgba(201,162,39,0.35)" }}>
                 <img src={LOGO_SRC} alt="" style={{ width: "100%", height: "100%", objectFit: "contain" }} />
               </div>
-              <div>
-                <div style={{ fontFamily: DISPLAY_FONT, fontWeight: 700, fontSize: 16, color: COLORS.ink, lineHeight: 1.1 }}>Mr.CAP.</div>
-                <div style={{ fontSize: 9.5, color: COLORS.gold, letterSpacing: 2, textTransform: "uppercase", lineHeight: 1.3 }}>Job Tracker</div>
+              <div style={{ whiteSpace: "nowrap" }}>
+                <div style={{ fontFamily: DISPLAY_FONT, fontWeight: 700, fontSize: 18, color: COLORS.gold, lineHeight: 1.05, letterSpacing: 0.2 }}>Mr.CAP.</div>
+                <div style={{ fontSize: 9, color: COLORS.muted, letterSpacing: 1.6, textTransform: "uppercase", lineHeight: 1.4 }}>Job Tracker</div>
               </div>
             </div>
           )}
         </div>
-        <div style={{ display: "flex", gap: 6 }}>
-          {view === "list" && hasPermission(session, team, "customers") && (
-            <button onClick={onCustomers} style={iconBtnStyle} className="mrcap-press" title="Customers"><Users size={16} color={COLORS.ink} /></button>
-          )}
-          {view === "list" && hasPermission(session, team, "quotations") && (
-            <button onClick={onQuotes} style={iconBtnStyle} className="mrcap-press" title="Quotations"><FileText size={16} color={COLORS.ink} /></button>
-          )}
-          {view === "list" && hasPermission(session, team, "archive") && (
-            <button onClick={onArchive} style={iconBtnStyle} className="mrcap-press" title="Archive"><Archive size={16} color={COLORS.ink} /></button>
-          )}
-          {view === "list" && hasPermission(session, team, "reports") && (
-            <button onClick={onReports} style={iconBtnStyle} className="mrcap-press" title="Reports"><BarChart3 size={16} color={COLORS.ink} /></button>
-          )}
-          {view === "list" && hasPermission(session, team, "team") && (
-            <button onClick={onTeam} style={iconBtnStyle} className="mrcap-press" title="Team"><ShieldCheck size={16} color={COLORS.ink} /></button>
-          )}
-          {view === "list" && (
-            <button onClick={onDispatch} style={iconBtnStyle} className="mrcap-press" title="Dispatch Board"><ListChecks size={16} color={COLORS.ink} /></button>
-          )}
-          {view === "list" && isSuperAdmin(session) && (
-            <button onClick={onAdminDash} style={iconBtnStyle} className="mrcap-press" title="Admin Dashboard"><LayoutDashboard size={16} color={COLORS.ink} /></button>
-          )}
-          {view === "list" && canSeeLiveUpdates(session) && (
-            <button onClick={onLiveUpdates} style={iconBtnStyle} className="mrcap-press" title="Live Updates"><MessageSquare size={16} color={COLORS.ink} /></button>
-          )}
-          {view === "list" && isSuperAdmin(session) && (
-            <button onClick={onMsgTemplates} style={iconBtnStyle} className="mrcap-press" title="WhatsApp Messages"><MessageSquare size={16} color={COLORS.ink} /></button>
-          )}
-          {view === "list" && isSuperAdmin(session) && (
-            <button onClick={onAnnouncements} style={iconBtnStyle} className="mrcap-press" title="Post Announcement"><Send size={16} color={COLORS.ink} /></button>
-          )}
-          {view === "list" && isSuperAdmin(session) && (
-            <button onClick={onIssues} style={iconBtnStyle} className="mrcap-press" title="Issue Reports"><AlertCircle size={16} color={COLORS.ink} /></button>
-          )}
+        <div style={{ display: "flex", flexWrap: "wrap", justifyContent: "flex-end", gap: 4, rowGap: 8 }}>
+          {directNav.map((n) => (
+            <button key={n.key} onClick={n.onClick} style={iconBtnStyle} className="mrcap-press mrcap-hit" title={n.title} aria-label={n.title}>
+              <n.Icon size={17} color={COLORS.ink} />
+            </button>
+          ))}
+          {view === "list" && <TopBarMoreMenu items={moreItems} />}
         </div>
       </div>
-      {view === "list" && (
-        <button onClick={onLogout} style={{ margin: "0 18px 10px", display: "flex", alignItems: "center", gap: 6, background: "none", border: "none", padding: 0, cursor: "pointer" }}>
-          <User size={13} color={COLORS.muted} />
-          <span style={{ fontSize: 12.5, color: COLORS.muted }}>{session.name} · {ROLE_DEFS[session.role].label} · tap to switch</span>
-        </button>
-      )}
     </div>
+    {/* Outside the sticky bar on purpose: only the icon row stays pinned
+        while scrolling — the "tap to switch" line scrolls away instead of
+        permanently costing another ~28px of a small phone's height. */}
+    {view === "list" && (
+      <button onClick={onLogout} className="mrcap-press" style={{ margin: "10px 18px 12px", display: "flex", alignItems: "center", gap: 10, background: "none", border: "none", padding: 0, cursor: "pointer", maxWidth: "calc(100% - 36px)", textAlign: "left" }}>
+        <span style={{ width: 30, height: 30, borderRadius: "50%", border: `1px solid ${COLORS.gold}`, background: COLORS.panel2, color: COLORS.gold, fontWeight: 700, fontSize: 12.5, display: "flex", alignItems: "center", justifyContent: "center", flexShrink: 0 }}>{(session.name || "?").charAt(0).toUpperCase()}</span>
+        <span style={{ minWidth: 0 }}>
+          <span style={{ display: "block", fontSize: 12.5, color: COLORS.muted, lineHeight: 1.3 }}>{new Date().toLocaleDateString([], { weekday: "long", day: "numeric", month: "short" })}</span>
+          <span style={{ display: "block", fontSize: 13, color: COLORS.ink, lineHeight: 1.3, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{session.name} · {ROLE_DEFS[session.role]?.label || session.role} <span style={{ color: COLORS.gold, fontWeight: 600 }}>· switch</span></span>
+        </span>
+      </button>
+    )}
+    </>
   );
 }
 
@@ -3622,13 +5359,50 @@ function OfflineBadge() {
   const pending = useOfflineQueueLength();
   if (online && pending === 0) return null;
   return (
-    <Pill bg={!online ? "rgba(201,162,39,0.22)" : "rgba(74,122,87,0.22)"} fg={!online ? COLORS.gold : "#7BC494"}>
+    <Pill bg={!online ? "rgba(201,162,39,0.22)" : "rgba(74,122,87,0.22)"} fg={!online ? COLORS.gold : COLORS.successText}>
       {!online ? (pending > 0 ? `Offline · ${pending} pending` : "Offline") : `Syncing ${pending}…`}
     </Pill>
   );
 }
 
-function SyncBar({ syncState, lastSyncedAt, onRefresh }) {
+// Changes made offline that the server refused once they finally sent —
+// shown on the board until dismissed, so "it saved" is never quietly false.
+function RejectedWritesBanner() {
+  const [items, setItems] = useState(() => getRejectedWrites());
+  useEffect(() => {
+    const on = () => setItems(getRejectedWrites());
+    window.addEventListener("mrcap-rejected-changed", on);
+    return () => window.removeEventListener("mrcap-rejected-changed", on);
+  }, []);
+  if (!items.length) return null;
+  return (
+    <div role="alert" className="mrcap-fade" style={{ background: "rgba(168,64,47,0.14)", border: `1px solid rgba(168,64,47,0.6)`, borderRadius: 14, padding: "12px 14px", marginBottom: 12 }}>
+      <div style={{ display: "flex", alignItems: "flex-start", justifyContent: "space-between", gap: 10 }}>
+        <div>
+          <div style={{ fontSize: 12.5, color: "#F0C4BA", fontWeight: 700 }}>
+            {items.length} change{items.length === 1 ? "" : "s"} made offline couldn't be saved
+          </div>
+          <div style={{ fontSize: 11, color: "#E8A99B", marginTop: 3, lineHeight: 1.45 }}>
+            The server refused {items.length === 1 ? "it" : "them"} when the connection came back — redo {items.length === 1 ? "it" : "them"} on the job:
+            {" "}{items.slice(-3).map((r) => r.what).join(" · ")}
+          </div>
+        </div>
+        <button onClick={() => setRejectedWrites([])} className="mrcap-press" style={{ fontSize: 12, color: "#fff", background: COLORS.red, border: "none", borderRadius: 10, minHeight: 36, padding: "6px 12px", cursor: "pointer", fontWeight: 700, flexShrink: 0 }}>Dismiss</button>
+      </div>
+    </div>
+  );
+}
+
+function SyncBar(props) {
+  return (
+    <>
+      <RejectedWritesBanner />
+      <SyncBarCore {...props} />
+    </>
+  );
+}
+
+function SyncBarCore({ syncState, lastSyncedAt, onRefresh }) {
   const [refreshing, setRefreshing] = useState(false);
   const doRefresh = async () => { setRefreshing(true); await onRefresh(); setRefreshing(false); };
   const online = useOnlineStatus();
@@ -3639,14 +5413,14 @@ function SyncBar({ syncState, lastSyncedAt, onRefresh }) {
   // yet" signal the old silent-failure behaviour never gave anyone.
   if (!online || pending > 0) {
     return (
-      <div style={{ background: !online ? "#3A2E14" : "#1F2A1E", border: `1px solid ${!online ? COLORS.gold : COLORS.green}`, borderRadius: 10, padding: "9px 12px", marginBottom: 12 }}>
+      <div className="mrcap-fade" style={{ background: !online ? "rgba(201,162,39,0.12)" : "rgba(74,122,87,0.14)", border: `1px solid ${!online ? "rgba(201,162,39,0.55)" : "rgba(74,122,87,0.6)"}`, borderRadius: 14, padding: "10px 14px", marginBottom: 12 }}>
         <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", gap: 8 }}>
-          <span style={{ fontSize: 12, color: !online ? COLORS.gold : "#7BC494", fontWeight: 600 }}>
+          <span style={{ fontSize: 12, color: !online ? COLORS.gold : COLORS.successText, fontWeight: 600 }}>
             {!online
               ? (pending > 0 ? `Offline — ${pending} change${pending === 1 ? "" : "s"} saved on this device, waiting for signal` : "Offline — working from the last data this device saw")
               : `Syncing ${pending} change${pending === 1 ? "" : "s"}…`}
           </span>
-          {online && <button onClick={doRefresh} style={{ fontSize: 11.5, color: COLORS.darkText, background: COLORS.gold, border: "none", borderRadius: 7, padding: "5px 9px", cursor: "pointer", fontWeight: 600, flexShrink: 0 }}>{refreshing ? "…" : "Refresh"}</button>}
+          {online && <button onClick={doRefresh} className="mrcap-press" style={{ fontSize: 12, color: COLORS.darkText, background: COLORS.gold, border: "none", borderRadius: 10, minHeight: 34, padding: "5px 12px", cursor: "pointer", fontWeight: 700, flexShrink: 0 }}>{refreshing ? "…" : "Refresh"}</button>}
         </div>
       </div>
     );
@@ -3654,23 +5428,24 @@ function SyncBar({ syncState, lastSyncedAt, onRefresh }) {
 
   if (syncState === "failed") {
     return (
-      <div style={{ background: "#3A2420", border: `1px solid ${COLORS.red}`, borderRadius: 10, padding: "9px 12px", marginBottom: 12 }}>
+      <div className="mrcap-fade" style={{ background: "rgba(168,64,47,0.14)", border: `1px solid rgba(168,64,47,0.6)`, borderRadius: 14, padding: "10px 14px", marginBottom: 12 }}>
         <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", gap: 8 }}>
-          <span style={{ fontSize: 12, color: COLORS.red, fontWeight: 600 }}>Didn't save to the shared server</span>
-          <button onClick={doRefresh} style={{ fontSize: 11.5, color: "#fff", background: COLORS.red, border: "none", borderRadius: 7, padding: "5px 9px", cursor: "pointer", fontWeight: 600, flexShrink: 0 }}>{refreshing ? "…" : "Retry"}</button>
+          <span style={{ fontSize: 12.5, color: COLORS.dangerText, fontWeight: 600 }}>Didn't save to the shared server</span>
+          <button onClick={doRefresh} className="mrcap-press" style={{ fontSize: 12, color: "#fff", background: COLORS.red, border: "none", borderRadius: 10, minHeight: 34, padding: "5px 12px", cursor: "pointer", fontWeight: 700, flexShrink: 0 }}>{refreshing ? "…" : "Retry"}</button>
         </div>
         {lastStorageError && (
-          <div style={{ fontSize: 10.5, color: "#E8A99B", marginTop: 6, fontFamily: "monospace", wordBreak: "break-word" }}>{lastStorageError}</div>
+          <div style={{ fontSize: 10.5, color: "#E8A99B", marginTop: 6, fontFamily: MONO_FONT, wordBreak: "break-word" }}>{lastStorageError}</div>
         )}
       </div>
     );
   }
   return (
-    <button onClick={doRefresh} style={{ display: "flex", alignItems: "center", justifyContent: "space-between", width: "100%", gap: 8, background: "none", border: "none", padding: "0 2px 12px", cursor: "pointer" }}>
-      <span style={{ fontSize: 11, color: COLORS.muted }}>
+    <button onClick={doRefresh} className="mrcap-press" style={{ display: "flex", alignItems: "center", justifyContent: "space-between", width: "100%", minHeight: 32, gap: 8, background: "none", border: "none", padding: "0 2px 10px", cursor: "pointer" }}>
+      <span style={{ fontSize: 11.5, color: COLORS.muted, display: "flex", alignItems: "center", gap: 7 }}>
+        <span style={{ width: 7, height: 7, borderRadius: "50%", background: refreshing || syncState === "syncing" ? COLORS.gold : lastSyncedAt ? COLORS.green : COLORS.line, boxShadow: lastSyncedAt && !(refreshing || syncState === "syncing") ? "0 0 0 3px rgba(74,122,87,0.18)" : "none" }} />
         {refreshing || syncState === "syncing" ? "Checking server…" : lastSyncedAt ? `Synced ${fmtTime(lastSyncedAt)}` : "Not synced yet"}
       </span>
-      <span style={{ fontSize: 11, color: COLORS.goldDeep, fontWeight: 600 }}>Refresh</span>
+      <span style={{ fontSize: 11.5, color: COLORS.gold, fontWeight: 600, display: "flex", alignItems: "center", gap: 5 }}><RotateCcw size={12} /> Refresh</span>
     </button>
   );
 }
@@ -3714,54 +5489,291 @@ function SimplifiedDashboard({ index, session, onOpen, onRefresh, syncState, las
     <div className="mrcap-view" style={{ padding: "0 18px 90px" }}>
       <SyncBar syncState={syncState} lastSyncedAt={lastSyncedAt} onRefresh={onRefresh} />
 
-      <div style={{ textAlign: "center", padding: "10px 0 16px" }}>
-        <div style={{ fontFamily: DISPLAY_FONT, fontWeight: 600, fontSize: 20, color: COLORS.ink }}>Hi, {session.name}</div>
+      <div style={{ padding: "4px 0 16px" }}>
+        <div style={{ fontFamily: DISPLAY_FONT, fontWeight: 700, fontSize: 26, color: COLORS.ink, lineHeight: 1.15 }}>Hi, {session.name}</div>
+        <div style={{ fontSize: 13, color: COLORS.muted, marginTop: 4 }}>{myJobs.length === 0 ? "Nothing waiting on you right now." : `${myJobs.length} car${myJobs.length === 1 ? "" : "s"} waiting on you`}</div>
       </div>
 
-      <div style={{ display: "flex", gap: 8, marginBottom: 16 }}>
-        <button onClick={() => setTab("waiting")} className="mrcap-press" style={{ flex: 1, position: "relative", padding: "10px", borderRadius: 10, border: `1.5px solid ${tab === "waiting" ? COLORS.gold : COLORS.line}`, background: tab === "waiting" ? COLORS.gold : COLORS.panel2, color: tab === "waiting" ? COLORS.darkText : COLORS.ink, fontSize: 13, fontWeight: 700, cursor: "pointer" }}>
+      <div style={{ display: "flex", gap: 4, marginBottom: 16, padding: 4, background: COLORS.panel, border: `1px solid ${COLORS.line}`, borderRadius: 14 }}>
+        <button onClick={() => setTab("waiting")} className="mrcap-press" aria-pressed={tab === "waiting"} style={{ flex: 1, position: "relative", minHeight: 44, padding: "8px", borderRadius: 11, border: "none", background: tab === "waiting" ? COLORS.gold : "transparent", color: tab === "waiting" ? COLORS.darkText : COLORS.muted, fontSize: 13.5, fontWeight: 700, cursor: "pointer" }}>
           Waiting on me ({myJobs.length})
           {newCount > 0 && (
-            <span style={{ position: "absolute", top: -6, right: -6, background: COLORS.red, color: "#fff", fontSize: 10, fontWeight: 700, borderRadius: 999, padding: "2px 6px", border: `2px solid ${COLORS.paper}` }}>{newCount} new</span>
+            <span style={{ position: "absolute", top: -8, right: -4, background: COLORS.red, color: "#fff", fontSize: 10, fontWeight: 700, borderRadius: 999, padding: "2px 7px", border: `2px solid ${COLORS.paper}` }}>{newCount} new</span>
           )}
         </button>
-        <button onClick={() => setTab("cleared")} className="mrcap-press" style={{ flex: 1, padding: "10px", borderRadius: 10, border: `1.5px solid ${tab === "cleared" ? COLORS.gold : COLORS.line}`, background: tab === "cleared" ? COLORS.gold : COLORS.panel2, color: tab === "cleared" ? COLORS.darkText : COLORS.ink, fontSize: 13, fontWeight: 700, cursor: "pointer" }}>
+        <button onClick={() => setTab("cleared")} className="mrcap-press" aria-pressed={tab === "cleared"} style={{ flex: 1, minHeight: 44, padding: "8px", borderRadius: 11, border: "none", background: tab === "cleared" ? COLORS.gold : "transparent", color: tab === "cleared" ? COLORS.darkText : COLORS.muted, fontSize: 13.5, fontWeight: 700, cursor: "pointer" }}>
           Cleared by me
         </button>
       </div>
 
       {list.length === 0 && (
-        <div style={{ textAlign: "center", padding: "40px 10px", color: COLORS.muted }}>
-          <CheckCircle2 size={32} color={COLORS.green} style={{ opacity: 0.6, marginBottom: 10 }} />
-          <div style={{ fontSize: 14 }}>{tab === "waiting" ? "All caught up" : "Nothing cleared in the last 3 days"}</div>
-        </div>
+        <EmptyState icon={CheckCircle2} title={tab === "waiting" ? "All caught up" : "Nothing cleared in the last 3 days"} sub={tab === "waiting" ? "New work for you will appear here." : null} />
       )}
 
       <div style={{ display: "flex", flexDirection: "column", gap: 12 }}>
-        {list.map((j) => (
-          <button key={j.id} onClick={() => onOpen(j.id)} className="mrcap-press" style={{ textAlign: "left", width: "100%", boxSizing: "border-box", background: COLORS.panel, border: `1px solid ${COLORS.line}`, borderLeft: `4px solid ${tab === "waiting" ? COLORS.gold : COLORS.green}`, borderRadius: "6px 14px 14px 6px", padding: "18px 16px", cursor: "pointer", position: "relative" }}>
-            {tab === "waiting" && j.createdAt > lastSeen && (
-              <span style={{ position: "absolute", top: 10, right: 12, fontSize: 10, fontWeight: 700, color: COLORS.gold, textTransform: "uppercase", letterSpacing: 0.5 }}>New</span>
-            )}
-            <div style={{ fontFamily: MONO_FONT, fontWeight: 700, fontSize: 22, color: COLORS.ink, letterSpacing: 0.5 }}>{j.plate}</div>
-            <div style={{ fontSize: 14, color: COLORS.muted, marginTop: 4 }}>{j.makeModel}</div>
-            {tab === "waiting" && j.priority === "High" && (
-              <div style={{ marginTop: 8 }}><Pill tone="red">Urgent</Pill></div>
-            )}
-          </button>
-        ))}
+        {list.map((j) => {
+          const stageIdx = Math.max(0, STAGES.findIndex((s) => s.key === j.stageKey));
+          const mine = SERVICES.filter((s) => s.role === session.role && (j.serviceTypes || []).includes(s.key)).map((s) => s.label);
+          return (
+            <button key={j.id} onClick={() => onOpen(j.id)} className="mrcap-press mrcap-rise" style={{ textAlign: "left", width: "100%", boxSizing: "border-box", background: COLORS.panel, border: `1px solid ${tab === "waiting" ? COLORS.line : "rgba(74,122,87,0.55)"}`, borderRadius: 18, padding: 16, cursor: "pointer", position: "relative", display: "flex", flexDirection: "column", gap: 12, color: COLORS.ink }}>
+              <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", gap: 10, width: "100%" }}>
+                <PlateChip plate={j.plate} size="lg" />
+                {tab === "waiting" && j.createdAt > lastSeen ? (
+                  <span style={{ fontSize: 10.5, fontWeight: 700, color: COLORS.darkText, background: COLORS.goldBright, borderRadius: 999, padding: "3px 9px", letterSpacing: 0.6 }}>NEW</span>
+                ) : tab === "cleared" ? (
+                  <CheckCircle2 size={22} color={COLORS.successText} />
+                ) : null}
+              </div>
+              <div>
+                <div style={{ fontFamily: DISPLAY_FONT, fontWeight: 700, fontSize: 19, color: COLORS.ink, lineHeight: 1.2 }}>{j.makeModel || "Vehicle"}</div>
+                <div style={{ fontSize: 13, color: COLORS.muted, marginTop: 3 }}>{mine.join(" · ") || j.stageLabel}</div>
+              </div>
+              <StageProgress index={stageIdx} />
+              <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", gap: 8, width: "100%" }}>
+                <span style={{ fontSize: 12.5, color: COLORS.gold, fontWeight: 600 }}>{j.stageLabel}</span>
+                {tab === "waiting" && j.priority === "High" ? <Pill tone="red">Urgent</Pill> : <span style={{ fontSize: 12.5, color: COLORS.gold, fontWeight: 600, display: "flex", alignItems: "center", gap: 4 }}>Open <ChevronLeft size={15} style={{ transform: "rotate(180deg)" }} /></span>}
+              </div>
+            </button>
+          );
+        })}
       </div>
     </div>
   );
 }
 
-function Dashboard({ index, session, onOpen, canArchive, onRefresh, syncState, lastSyncedAt }) {
+// Swipe-left-to-reveal Delete on a job card, iOS Mail-style — but the
+// swipe only ever REVEALS the action, never performs it. Tapping the
+// revealed button opens the exact same type-DELETE-to-confirm gate
+// already used on the Delete Job Card button inside JobDetail (same
+// copy, same deleteJob() call, same audit trail via deletion_log) — this
+// is a second entry point onto an unchanged, already-safety-gated
+// action, not a new way to lose a job. touch-action: pan-y tells the
+// browser this element handles its own horizontal gestures, so it
+// doesn't fight the page's vertical scroll the way relying on
+// preventDefault() inside onTouchMove unreliably would.
+function SwipeableJobCard({ job, session, team, onDeleted, children }) {
+  const REVEAL_WIDTH = 84;
+  const canDelete = hasPermission(session, team, "delete");
+  const [dragX, setDragX] = useState(0);
+  const [revealed, setRevealed] = useState(false);
+  const [dragging, setDragging] = useState(false);
+  const [confirming, setConfirming] = useState(false);
+  const [confirmText, setConfirmText] = useState("");
+  const [deleting, setDeleting] = useState(false);
+  const startRef = useRef({ x: 0, y: 0 });
+  const axisRef = useRef(null); // 'x' | 'y' | null — locked in on first real movement
+
+  const closeReveal = () => { setRevealed(false); setDragX(0); };
+
+  const onTouchStart = (e) => {
+    if (!canDelete) return;
+    const t = e.touches[0];
+    startRef.current = { x: t.clientX, y: t.clientY };
+    axisRef.current = null;
+    setDragging(true);
+  };
+  const onTouchMove = (e) => {
+    if (!canDelete || !dragging) return;
+    const t = e.touches[0];
+    const dx = t.clientX - startRef.current.x;
+    const dy = t.clientY - startRef.current.y;
+    if (!axisRef.current) {
+      if (Math.abs(dx) < 6 && Math.abs(dy) < 6) return;
+      axisRef.current = Math.abs(dx) > Math.abs(dy) ? "x" : "y";
+    }
+    if (axisRef.current !== "x") return; // vertical intent — leave it to page scroll
+    const base = revealed ? -REVEAL_WIDTH : 0;
+    setDragX(Math.min(0, Math.max(-REVEAL_WIDTH - 24, base + dx)));
+  };
+  const onTouchEnd = () => {
+    if (axisRef.current === "x") {
+      const shouldReveal = dragX < -REVEAL_WIDTH / 2;
+      setRevealed(shouldReveal);
+      setDragX(shouldReveal ? -REVEAL_WIDTH : 0);
+    }
+    setDragging(false);
+    axisRef.current = null;
+  };
+
+  const handleDelete = async () => {
+    if (confirmText !== "DELETE") return;
+    setDeleting(true);
+    const ok = await deleteJob(job, session);
+    setDeleting(false);
+    if (ok) onDeleted?.(job.id);
+  };
+
+  return (
+    <div style={{ position: "relative", borderRadius: 16, overflow: "hidden" }}>
+      {canDelete && (
+        <div
+          onClick={() => { setConfirming(true); setConfirmText(""); }}
+          style={{
+            position: "absolute", inset: 0, display: "flex", justifyContent: "flex-end",
+            background: `linear-gradient(90deg, ${COLORS.paper} 40%, ${COLORS.red} 40%)`, cursor: "pointer", borderRadius: 16,
+          }}
+        >
+          <div style={{ width: REVEAL_WIDTH, display: "flex", flexDirection: "column", alignItems: "center", justifyContent: "center", gap: 5 }}>
+            <Trash2 size={18} color="#fff" />
+            <span style={{ fontSize: 11, fontWeight: 700, color: "#fff", letterSpacing: 0.3 }}>Delete</span>
+          </div>
+        </div>
+      )}
+      <div
+        onTouchStart={onTouchStart}
+        onTouchMove={onTouchMove}
+        onTouchEnd={onTouchEnd}
+        style={{ touchAction: "pan-y", transform: `translateX(${dragX}px)`, transition: dragging ? "none" : "transform 0.2s cubic-bezier(0.22,0.61,0.36,1)" }}
+      >
+        {children}
+      </div>
+      {revealed && <div onClick={closeReveal} style={{ position: "absolute", top: 0, bottom: 0, left: 0, right: REVEAL_WIDTH, zIndex: 5 }} />}
+
+      {confirming && createPortal(
+        <div className="mrcap-fade" onClick={() => !deleting && setConfirming(false)} style={{ position: "fixed", inset: 0, background: "rgba(0,0,0,0.66)", backdropFilter: "blur(3px)", WebkitBackdropFilter: "blur(3px)", zIndex: 1000, display: "flex", alignItems: "flex-end", justifyContent: "center" }}>
+          <div className="mrcap-rise" onClick={(e) => e.stopPropagation()} style={{ width: "100%", maxWidth: 480, background: COLORS.panel, border: `1px solid ${COLORS.line}`, borderTop: `2px solid ${COLORS.red}`, borderRadius: "20px 20px 0 0", padding: 20, boxSizing: "border-box", paddingBottom: "max(20px, calc(env(safe-area-inset-bottom) + 20px))" }}>
+            <div style={{ width: 36, height: 4, borderRadius: 3, background: COLORS.line, margin: "0 auto 16px" }} />
+            <div style={{ display: "flex", alignItems: "center", gap: 10, marginBottom: 12 }}>
+              <span style={{ width: 36, height: 36, borderRadius: 12, background: "rgba(168,64,47,0.18)", display: "flex", alignItems: "center", justifyContent: "center", flexShrink: 0 }}><ShieldAlert size={19} color={COLORS.dangerText} /></span>
+              <div style={{ fontFamily: DISPLAY_FONT, fontWeight: 700, fontSize: 18, color: COLORS.dangerText }}>This cannot be undone</div>
+            </div>
+            <div style={{ fontSize: 13, color: "#F0C4BA", marginBottom: 14, lineHeight: 1.5 }}>
+              Deleting <b>{job.plate}</b> permanently removes this job card, its photos, and its full history. It will NOT appear in Archive. The deletion itself will be logged with your name and the time, but the job's contents are gone for good.
+            </div>
+            <div style={{ fontSize: 12, color: "#F0C4BA", marginBottom: 8 }}>Type <b>DELETE</b> to confirm:</div>
+            <input
+              value={confirmText}
+              onChange={(e) => setConfirmText(e.target.value)}
+              placeholder="DELETE"
+              autoFocus
+              style={{ width: "100%", boxSizing: "border-box", minHeight: 46, background: "#2A100D", border: `1px solid ${COLORS.red}`, borderRadius: 12, padding: "10px 14px", fontSize: 15, color: "#fff", fontFamily: MONO_FONT, marginBottom: 14, letterSpacing: 1.5 }}
+            />
+            <div style={{ display: "flex", gap: 10 }}>
+              <button onClick={() => { setConfirming(false); closeReveal(); }} className="mrcap-press" style={{ ...secondaryBtnStyle, flex: 1 }}>Cancel</button>
+              <button onClick={handleDelete} disabled={confirmText !== "DELETE" || deleting} className="mrcap-press" style={{ ...dangerBtnStyle, flex: 1, cursor: confirmText === "DELETE" ? "pointer" : "not-allowed", opacity: confirmText === "DELETE" ? 1 : 0.45 }}>
+                {deleting ? "Deleting…" : "Permanently Delete"}
+              </button>
+            </div>
+          </div>
+        </div>,
+        document.body
+      )}
+    </div>
+  );
+}
+
+// Colours for the on-site stage distribution bar (design comps): steel for
+// the early stages, gold while the work is happening, green when ready.
+const STAGE_BAR_COLORS = { intake: COLORS.blue, parts_removal: "#6B7F8F", service: COLORS.gold, qc: COLORS.goldBright, ready: COLORS.green };
+const STAGE_SHORT_LABELS = { intake: "Intake", parts_removal: "Parts off", service: "Service", qc: "QC", ready: "Ready", collected: "Collected" };
+
+// One tick a minute so the "time in stage" labels on the board stay honest
+// without re-rendering on every poll.
+function useMinuteClock() {
+  const [now, setNow] = useState(() => Date.now());
+  useEffect(() => {
+    const t = setInterval(() => setNow(Date.now()), 60000);
+    return () => clearInterval(t);
+  }, []);
+  return now;
+}
+
+function serviceLabelsFor(serviceTypes) {
+  return (serviceTypes || []).map((k) => SERVICES.find((s) => s.key === k)?.label || k);
+}
+
+// The job card on the board (design comps): plate chip + make/model, the
+// services line, a 6-segment stage bar, and how long it's been in this
+// stage. Only reads fields the board already has.
+function BoardJobCard({ j, now, onOpen, onHoldCard = false }) {
+  const stageIdx = Math.max(0, STAGES.findIndex((s) => s.key === j.stageKey));
+  const time = onHoldCard ? null : stageTimeInfo({ ...j, stageIndex: stageIdx }, now);
+  const isReady = j.stageKey === "ready";
+  const smartech = j.smartechFlag || jobRoutesToSmartech(j.serviceTypes, j.treatments);
+  const services = serviceLabelsFor(j.serviceTypes);
+  const assignees = assigneesFromHistory(j.history);
+  const border = onHoldCard ? "rgba(201,162,39,0.55)" : isReady ? "rgba(74,122,87,0.6)" : COLORS.line;
+  return (
+    <button
+      onClick={() => onOpen(j.id)}
+      className="mrcap-press mrcap-card"
+      style={{ textAlign: "left", background: onHoldCard ? "linear-gradient(160deg, rgba(201,162,39,0.08), rgba(201,162,39,0.02))" : COLORS.panel, border: `1px solid ${border}`, borderRadius: 16, padding: 14, cursor: "pointer", display: "flex", flexDirection: "column", gap: 10, width: "100%", boxSizing: "border-box", color: COLORS.ink, boxShadow: "0 10px 24px -18px rgba(0,0,0,0.9)" }}
+    >
+      <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", gap: 10, width: "100%" }}>
+        <div style={{ display: "flex", alignItems: "center", gap: 10, minWidth: 0 }}>
+          <PlateChip plate={j.plate} />
+          <span style={{ fontSize: 13.5, fontWeight: 600, color: COLORS.ink, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap", minWidth: 0 }}>{j.makeModel || "Vehicle"}</span>
+        </div>
+        {onHoldCard ? (
+          <span style={{ fontSize: 10.5, fontWeight: 700, letterSpacing: 0.6, color: COLORS.gold, flexShrink: 0 }}>ON HOLD</span>
+        ) : isReady ? (
+          <span style={{ fontSize: 11.5, fontWeight: 700, color: COLORS.successText, flexShrink: 0 }}>Ready</span>
+        ) : time && time.label ? (
+          <span title="Time in this stage (shop hours)" style={{ fontSize: 11.5, fontWeight: 600, color: time.color, fontFamily: MONO_FONT, flexShrink: 0, display: "flex", alignItems: "center", gap: 4 }}>
+            <Clock size={11} /> {time.label}
+          </span>
+        ) : null}
+      </div>
+      <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", gap: 8, width: "100%" }}>
+        <div style={{ fontSize: 12.5, color: COLORS.muted, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap", minWidth: 0 }}>
+          {[j.customerName && j.customerName !== "—" ? j.customerName : null, services.join(" · ") || "Service not set yet"].filter(Boolean).join(" · ")}
+        </div>
+        <div style={{ display: "flex", gap: 5, flexShrink: 0 }}>
+          {j.priority === "High" && <span style={{ fontSize: 10, fontWeight: 700, letterSpacing: 0.6, color: COLORS.dangerText, background: "rgba(168,64,47,0.18)", border: "1px solid rgba(214,106,86,0.45)", padding: "2px 6px", borderRadius: 5 }}>HIGH</span>}
+          {smartech && <span style={{ fontSize: 10, fontWeight: 700, letterSpacing: 0.6, color: COLORS.darkText, background: COLORS.gold, padding: "3px 7px", borderRadius: 5 }}>SMARTECH</span>}
+        </div>
+      </div>
+      {onHoldCard && j.onHoldNote && <div style={{ fontSize: 12.5, color: COLORS.ink, fontStyle: "italic", lineHeight: 1.4 }}>"{j.onHoldNote}"</div>}
+      <StageProgress index={stageIdx} />
+      <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", gap: 10, width: "100%" }}>
+        <span style={{ fontSize: 12, color: isReady ? COLORS.successText : COLORS.gold, fontWeight: 600, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap", minWidth: 0 }}>
+          {onHoldCard ? `Since ${fmtTime(j.onHoldSince)}` : j.stageLabel}{j.location ? <span style={{ color: COLORS.muted, fontWeight: 400 }}> · {j.location}</span> : null}
+        </span>
+        <span style={{ fontSize: 11.5, color: COLORS.muted, flexShrink: 0, display: "flex", alignItems: "center", gap: 4 }}>
+          {assignees.length ? <><User size={11} /> {assignees.join(", ")}</> : fmtTime(j.updatedAt)}
+        </span>
+      </div>
+    </button>
+  );
+}
+
+// Compact alert row (follow-ups, warranties, not-informed, reviews).
+function BoardAlertRow({ j, tone, sub, onOpen, action }) {
+  const t = tone === "red"
+    ? { bg: "rgba(168,64,47,0.10)", bd: "rgba(168,64,47,0.55)" }
+    : { bg: "rgba(201,162,39,0.08)", bd: "rgba(201,162,39,0.5)" };
+  return (
+    <div onClick={() => onOpen(j.id)} role="button" tabIndex={0} onKeyDown={(e) => { if (e.key === "Enter") onOpen(j.id); }} className="mrcap-press" style={{ textAlign: "left", background: t.bg, border: `1px solid ${t.bd}`, borderRadius: 14, padding: "12px 14px", cursor: "pointer", width: "100%", boxSizing: "border-box" }}>
+      <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", gap: 10 }}>
+        <div style={{ flex: 1, minWidth: 0 }}>
+          <div style={{ display: "flex", alignItems: "center", gap: 8, minWidth: 0 }}>
+            <PlateChip plate={j.plate} size="sm" />
+            <span style={{ fontSize: 13, fontWeight: 600, color: COLORS.ink, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{j.makeModel}</span>
+          </div>
+          <div style={{ fontSize: 12, color: COLORS.muted, marginTop: 5, lineHeight: 1.4 }}>{sub}</div>
+        </div>
+        {action}
+      </div>
+    </div>
+  );
+}
+function BoardSectionHead({ icon: Icon, color = COLORS.gold, title, count, tone = "yellow" }) {
+  return (
+    <div style={{ display: "flex", alignItems: "center", gap: 8, marginBottom: 10 }}>
+      {Icon && <Icon size={15} color={color} />}
+      <div style={{ fontFamily: DISPLAY_FONT, fontWeight: 700, fontSize: 16, color: COLORS.ink }}>{title}</div>
+      {count != null && <Pill tone={tone}>{count}</Pill>}
+    </div>
+  );
+}
+
+function Dashboard({ index, session, team, onOpen, onJobDeleted, canArchive, onRefresh, syncState, lastSyncedAt }) {
   const [filter, setFilter] = useState("open");
   const [search, setSearch] = useState("");
-  // Tapping a stat card toggles this: null (no extra filter), "high"
-  // (High priority only), "qc" (Ready for QC only), or "ready" (Ready for
-  // Collection only). Tapping the same card again, or "Active", clears it
-  // back to null.
+  // Tapping a stage count (or the High chip) toggles this: null (no extra
+  // filter), "high" (High priority only), or a stage key ("intake",
+  // "parts_removal", "service", "qc", "ready") for that stage only.
+  // Tapping the same one again, or the car count, clears it back to null.
   const [statFilter, setStatFilter] = useState(null);
   // Tapping a location chip toggles this to that location's exact string,
   // or back to null for "all locations". Uses getLocations() (the app's
@@ -3769,6 +5781,7 @@ function Dashboard({ index, session, onOpen, canArchive, onRefresh, syncState, l
   // sync with whatever locations actually exist.
   const [locationFilter, setLocationFilter] = useState(null);
   const isAdmin = session.role === "admin";
+  const now = useMinuteClock();
   const [outToday, setOutToday] = useState(STAFF_OUT_TODAY);
   const [savingOutToday, setSavingOutToday] = useState(false);
   const toggleOutToday = async (name) => {
@@ -3802,16 +5815,20 @@ function Dashboard({ index, session, onOpen, canArchive, onRefresh, syncState, l
 
   const active = visible.filter((j) => j.stageKey !== "collected");
   const highPriority = active.filter((j) => j.priority === "High");
-  const readyForQC = visible.filter((j) => j.stageKey === "qc");
-  const readyForCollection = visible.filter((j) => j.stageKey === "ready");
+
+  // "Brought in today" — cars whose job was created since midnight, so
+  // intake (Lani) can see at a glance which of today's arrivals still need
+  // their job card filled in.
+  const todayStart = new Date(); todayStart.setHours(0, 0, 0, 0);
+  const broughtToday = (j) => (j.createdAt || 0) >= todayStart.getTime();
 
   const filtered = visible.filter((j) => {
+    if (filter === "today" && !broughtToday(j)) return false;
     if (filter === "open" && j.stageKey === "collected") return false;
     if (filter === "mine" && j.stageKey !== "service") return false;
     if (filter === "collected" && j.stageKey !== "collected") return false;
     if (statFilter === "high" && j.priority !== "High") return false;
-    if (statFilter === "qc" && j.stageKey !== "qc") return false;
-    if (statFilter === "ready" && j.stageKey !== "ready") return false;
+    if (statFilter && statFilter !== "high" && j.stageKey !== statFilter) return false;
     if (locationFilter && j.location !== locationFilter) return false;
     if (search) {
       const q = search.toLowerCase();
@@ -3820,8 +5837,9 @@ function Dashboard({ index, session, onOpen, canArchive, onRefresh, syncState, l
     return true;
   });
 
-  const filterTabs = [["open", "Open"], ["mine", "In Service"], ["all", "All"]];
-  if (canArchive) filterTabs.splice(2, 0, ["collected", "Collected"]);
+  const filterTabs = [["open", "Open"], ["today", "Brought in today"], ["mine", "In Service"], ["all", "All"]];
+  if (canArchive) filterTabs.splice(3, 0, ["collected", "Collected"]);
+  const tabCount = (k) => visible.filter((j) => (k === "open" ? j.stageKey !== "collected" : k === "today" ? broughtToday(j) : k === "mine" ? j.stageKey === "service" : k === "collected" ? j.stageKey === "collected" : true)).length;
 
   const grouped = STAGES.map((s) => ({ stage: s, jobs: filtered.filter((j) => j.stageKey === s.key && !j.onHold) })).filter((g) => g.jobs.length || filter !== "open" || g.stage.key !== "collected");
   // On Hold is shown as its own section regardless of which pipeline stage
@@ -3829,6 +5847,12 @@ function Dashboard({ index, session, onOpen, canArchive, onRefresh, syncState, l
   // at the shop, sometimes for months), not a step in the normal workflow,
   // so it's pulled out of the stage groups above and always surfaced here.
   const onHoldJobs = filtered.filter((j) => j.onHold);
+  const onHoldOnSite = active.filter((j) => j.onHold).length;
+
+  // On-site stage distribution for the summary card (read-only counts).
+  const stageCounts = STAGES.filter((s) => s.key !== "collected").map((s) => ({ stage: s, count: active.filter((j) => j.stageKey === s.key).length }));
+  const todayKey = localDateKey(new Date(now));
+  const inToday = active.filter((j) => j.createdAt && localDateKey(new Date(j.createdAt)) === todayKey).length;
 
   // Follow-ups due: pulled from the FULL index, not the tab-filtered
   // subset, since a follow-up (e.g. "ceramic reapplication in 6 months")
@@ -3851,25 +5875,63 @@ function Dashboard({ index, session, onOpen, canArchive, onRefresh, syncState, l
   // no one having actually told the customer.
   const readyNotInformed = index.filter((j) => j.stageKey === "ready" && !(j.customerNotify || {}).ready_for_collection?.informedBy);
 
+  const toggleStage = (key) => setStatFilter((f) => (f === key ? null : key));
+
   return (
-    <div className="mrcap-view" style={{ padding: "0 18px 90px" }}>
+    <div className="mrcap-view" style={{ padding: "0 18px 120px" }}>
       <SyncBar syncState={syncState} lastSyncedAt={lastSyncedAt} onRefresh={onRefresh} />
 
       {/* The one number the boss actually wants: how many cars are
           physically in the shop right now. Counts everything not yet
-          collected — on-hold cars included, since they're still here. */}
-      <div style={{ position: "relative", background: COLORS.panel, border: `1.5px solid ${COLORS.gold}`, borderRadius: 14, padding: "20px", marginBottom: 18, textAlign: "center", overflow: "hidden", boxShadow: "0 10px 28px -14px rgba(0,0,0,0.65)" }}>
-        <div style={{ position: "absolute", inset: 0, background: "radial-gradient(circle at 50% 0%, rgba(201,162,39,0.10), transparent 65%)", pointerEvents: "none" }} />
-        <div style={{ position: "relative", fontFamily: MONO_FONT, fontWeight: 700, fontSize: 44, color: COLORS.gold, lineHeight: 1, textShadow: "0 0 24px rgba(201,162,39,0.25)" }}>{active.length}</div>
-        <div style={{ position: "relative", fontSize: 11.5, color: COLORS.muted, marginTop: 7, textTransform: "uppercase", letterSpacing: 1.2 }}>Cars In The Shop Right Now</div>
-        {onHoldJobs.length > 0 && (
-          <div style={{ position: "relative", fontSize: 11, color: COLORS.gold, marginTop: 6 }}>{onHoldJobs.length} of those on hold</div>
-        )}
-      </div>
+          collected — on-hold cars included, since they're still here.
+          Below it, where those cars are in the workflow; tap a stage to
+          show only those cars. */}
+      <section className="mrcap-rise" style={{ position: "relative", background: COLORS.panel, border: `1px solid ${COLORS.line}`, borderRadius: 18, padding: 16, marginBottom: 14, overflow: "hidden", boxShadow: "0 18px 40px -26px rgba(0,0,0,0.9)" }}>
+        <div aria-hidden="true" style={{ position: "absolute", inset: 0, background: "radial-gradient(circle at 100% 0%, rgba(201,162,39,0.10), transparent 55%)", pointerEvents: "none" }} />
+        <div style={{ position: "relative", display: "flex", alignItems: "flex-start", justifyContent: "space-between", gap: 10 }}>
+          <button onClick={() => setStatFilter(null)} className="mrcap-press" style={{ background: "none", border: "none", padding: 0, textAlign: "left", cursor: "pointer", color: COLORS.ink, minWidth: 0 }}>
+            <div style={eyebrowStyle}>Cars In The Shop Right Now</div>
+            <div style={{ display: "flex", alignItems: "baseline", gap: 8, marginTop: 6 }}>
+              <span style={{ fontFamily: MONO_FONT, fontWeight: 600, fontSize: 44, color: COLORS.ink, lineHeight: 1 }}>{active.length}</span>
+              <span style={{ fontSize: 13, color: COLORS.muted }}>{active.length === 1 ? "car on site" : "cars on site"}</span>
+            </div>
+          </button>
+          <div style={{ display: "flex", flexDirection: "column", alignItems: "flex-end", gap: 6, flexShrink: 0 }}>
+            {inToday > 0 && <span style={{ fontSize: 11, fontWeight: 600, color: COLORS.successText, background: "rgba(74,122,87,0.18)", padding: "4px 9px", borderRadius: 999 }}>{inToday} in today</span>}
+            {onHoldOnSite > 0 && <span style={{ fontSize: 11, fontWeight: 600, color: COLORS.gold, background: "rgba(201,162,39,0.14)", padding: "4px 9px", borderRadius: 999 }}>{onHoldOnSite} on hold</span>}
+          </div>
+        </div>
+        <div aria-hidden="true" style={{ position: "relative", display: "flex", height: 10, borderRadius: 5, overflow: "hidden", gap: 2, marginTop: 16, background: active.length ? "transparent" : COLORS.line }}>
+          {stageCounts.filter((c) => c.count > 0).map((c) => (
+            <div key={c.stage.key} style={{ flexGrow: c.count, flexBasis: 0, background: STAGE_BAR_COLORS[c.stage.key] || COLORS.gold, opacity: statFilter && statFilter !== "high" && statFilter !== c.stage.key ? 0.35 : 1, transition: "opacity 0.2s ease" }} />
+          ))}
+        </div>
+        <div style={{ position: "relative", display: "grid", gridTemplateColumns: `repeat(${stageCounts.length}, minmax(0, 1fr))`, gap: 4, marginTop: 10 }}>
+          {stageCounts.map((c) => {
+            const on = statFilter === c.stage.key;
+            return (
+              <button
+                key={c.stage.key}
+                onClick={() => toggleStage(c.stage.key)}
+                className="mrcap-press"
+                aria-pressed={on}
+                title={`Show only ${c.stage.label}`}
+                style={{ display: "flex", flexDirection: "column", alignItems: "flex-start", gap: 2, minHeight: 44, padding: "6px 6px 6px 7px", borderRadius: 10, border: "none", cursor: "pointer", textAlign: "left", background: on ? "rgba(201,162,39,0.16)" : "transparent", boxShadow: on ? `inset 0 -2px 0 ${COLORS.gold}` : "none", minWidth: 0 }}
+              >
+                <span style={{ display: "flex", alignItems: "center", gap: 5 }}>
+                  <span style={{ width: 6, height: 6, borderRadius: 2, background: STAGE_BAR_COLORS[c.stage.key] || COLORS.gold, flexShrink: 0 }} />
+                  <span style={{ fontFamily: MONO_FONT, fontSize: 16, fontWeight: 600, color: on ? COLORS.goldBright : c.stage.key === "ready" && c.count ? COLORS.successText : COLORS.ink, lineHeight: 1.1 }}>{c.count}</span>
+                </span>
+                <span style={{ fontSize: 10.5, color: on ? COLORS.gold : COLORS.muted, whiteSpace: "nowrap", overflow: "hidden", textOverflow: "ellipsis", maxWidth: "100%" }}>{STAGE_SHORT_LABELS[c.stage.key] || c.stage.label}</span>
+              </button>
+            );
+          })}
+        </div>
+      </section>
 
-      {(isAdmin || CORE_FOUR.includes((session.name || "").toLowerCase())) && (
-        <div style={{ background: COLORS.panel, border: `1px solid ${COLORS.line}`, borderRadius: 12, padding: "12px 13px", marginBottom: 16 }}>
-          <div style={{ fontSize: 11, fontWeight: 700, color: COLORS.muted, textTransform: "uppercase", letterSpacing: 0.5, marginBottom: 8 }}>
+      {(isAdmin || CORE_FOUR.includes(session.id) || CORE_FOUR.includes((session.name || "").toLowerCase())) && (
+        <div style={{ ...cardStyle, padding: "12px 14px", marginBottom: 16 }}>
+          <div style={{ ...eyebrowStyle, marginBottom: 10 }}>
             Who's Out Today
           </div>
           <div style={{ display: "flex", flexWrap: "wrap", gap: 6, marginBottom: outToday.length ? 8 : 0 }}>
@@ -3882,11 +5944,12 @@ function Dashboard({ index, session, onOpen, canArchive, onRefresh, syncState, l
                   onClick={() => toggleOutToday(name)}
                   disabled={savingOutToday}
                   className="mrcap-press"
+                  aria-pressed={isOut}
                   style={{
-                    padding: "6px 12px", borderRadius: 999, fontSize: 12, fontWeight: 600, cursor: "pointer",
-                    border: `1.5px solid ${isOut ? COLORS.red : COLORS.line}`,
-                    background: isOut ? "rgba(168,64,47,0.15)" : COLORS.panel2,
-                    color: isOut ? "#E08A78" : COLORS.ink, opacity: savingOutToday ? 0.6 : 1,
+                    minHeight: 38, padding: "0 14px", borderRadius: 999, fontSize: 12.5, fontWeight: 600, cursor: "pointer",
+                    border: isOut ? "1px solid rgba(214,106,86,0.55)" : `1px solid ${COLORS.line}`,
+                    background: isOut ? "rgba(168,64,47,0.16)" : COLORS.panel2,
+                    color: isOut ? COLORS.dangerText : COLORS.ink, opacity: savingOutToday ? 0.6 : 1,
                   }}
                 >
                   {label}{isOut ? " — Out" : ""}
@@ -3909,191 +5972,144 @@ function Dashboard({ index, session, onOpen, canArchive, onRefresh, syncState, l
       )}
 
       {followupsDue.length > 0 && (
-        <div style={{ marginBottom: 16 }}>
-          <div style={{ display: "flex", alignItems: "center", gap: 7, marginBottom: 8 }}>
-            <Clock size={14} color={COLORS.red} />
-            <div style={{ fontFamily: DISPLAY_FONT, fontWeight: 600, fontSize: 14.5, color: COLORS.ink }}>Follow-ups Due</div>
-            <Pill tone="red">{followupsDue.length}</Pill>
-          </div>
+        <div style={{ marginBottom: 18 }}>
+          <BoardSectionHead icon={Clock} color={COLORS.dangerText} title="Follow-ups Due" count={followupsDue.length} tone="red" />
           <div style={{ display: "flex", flexDirection: "column", gap: 8 }}>
             {followupsDue.map((j) => (
-              <div key={j.id} onClick={() => onOpen(j.id)} className="mrcap-press" style={{ textAlign: "left", background: "rgba(168,64,47,0.08)", border: `1.5px solid ${COLORS.red}`, borderRadius: 10, padding: "12px 13px", cursor: "pointer", width: "100%", boxSizing: "border-box" }}>
-                <div style={{ display: "flex", justifyContent: "space-between", alignItems: "flex-end", gap: 10 }}>
-                  <div style={{ flex: 1, minWidth: 0 }}>
-                    <div style={{ fontFamily: MONO_FONT, fontWeight: 600, fontSize: 14.5, color: COLORS.ink }}>{j.plate || "—"} · {j.makeModel}</div>
-                    <div style={{ fontSize: 12, color: COLORS.muted, marginTop: 2 }}>{j.followupNote || "Follow-up due"} — {j.followupDate}</div>
-                  </div>
-                  {j.customerPhone && (
-                    <WhatsAppSendButton
-                      phone={j.customerPhone}
-                      templateKey="follow_up"
-                      vars={{ customerName: j.customerName || "", makeModel: j.makeModel || "vehicle", plate: j.plate || "", reason: j.followupNote || "a follow-up" }}
-                      label="Message"
-                      small
-                    />
-                  )}
-                </div>
-              </div>
+              <BoardAlertRow
+                key={j.id} j={j} tone="red" onOpen={onOpen}
+                sub={`${j.followupNote || "Follow-up due"} — ${j.followupDate}`}
+                action={j.customerPhone ? (
+                  <WhatsAppSendButton
+                    phone={j.customerPhone}
+                    templateKey="follow_up"
+                    vars={{ customerName: j.customerName || "", makeModel: j.makeModel || "vehicle", plate: j.plate || "", reason: j.followupNote || "a follow-up" }}
+                    label="Message"
+                    small
+                  />
+                ) : null}
+              />
             ))}
           </div>
         </div>
       )}
 
       {warrantiesExpiringSoon.length > 0 && (
-        <div style={{ marginBottom: 16 }}>
-          <div style={{ display: "flex", alignItems: "center", gap: 7, marginBottom: 8 }}>
-            <ShieldCheck size={14} color={COLORS.gold} />
-            <div style={{ fontFamily: DISPLAY_FONT, fontWeight: 600, fontSize: 14.5, color: COLORS.ink }}>Warranty Expiring Soon</div>
-            <Pill tone="yellow">{warrantiesExpiringSoon.length}</Pill>
-          </div>
+        <div style={{ marginBottom: 18 }}>
+          <BoardSectionHead icon={ShieldCheck} title="Warranty Expiring Soon" count={warrantiesExpiringSoon.length} />
           <div style={{ display: "flex", flexDirection: "column", gap: 8 }}>
             {warrantiesExpiringSoon.map((j) => (
-              <div key={j.id} onClick={() => onOpen(j.id)} className="mrcap-press" style={{ textAlign: "left", background: "rgba(201,162,39,0.08)", border: `1.5px solid ${COLORS.gold}`, borderRadius: 10, padding: "12px 13px", cursor: "pointer", width: "100%", boxSizing: "border-box" }}>
-                <div style={{ display: "flex", justifyContent: "space-between", alignItems: "flex-end", gap: 10 }}>
-                  <div style={{ flex: 1, minWidth: 0 }}>
-                    <div style={{ fontFamily: MONO_FONT, fontWeight: 600, fontSize: 14.5, color: COLORS.ink }}>{j.plate || "—"} · {j.makeModel}</div>
-                    <div style={{ fontSize: 12, color: COLORS.muted, marginTop: 2 }}>Warranty expires {j.warrantyExpiry}</div>
-                  </div>
-                  {j.customerPhone && (
-                    <WhatsAppSendButton
-                      phone={j.customerPhone}
-                      templateKey="warranty_reminder"
-                      vars={{ customerName: j.customerName || "", makeModel: j.makeModel || "vehicle", plate: j.plate || "", expiryDate: j.warrantyExpiry }}
-                      label="Message"
-                      small
-                    />
-                  )}
-                </div>
-              </div>
+              <BoardAlertRow
+                key={j.id} j={j} tone="gold" onOpen={onOpen}
+                sub={`Warranty expires ${j.warrantyExpiry}`}
+                action={j.customerPhone ? (
+                  <WhatsAppSendButton
+                    phone={j.customerPhone}
+                    templateKey="warranty_reminder"
+                    vars={{ customerName: j.customerName || "", makeModel: j.makeModel || "vehicle", plate: j.plate || "", expiryDate: j.warrantyExpiry }}
+                    label="Message"
+                    small
+                  />
+                ) : null}
+              />
             ))}
           </div>
         </div>
       )}
 
       {readyNotInformed.length > 0 && (
-        <div style={{ marginBottom: 16 }}>
-          <div style={{ display: "flex", alignItems: "center", gap: 7, marginBottom: 8 }}>
-            <Send size={14} color={COLORS.red} />
-            <div style={{ fontFamily: DISPLAY_FONT, fontWeight: 600, fontSize: 14.5, color: COLORS.ink }}>Ready — Customer Not Yet Informed</div>
-            <Pill tone="red">{readyNotInformed.length}</Pill>
-          </div>
+        <div style={{ marginBottom: 18 }}>
+          <BoardSectionHead icon={Send} color={COLORS.dangerText} title="Ready — Customer Not Yet Informed" count={readyNotInformed.length} tone="red" />
           <div style={{ display: "flex", flexDirection: "column", gap: 8 }}>
             {readyNotInformed.map((j) => (
-              <div key={j.id} onClick={() => onOpen(j.id)} className="mrcap-press" style={{ textAlign: "left", background: "rgba(168,64,47,0.08)", border: `1.5px solid ${COLORS.red}`, borderRadius: 10, padding: "12px 13px", cursor: "pointer", width: "100%", boxSizing: "border-box" }}>
-                <div style={{ fontFamily: MONO_FONT, fontWeight: 600, fontSize: 14.5, color: COLORS.ink }}>{j.plate || "—"} · {j.makeModel}</div>
-                <div style={{ fontSize: 12, color: COLORS.muted, marginTop: 2 }}>Ready for collection — nobody's ticked "Customer informed" yet</div>
-              </div>
+              <BoardAlertRow key={j.id} j={j} tone="red" onOpen={onOpen} sub={'Ready for collection — nobody\'s ticked "Customer informed" yet'} action={<ChevronLeft size={18} color={COLORS.muted} style={{ transform: "rotate(180deg)", flexShrink: 0 }} />} />
             ))}
           </div>
         </div>
       )}
 
       {reviewQueue.length > 0 && (
-        <div style={{ marginBottom: 16 }}>
-          <div style={{ display: "flex", alignItems: "center", gap: 7, marginBottom: 8 }}>
-            <ShieldAlert size={15} color={COLORS.gold} />
-            <div style={{ fontFamily: DISPLAY_FONT, fontWeight: 600, fontSize: 14.5, color: COLORS.gold }}>Needs Your Review</div>
-            <Pill tone="yellow">{reviewQueue.length}</Pill>
-          </div>
+        <div style={{ marginBottom: 18 }}>
+          <BoardSectionHead icon={ShieldAlert} title="Needs Your Review" count={reviewQueue.length} />
           <div style={{ display: "flex", flexDirection: "column", gap: 8 }}>
             {reviewQueue.map((j) => (
-              <button key={j.id} onClick={() => onOpen(j.id)} className="mrcap-press" style={{ textAlign: "left", width: "100%", boxSizing: "border-box", background: "rgba(201,162,39,0.12)", border: `1.5px solid ${COLORS.gold}`, borderRadius: 10, padding: "11px 13px", cursor: "pointer" }}>
-                <div style={{ fontFamily: MONO_FONT, fontWeight: 600, fontSize: 14, color: COLORS.ink }}>{j.plate}</div>
-                <div style={{ fontSize: 11.5, color: COLORS.muted, marginTop: 2 }}>{j.customerName} · ready for your sign-off</div>
-              </button>
+              <BoardAlertRow key={j.id} j={j} tone="gold" onOpen={onOpen} sub={`${j.customerName} · ready for your sign-off`} action={<ChevronLeft size={18} color={COLORS.gold} style={{ transform: "rotate(180deg)", flexShrink: 0 }} />} />
             ))}
           </div>
         </div>
       )}
 
-      {isAdmin && (
-        <div style={{ display: "grid", gridTemplateColumns: "repeat(2, 1fr)", gap: 8, marginBottom: 10 }}>
-          <StatCard label="Active" value={active.length} onClick={() => setStatFilter(null)} isActive={statFilter === null} />
-          <StatCard label="High priority" value={highPriority.length} tone={highPriority.length ? COLORS.red : undefined} onClick={() => setStatFilter((f) => (f === "high" ? null : "high"))} isActive={statFilter === "high"} />
-          <StatCard label="Ready for QC" value={readyForQC.length} tone={readyForQC.length ? COLORS.blue : undefined} onClick={() => setStatFilter((f) => (f === "qc" ? null : "qc"))} isActive={statFilter === "qc"} />
-          <StatCard label="Ready for Collection" value={readyForCollection.length} tone={readyForCollection.length ? COLORS.gold : undefined} onClick={() => setStatFilter((f) => (f === "ready" ? null : "ready"))} isActive={statFilter === "ready"} />
+      <div style={{ position: "relative", marginBottom: 10 }}>
+        <Search size={16} color={COLORS.muted} style={{ position: "absolute", left: 14, top: 15, pointerEvents: "none" }} />
+        <input value={search} onChange={(e) => setSearch(e.target.value)} placeholder="Search plate, customer, model…" style={{ ...inputStyle, marginTop: 0, paddingLeft: 40, background: COLORS.panel }} />
+        {search && (
+          <button onClick={() => setSearch("")} className="mrcap-press" aria-label="Clear search" style={{ position: "absolute", right: 4, top: 1, width: 44, height: 44, background: "none", border: "none", color: COLORS.muted, cursor: "pointer", display: "flex", alignItems: "center", justifyContent: "center" }}><X size={16} /></button>
+        )}
+      </div>
+
+      {/* Status filters, then the location filter. Tapping the active
+          location chip again clears back to "all". Reads the app's real
+          location list, so a new location added from Settings shows up
+          here automatically. */}
+      <div className="mrcap-scroll-x" style={{ display: "flex", gap: 8, overflowX: "auto", margin: "0 -18px 8px", padding: "2px 18px" }}>
+        {filterTabs.map(([k, label]) => (
+          <button key={k} onClick={() => setFilter(k)} className="mrcap-press" aria-pressed={filter === k} style={filterChipStyle(filter === k)}>
+            {label} <span style={{ fontFamily: MONO_FONT, fontSize: 11.5, opacity: filter === k ? 0.8 : 0.6 }}>{tabCount(k)}</span>
+          </button>
+        ))}
+        {isAdmin && (
+          <button onClick={() => setStatFilter((f) => (f === "high" ? null : "high"))} className="mrcap-press" aria-pressed={statFilter === "high"}
+            style={{ ...filterChipStyle(false), border: statFilter === "high" ? `1px solid ${COLORS.dangerText}` : "1px solid rgba(214,106,86,0.45)", background: statFilter === "high" ? "rgba(168,64,47,0.32)" : "rgba(168,64,47,0.12)", color: COLORS.dangerText, fontWeight: statFilter === "high" ? 700 : 500 }}>
+            High priority <span style={{ fontFamily: MONO_FONT, fontSize: 11.5 }}>{highPriority.length}</span>
+          </button>
+        )}
+      </div>
+      <div className="mrcap-scroll-x" style={{ display: "flex", gap: 6, overflowX: "auto", margin: "0 -18px 14px", padding: "2px 18px" }}>
+        {getLocations().map((loc) => {
+          const on = locationFilter === loc;
+          return (
+            <button
+              key={loc}
+              onClick={() => setLocationFilter((f) => (f === loc ? null : loc))}
+              className="mrcap-press"
+              aria-pressed={on}
+              style={{
+                height: 32, padding: "0 12px", borderRadius: 999, fontSize: 11.5, fontWeight: on ? 600 : 500, whiteSpace: "nowrap", cursor: "pointer", flexShrink: 0,
+                display: "inline-flex", alignItems: "center", gap: 5,
+                border: on ? `1px solid ${COLORS.gold}` : `1px solid ${COLORS.line}`,
+                background: on ? "rgba(201,162,39,0.16)" : "transparent",
+                color: on ? COLORS.goldBright : COLORS.muted,
+              }}
+            >
+              <Building2 size={11} /> {loc}
+            </button>
+          );
+        })}
+      </div>
+
+      {statFilter && (
+        <div className="mrcap-fade" style={{ display: "flex", alignItems: "center", justifyContent: "space-between", gap: 8, marginBottom: 12, fontSize: 12.5, color: COLORS.muted }}>
+          <span>Showing <b style={{ color: COLORS.ink }}>{statFilter === "high" ? "High priority" : (STAGES.find((s) => s.key === statFilter)?.label || statFilter)}</b> only</span>
+          <button onClick={() => setStatFilter(null)} className="mrcap-press" style={{ minHeight: 32, padding: "0 12px", borderRadius: 999, border: `1px solid ${COLORS.line}`, background: COLORS.panel, color: COLORS.gold, fontSize: 12, fontWeight: 600, cursor: "pointer" }}>Show all</button>
         </div>
       )}
 
-      {/* Location filter chips — reads the app's real location list
-          (in-house + any shop-added external locations), so a new location
-          added from Settings shows up here automatically, no code change
-          needed. Tapping the active chip again clears back to "all". */}
-      <div style={{ display: "flex", gap: 6, marginBottom: 14, overflowX: "auto" }}>
-        {getLocations().map((loc) => (
-          <button
-            key={loc}
-            onClick={() => setLocationFilter((f) => (f === loc ? null : loc))}
-            className="mrcap-press"
-            style={{
-              padding: "6px 12px", borderRadius: 999, fontSize: 11.5, fontWeight: 600, whiteSpace: "nowrap", cursor: "pointer", flexShrink: 0,
-              border: `1.5px solid ${locationFilter === loc ? COLORS.gold : COLORS.line}`,
-              background: locationFilter === loc ? COLORS.gold : COLORS.panel2,
-              color: locationFilter === loc ? COLORS.darkText : COLORS.muted,
-            }}
-          >
-            {loc}
-          </button>
-        ))}
-      </div>
-
-      <div style={{ position: "relative", marginBottom: 12 }}>
-        <Search size={15} color={COLORS.muted} style={{ position: "absolute", left: 12, top: 12 }} />
-        <input value={search} onChange={(e) => setSearch(e.target.value)} placeholder="Search plate, customer, model…" style={{ ...inputStyle, marginTop: 0, paddingLeft: 34 }} />
-      </div>
-
-      <div style={{ display: "flex", gap: 8, marginBottom: 14, overflowX: "auto" }}>
-        {filterTabs.map(([k, label]) => (
-          <button key={k} onClick={() => setFilter(k)} className="mrcap-press" style={{ padding: "7px 13px", borderRadius: 999, border: `1.5px solid ${filter === k ? COLORS.gold : COLORS.line}`, background: filter === k ? COLORS.gold : COLORS.panel2, color: filter === k ? COLORS.darkText : COLORS.ink, fontSize: 12.5, fontWeight: 600, whiteSpace: "nowrap", cursor: "pointer", flexShrink: 0 }}>
-            {label}
-          </button>
-        ))}
-      </div>
-
       {filtered.length === 0 && (
-        <div style={{ textAlign: "center", padding: "50px 10px", color: COLORS.muted }}>
-          <Car size={26} style={{ opacity: 0.4, marginBottom: 8 }} />
-          <div style={{ fontSize: 14 }}>No job cards here yet.</div>
-        </div>
+        <EmptyState icon={Car} title="No job cards here yet." sub={search || statFilter || locationFilter ? "Try clearing the search or filters." : "New cars you check in will show up here."} />
       )}
 
       {grouped.map(({ stage, jobs }) => jobs.length > 0 && (
-        <div key={stage.key} style={{ marginBottom: 18 }}>
-          <div style={{ display: "flex", alignItems: "center", gap: 8, marginBottom: 8 }}>
-            <div style={{ fontFamily: DISPLAY_FONT, fontWeight: 600, fontSize: 14.5, color: COLORS.ink }}>{stage.label}</div>
-            <Pill tone={stageTone(stage.key)}>{jobs.length}</Pill>
+        <div key={stage.key} style={{ marginBottom: 20 }}>
+          <div style={{ display: "flex", alignItems: "center", gap: 8, marginBottom: 10 }}>
+            <span style={{ width: 8, height: 8, borderRadius: 2, background: STAGE_BAR_COLORS[stage.key] || COLORS.muted }} />
+            <div style={{ fontFamily: DISPLAY_FONT, fontWeight: 700, fontSize: 16, color: COLORS.ink }}>{stage.label}</div>
+            <span style={{ fontFamily: MONO_FONT, fontSize: 12, color: COLORS.muted }}>{jobs.length}</span>
           </div>
           <div style={{ display: "flex", flexDirection: "column", gap: 10 }}>
             {jobs.map((j) => (
-              <button key={j.id} onClick={() => onOpen(j.id)} className="mrcap-press mrcap-card" style={{ textAlign: "left", background: COLORS.panel, borderTop: `1px solid ${COLORS.line}`, borderRight: `1px solid ${COLORS.line}`, borderBottom: `1px solid ${COLORS.line}`, borderLeft: `3px solid ${COLORS.gold}`, borderRadius: "4px 10px 10px 4px", padding: "13px 14px", cursor: "pointer", display: "flex", flexDirection: "column", gap: 6, width: "100%", boxSizing: "border-box", boxShadow: "0 6px 16px -10px rgba(0,0,0,0.6)" }}>
-                <div style={{ display: "flex", justifyContent: "space-between", alignItems: "flex-start" }}>
-                  <div>
-                    <div style={{ fontFamily: MONO_FONT, fontWeight: 700, fontSize: 16, color: COLORS.ink, letterSpacing: 1.1 }}>{j.plate || "—"}</div>
-                    <div style={{ fontSize: 12.5, color: COLORS.muted, marginTop: 1 }}>{j.makeModel} · {j.customerName}</div>
-                  </div>
-                  <Pill tone={priorityTone(j.priority)}>{j.priority}</Pill>
-                </div>
-                {(() => {
-                  const { primary, rest } = splitPrimaryService(j.serviceTypes);
-                  if (!primary) return null;
-                  return (
-                    <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
-                      <div style={{ fontSize: 13, fontWeight: 600, color: COLORS.ink }}>{primary.label}</div>
-                      {rest.length > 0 && (
-                        <div style={{ display: "flex", gap: 5 }}>
-                          {rest.map((s) => {
-                            const Icon = SERVICE_ICONS[s.key];
-                            return Icon ? <Icon key={s.key} size={13} color={COLORS.muted} /> : null;
-                          })}
-                        </div>
-                      )}
-                    </div>
-                  );
-                })()}
-                <div style={{ fontSize: 11, color: COLORS.muted, display: "flex", alignItems: "center", gap: 5 }}>
-                  <Clock size={11} /> {fmtTime(j.updatedAt)} · <Building2 size={11} /> {j.location}
-                </div>
-              </button>
+              <SwipeableJobCard key={j.id} job={j} session={session} team={team} onDeleted={onJobDeleted}>
+                <BoardJobCard j={j} now={now} onOpen={onOpen} />
+              </SwipeableJobCard>
             ))}
           </div>
         </div>
@@ -4104,27 +6120,15 @@ function Dashboard({ index, session, onOpen, canArchive, onRefresh, syncState, l
           they shouldn't push the actually-moving jobs further down the
           screen. Still its own clearly-labeled section, never mixed in. */}
       {onHoldJobs.length > 0 && (
-        <div style={{ marginBottom: 18 }}>
-          <div style={{ display: "flex", alignItems: "center", gap: 8, marginBottom: 8 }}>
+        <div style={{ marginBottom: 20 }}>
+          <div style={{ display: "flex", alignItems: "center", gap: 8, marginBottom: 10 }}>
             <PauseCircle size={15} color={COLORS.gold} />
-            <div style={{ fontFamily: DISPLAY_FONT, fontWeight: 600, fontSize: 14.5, color: COLORS.gold }}>On Hold</div>
-            <Pill tone="yellow">{onHoldJobs.length}</Pill>
+            <div style={{ fontFamily: DISPLAY_FONT, fontWeight: 700, fontSize: 16, color: COLORS.gold }}>On Hold</div>
+            <span style={{ fontFamily: MONO_FONT, fontSize: 12, color: COLORS.muted }}>{onHoldJobs.length}</span>
           </div>
           <div style={{ display: "flex", flexDirection: "column", gap: 10 }}>
             {onHoldJobs.map((j) => (
-              <button key={j.id} onClick={() => onOpen(j.id)} className="mrcap-press mrcap-card" style={{ textAlign: "left", background: "rgba(201,162,39,0.08)", border: `1.5px solid ${COLORS.gold}`, borderRadius: 10, padding: "13px 14px", cursor: "pointer", display: "flex", flexDirection: "column", gap: 6, width: "100%", boxSizing: "border-box", boxShadow: "0 6px 16px -10px rgba(0,0,0,0.6)" }}>
-                <div style={{ display: "flex", justifyContent: "space-between", alignItems: "flex-start" }}>
-                  <div>
-                    <div style={{ fontFamily: MONO_FONT, fontWeight: 700, fontSize: 16, color: COLORS.ink, letterSpacing: 1.1 }}>{j.plate || "—"}</div>
-                    <div style={{ fontSize: 12.5, color: COLORS.muted, marginTop: 1 }}>{j.makeModel} · {j.customerName}</div>
-                  </div>
-                  <Pill tone="yellow">On Hold</Pill>
-                </div>
-                {j.onHoldNote && <div style={{ fontSize: 12, color: COLORS.ink, fontStyle: "italic" }}>"{j.onHoldNote}"</div>}
-                <div style={{ fontSize: 11, color: COLORS.muted, display: "flex", alignItems: "center", gap: 5 }}>
-                  <Clock size={11} /> Since {fmtTime(j.onHoldSince)} · <Building2 size={11} /> {j.location}
-                </div>
-              </button>
+              <BoardJobCard key={j.id} j={j} now={now} onOpen={onOpen} onHoldCard />
             ))}
           </div>
         </div>
@@ -4217,8 +6221,8 @@ function NewQuoteForm({ session, onCreated, onCancel }) {
 
       <Field label="Customer type">
         <div style={{ display: "flex", gap: 8 }}>
-          <button onClick={() => setCustomerType("retail")} className="mrcap-press" style={{ flex: 1, padding: "9px", borderRadius: 9, border: `1.5px solid ${customerType === "retail" ? COLORS.gold : COLORS.line}`, background: customerType === "retail" ? COLORS.gold : COLORS.panel2, color: customerType === "retail" ? COLORS.darkText : COLORS.ink, fontWeight: 600, fontSize: 13, cursor: "pointer" }}>Retail / Walk-in</button>
-          <button onClick={() => setCustomerType("b2b")} className="mrcap-press" style={{ flex: 1, padding: "9px", borderRadius: 9, border: `1.5px solid ${customerType === "b2b" ? COLORS.gold : COLORS.line}`, background: customerType === "b2b" ? COLORS.gold : COLORS.panel2, color: customerType === "b2b" ? COLORS.darkText : COLORS.ink, fontWeight: 600, fontSize: 13, cursor: "pointer" }}>B2B</button>
+          <button onClick={() => setCustomerType("retail")} className="mrcap-press" aria-pressed={customerType === "retail"} style={{ ...selectChipStyle(customerType === "retail"), flex: 1, borderRadius: 12, minHeight: 46 }}>Retail / Walk-in</button>
+          <button onClick={() => setCustomerType("b2b")} className="mrcap-press" aria-pressed={customerType === "b2b"} style={{ ...selectChipStyle(customerType === "b2b"), flex: 1, borderRadius: 12, minHeight: 46 }}>B2B</button>
         </div>
       </Field>
 
@@ -4247,11 +6251,14 @@ function NewQuoteForm({ session, onCreated, onCancel }) {
                         </button>
                         {picked && (
                           <div style={{ padding: "5px 9px 0 30px" }}>
-                            <div style={{ display: "flex", alignItems: "center", gap: 6 }}>
+                            <div style={{ display: "flex", alignItems: "center", gap: 6, flexWrap: "wrap" }}>
                               <span style={{ fontSize: 10.5, color: COLORS.muted }}>AED</span>
                               <input type="number" value={treatmentPrices[priceKey] ?? ""} onChange={(e) => setTreatmentPrices((p) => ({ ...p, [priceKey]: e.target.value }))} style={{ width: 90, background: COLORS.panel2, border: `1px solid ${COLORS.line}`, borderRadius: 6, padding: "4px 7px", fontSize: 11.5, color: COLORS.gold, fontFamily: MONO_FONT }} />
                               {t.retail != null && Number(treatmentPrices[priceKey]) !== t.retail && (
                                 <span style={{ fontSize: 10, color: COLORS.muted, textDecoration: "line-through", fontFamily: MONO_FONT }}>AED {t.retail.toLocaleString()}</span>
+                              )}
+                              {isPerPieceTreatment(s.key, t.name) && (
+                                <span style={{ fontSize: 10, color: COLORS.gold }}>per piece — enter the unit price, not the total (quotes don't have a pieces picker yet)</span>
                               )}
                             </div>
                           </div>
@@ -4303,8 +6310,8 @@ function NewQuoteForm({ session, onCreated, onCancel }) {
       </Field>
 
       {saveError && (
-        <div style={{ background: "rgba(168,64,47,0.15)", border: `1px solid ${COLORS.red}`, borderRadius: 10, padding: "10px 12px", marginBottom: 14, fontSize: 12.5, color: "#E08A78" }}>
-          {typeof saveError === "string" ? saveError : "Couldn't save to the server."} {lastStorageError && <span style={{ fontFamily: "monospace", display: "block", marginTop: 4, fontSize: 10.5 }}>{lastStorageError}</span>}
+        <div style={{ background: "rgba(168,64,47,0.15)", border: `1px solid ${COLORS.red}`, borderRadius: 10, padding: "10px 12px", marginBottom: 14, fontSize: 12.5, color: COLORS.dangerText }}>
+          {typeof saveError === "string" ? saveError : "Couldn't save to the server."} {lastStorageError && <span style={{ fontFamily: MONO_FONT, display: "block", marginTop: 4, fontSize: 10.5 }}>{lastStorageError}</span>}
         </div>
       )}
 
@@ -4365,8 +6372,8 @@ function ParkVehicleForm({ session, onCreated, onCancel }) {
       <Field label="Why it's on hold"><textarea style={textareaStyle} value={note} onChange={(e) => setNote(e.target.value)} placeholder="e.g. Owner's car, parked at the office for a few weeks" /></Field>
 
       {saveError && (
-        <div style={{ background: "rgba(168,64,47,0.15)", border: `1px solid ${COLORS.red}`, borderRadius: 10, padding: "10px 12px", marginBottom: 14, fontSize: 12.5, color: "#E08A78" }}>
-          {typeof saveError === "string" ? saveError : "Couldn't save to the server."} {lastStorageError && <span style={{ fontFamily: "monospace", display: "block", marginTop: 4, fontSize: 10.5 }}>{lastStorageError}</span>}
+        <div style={{ background: "rgba(168,64,47,0.15)", border: `1px solid ${COLORS.red}`, borderRadius: 10, padding: "10px 12px", marginBottom: 14, fontSize: 12.5, color: COLORS.dangerText }}>
+          {typeof saveError === "string" ? saveError : "Couldn't save to the server."} {lastStorageError && <span style={{ fontFamily: MONO_FONT, display: "block", marginTop: 4, fontSize: 10.5 }}>{lastStorageError}</span>}
         </div>
       )}
 
@@ -4397,6 +6404,19 @@ function QuickIntakeForm({ session, onCreated, onCancel, onFullForm }) {
   const [saving, setSaving] = useState(false);
   const [saveError, setSaveError] = useState(false);
   const fileRef = useRef(null);
+  const [make, setMake] = useState("");
+  const [model, setModel] = useState("");
+  const [modelYear, setModelYear] = useState("");
+  const [color, setColor] = useState("");
+  const [bodyType, setBodyType] = useState("");
+  const [saveAttempted, setSaveAttempted] = useState(false);
+  const setVehicle = (patch) => {
+    if ("make" in patch) setMake(patch.make);
+    if ("model" in patch) setModel(patch.model);
+    if ("modelYear" in patch) setModelYear(patch.modelYear);
+    if ("color" in patch) setColor(patch.color);
+    if ("bodyType" in patch) setBodyType(patch.bodyType);
+  };
 
   const addPhotos = async (files) => {
     const compressed = await Promise.all(Array.from(files).map((f) => compressImage(f)));
@@ -4405,10 +6425,12 @@ function QuickIntakeForm({ session, onCreated, onCancel, onFullForm }) {
 
   const submit = async () => {
     if (!plate.trim()) return;
+    if (!bodyType) { setSaveAttempted(true); return; }
     setSaving(true);
     const now = Date.now();
     const job = {
-      plate: plate.trim().toUpperCase(), makeModel: "", customerName: customerName.trim() || "—", customerPhone: "",
+      plate: plate.trim().toUpperCase(), makeModel: composeMakeModel(make, model, ""), customerName: customerName.trim() || "—", customerPhone: "",
+      make: make.trim(), model: model.trim(), modelYear: modelYear || null, color: color || null, bodyType: bodyType || null,
       description: "", damageNotes: "", priority: "Medium", location: BASE_LOCATIONS[0],
       serviceTypes: [], treatments: {}, treatmentPrices: {}, discountPercent: 0, priceHistory: [],
       serviceDone: {}, assignedTo: {}, stageIndex: 0,
@@ -4427,44 +6449,47 @@ function QuickIntakeForm({ session, onCreated, onCancel, onFullForm }) {
   return (
     <div className="mrcap-view" style={{ padding: "4px 18px 30px" }}>
       <SectionTitle>Quick Intake</SectionTitle>
-      <div style={{ fontSize: 12, color: COLORS.muted, marginTop: -10, marginBottom: 16 }}>
+      <div style={{ fontSize: 12.5, color: COLORS.muted, marginTop: -8, marginBottom: 18, lineHeight: 1.45 }}>
         Get it into the system now — plate and a photo. Everything else (service type, pricing, damage notes) can be filled in later.
       </div>
 
-      <Field label="Plate number"><PlatePicker value={plate} onChange={setPlate} /></Field>
+      <Field label="Plate"><PlatePicker value={plate} onChange={setPlate} /></Field>
       <Field label="Whose car (optional)"><input style={inputStyle} value={customerName} onChange={(e) => setCustomerName(e.target.value)} placeholder="Skip if you don't know it yet" /></Field>
 
-      <Field label="Photo">
+      <VehicleDetailsFields values={{ make, model, modelYear, color, bodyType }} onChange={setVehicle} bodyTypeRequired showBodyTypeMissing={saveAttempted && !bodyType} />
+
+      <Field label="Photos">
         <input ref={fileRef} type="file" accept="image/*" capture="environment" multiple style={{ display: "none" }} onChange={(e) => { if (e.target.files.length) addPhotos(e.target.files); e.target.value = ""; }} />
-        <button onClick={() => fileRef.current.click()} className="mrcap-press" style={{ ...cameraBtnStyle, width: "100%", justifyContent: "center", padding: "16px" }}>
-          <Camera size={18} /> {photos.length ? `${photos.length} photo${photos.length === 1 ? "" : "s"} added — add more` : "Take a photo"}
+        <button onClick={() => fileRef.current.click()} className="mrcap-press" style={{ ...cameraBtnStyle, width: "100%", minHeight: 64, marginTop: 0, color: photos.length ? COLORS.ink : COLORS.muted, border: `1.5px dashed ${photos.length ? "rgba(201,162,39,0.55)" : "#3A3526"}` }}>
+          <Camera size={20} color={photos.length ? COLORS.gold : COLORS.muted} /> {photos.length ? `${photos.length} photo${photos.length === 1 ? "" : "s"} added — add more` : "Take a photo"}
         </button>
         {photos.length > 0 && (
-          <div style={{ display: "flex", gap: 7, overflowX: "auto", marginTop: 10 }}>
+          <div className="mrcap-scroll-x" style={{ display: "flex", gap: 7, overflowX: "auto", marginTop: 10 }}>
             {photos.map((src, i) => (
-              <img key={i} src={src} alt="" style={{ width: 64, height: 64, objectFit: "cover", borderRadius: 8, border: `1px solid ${COLORS.line}`, flexShrink: 0 }} />
+              <img key={i} src={src} alt="" style={{ width: 68, height: 68, objectFit: "cover", borderRadius: 10, border: `1px solid ${COLORS.line}`, flexShrink: 0 }} />
             ))}
           </div>
         )}
       </Field>
 
+      {onFullForm && (
+        <button onClick={onFullForm} className="mrcap-press" style={{ width: "100%", minHeight: 44, marginTop: 4, background: "none", border: `1px solid ${COLORS.line}`, borderRadius: 12, color: COLORS.muted, fontSize: 13, cursor: "pointer", display: "flex", alignItems: "center", justifyContent: "center", gap: 6 }}>
+          Have all the details now? <span style={{ color: COLORS.gold, fontWeight: 600 }}>Full job card</span>
+        </button>
+      )}
+
       {saveError && (
-        <div style={{ background: "rgba(168,64,47,0.15)", border: `1px solid ${COLORS.red}`, borderRadius: 10, padding: "10px 12px", marginBottom: 14, fontSize: 12.5, color: "#E08A78" }}>
-          {typeof saveError === "string" ? saveError : "Couldn't save to the server."} {lastStorageError && <span style={{ fontFamily: "monospace", display: "block", marginTop: 4, fontSize: 10.5 }}>{lastStorageError}</span>}
+        <div role="alert" style={{ background: "rgba(168,64,47,0.14)", border: "1px solid rgba(168,64,47,0.6)", borderRadius: 14, padding: "10px 14px", marginTop: 14, fontSize: 13, color: COLORS.dangerText }}>
+          {typeof saveError === "string" ? saveError : "Couldn't save to the server."} {lastStorageError && <span style={{ fontFamily: MONO_FONT, display: "block", marginTop: 4, fontSize: 10.5 }}>{lastStorageError}</span>}
         </div>
       )}
 
-      <div style={{ display: "flex", gap: 10, marginTop: 20 }}>
-        <button onClick={onCancel} className="mrcap-press" style={{ ...secondaryBtnStyle, flex: 1 }}>Cancel</button>
-        <button onClick={submit} disabled={!plate.trim() || saving} className="mrcap-press" style={{ ...primaryBtnStyle, flex: 2, opacity: !plate.trim() ? 0.5 : 1 }}>
-          {saving ? "Saving…" : "Save — finish details later"}
+      <StickyActionBar>
+        <button onClick={onCancel} className="mrcap-press" style={{ ...secondaryBtnStyle, minHeight: 54, borderRadius: 14, padding: "0 18px", background: COLORS.panel }}>Cancel</button>
+        <button onClick={submit} disabled={!plate.trim() || saving} className="mrcap-press" style={{ ...primaryBtnStyle, flex: 1, minHeight: 54, borderRadius: 14, display: "flex", alignItems: "center", justifyContent: "center", gap: 8, opacity: !plate.trim() ? 0.45 : 1 }}>
+          {saving ? "Saving…" : !plate.trim() ? "Pick the plate first" : <>Check in car <ArrowRight size={18} /></>}
         </button>
-      </div>
-      {onFullForm && (
-        <button onClick={onFullForm} className="mrcap-press" style={{ width: "100%", marginTop: 12, background: "none", border: "none", color: COLORS.muted, fontSize: 12, textDecoration: "underline", cursor: "pointer" }}>
-          Have all the details now? Fill in the full job card instead
-        </button>
-      )}
+      </StickyActionBar>
     </div>
   );
 }
@@ -4472,7 +6497,19 @@ function QuickIntakeForm({ session, onCreated, onCancel, onFullForm }) {
 function NewJobForm({ session, team, onCreated, onCancel }) {
   const [, setRefreshTick] = useState(0); // forces a re-render so a just-added pricing module shows immediately
   const [plate, setPlate] = useState("");
-  const [makeModel, setMakeModel] = useState("");
+  const [make, setMake] = useState("");
+  const [model, setModel] = useState("");
+  const [modelYear, setModelYear] = useState("");
+  const [color, setColor] = useState("");
+  const [bodyType, setBodyType] = useState("");
+  const [saveAttempted, setSaveAttempted] = useState(false);
+  const setVehicle = (patch) => {
+    if ("make" in patch) setMake(patch.make);
+    if ("model" in patch) setModel(patch.model);
+    if ("modelYear" in patch) setModelYear(patch.modelYear);
+    if ("color" in patch) setColor(patch.color);
+    if ("bodyType" in patch) setBodyType(patch.bodyType);
+  };
   const [customerName, setCustomerName] = useState("");
   const [customerPhone, setCustomerPhone] = useState("");
   const [description, setDescription] = useState("");
@@ -4493,6 +6530,22 @@ function NewJobForm({ session, team, onCreated, onCancel }) {
   const [termsAccepted, setTermsAccepted] = useState(false);
   const [confirmNoSignature, setConfirmNoSignature] = useState(false); // warning shown once, if they try to submit without signing
   const fileRef = useRef(null);
+
+  // Smartech: a second description + photo set, separate from the main
+  // Mr.CAP-facing fields above, that only Smartech's own dashboard shows
+  // (see SmartechJobDetail). Revealed once Body Work or "Dent & Paint" is
+  // selected (see jobRoutesToSmartech) — "Paintless Dent Removal" stays
+  // in-house and never reveals this section.
+  const [smartechDescription, setSmartechDescription] = useState("");
+  const [smartechPhotos, setSmartechPhotos] = useState([]); // [{path,url}]
+  const [uploadingSmartechPhoto, setUploadingSmartechPhoto] = useState(false);
+  const [smartechPhotoError, setSmartechPhotoError] = useState(false);
+  const smartechFileRef = useRef(null);
+  // Piece/panel counts per Smartech-routed treatment ("serviceKey::name" ->
+  // number) — informational only, shown to Smartech instead of price.
+  // Ahmed still sets one aggregate price for the line in the price field
+  // above, same convention as any other null-list-price treatment.
+  const [smartechPieces, setSmartechPieces] = useState({});
 
   // Duplicate-customer detection: as the person types, check for existing
   // customers/vehicles that might be the same one, so intake staff get a
@@ -4569,8 +6622,21 @@ function NewJobForm({ session, team, onCreated, onCancel }) {
     if (isVinMode || p.length < 3) { setPlateMatch(null); setOwnerChoice(null); setPlateHistory(null); return; }
     const t = setTimeout(async () => {
       const { ok, data } = await sbFetch(`vehicles?plate=eq.${encodeURIComponent(p)}&select=*,customers(name,phone,customer_type)&limit=1`);
-      setPlateMatch(ok && data && data.length ? data[0] : null);
+      const matched = ok && data && data.length ? data[0] : null;
+      setPlateMatch(matched);
       setOwnerChoice(null);
+      // A plate we already have on file — pre-fill the structured vehicle
+      // fields from it (only into whatever's still blank, never over
+      // something staff already typed).
+      if (matched) {
+        setVehicle({
+          ...(!make && matched.make ? { make: matched.make } : {}),
+          ...(!model && matched.model ? { model: matched.model } : {}),
+          ...(!modelYear && matched.model_year ? { modelYear: matched.model_year } : {}),
+          ...(!color && matched.color ? { color: matched.color } : {}),
+          ...(!bodyType && matched.body_type ? { bodyType: matched.body_type } : {}),
+        });
+      }
       // Most recent past job on this plate (any stage) — a quick "we've
       // seen this car before, here's what was last done" note at intake,
       // so Ahmed/Lani don't have to go dig through the archive.
@@ -4603,11 +6669,31 @@ function NewJobForm({ session, team, onCreated, onCancel }) {
       const listPrice = customerType === "b2b" ? treatmentObj.b2b : treatmentObj.retail;
       return { ...p, [priceKey]: listPrice != null ? listPrice : "" };
     });
+    // Un-ticking drops its piece count too — otherwise Smartech would
+    // keep seeing a piece count for a treatment that isn't on the job.
+    const alreadyPicked = (treatments[serviceKey] || []).includes(name);
+    if (alreadyPicked) {
+      setSmartechPieces((p) => {
+        const next = { ...p };
+        delete next[priceKey];
+        return next;
+      });
+    }
   };
   const assign = (key, memberId) => setAssignedTo((a) => ({ ...a, [key]: a[key] === memberId ? undefined : memberId }));
   const addPhotos = async (files) => {
     const compressed = await Promise.all(Array.from(files).map((f) => compressImage(f)));
     setPhotos((p) => [...p, ...compressed]);
+  };
+  const routesToSmartech = jobRoutesToSmartech(serviceTypes, treatments);
+  const addSmartechPhotos = async (files) => {
+    setUploadingSmartechPhoto(true);
+    setSmartechPhotoError(false);
+    const uploaded = await Promise.all(Array.from(files).map((f) => uploadSmartechPhoto(f, "intake")));
+    const succeeded = uploaded.filter(Boolean);
+    setSmartechPhotos((p) => [...p, ...succeeded]);
+    if (succeeded.length < uploaded.length) setSmartechPhotoError(true);
+    setUploadingSmartechPhoto(false);
   };
 
   const hasUnresolvedMismatch = !!(
@@ -4618,6 +6704,7 @@ function NewJobForm({ session, team, onCreated, onCancel }) {
 
   const submit = async () => {
     if (!plate.trim() || !customerName.trim() || hasUnresolvedMismatch || !termsAccepted) return;
+    if (!bodyType) { setSaveAttempted(true); return; }
     // Signature is encouraged, not required — but don't let it slip
     // through silently. First tap with no signature shows a one-time
     // warning; tapping again proceeds without it.
@@ -4629,7 +6716,8 @@ function NewJobForm({ session, team, onCreated, onCancel }) {
       // insert (jobs.id defaults to gen_random_uuid()). We read the
       // assigned id back from Supabase's response after saving.
       plate: plate.trim().toUpperCase(),
-      makeModel: makeModel.trim(),
+      makeModel: composeMakeModel(make, model, ""),
+      make: make.trim(), model: model.trim(), modelYear: modelYear || null, color: color || null, bodyType: bodyType || null,
       customerName: customerName.trim(),
       customerPhone: customerPhone.trim(),
       description: description.trim(),
@@ -4651,6 +6739,13 @@ function NewJobForm({ session, team, onCreated, onCancel }) {
       startTime: null, stopTime: null, invoiceAmount: "",
       signature, signedAt: signature ? now : null,
       damagePanels, damageDiagramImage,
+      smartechFlag: routesToSmartech,
+      smartechDescription: routesToSmartech ? smartechDescription.trim() : "",
+      smartechPhotos: routesToSmartech ? smartechPhotos : [],
+      // Piece quantities are independent of Smartech routing — any
+      // treatment can be flagged per-piece from Services & Pricing — so
+      // always saved, not gated on routesToSmartech.
+      smartechPieces,
       history: [{ stage: "intake", label: "Intake", by: session.name, role: session.role, note: "Job card opened — customer signed", at: now }],
       createdAt: now, updatedAt: now, createdBy: session.name,
     };
@@ -4690,7 +6785,7 @@ function NewJobForm({ session, team, onCreated, onCancel }) {
               genuinely changed hands. Never guess; make staff choose. */}
           {plateMatch.customers?.name && customerName.trim() && customerName.trim().toLowerCase() !== plateMatch.customers.name.trim().toLowerCase() && (
             <div style={{ marginTop: 9 }}>
-              <div style={{ fontSize: 11.5, color: "#E08A78", marginBottom: 6 }}>
+              <div style={{ fontSize: 11.5, color: COLORS.dangerText, marginBottom: 6 }}>
                 Name doesn't match the owner on file — is this the same customer, or has the car changed hands?
               </div>
               <div style={{ display: "flex", gap: 8 }}>
@@ -4706,14 +6801,14 @@ function NewJobForm({ session, team, onCreated, onCancel }) {
         </div>
       )}
 
-      <Field label="Make / model"><input style={inputStyle} value={makeModel} onChange={(e) => setMakeModel(e.target.value)} placeholder="e.g. Prado" /></Field>
+      <VehicleDetailsFields values={{ make, model, modelYear, color, bodyType }} onChange={setVehicle} bodyTypeRequired showBodyTypeMissing={saveAttempted && !bodyType} />
       <Field label="Customer name"><input style={inputStyle} value={customerName} onChange={(e) => setCustomerName(e.target.value)} placeholder="Customer full name" /></Field>
       <Field label="Customer phone"><input type="tel" inputMode="numeric" style={inputStyle} value={customerPhone} onChange={(e) => setCustomerPhone(e.target.value.replace(/[^0-9]/g, ""))} placeholder="050 xxx xxxx" /></Field>
 
       <Field label="Customer type">
         <div style={{ display: "flex", gap: 8 }}>
-          <button onClick={() => setCustomerType("retail")} className="mrcap-press" style={{ flex: 1, padding: "9px", borderRadius: 9, border: `1.5px solid ${customerType === "retail" ? COLORS.gold : COLORS.line}`, background: customerType === "retail" ? COLORS.gold : COLORS.panel2, color: customerType === "retail" ? COLORS.darkText : COLORS.ink, fontWeight: 600, fontSize: 13, cursor: "pointer" }}>Retail / Walk-in</button>
-          <button onClick={() => setCustomerType("b2b")} className="mrcap-press" style={{ flex: 1, padding: "9px", borderRadius: 9, border: `1.5px solid ${customerType === "b2b" ? COLORS.gold : COLORS.line}`, background: customerType === "b2b" ? COLORS.gold : COLORS.panel2, color: customerType === "b2b" ? COLORS.darkText : COLORS.ink, fontWeight: 600, fontSize: 13, cursor: "pointer" }}>B2B</button>
+          <button onClick={() => setCustomerType("retail")} className="mrcap-press" aria-pressed={customerType === "retail"} style={{ ...selectChipStyle(customerType === "retail"), flex: 1, borderRadius: 12, minHeight: 46 }}>Retail / Walk-in</button>
+          <button onClick={() => setCustomerType("b2b")} className="mrcap-press" aria-pressed={customerType === "b2b"} style={{ ...selectChipStyle(customerType === "b2b"), flex: 1, borderRadius: 12, minHeight: 46 }}>B2B</button>
         </div>
       </Field>
 
@@ -4737,7 +6832,7 @@ function NewJobForm({ session, team, onCreated, onCancel }) {
       <Field label="Priority">
         <div style={{ display: "flex", gap: 8 }}>
           {PRIORITIES.map((p) => (
-            <button key={p} onClick={() => setPriority(p)} className="mrcap-press" style={{ flex: 1, padding: "9px", borderRadius: 9, border: `1.5px solid ${priority === p ? COLORS.gold : COLORS.line}`, background: priority === p ? COLORS.gold : COLORS.panel2, color: priority === p ? COLORS.darkText : COLORS.ink, fontWeight: 600, fontSize: 13, cursor: "pointer" }}>{p}</button>
+            <button key={p} onClick={() => setPriority(p)} className="mrcap-press" aria-pressed={priority === p} style={{ ...selectChipStyle(priority === p), flex: 1, borderRadius: 12, minHeight: 46, ...(priority === p && p === "High" ? { border: `1.5px solid ${COLORS.dangerText}`, background: "rgba(168,64,47,0.18)", color: COLORS.dangerText } : {}) }}>{p}</button>
           ))}
         </div>
       </Field>
@@ -4746,55 +6841,90 @@ function NewJobForm({ session, team, onCreated, onCancel }) {
         <LocationPicker location={location} setLocation={setLocation} session={session} />
       </Field>
 
-      <Field label="Service needed (select all that apply)">
-        <div style={{ display: "flex", flexDirection: "column", gap: 8 }}>
+      <Field label="Services — tap all that apply">
+        <div style={{ display: "flex", flexWrap: "wrap", gap: 8 }}>
           {visibleServices(serviceTypes).map((s) => {
+            const on = serviceTypes.includes(s.key);
+            const Icon = SERVICE_ICONS[s.key];
+            return (
+              <button key={s.key} onClick={() => toggleService(s.key)} className="mrcap-press" aria-pressed={on} style={selectChipStyle(on)}>
+                {on ? <Check size={14} strokeWidth={3} /> : Icon ? <Icon size={14} color={COLORS.muted} /> : null}
+                {s.label}
+              </button>
+            );
+          })}
+        </div>
+        <div style={{ display: "flex", flexDirection: "column", gap: 10, marginTop: serviceTypes.length ? 12 : 0 }}>
+          {visibleServices(serviceTypes).filter((s) => serviceTypes.includes(s.key)).map((s) => {
             const candidates = team.filter((m) => m.role === s.role);
             return (
-              <div key={s.key}>
-                <button onClick={() => toggleService(s.key)} className="mrcap-press" style={{ display: "flex", alignItems: "center", gap: 10, padding: "11px 12px", borderRadius: 10, border: `1.5px solid ${serviceTypes.includes(s.key) ? COLORS.green : COLORS.line}`, background: serviceTypes.includes(s.key) ? "rgba(74,122,87,0.18)" : COLORS.panel2, cursor: "pointer", width: "100%" }}>
-                  <div style={{ width: 18, height: 18, borderRadius: 5, border: `2px solid ${serviceTypes.includes(s.key) ? COLORS.green : COLORS.muted}`, background: serviceTypes.includes(s.key) ? COLORS.green : "transparent", display: "flex", alignItems: "center", justifyContent: "center", flexShrink: 0 }}>
-                    {serviceTypes.includes(s.key) && <Check size={12} color="#fff" />}
-                  </div>
-                  <span style={{ fontSize: 13.5, fontWeight: 600, color: COLORS.ink }}>{s.label}</span>
-                </button>
-                {serviceTypes.includes(s.key) && (
-                  <div style={{ display: "flex", flexWrap: "wrap", gap: 6, padding: "8px 4px 2px 4px" }}>
-                    {candidates.length === 0 && <span style={{ fontSize: 11.5, color: COLORS.muted }}>No one set up for this role yet — assign later from Team.</span>}
-                    {candidates.map((m) => (
-                      <button key={m.id} onClick={() => assign(s.key, m.id)} className="mrcap-press" style={{ padding: "6px 10px", borderRadius: 999, border: `1.5px solid ${assignedTo[s.key] === m.id ? COLORS.gold : COLORS.line}`, background: assignedTo[s.key] === m.id ? COLORS.gold : COLORS.panel2, color: assignedTo[s.key] === m.id ? COLORS.darkText : COLORS.muted, fontSize: 12, fontWeight: 600, cursor: "pointer" }}>{m.name}</button>
-                    ))}
-                  </div>
-                )}
-                {serviceTypes.includes(s.key) && s.treatments && (
-                  <div style={{ padding: "6px 4px 4px 4px" }}>
-                    <div style={{ fontSize: 10.5, color: COLORS.muted, textTransform: "uppercase", letterSpacing: 0.4, marginBottom: 6 }}>Which treatment(s)</div>
-                    <div style={{ display: "flex", flexDirection: "column", gap: 5 }}>
+              <div key={s.key} className="mrcap-fade" style={{ background: COLORS.panel, border: `1px solid ${COLORS.line}`, borderRadius: 16, padding: 14 }}>
+                <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", gap: 8 }}>
+                  <span style={{ fontSize: 14.5, fontWeight: 600, color: COLORS.ink }}>{s.label}</span>
+                  <button onClick={() => toggleService(s.key)} className="mrcap-press" aria-label={`Remove ${s.label}`} style={{ width: 36, height: 36, borderRadius: 10, border: "none", background: "transparent", color: COLORS.muted, display: "flex", alignItems: "center", justifyContent: "center", cursor: "pointer" }}><X size={16} /></button>
+                </div>
+                <div style={{ ...eyebrowStyle, fontSize: 10, margin: "6px 0 6px" }}>Assign to</div>
+                <div style={{ display: "flex", flexWrap: "wrap", gap: 6 }}>
+                  {candidates.length === 0 && <span style={{ fontSize: 12, color: COLORS.muted }}>No one set up for this role yet — assign later from Team.</span>}
+                  {candidates.map((m) => (
+                    <button key={m.id} onClick={() => assign(s.key, m.id)} className="mrcap-press" aria-pressed={assignedTo[s.key] === m.id} style={{ ...selectChipStyle(assignedTo[s.key] === m.id), minHeight: 36, fontSize: 12.5 }}>{m.name}</button>
+                  ))}
+                </div>
+                {s.treatments && (
+                  <div style={{ marginTop: 12 }}>
+                    <div style={{ ...eyebrowStyle, fontSize: 10, marginBottom: 6 }}>Which treatment(s)</div>
+                    <div style={{ display: "flex", flexDirection: "column", gap: 6 }}>
                       {s.treatments.map((t) => {
                         const picked = (treatments[s.key] || []).includes(t.name);
                         const priceKey = `${s.key}::${t.name}`;
                         const hasListPrice = t.retail != null;
+                        const perPiece = isPerPieceTreatment(s.key, t.name);
+                        const qty = Math.max(1, Number(smartechPieces[priceKey]) || 1);
                         return (
-                          <div key={t.name}>
-                            <button onClick={() => toggleTreatment(s.key, t)} className="mrcap-press" style={{ display: "flex", alignItems: "center", justifyContent: "space-between", gap: 8, padding: "7px 9px", borderRadius: 7, border: `1px solid ${picked ? COLORS.gold : COLORS.line}`, background: picked ? "rgba(201,162,39,0.12)" : COLORS.panel, cursor: "pointer", textAlign: "left", width: "100%", boxSizing: "border-box" }}>
-                              <span style={{ display: "flex", alignItems: "center", gap: 8 }}>
-                                <div style={{ width: 14, height: 14, borderRadius: 4, border: `2px solid ${picked ? COLORS.gold : COLORS.muted}`, background: picked ? COLORS.gold : "transparent", display: "flex", alignItems: "center", justifyContent: "center", flexShrink: 0 }}>
-                                  {picked && <Check size={9} color={COLORS.darkText} />}
+                          <div key={t.name} style={{ borderRadius: 12, border: picked ? "1px solid rgba(201,162,39,0.6)" : `1px solid ${COLORS.line}`, background: picked ? "rgba(201,162,39,0.08)" : COLORS.panel2, overflow: "hidden" }}>
+                            <button onClick={() => toggleTreatment(s.key, t)} className="mrcap-press" aria-pressed={picked} style={{ display: "flex", alignItems: "center", justifyContent: "space-between", gap: 8, minHeight: 44, padding: "8px 12px", border: "none", background: "transparent", cursor: "pointer", textAlign: "left", width: "100%", boxSizing: "border-box" }}>
+                              <span style={{ display: "flex", alignItems: "center", gap: 10 }}>
+                                <div style={{ width: 20, height: 20, borderRadius: 6, border: `2px solid ${picked ? COLORS.gold : COLORS.muted}`, background: picked ? COLORS.gold : "transparent", display: "flex", alignItems: "center", justifyContent: "center", flexShrink: 0, boxSizing: "border-box" }}>
+                                  {picked && <Check size={13} strokeWidth={3} color={COLORS.darkText} />}
                                 </div>
-                                <span style={{ fontSize: 12, color: COLORS.ink }}>{t.name}</span>
+                                <span style={{ fontSize: 13.5, color: COLORS.ink }}>{t.name}</span>
                               </span>
-                              {hasListPrice && !customerType && <span style={{ fontSize: 10, color: COLORS.muted }}>pick customer type</span>}
+                              {hasListPrice && !customerType && <span style={{ fontSize: 11, color: COLORS.muted }}>pick customer type</span>}
                             </button>
                             {picked && (
-                              <div style={{ display: "flex", alignItems: "center", gap: 6, padding: "5px 9px 0 30px" }}>
-                                <span style={{ fontSize: 10.5, color: COLORS.muted }}>AED</span>
-                                <input
-                                  type="number"
-                                  value={treatmentPrices[priceKey] ?? ""}
-                                  onChange={(e) => setTreatmentPrices((p) => ({ ...p, [priceKey]: e.target.value }))}
-                                  placeholder={hasListPrice ? "" : "type price"}
-                                  style={{ width: 90, background: COLORS.panel2, border: `1px solid ${COLORS.line}`, borderRadius: 6, padding: "4px 7px", fontSize: 11.5, color: COLORS.gold, fontFamily: MONO_FONT }}
-                                />
+                              <div style={{ display: "flex", alignItems: "center", flexWrap: "wrap", gap: 8, padding: "0 12px 10px 42px" }}>
+                                <span style={{ display: "flex", alignItems: "center", gap: 6 }}>
+                                  <span style={{ fontSize: 11.5, color: COLORS.muted }}>AED{perPiece ? " / pc" : ""}</span>
+                                  <input
+                                    type="number"
+                                    value={treatmentPrices[priceKey] ?? ""}
+                                    onChange={(e) => setTreatmentPrices((p) => ({ ...p, [priceKey]: e.target.value }))}
+                                    placeholder={hasListPrice ? "" : "type price"}
+                                    style={{ width: 96, minHeight: 40, background: COLORS.paper, border: `1px solid ${COLORS.line}`, borderRadius: 10, padding: "6px 10px", fontSize: 14, color: COLORS.gold, fontFamily: MONO_FONT, boxSizing: "border-box" }}
+                                  />
+                                </span>
+                                {perPiece && (
+                                  <span style={{ display: "flex", alignItems: "center", gap: 4 }}>
+                                    <button type="button" onClick={() => setSmartechPieces((p) => ({ ...p, [priceKey]: String(Math.max(1, qty - 1)) }))} disabled={qty <= 1} className="mrcap-press" aria-label="Fewer pieces" style={{ width: 44, height: 44, borderRadius: 12, border: `1px solid ${COLORS.line}`, background: COLORS.panel2, color: COLORS.ink, display: "flex", alignItems: "center", justifyContent: "center", cursor: qty <= 1 ? "not-allowed" : "pointer", opacity: qty <= 1 ? 0.4 : 1 }}><Minus size={18} /></button>
+                                    <input
+                                      type="number"
+                                      min="1"
+                                      aria-label="Pieces"
+                                      value={smartechPieces[priceKey] ?? ""}
+                                      onChange={(e) => setSmartechPieces((p) => ({ ...p, [priceKey]: e.target.value }))}
+                                      placeholder="1"
+                                      style={{ width: 44, minHeight: 44, background: "transparent", border: "none", textAlign: "center", fontSize: 19, fontWeight: 600, color: COLORS.ink, fontFamily: MONO_FONT, padding: 0, MozAppearance: "textfield" }}
+                                    />
+                                    <button type="button" onClick={() => setSmartechPieces((p) => ({ ...p, [priceKey]: String(qty + 1) }))} className="mrcap-press" aria-label="More pieces" style={{ width: 44, height: 44, borderRadius: 12, border: `1px solid ${COLORS.line}`, background: COLORS.panel2, color: COLORS.ink, display: "flex", alignItems: "center", justifyContent: "center", cursor: "pointer" }}><Plus size={18} /></button>
+                                    <span style={{ fontSize: 11.5, color: COLORS.muted, marginLeft: 2 }}>pcs</span>
+                                  </span>
+                                )}
+                                {perPiece && (
+                                  <span style={{ fontSize: 12, color: COLORS.gold, fontFamily: MONO_FONT, width: "100%" }}>
+                                    = AED {Math.round(treatmentLineTotal(s.key, t.name, treatmentPrices[priceKey], smartechPieces[priceKey])).toLocaleString()}
+                                    {jobRoutesToSmartech([], { [s.key]: [t.name] }) || s.key === "bodyshop" ? <span style={{ color: COLORS.muted, fontFamily: BODY_FONT }}> · goes to Smartech</span> : null}
+                                  </span>
+                                )}
                               </div>
                             )}
                           </div>
@@ -4814,15 +6944,15 @@ function NewJobForm({ session, team, onCreated, onCancel }) {
         <div style={{ background: COLORS.panel, border: `1px solid ${COLORS.line}`, borderRadius: 10, padding: 14, marginBottom: 14 }}>
           <div style={{ display: "flex", justifyContent: "space-between", fontSize: 12.5, color: COLORS.muted, marginBottom: 8 }}>
             <span>Subtotal</span>
-            <span style={{ fontFamily: MONO_FONT, color: COLORS.ink }}>AED {Object.values(treatmentPrices).reduce((sum, v) => sum + (Number(v) || 0), 0).toLocaleString()}</span>
+            <span style={{ fontFamily: MONO_FONT, color: COLORS.ink }}>AED {treatmentPricesSubtotal(treatmentPrices, smartechPieces).toLocaleString()}</span>
           </div>
           <div style={{ marginBottom: 4 }}>
-            <DiscountPicker value={discountPercent} onChange={setDiscountPercent} subtotal={Object.values(treatmentPrices).reduce((sum, v) => sum + (Number(v) || 0), 0)} />
+            <DiscountPicker value={discountPercent} onChange={setDiscountPercent} subtotal={treatmentPricesSubtotal(treatmentPrices, smartechPieces)} />
           </div>
           <div style={{ display: "flex", justifyContent: "space-between", marginTop: 10, paddingTop: 10, borderTop: `1px dashed ${COLORS.line}` }}>
             <span style={{ fontSize: 13.5, fontWeight: 700, color: COLORS.ink }}>Total</span>
             <span style={{ fontFamily: MONO_FONT, fontWeight: 700, fontSize: 16, color: COLORS.gold }}>
-              AED {Math.round(Object.values(treatmentPrices).reduce((sum, v) => sum + (Number(v) || 0), 0) * (1 - discountPercent / 100)).toLocaleString()}
+              AED {Math.round(treatmentPricesSubtotal(treatmentPrices, smartechPieces) * (1 - discountPercent / 100)).toLocaleString()}
             </span>
           </div>
         </div>
@@ -4846,6 +6976,26 @@ function NewJobForm({ session, team, onCreated, onCancel }) {
         </Field>
       )}
 
+      {/* Smartech: its own description + photos, separate from the main
+          Mr.CAP-facing fields above — only Smartech's dashboard shows
+          these (see SmartechJobDetail). Revealed by Body Work or
+          "Dent & Paint" (see jobRoutesToSmartech); "Paintless Dent
+          Removal" stays in-house and never reveals this. */}
+      {routesToSmartech && (
+        <div style={{ background: "rgba(179,64,43,0.08)", border: `1px solid #B3402B`, borderRadius: 12, padding: 14, marginBottom: 16 }}>
+          <div style={{ fontSize: 12.5, fontWeight: 700, color: "#D97862", marginBottom: 10 }}>For Smartech</div>
+          <Field label="Description for Smartech">
+            <textarea style={textareaStyle} value={smartechDescription} onChange={(e) => setSmartechDescription(e.target.value)} placeholder="What Smartech needs to know — separate from the customer-facing description above" />
+          </Field>
+          <Field label="Photos for Smartech">
+            <PhotoGrid photos={smartechPhotos.map((p) => p.url)} onRemove={(i) => setSmartechPhotos((p) => p.filter((_, idx) => idx !== i))} />
+            <input ref={smartechFileRef} type="file" accept="image/*" multiple style={{ display: "none" }} onChange={(e) => e.target.files.length && addSmartechPhotos(e.target.files)} />
+            <button onClick={() => smartechFileRef.current.click()} disabled={uploadingSmartechPhoto} className="mrcap-press" style={{ ...cameraBtnStyle, opacity: uploadingSmartechPhoto ? 0.6 : 1 }}><Camera size={15} /> {uploadingSmartechPhoto ? "Uploading…" : "Add photo"}</button>
+            {smartechPhotoError && <div style={{ fontSize: 11, color: COLORS.red, marginTop: 6 }}>One or more photos didn't upload — check your connection and try again.</div>}
+          </Field>
+        </div>
+      )}
+
       <Field label="Terms & Conditions">
         <div style={{ background: COLORS.panel, border: `1px solid ${COLORS.line}`, borderRadius: 10, padding: 12, maxHeight: 260, overflowY: "auto", marginBottom: 10 }}>
           <div style={{ fontSize: 12, color: COLORS.ink, lineHeight: 1.6, whiteSpace: "pre-wrap" }}>{TERMS_AND_CONDITIONS_TEXT}</div>
@@ -4863,24 +7013,31 @@ function NewJobForm({ session, team, onCreated, onCancel }) {
       </Field>
 
       {saveError && (
-        <div style={{ background: "rgba(168,64,47,0.15)", border: `1px solid ${COLORS.red}`, borderRadius: 10, padding: "10px 12px", marginBottom: 14, fontSize: 12.5, color: "#E08A78" }}>
-          {typeof saveError === "string" ? saveError : "Couldn't save to the server."} {lastStorageError && <span style={{ fontFamily: "monospace", display: "block", marginTop: 4, fontSize: 10.5 }}>{lastStorageError}</span>}
+        <div style={{ background: "rgba(168,64,47,0.15)", border: `1px solid ${COLORS.red}`, borderRadius: 10, padding: "10px 12px", marginBottom: 14, fontSize: 12.5, color: COLORS.dangerText }}>
+          {typeof saveError === "string" ? saveError : "Couldn't save to the server."} {lastStorageError && <span style={{ fontFamily: MONO_FONT, display: "block", marginTop: 4, fontSize: 10.5 }}>{lastStorageError}</span>}
         </div>
       )}
 
       {confirmNoSignature && !signature && (
         <div className="mrcap-fade" style={{ background: "rgba(201,162,39,0.12)", border: `1.5px solid ${COLORS.gold}`, borderRadius: 10, padding: "12px 14px", marginBottom: 14 }}>
           <div style={{ fontSize: 12.5, color: COLORS.gold, fontWeight: 600, marginBottom: 4 }}>No signature captured</div>
-          <div style={{ fontSize: 11.5, color: COLORS.muted, lineHeight: 1.4 }}>This is fine for B2B or when the signer isn't present — tap "Open Job Card" again to continue without one, or scroll up to add it.</div>
+          <div style={{ fontSize: 12, color: COLORS.muted, lineHeight: 1.45 }}>This is fine for B2B or when the signer isn't present — tap "Continue without signature" to go ahead without one, or scroll up to add it.</div>
         </div>
       )}
 
-      <div style={{ display: "flex", gap: 10, marginTop: 20 }}>
-        <button onClick={onCancel} className="mrcap-press" style={{ ...secondaryBtnStyle, flex: 1 }}>Cancel</button>
-        <button onClick={submit} disabled={!plate.trim() || !customerName.trim() || saving || hasUnresolvedMismatch || !termsAccepted} className="mrcap-press" style={{ ...primaryBtnStyle, flex: 2, opacity: !plate.trim() || !customerName.trim() || hasUnresolvedMismatch || !termsAccepted ? 0.5 : 1 }}>
-          {saving ? "Saving…" : !termsAccepted ? "Accept terms to continue" : !signature && !confirmNoSignature ? "Open Job Card" : !signature ? "Continue without signature" : "Open Job Card"}
+      <StickyActionBar>
+        {Object.keys(treatmentPrices).length > 0 ? (
+          <div style={{ display: "flex", flexDirection: "column", flexShrink: 0, minWidth: 0 }}>
+            <span style={{ fontSize: 11, color: COLORS.muted }}>Estimate</span>
+            <span style={{ fontFamily: MONO_FONT, fontSize: 16, fontWeight: 600, color: COLORS.gold, whiteSpace: "nowrap" }}>AED {Math.round(treatmentPricesSubtotal(treatmentPrices, smartechPieces) * (1 - discountPercent / 100)).toLocaleString()}</span>
+          </div>
+        ) : (
+          <button onClick={onCancel} className="mrcap-press" style={{ ...secondaryBtnStyle, minHeight: 54, borderRadius: 14, padding: "0 16px", background: COLORS.panel }}>Cancel</button>
+        )}
+        <button onClick={submit} disabled={!plate.trim() || !customerName.trim() || saving || hasUnresolvedMismatch || !termsAccepted} className="mrcap-press" style={{ ...primaryBtnStyle, flex: 1, minWidth: 0, minHeight: 54, borderRadius: 14, padding: "0 12px", display: "flex", alignItems: "center", justifyContent: "center", gap: 8, opacity: !plate.trim() || !customerName.trim() || hasUnresolvedMismatch || !termsAccepted ? 0.45 : 1 }}>
+          <span style={{ overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{saving ? "Saving…" : !plate.trim() ? "Pick the plate first" : !customerName.trim() ? "Add the customer's name" : hasUnresolvedMismatch ? "Confirm the owner above" : !termsAccepted ? "Accept terms to continue" : !signature && !confirmNoSignature ? "Check in car" : !signature ? "Continue without signature" : "Check in car"}</span>
         </button>
-      </div>
+      </StickyActionBar>
     </div>
   );
 }
@@ -4958,7 +7115,16 @@ function PartsEditor({ parts, onChange, showTotal }) {
 function EditJobScreen({ job, session, onSaved, onCancel }) {
   const [, setRefreshTick] = useState(0); // forces a re-render so a just-added pricing module shows immediately
   const [plate, setPlate] = useState(job.plate);
-  const [makeModel, setMakeModel] = useState(job.makeModel);
+  // Legacy jobs (no structured make yet) get a best-effort split of their
+  // combined makeModel string as a starting point — nothing is saved
+  // until the user actually hits Save.
+  const [vehicleDetails, setVehicleDetails] = useState(() => {
+    if (job.make) return { make: job.make, model: job.model || "", modelYear: job.modelYear || "", color: job.color || "", bodyType: job.bodyType || "" };
+    const guess = prefillFromLegacyMakeModel(job.makeModel);
+    return { make: guess.make, model: guess.model, modelYear: guess.modelYear, color: guess.color, bodyType: "" };
+  });
+  const { make, model, modelYear, color, bodyType } = vehicleDetails;
+  const setVehicle = (patch) => setVehicleDetails((v) => ({ ...v, ...patch }));
   const [customerName, setCustomerName] = useState(job.customerName);
   const [customerPhone, setCustomerPhone] = useState(job.customerPhone);
   const [description, setDescription] = useState(job.description);
@@ -4968,6 +7134,10 @@ function EditJobScreen({ job, session, onSaved, onCancel }) {
   const [serviceTypes, setServiceTypes] = useState(job.serviceTypes || []);
   const [treatments, setTreatments] = useState(job.treatments || {});
   const [treatmentPrices, setTreatmentPrices] = useState(job.treatmentPrices || {});
+  // Piece/panel quantities for treatments flagged "per piece" from
+  // Services & Pricing (see isPerPieceTreatment) — same "serviceKey::name"
+  // keys as treatmentPrices, same field the Smartech dashboard reads.
+  const [smartechPieces, setSmartechPieces] = useState(job.smartechPieces || {});
   const [discountPercent, setDiscountPercent] = useState(job.discountPercent || 0);
   const [parts, setParts] = useState(job.parts || []);
   const [warrantyExpiry, setWarrantyExpiry] = useState(job.warrantyExpiry || "");
@@ -4999,11 +7169,14 @@ function EditJobScreen({ job, session, onSaved, onCancel }) {
       return { ...cur, [serviceKey]: next };
     });
     const priceKey = `${serviceKey}::${name}`;
+    const already = (treatments[serviceKey] || []).includes(name);
     setTreatmentPrices((p) => {
-      const already = (treatments[serviceKey] || []).includes(name);
       if (already) { const next = { ...p }; delete next[priceKey]; return next; }
       return { ...p, [priceKey]: t.retail != null ? t.retail : "" };
     });
+    if (already) {
+      setSmartechPieces((p) => { const next = { ...p }; delete next[priceKey]; return next; });
+    }
   };
 
 
@@ -5020,7 +7193,11 @@ function EditJobScreen({ job, session, onSaved, onCancel }) {
     diff("Plate", job.plate, plate.trim().toUpperCase());
     diff("Customer name", job.customerName, customerName.trim());
     diff("Customer phone", job.customerPhone, customerPhone.trim());
-    diff("Make/model", job.makeModel, makeModel.trim());
+    diff("Make", job.make || "", make.trim());
+    diff("Model", job.model || "", model.trim());
+    diff("Year", job.modelYear || "", modelYear || "");
+    diff("Colour", job.color || "", color || "");
+    diff("Body type", job.bodyType || "", bodyType || "");
     diff("Description", job.description, description.trim());
     diff("Damage notes", job.damageNotes, damageNotes.trim());
     diff("Priority", job.priority, priority);
@@ -5036,6 +7213,17 @@ function EditJobScreen({ job, session, onSaved, onCancel }) {
       if (String(before ?? "") !== String(after ?? "")) {
         const treatmentName = priceKey.split("::")[1] || priceKey;
         changes.push(`Price — ${treatmentName}: AED ${before || "0"} → AED ${after || "0"}`);
+      }
+    });
+    // Piece-quantity changes get the same per-line logging as price
+    // changes — only meaningful for per-piece treatments, but cheap to
+    // check unconditionally.
+    Object.keys(smartechPieces).forEach((priceKey) => {
+      const before = (job.smartechPieces || {})[priceKey];
+      const after = smartechPieces[priceKey];
+      if (String(before ?? "") !== String(after ?? "")) {
+        const treatmentName = priceKey.split("::")[1] || priceKey;
+        changes.push(`Pieces — ${treatmentName}: ${before || "1"} → ${after || "1"}`);
       }
     });
     const addedServices = serviceTypes.filter((k) => !(job.serviceTypes || []).includes(k));
@@ -5068,10 +7256,17 @@ function EditJobScreen({ job, session, onSaved, onCancel }) {
 
     const updated = {
       ...job,
-      plate: plate.trim().toUpperCase(), makeModel: makeModel.trim(),
+      plate: plate.trim().toUpperCase(), makeModel: composeMakeModel(make, model, job.makeModel),
+      make: make.trim() || null, model: model.trim() || null, modelYear: modelYear || null, color: color || null, bodyType: bodyType || null,
       customerName: customerName.trim(), customerPhone: customerPhone.trim(),
       description: description.trim(), damageNotes: damageNotes.trim(),
-      priority, location, serviceTypes, treatments, treatmentPrices, discountPercent, parts,
+      priority, location, serviceTypes, treatments, treatmentPrices, smartechPieces, discountPercent, parts,
+      // Body Work or "Dent & Paint" added here (not just at intake) should
+      // also route the job to Smartech's dashboard — only ever turns this
+      // ON, never off, so removing a service later can't silently hide
+      // Smartech's existing description/photos on a job they're mid-way
+      // through.
+      smartechFlag: job.smartechFlag || jobRoutesToSmartech(serviceTypes, treatments),
       warrantyExpiry: warrantyExpiry || null, followupDate: followupDate || null, followupNote: followupNote.trim() || null,
       // Removing a service drops its done/assign/review state too, but the
       // fact it was removed (and by whom) stays in history permanently.
@@ -5091,14 +7286,14 @@ function EditJobScreen({ job, session, onSaved, onCancel }) {
     <div className="mrcap-view" style={{ padding: "0 18px 34px" }}>
       <SectionTitle>Edit Job Card</SectionTitle>
       <Field label="Plate number"><input style={{ ...inputStyle, fontFamily: MONO_FONT, letterSpacing: 0.5 }} value={plate} onChange={(e) => setPlate(e.target.value)} /></Field>
-      <Field label="Make / model"><input style={inputStyle} value={makeModel} onChange={(e) => setMakeModel(e.target.value)} /></Field>
+      <VehicleDetailsFields values={vehicleDetails} onChange={setVehicle} />
       <Field label="Customer name"><input style={inputStyle} value={customerName} onChange={(e) => setCustomerName(e.target.value)} /></Field>
       <Field label="Customer phone"><input type="tel" inputMode="numeric" style={inputStyle} value={customerPhone} onChange={(e) => setCustomerPhone(e.target.value.replace(/[^0-9]/g, ""))} /></Field>
 
       <Field label="Priority">
         <div style={{ display: "flex", gap: 8 }}>
           {PRIORITIES.map((p) => (
-            <button key={p} onClick={() => setPriority(p)} className="mrcap-press" style={{ flex: 1, padding: "9px", borderRadius: 9, border: `1.5px solid ${priority === p ? COLORS.gold : COLORS.line}`, background: priority === p ? COLORS.gold : COLORS.panel2, color: priority === p ? COLORS.darkText : COLORS.ink, fontWeight: 600, fontSize: 13, cursor: "pointer" }}>{p}</button>
+            <button key={p} onClick={() => setPriority(p)} className="mrcap-press" aria-pressed={priority === p} style={{ ...selectChipStyle(priority === p), flex: 1, borderRadius: 12, minHeight: 46, ...(priority === p && p === "High" ? { border: `1.5px solid ${COLORS.dangerText}`, background: "rgba(168,64,47,0.18)", color: COLORS.dangerText } : {}) }}>{p}</button>
           ))}
         </div>
       </Field>
@@ -5133,6 +7328,22 @@ function EditJobScreen({ job, session, onSaved, onCancel }) {
                           <div style={{ display: "flex", alignItems: "center", gap: 6, padding: "5px 9px 0 30px" }}>
                             <span style={{ fontSize: 10.5, color: COLORS.muted }}>AED</span>
                             <input type="number" value={treatmentPrices[priceKey] ?? ""} onChange={(e) => setTreatmentPrices((p) => ({ ...p, [priceKey]: e.target.value }))} style={{ width: 90, background: COLORS.panel2, border: `1px solid ${COLORS.line}`, borderRadius: 6, padding: "4px 7px", fontSize: 11.5, color: COLORS.gold, fontFamily: MONO_FONT }} />
+                            {isPerPieceTreatment(s.key, t.name) && (
+                              <>
+                                <span style={{ fontSize: 10.5, color: COLORS.muted, marginLeft: 4 }}>x Pcs</span>
+                                <input
+                                  type="number"
+                                  min="1"
+                                  value={smartechPieces[priceKey] ?? ""}
+                                  onChange={(e) => setSmartechPieces((p) => ({ ...p, [priceKey]: e.target.value }))}
+                                  placeholder="1"
+                                  style={{ width: 50, background: COLORS.panel2, border: `1px solid ${COLORS.line}`, borderRadius: 6, padding: "4px 7px", fontSize: 11.5, color: COLORS.ink, fontFamily: MONO_FONT }}
+                                />
+                                <span style={{ fontSize: 10.5, color: COLORS.gold, fontFamily: MONO_FONT }}>
+                                  = AED {Math.round(treatmentLineTotal(s.key, t.name, treatmentPrices[priceKey], smartechPieces[priceKey])).toLocaleString()}
+                                </span>
+                              </>
+                            )}
                           </div>
                         )}
                       </div>
@@ -5149,10 +7360,10 @@ function EditJobScreen({ job, session, onSaved, onCancel }) {
       <div style={{ background: COLORS.panel, border: `1px solid ${COLORS.line}`, borderRadius: 10, padding: 14, marginBottom: 14 }}>
         <div style={{ display: "flex", justifyContent: "space-between", fontSize: 12.5, color: COLORS.muted, marginBottom: 8 }}>
           <span>Services subtotal</span>
-          <span style={{ fontFamily: MONO_FONT, color: COLORS.ink }}>AED {Object.values(treatmentPrices).reduce((sum, v) => sum + (Number(v) || 0), 0).toLocaleString()}</span>
+          <span style={{ fontFamily: MONO_FONT, color: COLORS.ink }}>AED {treatmentPricesSubtotal(treatmentPrices, smartechPieces).toLocaleString()}</span>
         </div>
         <div style={{ marginBottom: 4 }}>
-          <DiscountPicker value={discountPercent} onChange={setDiscountPercent} subtotal={Object.values(treatmentPrices).reduce((sum, v) => sum + (Number(v) || 0), 0)} />
+          <DiscountPicker value={discountPercent} onChange={setDiscountPercent} subtotal={treatmentPricesSubtotal(treatmentPrices, smartechPieces)} />
         </div>
         {parts.length > 0 && (
           <div style={{ display: "flex", justifyContent: "space-between", fontSize: 12.5, color: COLORS.muted, marginTop: 10, paddingTop: 10, borderTop: `1px dashed ${COLORS.line}` }}>
@@ -5166,7 +7377,7 @@ function EditJobScreen({ job, session, onSaved, onCancel }) {
           <span style={{ fontSize: 13.5, fontWeight: 700, color: COLORS.ink }}>Total</span>
           <span style={{ fontFamily: MONO_FONT, fontWeight: 700, fontSize: 16, color: COLORS.gold }}>
             AED {Math.round(
-              Object.values(treatmentPrices).reduce((sum, v) => sum + (Number(v) || 0), 0) * (1 - discountPercent / 100)
+              treatmentPricesSubtotal(treatmentPrices, smartechPieces) * (1 - discountPercent / 100)
               + parts.reduce((sum, p) => sum + (Number(p.price) || 0) * (Number(p.qty) || 1) * (1 - (Number(p.discountPercent) || 0) / 100), 0)
             ).toLocaleString()}
           </span>
@@ -5203,7 +7414,7 @@ function EditJobScreen({ job, session, onSaved, onCancel }) {
   );
 }
 
-function JobDetail({ id, initialJob, session, team, onChanged, onBack, canArchive, onDeleted }) {
+function JobDetail({ id, initialJob, session, team, onChanged, onBack, canArchive, onDeleted, onCreateProforma }) {
   const [job, setJob] = useState(initialJob || null);
   const [loadError, setLoadError] = useState(false);
   const [note, setNote] = useState("");
@@ -5234,7 +7445,7 @@ function JobDetail({ id, initialJob, session, team, onChanged, onBack, canArchiv
     const saved = await saveJob(updated);
     setJob(updated);
     setUploadingCompletion(false);
-    onChanged(updated, saved);
+    notifyChanged(updated, saved);
   };
   const [pickerFor, setPickerFor] = useState(null); // service key currently showing the reassign list
   const [finalizingInvoice, setFinalizingInvoice] = useState(false);
@@ -5288,6 +7499,37 @@ function JobDetail({ id, initialJob, session, team, onChanged, onBack, canArchiv
   const [showDeleteConfirm, setShowDeleteConfirm] = useState(false); // first tap
   const [deleteConfirmText, setDeleteConfirmText] = useState(""); // must type DELETE to actually confirm
   const [deleting, setDeleting] = useState(false);
+  // Every quick action on this screen saves through notifyChanged. A save
+  // the server actually refused (not "offline" — that's queued and shown by
+  // the offline badge) used to look identical to a successful one: the tap
+  // updated the screen and nothing said it hadn't stuck. Now it raises a
+  // banner with a Retry, same as the job form screens already did.
+  const [saveFailed, setSaveFailed] = useState(false);
+  const [retrying, setRetrying] = useState(false);
+  const updateRef = useRef(null); // "Post update" in the bottom bar scrolls here
+  // Debounced Parts & fees save (see updateJobParts): latest job + callback
+  // kept in refs so a pending save still goes out if the card closes.
+  const jobRef = useRef(job);
+  jobRef.current = job;
+  const onChangedRef = useRef(onChanged);
+  onChangedRef.current = onChanged;
+  const partsSaveTimerRef = useRef(null);
+  useEffect(() => () => {
+    if (!partsSaveTimerRef.current) return;
+    clearTimeout(partsSaveTimerRef.current);
+    const pending = jobRef.current;
+    if (pending) saveJob(pending).then((ok) => onChangedRef.current && onChangedRef.current(pending, ok));
+  }, []);
+  const notifyChanged = (updatedJob, savedOk) => {
+    setSaveFailed(!savedOk);
+    onChanged(updatedJob, savedOk);
+  };
+  const retrySave = async () => {
+    setRetrying(true);
+    const savedOk = await saveJob(job);
+    setRetrying(false);
+    notifyChanged(job, savedOk);
+  };
 
   const load = useCallback(async () => {
     setLoadError(false);
@@ -5309,7 +7551,7 @@ function JobDetail({ id, initialJob, session, team, onChanged, onBack, canArchiv
       </div>
     );
   }
-  if (!job) return <div style={{ padding: 30, color: COLORS.muted, textAlign: "center" }}>Loading job card…</div>;
+  if (!job) return <div className="mrcap-fade" style={{ padding: "18px 18px 30px" }}><div className="mrcap-skeleton" style={{ height: 34, width: 150, marginBottom: 12 }} /><div className="mrcap-skeleton" style={{ height: 30, width: "70%", marginBottom: 18 }} /><SkeletonRows count={3} height={96} /><div style={{ color: COLORS.muted, textAlign: "center", fontSize: 12.5, marginTop: 14 }}>Loading job card…</div></div>;
 
   if (job.stageIndex >= STAGES.length - 1 && !canArchive) {
     return (
@@ -5367,7 +7609,7 @@ function JobDetail({ id, initialJob, session, team, onChanged, onBack, canArchiv
     };
     const saved = await saveJob(updated);
     setJob(updated);
-    onChanged(updated, saved);
+    notifyChanged(updated, saved);
   };
 
   // Moves a service module to a specific step in its category's real,
@@ -5398,14 +7640,14 @@ function JobDetail({ id, initialJob, session, team, onChanged, onBack, canArchiv
     };
     const saved = await saveJob(updated);
     setJob(updated);
-    onChanged(updated, saved);
+    notifyChanged(updated, saved);
   };
 
   const setServiceNote = async (key, text) => {
     const updated = { ...job, serviceNotes: { ...(job.serviceNotes || {}), [key]: text }, updatedAt: Date.now() };
     const saved = await saveJob(updated);
     setJob(updated);
-    onChanged(updated, saved);
+    notifyChanged(updated, saved);
   };
 
   // Passed as onSave to CustomerNotifyControl — it hands back the whole
@@ -5414,7 +7656,7 @@ function JobDetail({ id, initialJob, session, team, onChanged, onBack, canArchiv
   const saveJobRecord = async (updated) => {
     const saved = await saveJob(updated);
     setJob(updated);
-    onChanged(updated, saved);
+    notifyChanged(updated, saved);
   };
 
   // Markup calculator — cost + % in, charge price out, saved as a line
@@ -5440,7 +7682,7 @@ function JobDetail({ id, initialJob, session, team, onChanged, onBack, canArchiv
     setJob(updated);
     setMarkupDesc(""); setMarkupCost(""); setMarkupPercent(""); setMarkupPhotos([]);
     setSavingMarkup(false);
-    onChanged(updated, saved);
+    notifyChanged(updated, saved);
   };
 
   // Photos for the entry currently being composed (bill/receipt shots,
@@ -5459,18 +7701,32 @@ function JobDetail({ id, initialJob, session, team, onChanged, onBack, canArchiv
     const updated = { ...job, markupEntries: (job.markupEntries || []).filter((e) => e.id !== entryId), updatedAt: Date.now() };
     const saved = await saveJob(updated);
     setJob(updated);
-    onChanged(updated, saved);
+    notifyChanged(updated, saved);
   };
 
   // Parts & fees, editable straight from the main job card now instead
   // of only inside Edit Job — same PartsEditor component, same data
   // (job.parts), just an inline save on every change like the other
   // quick-edit handlers on this screen.
-  const updateJobParts = async (newParts) => {
-    const updated = { ...job, parts: newParts, updatedAt: Date.now() };
-    const saved = await saveJob(updated);
-    setJob(updated);
-    onChanged(updated, saved);
+  // Parts & fees are typed into, so each keystroke must not wait on a
+  // server round-trip: that made every letter take ~4s to appear. The
+  // screen updates at once and the save goes out after a short pause in
+  // typing (and is flushed if the job card closes first).
+  const updateJobParts = (newParts) => {
+    setJob((j) => ({ ...j, parts: newParts, updatedAt: Date.now() }));
+    clearTimeout(partsSaveTimerRef.current);
+    partsSaveTimerRef.current = setTimeout(() => { flushPartsSave(); }, 800);
+  };
+  const flushPartsSave = async () => {
+    clearTimeout(partsSaveTimerRef.current);
+    partsSaveTimerRef.current = null;
+    const current = jobRef.current;
+    if (!current) return;
+    const saved = await saveJob(current);
+    // saveJob refreshes _base on the object it was given; carry that onto
+    // whatever the latest state is so the next diff starts from it.
+    setJob((j) => (j && j !== current && j.id === current.id ? { ...j, _base: current._base } : j));
+    notifyChanged(current, saved);
   };
 
   // Used to be the customer-facing status line. Repurposed per request:
@@ -5505,19 +7761,28 @@ function JobDetail({ id, initialJob, session, team, onChanged, onBack, canArchiv
     setJob(updated);
     setSavingStatusNote(false);
     setCustomStatusNote("");
-    onChanged(updated, saved);
+    notifyChanged(updated, saved);
   };
 
-  const reviewService = async (key) => {
+  const reviewService = async (key, extra) => {
     const current = (job.serviceReviewed || {})[key];
     const updated = {
       ...job,
       serviceReviewed: { ...(job.serviceReviewed || {}), [key]: current ? undefined : { by: session.name, at: Date.now() } },
       updatedAt: Date.now(),
     };
+    // PPF's review step also records Ahmed's corrected panel list and the
+    // film-metres/roll-width he measured (owner request, waste-per-model
+    // tracking) — stored alongside the plain serviceReviewed approval flag.
+    if (key === "ppf" && !current && extra) {
+      updated.ppfProgress = {
+        ...(job.ppfProgress || {}),
+        review: { actualKeys: extra.actualKeys || [], note: extra.note || "", filmMetres: extra.filmMetres ?? null, rollWidth: extra.rollWidth ?? null, by: session.name, at: Date.now() },
+      };
+    }
     const saved = await saveJob(updated);
     setJob(updated);
-    onChanged(updated, saved);
+    notifyChanged(updated, saved);
   };
 
   const assignService = async (key, memberId) => {
@@ -5547,7 +7812,7 @@ function JobDetail({ id, initialJob, session, team, onChanged, onBack, canArchiv
     const saved = await saveJob(updated);
     setJob(updated);
     setPickerFor(null);
-    onChanged(updated, saved);
+    notifyChanged(updated, saved);
   };
 
   const advance = async () => {
@@ -5573,7 +7838,7 @@ function JobDetail({ id, initialJob, session, team, onChanged, onBack, canArchiv
     const saved = await saveJob(updated);
     setJob(updated);
     setNote(""); setPendingPhotos([]); setBusy(false);
-    onChanged(updated, saved);
+    notifyChanged(updated, saved);
   };
 
   // Admin-only: send a job back a stage, from ANY stage including
@@ -5599,7 +7864,7 @@ function JobDetail({ id, initialJob, session, team, onChanged, onBack, canArchiv
     setBusy(false);
     setShowReverseConfirm(false);
     setClearReviewsOnReverse(false);
-    onChanged(updated, saved);
+    notifyChanged(updated, saved);
   };
 
   // Admin/Intake only. A car can be put on hold from wherever it currently
@@ -5624,7 +7889,7 @@ function JobDetail({ id, initialJob, session, team, onChanged, onBack, canArchiv
     setBusy(false);
     setShowHoldPrompt(false);
     setHoldNoteInput("");
-    onChanged(updated, saved);
+    notifyChanged(updated, saved);
   };
 
   const takeOffHold = async () => {
@@ -5641,7 +7906,7 @@ function JobDetail({ id, initialJob, session, team, onChanged, onBack, canArchiv
     const saved = await saveJob(updated);
     setJob(updated);
     setBusy(false);
-    onChanged(updated, saved);
+    notifyChanged(updated, saved);
   };
 
   const handleDelete = async () => {
@@ -5667,30 +7932,34 @@ function JobDetail({ id, initialJob, session, team, onChanged, onBack, canArchiv
     return (
       <div className="mrcap-view" style={{ padding: "0 18px 34px" }}>
         <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", marginBottom: 16 }}>
-          <button onClick={onBack} className="mrcap-press" style={iconBtnStyle}><ChevronLeft size={20} color={COLORS.ink} /></button>
+          <button onClick={onBack} className="mrcap-press" aria-label="Back" style={{ ...iconBtnStyle, width: 44, height: 44 }}><ChevronLeft size={22} color={COLORS.ink} /></button>
           <OfflineBadge />
         </div>
 
-        <div style={{ textAlign: "center", marginBottom: 22 }}>
-          <div style={{ fontFamily: MONO_FONT, fontWeight: 700, fontSize: 28, color: COLORS.ink, letterSpacing: 0.5 }}>{job.plate}</div>
-          <div style={{ fontSize: 14, color: COLORS.muted, marginTop: 4 }}>{job.makeModel}</div>
-          {job.priority === "High" && <div style={{ marginTop: 8 }}><Pill tone="red">Urgent</Pill></div>}
+        <div className="mrcap-rise" style={{ display: "flex", flexDirection: "column", alignItems: "center", gap: 10, marginBottom: 22, textAlign: "center" }}>
+          <PlateChip plate={job.plate} size="lg" />
+          <div style={{ fontFamily: DISPLAY_FONT, fontWeight: 700, fontSize: 24, color: COLORS.ink, lineHeight: 1.15 }}>{job.makeModel || "Vehicle"}</div>
+          {vehicleSubline(job) && <div style={{ fontSize: 12.5, color: COLORS.muted, marginTop: -6 }}>{vehicleSubline(job)}</div>}
+          <div style={{ display: "flex", gap: 6, flexWrap: "wrap", justifyContent: "center" }}>
+            <Pill tone={stageTone(stage.key)}>{stage.label}</Pill>
+            {job.priority === "High" && <Pill tone="red">Urgent</Pill>}
+          </div>
         </div>
 
         {job.description && (
-          <div style={{ background: COLORS.panel, border: `1px solid ${COLORS.line}`, borderRadius: 12, padding: 16, marginBottom: 20 }}>
-            <div style={{ fontSize: 11, color: COLORS.muted, textTransform: "uppercase", letterSpacing: 0.4, marginBottom: 6 }}>What to do</div>
-            <div style={{ fontSize: 15, color: COLORS.ink, lineHeight: 1.4 }}>{job.description}</div>
+          <div style={{ ...cardStyle, marginBottom: 20 }}>
+            <div style={{ ...eyebrowStyle, marginBottom: 6 }}>What to do</div>
+            <div style={{ fontSize: 15.5, color: COLORS.ink, lineHeight: 1.45 }}>{job.description}</div>
           </div>
         )}
 
         {introPhotos.length > 0 && (
           <div style={{ marginBottom: 20 }}>
-            <div style={{ fontSize: 11, color: COLORS.muted, textTransform: "uppercase", letterSpacing: 0.4, marginBottom: 8 }}>Photos</div>
-            <div style={{ display: "flex", flexWrap: "wrap", gap: 8 }}>
+            <div style={{ ...eyebrowStyle, marginBottom: 8 }}>Photos · {introPhotos.length}</div>
+            <div style={{ display: "grid", gridTemplateColumns: "repeat(4, minmax(0, 1fr))", gap: 6 }}>
               {introPhotos.map((p, i) => (
-                <button key={i} onClick={() => setViewerIndex(i)} className="mrcap-press" style={{ width: 68, background: "none", border: "none", padding: 0, cursor: "pointer" }}>
-                  <img src={p.src} alt="" style={{ width: 68, height: 68, objectFit: "cover", borderRadius: 8, border: `1px solid ${COLORS.line}` }} />
+                <button key={i} onClick={() => setViewerIndex(i)} className="mrcap-press" style={{ aspectRatio: "1 / 1", background: COLORS.panel2, border: `1px solid ${COLORS.line}`, borderRadius: 10, padding: 0, overflow: "hidden", cursor: "pointer" }}>
+                  <img src={p.src} alt="" style={{ width: "100%", height: "100%", objectFit: "cover", display: "block" }} />
                 </button>
               ))}
             </div>
@@ -5732,7 +8001,7 @@ function JobDetail({ id, initialJob, session, team, onChanged, onBack, canArchiv
                   </div>
                 </div>
               )}
-              <div style={{ width: "100%", boxSizing: "border-box", display: "flex", alignItems: "center", justifyContent: "center", gap: 10, padding: "18px", borderRadius: 14, border: `2px solid ${done ? COLORS.green : COLORS.gold}`, background: done ? "rgba(74,122,87,0.18)" : "rgba(201,162,39,0.12)" }}>
+              <div style={{ width: "100%", boxSizing: "border-box", display: "flex", alignItems: "center", justifyContent: "center", gap: 10, padding: "18px", borderRadius: 16, border: `1.5px solid ${done ? COLORS.green : COLORS.gold}`, background: done ? "rgba(74,122,87,0.16)" : "rgba(201,162,39,0.10)" }}>
                 {done ? (canToggle ? <CheckCircle2 size={26} color={COLORS.green} /> : <Lock size={22} color={COLORS.green} />) : <div style={{ width: 22, height: 22, borderRadius: "50%", border: `3px solid ${COLORS.gold}` }} />}
                 <span style={{ fontSize: 16, fontWeight: 700, color: COLORS.ink }}>{stepList.find((st) => st.key === currentStepKey)?.label || (done ? "Marked Done" : "Not Started")}</span>
               </div>
@@ -5755,7 +8024,7 @@ function JobDetail({ id, initialJob, session, team, onChanged, onBack, canArchiv
               </div>
 
               {s.reviewerRole && done && (
-                <div style={{ marginTop: 8, textAlign: "center", fontSize: 12.5, color: review ? "#7BC494" : COLORS.gold }}>
+                <div style={{ marginTop: 8, textAlign: "center", fontSize: 12.5, color: review ? COLORS.successText : COLORS.gold }}>
                   {review ? `✓ ${s.reviewerNote}` : `Waiting on ${s.reviewerNote.replace("Reviewed by ", "")}'s review`}
                 </div>
               )}
@@ -5765,7 +8034,7 @@ function JobDetail({ id, initialJob, session, team, onChanged, onBack, canArchiv
                   defaultValue={(job.serviceNotes || {})[s.key] || ""}
                   onBlur={(e) => { if (e.target.value !== ((job.serviceNotes || {})[s.key] || "")) setServiceNote(s.key, e.target.value); }}
                   placeholder="Add a note (optional)"
-                  style={{ width: "100%", boxSizing: "border-box", background: COLORS.panel2, border: `1px solid ${COLORS.line}`, borderRadius: 10, padding: "12px 14px", fontSize: 14, color: COLORS.ink, fontFamily: "Inter, sans-serif" }}
+                  style={{ width: "100%", boxSizing: "border-box", background: COLORS.panel2, border: `1px solid ${COLORS.line}`, borderRadius: 10, padding: "12px 14px", fontSize: 14, color: COLORS.ink, fontFamily: BODY_FONT }}
                 />
               </div>
 
@@ -5777,6 +8046,7 @@ function JobDetail({ id, initialJob, session, team, onChanged, onBack, canArchiv
             </div>
           );
         })}
+        {job.serviceTypes.includes("ppf") && <PPFOfficeView job={job} team={team} />}
         {damageViewerOpen && job.damageDiagramImage && (
           <PhotoViewer photos={[{ src: job.damageDiagramImage, label: "Damage diagram" }]} index={0} onClose={() => window.history.back()} onNavigate={() => {}} />
         )}
@@ -5785,51 +8055,166 @@ function JobDetail({ id, initialJob, session, team, onChanged, onBack, canArchiv
   }
 
   if (editing) {
-    return <EditJobScreen job={job} session={session} onSaved={(updated, saved) => { setJob(updated); window.history.back(); onChanged(updated, saved); }} onCancel={() => window.history.back()} />;
+    return <EditJobScreen job={job} session={session} onSaved={(updated, saved) => { setJob(updated); window.history.back(); notifyChanged(updated, saved); }} onCancel={() => window.history.back()} />;
   }
 
   return (
     <div className="mrcap-view" style={{ padding: "0 18px 34px" }}>
-      <div style={{ position: "sticky", top: 0, zIndex: 20, background: COLORS.paper, margin: "0 -18px", padding: "10px 18px", borderBottom: `1px solid ${COLORS.line}`, display: "flex", alignItems: "center", justifyContent: "space-between", gap: 10 }}>
+      <div style={{ position: "sticky", top: "env(safe-area-inset-top)", zIndex: 20, background: "rgba(10,10,9,0.9)", backdropFilter: "blur(14px)", WebkitBackdropFilter: "blur(14px)", margin: "0 -18px", padding: "10px 18px", borderBottom: `1px solid ${COLORS.line}`, display: "flex", alignItems: "center", justifyContent: "space-between", gap: 10 }}>
         <div style={{ display: "flex", alignItems: "center", gap: 8, minWidth: 0 }}>
-          <span style={{ fontFamily: MONO_FONT, fontWeight: 700, fontSize: 13, color: COLORS.ink, flexShrink: 0 }}>{job.plate}</span>
-          <span style={{ fontSize: 11.5, color: COLORS.muted, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{job.makeModel}</span>
+          <PlateChip plate={job.plate} size="sm" />
+          <span style={{ fontSize: 12.5, color: COLORS.muted, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{job.makeModel}</span>
         </div>
         <div style={{ display: "flex", alignItems: "center", gap: 6, flexShrink: 0 }}>
           <OfflineBadge />
           <Pill tone={stageTone(stage.key)}>{stage.label}</Pill>
         </div>
       </div>
-      {stage.key === "ready" && job.customerPhone && (
+      {saveFailed && (
+        <div className="mrcap-fade" role="alert" style={{ background: "rgba(168,64,47,0.14)", border: "1px solid rgba(168,64,47,0.6)", borderRadius: 14, padding: "10px 14px", margin: "12px 0" }}>
+          <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", gap: 8 }}>
+            <span style={{ fontSize: 13, color: "#F0C4BA", fontWeight: 600 }}>Your last change didn't save to the server.</span>
+            <button onClick={retrySave} disabled={retrying} className="mrcap-press" style={{ fontSize: 12.5, color: "#fff", background: COLORS.red, border: "none", borderRadius: 10, minHeight: 38, padding: "6px 14px", cursor: "pointer", fontWeight: 700, flexShrink: 0, opacity: retrying ? 0.6 : 1 }}>{retrying ? "Retrying…" : "Retry"}</button>
+          </div>
+          {lastStorageError && <div style={{ fontSize: 10.5, color: "#E8A99B", marginTop: 6, fontFamily: MONO_FONT, wordBreak: "break-word" }}>{lastStorageError}</div>}
+        </div>
+      )}
+
+      {/* ---- Case file hero: plate, make/model, customer with one-tap call / WhatsApp ---- */}
+      <section className="mrcap-rise" style={{ padding: "18px 0 14px", display: "flex", flexDirection: "column", gap: 10 }}>
+        <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", gap: 10 }}>
+          <span style={{ ...eyebrowStyle, color: COLORS.gold, letterSpacing: 2 }}>Case File</span>
+          {(job.invoiceAmount || Object.keys(job.treatmentPrices || {}).length > 0 || (job.parts || []).length > 0) && (
+            <div style={{ textAlign: "right" }}>
+              <div style={{ fontFamily: MONO_FONT, fontWeight: 600, fontSize: 18, color: COLORS.gold }}>
+                AED {job.invoiceAmount || Math.round(
+                  Object.values(job.treatmentPrices || {}).reduce((sum, v) => sum + (Number(v) || 0), 0) * (1 - (job.discountPercent || 0) / 100)
+                  + (job.parts || []).reduce((sum, p) => sum + (Number(p.price) || 0) * (Number(p.qty) || 1) * (1 - (Number(p.discountPercent) || 0) / 100), 0)
+                ).toLocaleString()}
+              </div>
+              {job.invoiceNo && <div style={{ fontSize: 10.5, color: COLORS.muted, marginTop: 1, fontFamily: MONO_FONT }}>{job.invoiceNo}</div>}
+              {!job.invoiceAmount && job.discountPercent > 0 && <div style={{ fontSize: 10.5, color: COLORS.muted, marginTop: 1 }}>{job.discountPercent}% off</div>}
+            </div>
+          )}
+        </div>
+        <PlateChip plate={job.plate} size="lg" style={{ alignSelf: "flex-start" }} />
+        <div style={{ fontFamily: DISPLAY_FONT, fontSize: 27, fontWeight: 700, lineHeight: 1.12, color: COLORS.ink, overflowWrap: "anywhere" }}>{job.makeModel || "Vehicle"}</div>
+        {vehicleSubline(job) && <div style={{ fontSize: 13, color: COLORS.muted, marginTop: -6 }}>{vehicleSubline(job)}</div>}
+        <div style={{ fontSize: 13, color: COLORS.muted, display: "flex", alignItems: "center", gap: 6, flexWrap: "wrap" }}>
+          <Building2 size={13} /> {job.location}{job.createdAt ? <> · in since {fmtTime(job.createdAt)}</> : null}
+        </div>
+        <div style={{ display: "flex", gap: 6, flexWrap: "wrap" }}>
+          <Pill tone={priorityTone(job.priority)}>{job.priority}</Pill>
+          {job.onHold && <Pill tone="yellow">On Hold</Pill>}
+          {job.smartechFlag && <Pill bg={COLORS.gold} fg={COLORS.darkText}>Smartech</Pill>}
+        </div>
+        <div style={{ display: "flex", alignItems: "center", gap: 10, padding: "10px 10px 10px 14px", borderRadius: 14, background: COLORS.panel, border: `1px solid ${COLORS.line}`, marginTop: 2 }}>
+          <div style={{ flex: 1, minWidth: 0, display: "flex", flexDirection: "column", gap: 2 }}>
+            <span style={{ fontSize: 14, fontWeight: 600, color: COLORS.ink, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap", display: "flex", alignItems: "center", gap: 6 }}><User size={13} color={COLORS.muted} /> {job.customerName || "—"}</span>
+            <span style={{ fontSize: 12.5, color: COLORS.muted, fontFamily: MONO_FONT }}>{job.customerPhone || "No phone on file"}</span>
+          </div>
+          {job.customerPhone && (
+            <a href={`tel:${job.customerPhone}`} aria-label="Call customer" title="Call customer" className="mrcap-press" style={{ width: 44, height: 44, borderRadius: 12, border: `1px solid ${COLORS.line}`, background: COLORS.panel2, color: COLORS.ink, display: "flex", alignItems: "center", justifyContent: "center", flexShrink: 0 }}>
+              <Phone size={18} />
+            </a>
+          )}
+          {job.customerPhone && toWhatsAppNumber(job.customerPhone) && (
+            <a href={`https://wa.me/${toWhatsAppNumber(job.customerPhone)}`} target="_blank" rel="noopener noreferrer" aria-label="WhatsApp customer" title="WhatsApp customer" className="mrcap-press" style={{ width: 44, height: 44, borderRadius: 12, background: "#25D366", color: COLORS.darkText, display: "flex", alignItems: "center", justifyContent: "center", flexShrink: 0 }}>
+              <MessageCircle size={19} />
+            </a>
+          )}
+        </div>
+      </section>
+
+      {/* ---- Progress: 6-stage stepper ---- */}
+      <section aria-label="Progress" style={{ ...cardStyle, padding: 14, marginBottom: 14 }}>
+        <div style={{ display: "flex", justifyContent: "space-between", alignItems: "baseline", gap: 8, marginBottom: 12 }}>
+          <span style={eyebrowStyle}>Stage {job.stageIndex + 1} of {STAGES.length}</span>
+          {(() => {
+            if (isLast) return <span style={{ fontSize: 12, color: COLORS.successText, fontWeight: 600 }}>Collected</span>;
+            const t = stageTimeInfo(job);
+            return t && t.label ? <span style={{ fontSize: 12, color: t.color === COLORS.muted ? COLORS.ink : t.color, fontWeight: 600 }}>{t.label === "Just in" ? "Just moved to" : `${t.label} in`} {STAGE_SHORT_LABELS[stage.key] || stage.label}</span> : <span style={{ fontSize: 12, color: COLORS.goldBright, fontWeight: 600 }}>{stage.label}</span>;
+          })()}
+        </div>
+        <StageStepper currentIndex={job.stageIndex} />
+      </section>
+
+      {/* ---- What happens next (note / parts photos travel with the advance below) ---- */}
+      {!isLast && (
+        <section style={{ ...cardStyle, padding: 14, marginBottom: 14, border: `1px solid ${stage.key === "service" && !allServicesDone ? "rgba(214,106,86,0.45)" : COLORS.line}` }}>
+          <div style={{ fontSize: 13, color: COLORS.muted, display: "flex", alignItems: "center", gap: 6 }}>
+            <Wrench size={14} color={COLORS.gold} /> Next: <b style={{ color: COLORS.ink }}>{nextStage.label}</b>
+          </div>
+          {stage.key === "parts_removal" && (
+            <>
+              <div style={{ marginTop: 10 }}><PhotoGrid photos={pendingPhotos} onRemove={(i) => setPendingPhotos((p) => p.filter((_, idx) => idx !== i))} /></div>
+              <input ref={fileRef} type="file" accept="image/*" multiple style={{ display: "none" }} onChange={(e) => e.target.files.length && addPendingPhotos(e.target.files)} />
+              <button onClick={() => fileRef.current.click()} className="mrcap-press" style={{ ...cameraBtnStyle, width: "100%" }}><Camera size={16} /> Add parts-removal photo</button>
+            </>
+          )}
+          {stage.key === "service" && !allServicesDone && (
+            <div style={{ fontSize: 12.5, color: COLORS.dangerText, marginTop: 8 }}>Check off every service below before advancing.</div>
+          )}
+          <textarea value={note} onChange={(e) => setNote(e.target.value)} placeholder="Add a note for this step (optional)" style={{ ...textareaStyle, minHeight: 50, marginTop: 10 }} />
+        </section>
+      )}
+
+      {/* WhatsAppSendButton already no-ops (returns null) when there's no
+          phone on file — but CustomerNotifyControl must NOT be gated on
+          phone too: "Customer informed" (or "not needed") is a plain
+          acknowledgment staff can tick regardless of how they told the
+          customer (call, in person, WhatsApp from a personal phone,
+          etc). Nesting it inside `job.customerPhone &&` used to hide the
+          checkbox entirely for any job with no phone on file (e.g. every
+          Quick Intake job) — leaving no way to ever clear the dashboard's
+          "Customer Not Yet Informed" flag for that car. */}
+      {stage.key === "ready" && (
         <>
           <WhatsAppSendButton
             phone={job.customerPhone}
             templateKey="ready_for_collection"
-            vars={{ customerName: job.customerName || "", makeModel: job.makeModel || "vehicle", plate: job.plate || "", trackingLink: `${window.location.origin}/?track=${job.id}` }}
+            vars={{ customerName: job.customerName || "", makeModel: job.makeModel || "vehicle", plate: job.plate || "" }}
             label="Notify Customer on WhatsApp"
           />
+          {!job.customerPhone && <div style={{ fontSize: 11.5, color: COLORS.muted, marginBottom: 8, fontStyle: "italic" }}>No phone on file — add one via Edit Job to WhatsApp them, or just tick below once you've told them another way.</div>}
           <CustomerNotifyControl record={job} templateKey="ready_for_collection" session={session} onSave={saveJobRecord} skippable={false} />
+          {/* Second WhatsApp message at pickup: the Google review thank-you,
+              with its own tick so the shop can see it was sent. Same
+              google_review record as the Collected-stage card, so ticking
+              it here also shows as sent there. */}
+          {GOOGLE_REVIEW_LINK && hasPermission(session, team, "googleReview") && (
+            <>
+              <WhatsAppSendButton
+                phone={job.customerPhone}
+                templateKey="google_review"
+                vars={{ customerName: job.customerName || "", makeModel: job.makeModel || "vehicle", plate: job.plate || "", reviewLink: GOOGLE_REVIEW_LINK }}
+                label="Send Thank-You + Google Review"
+              />
+              <CustomerNotifyControl record={job} templateKey="google_review" session={session} onSave={saveJobRecord} skippable={true} label="Google review sent to customer" />
+            </>
+          )}
         </>
       )}
-      {stage.key === "intake" && job.customerPhone && (
+      {stage.key === "intake" && (
         <>
           <WhatsAppSendButton
             phone={job.customerPhone}
             templateKey="job_started"
-            vars={{ customerName: job.customerName || "", makeModel: job.makeModel || "vehicle", plate: job.plate || "", trackingLink: `${window.location.origin}/?track=${job.id}` }}
+            vars={{ customerName: job.customerName || "", makeModel: job.makeModel || "vehicle", plate: job.plate || "" }}
             label="Send Intake Confirmation"
           />
+          {!job.customerPhone && <div style={{ fontSize: 11.5, color: COLORS.muted, marginBottom: 8, fontStyle: "italic" }}>No phone on file — add one via Edit Job to WhatsApp them, or just tick below once you've told them another way.</div>}
           <CustomerNotifyControl record={job} templateKey="job_started" session={session} onSave={saveJobRecord} skippable={true} />
         </>
       )}
 
-      {stage.key === "collected" && job.customerPhone && hasPermission(session, team, "googleReview") && (
-        <div style={{ background: "linear-gradient(160deg, rgba(201,162,39,0.14), rgba(201,162,39,0.04))", border: `1.5px solid ${COLORS.gold}`, borderRadius: 12, padding: "14px 15px", marginBottom: 12 }}>
+      {stage.key === "collected" && hasPermission(session, team, "googleReview") && (
+        <div style={{ background: "linear-gradient(160deg, rgba(201,162,39,0.14), rgba(201,162,39,0.04))", border: "1px solid rgba(201,162,39,0.55)", borderRadius: 16, padding: "14px 16px", marginBottom: 14 }}>
           <div style={{ display: "flex", alignItems: "center", gap: 7, marginBottom: 6 }}>
             <Star size={15} color={COLORS.gold} fill={COLORS.gold} />
-            <div style={{ fontFamily: DISPLAY_FONT, fontWeight: 600, fontSize: 14, color: COLORS.ink }}>Ask for a Google Review</div>
+            <div style={{ fontFamily: DISPLAY_FONT, fontWeight: 700, fontSize: 16, color: COLORS.ink }}>Ask for a Google Review</div>
           </div>
-          <div style={{ fontSize: 12, color: COLORS.muted, marginBottom: 12, lineHeight: 1.45 }}>
+          <div style={{ fontSize: 12.5, color: COLORS.muted, marginBottom: 12, lineHeight: 1.45 }}>
             This car's been collected — a good moment to ask {job.customerName || "the customer"} for a quick review.
           </div>
           {GOOGLE_REVIEW_LINK ? (
@@ -5840,7 +8225,7 @@ function JobDetail({ id, initialJob, session, team, onChanged, onBack, canArchiv
                 vars={{ customerName: job.customerName || "", makeModel: job.makeModel || "vehicle", plate: job.plate || "", reviewLink: GOOGLE_REVIEW_LINK }}
                 label="Ask for a Review on WhatsApp"
               />
-              <CustomerNotifyControl record={job} templateKey="google_review" session={session} onSave={saveJobRecord} skippable={true} />
+              <CustomerNotifyControl record={job} templateKey="google_review" session={session} onSave={saveJobRecord} skippable={true} label="Google review sent to customer" />
             </>
           ) : (
             <div style={{ fontSize: 11.5, color: COLORS.muted, fontStyle: "italic" }}>Add your Google review link under WhatsApp Messages to enable this.</div>
@@ -5849,381 +8234,20 @@ function JobDetail({ id, initialJob, session, team, onChanged, onBack, canArchiv
       )}
 
       {job.onHold && (
-        <div style={{ display: "flex", alignItems: "flex-start", gap: 10, padding: "12px 13px", borderRadius: 10, border: `1.5px solid ${COLORS.gold}`, background: "rgba(201,162,39,0.12)", marginBottom: 12 }}>
+        <div style={{ display: "flex", alignItems: "flex-start", gap: 10, padding: "12px 14px", borderRadius: 14, border: "1px solid rgba(201,162,39,0.55)", background: "rgba(201,162,39,0.10)", marginBottom: 12 }}>
           <PauseCircle size={18} color={COLORS.gold} style={{ flexShrink: 0, marginTop: 1 }} />
           <div style={{ flex: 1 }}>
-            <div style={{ fontFamily: DISPLAY_FONT, fontWeight: 600, fontSize: 14, color: COLORS.gold }}>On Hold since {fmtTime(job.onHoldSince)}</div>
-            {job.onHoldNote && <div style={{ fontSize: 12.5, color: COLORS.ink, marginTop: 3 }}>"{job.onHoldNote}"</div>}
+            <div style={{ fontWeight: 700, fontSize: 14, color: COLORS.gold }}>On Hold since {fmtTime(job.onHoldSince)}</div>
+            {job.onHoldNote && <div style={{ fontSize: 13, color: COLORS.ink, marginTop: 3 }}>"{job.onHoldNote}"</div>}
           </div>
         </div>
       )}
 
-      {isFullDashboardRole(session) && (
-        job.onHold ? (
-          <button onClick={takeOffHold} disabled={busy} className="mrcap-press" style={{ display: "flex", alignItems: "center", justifyContent: "center", gap: 8, width: "100%", padding: "12px", borderRadius: 10, border: `1.5px solid ${COLORS.green}`, background: "rgba(74,122,87,0.1)", color: "#7BC494", fontWeight: 700, fontSize: 13, cursor: "pointer", marginBottom: 12, opacity: busy ? 0.6 : 1 }}>
-            <PauseCircle size={15} /> Take Off Hold
-          </button>
-        ) : showHoldPrompt ? (
-          <div style={{ padding: "12px 13px", borderRadius: 10, border: `1.5px solid ${COLORS.gold}`, background: COLORS.panel, marginBottom: 12, display: "flex", flexDirection: "column", gap: 8 }}>
-            <div style={{ fontSize: 12.5, color: COLORS.ink, fontWeight: 600 }}>Why is this car going on hold?</div>
-            <input autoFocus value={holdNoteInput} onChange={(e) => setHoldNoteInput(e.target.value)} placeholder="e.g. Showroom display — owner's request" style={{ ...inputStyle, marginTop: 0 }} />
-            <div style={{ display: "flex", gap: 8 }}>
-              <button onClick={() => putOnHold(holdNoteInput)} disabled={busy || !holdNoteInput.trim()} className="mrcap-press" style={{ flex: 1, padding: "10px", borderRadius: 9, border: "none", background: COLORS.gold, color: COLORS.darkText, fontWeight: 700, fontSize: 12.5, cursor: "pointer", opacity: busy || !holdNoteInput.trim() ? 0.5 : 1 }}>Confirm On Hold</button>
-              <button onClick={() => { setShowHoldPrompt(false); setHoldNoteInput(""); }} className="mrcap-press" style={{ padding: "10px 14px", borderRadius: 9, border: `1px solid ${COLORS.line}`, background: "none", color: COLORS.muted, cursor: "pointer" }}>Cancel</button>
-            </div>
-          </div>
-        ) : (
-          <button onClick={() => setShowHoldPrompt(true)} className="mrcap-press" style={{ display: "flex", alignItems: "center", justifyContent: "center", gap: 8, width: "100%", padding: "12px", borderRadius: 10, border: `1.5px dashed ${COLORS.gold}`, background: "rgba(201,162,39,0.08)", color: COLORS.gold, fontWeight: 600, fontSize: 12.5, cursor: "pointer", marginBottom: 12 }}>
-            <PauseCircle size={15} /> Put On Hold
-          </button>
-        )
-      )}
-
-      {isFullDashboardRole(session) && (
-        <div style={{ marginBottom: 12 }}>
-          {finalizeError && (
-            <div style={{ fontSize: 11.5, color: COLORS.red, marginBottom: 8 }}>{finalizeError}</div>
-          )}
-
-          {job.invoiceNo ? (
-            <div style={{ fontSize: 11, color: COLORS.muted, marginBottom: 8 }}>
-              Invoice <span style={{ fontFamily: MONO_FONT, color: COLORS.gold }}>{job.invoiceNo}</span> — finalized by {job.invoiceFinalizedBy} on {job.invoiceFinalizedAt ? new Date(job.invoiceFinalizedAt).toLocaleDateString() : ""}
-            </div>
-          ) : (
-            <>
-              <div style={{ fontSize: 11, color: COLORS.muted, marginBottom: 5 }}>COMMISSION ENTITY</div>
-              <div style={{ display: "flex", gap: 6, marginBottom: 10 }}>
-                {COMMISSION_ENTITIES.map((e) => (
-                  <button
-                    key={e.key}
-                    onClick={() => { setJob({ ...job, commissionEntity: e.key }); setFinalizeError(""); }}
-                    className="mrcap-press"
-                    style={{ flex: 1, padding: "8px 6px", borderRadius: 8, fontSize: 11, fontWeight: 600, cursor: "pointer",
-                      border: `1.5px solid ${job.commissionEntity === e.key ? COLORS.gold : COLORS.line}`,
-                      background: job.commissionEntity === e.key ? COLORS.gold : "transparent",
-                      color: job.commissionEntity === e.key ? COLORS.darkText : COLORS.ink }}
-                  >
-                    {e.label}
-                  </button>
-                ))}
-              </div>
-            </>
-          )}
-
-          <button
-            onClick={async () => {
-              setFinalizeError("");
-              if (!job.invoiceNo) {
-                setFinalizingInvoice(true);
-                const result = await finalizeInvoiceNumber(job, session);
-                setFinalizingInvoice(false);
-                if (!result.ok) { setFinalizeError(result.error); return; }
-                setJob(result.job);
-                const doc = generateJobCardPDF(result.job);
-                doc.save(`MrCAP-Invoice-${result.invoiceNo}.pdf`);
-              } else {
-                // Already finalized — reprint the exact same number, no
-                // new number is ever consumed for the same job.
-                const doc = generateJobCardPDF(job);
-                doc.save(`MrCAP-Invoice-${job.invoiceNo}.pdf`);
-              }
-            }}
-            disabled={finalizingInvoice}
-            className="mrcap-press"
-            style={{ display: "flex", alignItems: "center", justifyContent: "center", gap: 8, width: "100%", padding: "12px", borderRadius: 10, border: "none", background: COLORS.gold, color: COLORS.darkText, fontWeight: 700, fontSize: 13, cursor: finalizingInvoice ? "default" : "pointer", opacity: finalizingInvoice ? 0.7 : 1 }}
-          >
-            <FileText size={15} /> {finalizingInvoice ? "Finalizing..." : job.invoiceNo ? "Reprint Invoice" : "Finalize & Generate Invoice"}
-          </button>
-        </div>
-      )}
-
-      {(hasPermission(session, team, "editJob") || hasPermission(session, team, "sendBack")) && (
-        <div style={{ display: "flex", gap: 8, marginBottom: 12 }}>
-          {hasPermission(session, team, "editJob") && (
-            <button onClick={() => setEditing(true)} className="mrcap-press" style={{ flex: 1, display: "flex", alignItems: "center", justifyContent: "center", gap: 7, padding: "10px", borderRadius: 10, border: `1.5px dashed ${COLORS.gold}`, background: "rgba(201,162,39,0.08)", color: COLORS.gold, fontWeight: 600, fontSize: 12.5, cursor: "pointer" }}>
-              <Wrench size={13} /> Edit Job
-            </button>
-          )}
-          {job.stageIndex > 0 && hasPermission(session, team, "sendBack") && (
-            <button onClick={() => setShowReverseConfirm((v) => !v)} className="mrcap-press" style={{ flex: 1, display: "flex", alignItems: "center", justifyContent: "center", gap: 7, padding: "10px", borderRadius: 10, border: `1.5px dashed ${COLORS.red}`, background: "rgba(168,64,47,0.08)", color: "#E08A78", fontWeight: 600, fontSize: 12.5, cursor: "pointer" }}>
-              <ChevronLeft size={13} /> Send Back
-            </button>
-          )}
-        </div>
-      )}
-
-      {hasPermission(session, team, "delete") && (
-        <button onClick={() => { setShowDeleteConfirm(true); setDeleteConfirmText(""); }} className="mrcap-press" style={{ display: "flex", alignItems: "center", justifyContent: "center", gap: 7, width: "100%", padding: "10px", borderRadius: 10, border: `1.5px solid ${COLORS.red}`, background: "rgba(168,64,47,0.1)", color: COLORS.red, fontWeight: 700, fontSize: 12.5, cursor: "pointer", marginBottom: 12 }}>
-          <X size={14} /> Delete Job Card
-        </button>
-      )}
-
-      {showDeleteConfirm && (
-        <div className="mrcap-fade" style={{ background: "#3A1815", border: `2px solid ${COLORS.red}`, borderRadius: 12, padding: 16, marginBottom: 14 }}>
-          <div style={{ display: "flex", alignItems: "center", gap: 8, marginBottom: 10 }}>
-            <ShieldAlert size={20} color={COLORS.red} />
-            <div style={{ fontFamily: DISPLAY_FONT, fontWeight: 700, fontSize: 15, color: "#FF8A73" }}>This cannot be undone</div>
-          </div>
-          <div style={{ fontSize: 12.5, color: "#F0C4BA", marginBottom: 12, lineHeight: 1.5 }}>
-            Deleting <b>{job.plate}</b> permanently removes this job card, its photos, and its full history. It will NOT appear in Archive. The deletion itself will be logged with your name and the time, but the job's contents are gone for good.
-          </div>
-          <div style={{ fontSize: 11.5, color: "#F0C4BA", marginBottom: 8 }}>Type <b>DELETE</b> to confirm:</div>
-          <input
-            value={deleteConfirmText}
-            onChange={(e) => setDeleteConfirmText(e.target.value)}
-            placeholder="DELETE"
-            style={{ width: "100%", boxSizing: "border-box", background: "#2A100D", border: `1.5px solid ${COLORS.red}`, borderRadius: 8, padding: "10px 12px", fontSize: 14, color: "#fff", fontFamily: MONO_FONT, marginBottom: 12, letterSpacing: 1 }}
-          />
-          <div style={{ display: "flex", gap: 8 }}>
-            <button onClick={() => setShowDeleteConfirm(false)} className="mrcap-press" style={{ ...secondaryBtnStyle, flex: 1, padding: "10px", fontSize: 12.5 }}>Cancel</button>
-            <button onClick={handleDelete} disabled={deleteConfirmText !== "DELETE" || deleting} className="mrcap-press" style={{ flex: 1, padding: "10px", borderRadius: 9, border: "none", background: COLORS.red, color: "#fff", fontWeight: 700, fontSize: 12.5, cursor: deleteConfirmText === "DELETE" ? "pointer" : "not-allowed", opacity: deleteConfirmText === "DELETE" ? 1 : 0.5 }}>
-              {deleting ? "Deleting…" : "Permanently Delete"}
-            </button>
-          </div>
-        </div>
-      )}
-
-      {showReverseConfirm && (
-        <div className="mrcap-fade" style={{ background: "rgba(168,64,47,0.12)", border: `1px solid ${COLORS.red}`, borderRadius: 10, padding: 14, marginBottom: 14 }}>
-          <div style={{ fontSize: 12.5, color: "#E08A78", marginBottom: 10 }}>
-            Move this job back from <b>{stage.label}</b> to <b>{STAGES[job.stageIndex - 1].label}</b>?
-          </div>
-          {Object.keys(job.serviceReviewed || {}).length > 0 && (
-            <label style={{ display: "flex", alignItems: "center", gap: 8, marginBottom: 12, fontSize: 12, color: COLORS.ink, cursor: "pointer" }}>
-              <input type="checkbox" checked={clearReviewsOnReverse} onChange={(e) => setClearReviewsOnReverse(e.target.checked)} style={{ width: 15, height: 15 }} />
-              Also clear existing review sign-off(s)
-            </label>
-          )}
-          <div style={{ display: "flex", gap: 8 }}>
-            <button onClick={() => setShowReverseConfirm(false)} className="mrcap-press" style={{ ...secondaryBtnStyle, flex: 1, padding: "9px", fontSize: 12.5 }}>Cancel</button>
-            <button onClick={() => reverseStage(clearReviewsOnReverse)} disabled={busy} className="mrcap-press" style={{ flex: 1, padding: "9px", borderRadius: 9, border: "none", background: COLORS.red, color: "#fff", fontWeight: 700, fontSize: 12.5, cursor: "pointer" }}>
-              {busy ? "…" : "Confirm"}
-            </button>
-          </div>
-        </div>
-      )}
-
-      <div style={{ background: `linear-gradient(160deg, ${COLORS.panel2}, ${COLORS.panel})`, border: `1px solid ${COLORS.line}`, borderTop: `2px solid ${COLORS.gold}`, borderRadius: 12, padding: "18px 16px 15px", color: "#fff", marginBottom: 14, position: "relative" }}>
-        <div style={{ position: "absolute", top: 14, right: 16, fontSize: 9, color: COLORS.gold, letterSpacing: 2, textTransform: "uppercase", opacity: 0.7 }}>Case File</div>
-        <div style={{ display: "flex", justifyContent: "space-between", alignItems: "flex-start" }}>
-          <div>
-            <div style={{ fontFamily: MONO_FONT, fontWeight: 600, fontSize: 21, letterSpacing: 0.5 }}>{job.plate}</div>
-            <div style={{ fontSize: 12.5, opacity: 0.7, marginTop: 3 }}>{job.makeModel} · {job.location}</div>
-          </div>
-          {(job.invoiceAmount || Object.keys(job.treatmentPrices || {}).length > 0 || (job.parts || []).length > 0) && (
-            <div style={{ textAlign: "right" }}>
-              <div style={{ fontFamily: MONO_FONT, fontWeight: 700, fontSize: 17, color: COLORS.gold }}>
-                AED {job.invoiceAmount || Math.round(
-                  Object.values(job.treatmentPrices || {}).reduce((sum, v) => sum + (Number(v) || 0), 0) * (1 - (job.discountPercent || 0) / 100)
-                  + (job.parts || []).reduce((sum, p) => sum + (Number(p.price) || 0) * (Number(p.qty) || 1) * (1 - (Number(p.discountPercent) || 0) / 100), 0)
-                ).toLocaleString()}
-              </div>
-              {job.invoiceNo && <div style={{ fontSize: 9.5, opacity: 0.6, marginTop: 1 }}>{job.invoiceNo}</div>}
-              {!job.invoiceAmount && job.discountPercent > 0 && <div style={{ fontSize: 9.5, opacity: 0.6, marginTop: 1 }}>{job.discountPercent}% off</div>}
-            </div>
-          )}
-        </div>
-        <div style={{ display: "flex", gap: 6, marginTop: 10 }}>
-          <Pill tone={stageTone(stage.key)}>{stage.label}</Pill>
-          <Pill tone={priorityTone(job.priority)}>{job.priority}</Pill>
-        </div>
-        <div style={{ display: "flex", alignItems: "center", gap: 6, marginTop: 10, fontSize: 12, opacity: 0.75 }}>
-          <User size={12} /> {job.customerName} {job.customerPhone && `· ${job.customerPhone}`}
-        </div>
-        <div style={{ borderTop: `1px dashed ${COLORS.line}`, margin: "12px 0 10px" }} />
-        <StageStrip currentIndex={job.stageIndex} />
-      </div>
-
-      {hasPermission(session, team, "statusUpdate") && (
-        <div style={{ background: COLORS.panel, border: `1px solid ${COLORS.line}`, borderRadius: 12, padding: 16, marginBottom: 16 }}>
-          <div style={{ display: "flex", alignItems: "center", gap: 7, marginBottom: 3 }}>
-            <MessageSquare size={14} color={COLORS.gold} />
-            <div style={{ fontFamily: DISPLAY_FONT, fontWeight: 600, fontSize: 14.5, color: COLORS.ink }}>Admin Update</div>
-          </div>
-          <div style={{ fontSize: 11.5, color: COLORS.muted, marginBottom: 12 }}>
-            Internal only — posts to the Live Updates admin board, not shown to the customer. Pick one or type your own.
-          </div>
-
-          {(job.history || []).filter((h) => h.stage === "progress_update").slice(-3).reverse().length > 0 && (
-            <div style={{ display: "flex", flexDirection: "column", gap: 6, marginBottom: 12 }}>
-              {(job.history || []).filter((h) => h.stage === "progress_update").slice(-3).reverse().map((h, i) => (
-                <div key={i} style={{ background: "rgba(201,162,39,0.08)", border: `1px solid ${COLORS.gold}`, borderRadius: 8, padding: "9px 11px" }}>
-                  <div style={{ fontSize: 12.5, color: COLORS.ink, fontWeight: 600 }}>{h.note}</div>
-                  <div style={{ fontSize: 10.5, color: COLORS.muted, marginTop: 2 }}>{h.by} · {new Date(h.at).toLocaleString()}</div>
-                </div>
-              ))}
-            </div>
-          )}
-
-          {dupeUpdateWarning && (
-            <div style={{ fontSize: 11.5, color: COLORS.gold, background: "rgba(201,162,39,0.12)", border: `1px solid ${COLORS.gold}`, borderRadius: 8, padding: "7px 10px", marginBottom: 10 }}>
-              {dupeUpdateWarning}
-            </div>
-          )}
-          <div style={{ display: "flex", flexWrap: "wrap", gap: 6, marginBottom: 10 }}>
-            {DISPATCH_UPDATE_PRESETS.map((preset) => (
-              <button
-                key={preset}
-                onClick={() => postAdminUpdate(preset)}
-                disabled={savingStatusNote}
-                className="mrcap-press"
-                style={{
-                  padding: "7px 11px", borderRadius: 999, fontSize: 11.5, cursor: "pointer",
-                  border: `1.5px solid ${COLORS.line}`, background: COLORS.panel2, color: COLORS.ink,
-                  fontWeight: 500, opacity: savingStatusNote ? 0.6 : 1,
-                }}
-              >
-                {preset}
-              </button>
-            ))}
-          </div>
-
-          <div style={{ display: "flex", gap: 8 }}>
-            <input
-              value={customStatusNote}
-              onChange={(e) => setCustomStatusNote(e.target.value)}
-              placeholder="Or type a custom update…"
-              style={{ ...inputStyle, marginTop: 0, flex: 1 }}
-              onKeyDown={(e) => { if (e.key === "Enter" && customStatusNote.trim()) postAdminUpdate(customStatusNote); }}
-            />
-            <button
-              onClick={() => postAdminUpdate(customStatusNote)}
-              disabled={savingStatusNote || !customStatusNote.trim()}
-              className="mrcap-press"
-              style={{ ...secondaryBtnStyle, padding: "0 16px", opacity: savingStatusNote || !customStatusNote.trim() ? 0.5 : 1 }}
-            >
-              Post
-            </button>
-          </div>
-        </div>
-      )}
-
-      {hasPermission(session, team, "markupCalc") && (
-        <div style={{ background: COLORS.panel, border: `1px solid ${COLORS.line}`, borderRadius: 12, padding: 16, marginBottom: 16 }}>
-          <div style={{ display: "flex", alignItems: "center", gap: 7, marginBottom: 3 }}>
-            <TrendingUp size={14} color={COLORS.gold} />
-            <div style={{ fontFamily: DISPLAY_FONT, fontWeight: 600, fontSize: 14.5, color: COLORS.ink }}>Markup Calculator</div>
-            <Lock size={11} color={COLORS.muted} style={{ marginLeft: "auto" }} />
-          </div>
-          <div style={{ fontSize: 11.5, color: COLORS.muted, marginBottom: 4 }}>
-            Enter a cost (e.g. a supplier or parts bill) and a markup % — this works out what to charge and saves it with the job.
-          </div>
-          <div style={{ fontSize: 10.5, color: COLORS.muted, marginBottom: 12, display: "flex", alignItems: "center", gap: 5, fontStyle: "italic" }}>
-            <Lock size={9} /> Internal reference only — the customer never sees this section or its photos.
-          </div>
-
-          {(job.markupEntries || []).length > 0 && (
-            <div style={{ display: "flex", flexDirection: "column", gap: 6, marginBottom: 12 }}>
-              {job.markupEntries.map((e) => (
-                <div key={e.id} style={{ display: "flex", alignItems: "center", gap: 8, background: COLORS.panel2, border: `1px solid ${COLORS.line}`, borderRadius: 8, padding: "9px 11px" }}>
-                  {(e.photos || []).length > 0 && (
-                    <img
-                      src={e.photos[0]}
-                      alt=""
-                      onClick={() => setMarkupPhotoViewer({ photos: e.photos.map((src) => ({ src, label: e.description })), index: 0 })}
-                      style={{ width: 40, height: 40, objectFit: "cover", borderRadius: 6, border: `1px solid ${COLORS.line}`, cursor: "pointer", flexShrink: 0 }}
-                    />
-                  )}
-                  <div style={{ flex: 1, minWidth: 0 }}>
-                    <div style={{ fontSize: 12.5, color: COLORS.ink, fontWeight: 600 }}>{e.description}</div>
-                    <div style={{ fontSize: 11, color: COLORS.muted, marginTop: 1 }}>Cost AED {e.cost.toLocaleString()} + {e.markupPercent}%{(e.photos || []).length > 1 ? ` · ${e.photos.length} photos` : ""}</div>
-                  </div>
-                  <div style={{ fontFamily: MONO_FONT, fontWeight: 700, fontSize: 14, color: COLORS.gold, whiteSpace: "nowrap" }}>AED {e.chargePrice.toLocaleString()}</div>
-                  <button onClick={() => removeMarkupEntry(e.id)} className="mrcap-press" style={{ background: "none", border: "none", color: COLORS.muted, cursor: "pointer", padding: 4, flexShrink: 0 }} title="Remove">
-                    <X size={14} />
-                  </button>
-                </div>
-              ))}
-              <div style={{ display: "flex", justifyContent: "space-between", fontSize: 12, color: COLORS.muted, padding: "2px 2px 0" }}>
-                <span>Total to charge</span>
-                <span style={{ fontWeight: 700, color: COLORS.ink }}>AED {job.markupEntries.reduce((sum, e) => sum + e.chargePrice, 0).toLocaleString()}</span>
-              </div>
-            </div>
-          )}
-
-          <div style={{ display: "flex", gap: 8, marginBottom: 8 }}>
-            <input value={markupDesc} onChange={(e) => setMarkupDesc(e.target.value)} placeholder="What is this? e.g. Front bumper" style={{ ...inputStyle, marginTop: 0, flex: 1 }} />
-          </div>
-          <div style={{ display: "flex", gap: 8, marginBottom: 8 }}>
-            <input type="number" inputMode="decimal" value={markupCost} onChange={(e) => setMarkupCost(e.target.value)} placeholder="Cost (AED)" style={{ ...inputStyle, marginTop: 0, flex: 1 }} />
-            <input type="number" inputMode="decimal" value={markupPercent} onChange={(e) => setMarkupPercent(e.target.value)} placeholder="Markup %" style={{ ...inputStyle, marginTop: 0, flex: 1 }} />
-          </div>
-          {markupCost && markupPercent !== "" && Number(markupCost) > 0 && (
-            <div style={{ fontSize: 12, color: COLORS.muted, marginBottom: 10 }}>
-              Charge: <span style={{ color: COLORS.gold, fontWeight: 700 }}>AED {(Number(markupCost) * (1 + Number(markupPercent) / 100)).toLocaleString(undefined, { maximumFractionDigits: 2 })}</span>
-            </div>
-          )}
-
-          <PhotoGrid photos={markupPhotos} onRemove={removeMarkupPhoto} />
-          <input ref={markupFileRef} type="file" accept="image/*" multiple style={{ display: "none" }} onChange={(e) => e.target.files.length && addMarkupPhotos(e.target.files)} />
-          <button
-            onClick={() => markupFileRef.current.click()}
-            className="mrcap-press"
-            style={{ display: "flex", alignItems: "center", justifyContent: "center", gap: 7, width: "100%", padding: "9px", borderRadius: 9, border: `1.5px dashed ${COLORS.line}`, background: "transparent", color: COLORS.muted, fontWeight: 600, fontSize: 12, cursor: "pointer", marginBottom: 10 }}
-          >
-            <Camera size={13} /> {uploadingMarkupPhoto ? "Uploading…" : markupPhotos.length ? "Add Another Bill Photo" : "Attach Bill / Receipt Photo"}
-          </button>
-
-          <button
-            onClick={addMarkupEntry}
-            disabled={savingMarkup || !markupCost || Number(markupCost) <= 0 || markupPercent === ""}
-            className="mrcap-press"
-            style={{ ...secondaryBtnStyle, width: "100%", padding: "10px", fontSize: 12.5, opacity: savingMarkup || !markupCost || Number(markupCost) <= 0 || markupPercent === "" ? 0.5 : 1 }}
-          >
-            {savingMarkup ? "Saving…" : "Add Entry"}
-          </button>
-        </div>
-      )}
-
-      {hasPermission(session, team, "editJob") && (
-        <div style={{ background: COLORS.panel, border: `1px solid ${COLORS.line}`, borderRadius: 12, padding: 16, marginBottom: 16 }}>
-          <div style={{ display: "flex", alignItems: "center", gap: 7, marginBottom: 12 }}>
-            <Wrench size={14} color={COLORS.gold} />
-            <div style={{ fontFamily: DISPLAY_FONT, fontWeight: 600, fontSize: 14.5, color: COLORS.ink }}>Parts & Charges</div>
-          </div>
-          <PartsEditor parts={job.parts || []} onChange={updateJobParts} showTotal />
-        </div>
-      )}
-
-      {markupPhotoViewer && (
-        <PhotoViewer
-          photos={markupPhotoViewer.photos}
-          index={markupPhotoViewer.index}
-          onClose={() => setMarkupPhotoViewer(null)}
-          onNavigate={(i) => setMarkupPhotoViewer((v) => ({ ...v, index: i }))}
-        />
-      )}
-
-      {job.description && <InfoBlock title="Requested work">{job.description}</InfoBlock>}
-      {job.damageNotes && <InfoBlock title="Damage / walk-around notes">{job.damageNotes}</InfoBlock>}
-
-      {job.damageDiagramImage && (
-        <div style={{ marginBottom: 16 }}>
-          <div style={labelStyle}>Body damage — panels & location</div>
-          {job.damagePanels && job.damagePanels.length > 0 && (
-            <div style={{ display: "flex", flexWrap: "wrap", gap: 6, marginTop: 8, marginBottom: 8 }}>
-              {job.damagePanels.map((p) => <Pill key={p} tone="red">{p}</Pill>)}
-            </div>
-          )}
-          <button onClick={() => setDamageViewerOpen(true)} className="mrcap-press" style={{ display: "block", width: "100%", background: "#fff", borderRadius: 10, border: `1px solid ${COLORS.line}`, padding: 6, cursor: "pointer" }}>
-            <img src={job.damageDiagramImage} alt="Damage diagram" style={{ width: "100%", height: "auto", display: "block", borderRadius: 6 }} />
-          </button>
-        </div>
-      )}
-
-      {job.signature && (
-        <div style={{ marginBottom: 16 }}>
-          <div style={labelStyle}>Customer signature{job.signedAt ? ` · ${fmtTime(job.signedAt)}` : ""}</div>
-          <div style={{ background: "#fff", borderRadius: 10, border: `1px solid ${COLORS.line}`, padding: 8, marginTop: 8 }}>
-            <img src={job.signature} alt="Customer signature" style={{ width: "100%", height: 80, objectFit: "contain" }} />
-          </div>
-        </div>
-      )}
-
+      {/* ---- Work: service checklist ---- */}
       {activeServices.length > 0 && (
-        <div style={{ marginBottom: 14 }}>
-          <div style={labelStyle}>Service checklist</div>
-          <div style={{ display: "flex", flexDirection: "column", gap: 8, marginTop: 8 }}>
+        <section style={{ marginBottom: 16 }}>
+          <div style={{ ...eyebrowStyle, marginBottom: 8 }}>Work · {activeServices.filter(isServiceComplete).length}/{activeServices.length} done</div>
+          <div style={{ display: "flex", flexDirection: "column", gap: 8 }}>
             {activeServices.map((s) => {
               const assignedId = (job.assignedTo || {})[s.key];
               const assignedMember = team.find((m) => m.id === assignedId);
@@ -6235,22 +8259,22 @@ function JobDetail({ id, initialJob, session, team, onChanged, onBack, canArchiv
               const stepList = stepsForCategory(s.key);
               const currentStepKey = (job.serviceStep || {})[s.key] || (job.serviceDone[s.key] ? stepList[stepList.length - 1].key : stepList[0].key);
               return (
-                <div key={s.key} style={{ borderRadius: 10, border: `1.5px solid ${complete ? COLORS.green : needsReview ? COLORS.gold : COLORS.line}`, background: complete ? "rgba(74,122,87,0.15)" : needsReview ? "rgba(201,162,39,0.1)" : COLORS.panel, overflow: "hidden" }}>
-                  <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", padding: "11px 12px" }}>
-                    <div style={{ display: "flex", alignItems: "center", gap: 8, flex: 1, minWidth: 0 }}>
-                      {job.serviceDone[s.key] ? <CheckCircle2 size={17} color={complete ? COLORS.green : COLORS.gold} style={{ flexShrink: 0 }} /> : <div style={{ width: 17, height: 17, borderRadius: "50%", border: `2px solid ${COLORS.muted}`, flexShrink: 0 }} />}
+                <div key={s.key} style={{ borderRadius: 14, border: `1px solid ${complete ? "rgba(74,122,87,0.6)" : needsReview ? "rgba(201,162,39,0.6)" : COLORS.line}`, background: complete ? "rgba(74,122,87,0.10)" : needsReview ? "rgba(201,162,39,0.08)" : COLORS.panel, overflow: "hidden" }}>
+                  <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", gap: 8, padding: "12px 12px 10px 14px" }}>
+                    <div style={{ display: "flex", alignItems: "center", gap: 10, flex: 1, minWidth: 0 }}>
+                      {job.serviceDone[s.key] ? <CheckCircle2 size={19} color={complete ? COLORS.successText : COLORS.gold} style={{ flexShrink: 0 }} /> : <div style={{ width: 17, height: 17, borderRadius: "50%", border: `2px solid ${COLORS.muted}`, flexShrink: 0 }} />}
                       <span style={{ minWidth: 0 }}>
-                        <div style={{ fontSize: 13.5, fontWeight: 600, color: COLORS.ink }}>{s.label}</div>
+                        <div style={{ fontSize: 14, fontWeight: 600, color: COLORS.ink }}>{s.label}</div>
                         {(job.treatments || {})[s.key]?.length > 0 && (
-                          <div style={{ fontSize: 10.5, color: COLORS.muted, marginTop: 1 }}>{(job.treatments[s.key] || []).join(", ")}</div>
+                          <div style={{ fontSize: 11.5, color: COLORS.muted, marginTop: 2 }}>{(job.treatments[s.key] || []).join(", ")}</div>
                         )}
                       </span>
                     </div>
-                    <button onClick={() => setPickerFor(pickerFor === s.key ? null : s.key)} className="mrcap-press" style={{ background: "none", border: "none", padding: 0, cursor: "pointer", flexShrink: 0 }}>
+                    <button onClick={() => setPickerFor(pickerFor === s.key ? null : s.key)} className="mrcap-press" style={{ background: "none", border: "none", padding: "6px 0", minHeight: 36, cursor: "pointer", flexShrink: 0 }}>
                       {assignedMember ? (
                         <Pill bg={`${ROLE_DEFS[s.role].color}33`} fg={ROLE_DEFS[s.role].color}>{assignedMember.name}</Pill>
                       ) : (
-                        <Pill bg={COLORS.panel2} fg={COLORS.muted}>Assign</Pill>
+                        <Pill bg={COLORS.panel2} fg={COLORS.gold}>+ Assign</Pill>
                       )}
                     </button>
                   </div>
@@ -6260,7 +8284,7 @@ function JobDetail({ id, initialJob, session, team, onChanged, onBack, canArchiv
                       skip Parts Removal while Bodyshop keeps it. Tapping a step
                       jumps straight there; reaching the last step marks the
                       module done exactly as the old toggle did. */}
-                  <div style={{ padding: "0 12px 11px" }}>
+                  <div style={{ padding: "0 12px 12px 14px" }}>
                     <ServiceStepPills
                       steps={stepList}
                       currentKey={currentStepKey}
@@ -6270,53 +8294,55 @@ function JobDetail({ id, initialJob, session, team, onChanged, onBack, canArchiv
                   </div>
 
                   {pickerFor === s.key && (
-                    <div style={{ display: "flex", flexWrap: "wrap", gap: 6, padding: "0 12px 11px" }}>
-                      {candidates.length === 0 && <span style={{ fontSize: 11.5, color: COLORS.muted }}>No one set up for this role yet.</span>}
+                    <div className="mrcap-fade" style={{ display: "flex", flexWrap: "wrap", gap: 6, padding: "0 12px 12px 14px" }}>
+                      {candidates.length === 0 && <span style={{ fontSize: 12, color: COLORS.muted }}>No one set up for this role yet.</span>}
                       {candidates.map((m) => (
-                        <button key={m.id} onClick={() => assignService(s.key, m.id)} style={{ padding: "6px 10px", borderRadius: 999, border: `1.5px solid ${assignedId === m.id ? COLORS.gold : COLORS.line}`, background: assignedId === m.id ? COLORS.gold : COLORS.panel2, color: assignedId === m.id ? COLORS.darkText : COLORS.muted, fontSize: 12, fontWeight: 600, cursor: "pointer" }}>{m.name}</button>
+                        <button key={m.id} onClick={() => assignService(s.key, m.id)} className="mrcap-press" style={{ ...selectChipStyle(assignedId === m.id), minHeight: 36 }}>{m.name}</button>
                       ))}
                     </div>
                   )}
 
                   {/* Per-service note — independent per service, not shared */}
-                  <div style={{ padding: "0 12px 10px" }}>
+                  <div style={{ padding: "0 12px 12px 14px" }}>
                     <input
                       defaultValue={(job.serviceNotes || {})[s.key] || ""}
                       onBlur={(e) => { if (e.target.value !== ((job.serviceNotes || {})[s.key] || "")) setServiceNote(s.key, e.target.value); }}
                       placeholder="Note for this service (optional)"
-                      style={{ width: "100%", boxSizing: "border-box", background: COLORS.panel2, border: `1px solid ${COLORS.line}`, borderRadius: 7, padding: "6px 9px", fontSize: 11.5, color: COLORS.ink, fontFamily: "Inter, sans-serif" }}
+                      style={{ width: "100%", boxSizing: "border-box", minHeight: 40, background: COLORS.panel2, border: `1px solid ${COLORS.line}`, borderRadius: 10, padding: "8px 12px", fontSize: 13, color: COLORS.ink, fontFamily: BODY_FONT }}
                     />
                   </div>
 
                   {/* Damage diagram — shown directly on the Body Work card so
-                      Jobish/Smartech see exactly what to fix without
-                      scrolling back up to the case file. */}
+                      Smartech sees exactly what to fix without scrolling
+                      back up to the case file. */}
                   {s.key === "bodyshop" && job.damageDiagramImage && (
-                    <div style={{ padding: "0 12px 11px" }}>
+                    <div style={{ padding: "0 12px 12px 14px" }}>
                       {job.damagePanels && job.damagePanels.length > 0 && (
                         <div style={{ display: "flex", flexWrap: "wrap", gap: 5, marginBottom: 6 }}>
                           {job.damagePanels.map((p) => <Pill key={p} tone="red">{p}</Pill>)}
                         </div>
                       )}
-                      <button onClick={() => setDamageViewerOpen(true)} className="mrcap-press" style={{ display: "block", width: "100%", background: "#fff", borderRadius: 8, border: `1px solid ${COLORS.line}`, padding: 4, cursor: "pointer" }}>
-                        <img src={job.damageDiagramImage} alt="Damage diagram" style={{ width: "100%", height: "auto", display: "block", borderRadius: 5 }} />
+                      <button onClick={() => setDamageViewerOpen(true)} className="mrcap-press" style={{ display: "block", width: "100%", background: "#fff", borderRadius: 10, border: `1px solid ${COLORS.line}`, padding: 4, cursor: "pointer" }}>
+                        <img src={job.damageDiagramImage} alt="Damage diagram" style={{ width: "100%", height: "auto", display: "block", borderRadius: 6 }} />
                       </button>
                     </div>
                   )}
 
                   {/* Reviewer step — only for services with a reviewerRole (PPF & Films) */}
                   {s.reviewerRole && job.serviceDone[s.key] && (
-                    <div style={{ padding: "0 12px 11px" }}>
+                    <div style={{ padding: "0 12px 12px 14px" }}>
                       {review ? (
-                        <div style={{ display: "flex", alignItems: "center", gap: 6, fontSize: 11.5, color: "#7BC494" }}>
-                          <CheckCircle2 size={13} color={COLORS.green} /> {s.reviewerNote} — {review.by}
+                        <div style={{ display: "flex", alignItems: "center", gap: 6, fontSize: 12, color: COLORS.successText }}>
+                          <CheckCircle2 size={14} color={COLORS.successText} /> {s.reviewerNote} — {review.by}
                         </div>
+                      ) : canReview && s.key === "ppf" ? (
+                        <PPFReviewerPanel job={job} onApprove={(extra) => reviewService("ppf", extra)} />
                       ) : canReview ? (
-                        <button onClick={() => reviewService(s.key)} className="mrcap-press" style={{ width: "100%", padding: "8px", borderRadius: 7, border: `1.5px solid ${COLORS.gold}`, background: COLORS.gold, color: COLORS.darkText, fontSize: 12, fontWeight: 700, cursor: "pointer" }}>
+                        <button onClick={() => reviewService(s.key)} className="mrcap-press" style={{ ...primaryBtnStyle, width: "100%", minHeight: 42, padding: "8px", fontSize: 13 }}>
                           Confirm review
                         </button>
                       ) : (
-                        <div style={{ fontSize: 11.5, color: COLORS.gold }}>Waiting on {s.reviewerNote.replace("Reviewed by ", "")}'s review</div>
+                        <div style={{ fontSize: 12, color: COLORS.gold }}>Waiting on {s.reviewerNote.replace("Reviewed by ", "")}'s review</div>
                       )}
                     </div>
                   )}
@@ -6324,71 +8350,445 @@ function JobDetail({ id, initialJob, session, team, onChanged, onBack, canArchiv
               );
             })}
           </div>
-        </div>
+        </section>
       )}
 
-      {introPhotos.length > 0 && (
-        <div style={{ marginBottom: 16 }}>
-          <div style={labelStyle}>Photos · tap to view or save</div>
-          <div style={{ display: "flex", flexWrap: "wrap", gap: 8, marginTop: 8 }}>
+      {job.serviceTypes.includes("ppf") && (
+        <PPFScopeEditor job={job} session={session} team={team} onSaved={(updated, saved) => { setJob(updated); notifyChanged(updated, saved); }} />
+      )}
+      {job.serviceTypes.includes("ppf") && <PPFOfficeView job={job} team={team} />}
+
+      {hasPermission(session, team, "editJob") && (
+        <section style={{ ...cardStyle, marginBottom: 16 }}>
+          <div style={{ display: "flex", alignItems: "center", gap: 8, marginBottom: 12 }}>
+            <Wrench size={15} color={COLORS.gold} />
+            <div style={{ fontFamily: DISPLAY_FONT, fontWeight: 700, fontSize: 16, color: COLORS.ink }}>Parts & Charges</div>
+          </div>
+          <PartsEditor parts={job.parts || []} onChange={updateJobParts} showTotal />
+        </section>
+      )}
+
+      {/* ---- Photos ---- */}
+      <section style={{ marginBottom: 16 }}>
+        <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 8 }}>
+          <span style={eyebrowStyle}>Photos · {introPhotos.length}</span>
+          <button onClick={() => completionFileRef.current?.click()} disabled={uploadingCompletion} className="mrcap-press" style={{ display: "flex", alignItems: "center", gap: 6, minHeight: 36, padding: "0 4px", background: "none", border: "none", color: COLORS.gold, fontSize: 12.5, fontWeight: 600, cursor: "pointer" }}>
+            <Camera size={14} /> {uploadingCompletion ? "Uploading…" : "Add Completion Photo"}
+          </button>
+        </div>
+        {introPhotos.length > 0 ? (
+          <div style={{ display: "grid", gridTemplateColumns: "repeat(4, minmax(0, 1fr))", gap: 6 }}>
             {introPhotos.map((p, i) => (
-              <button key={i} onClick={() => setViewerIndex(i)} className="mrcap-press" style={{ width: 68, background: "none", border: "none", padding: 0, cursor: "pointer" }}>
-                <img src={p.src} alt="" style={{ width: 68, height: 68, objectFit: "cover", borderRadius: 8, border: `1px solid ${COLORS.line}` }} />
-                <div style={{ fontSize: 9.5, color: COLORS.muted, textAlign: "center", marginTop: 3 }}>{p.label}</div>
+              <button key={i} onClick={() => setViewerIndex(i)} className="mrcap-press" style={{ position: "relative", aspectRatio: "1 / 1", background: COLORS.panel2, border: `1px solid ${COLORS.line}`, borderRadius: 10, padding: 0, overflow: "hidden", cursor: "pointer" }} title={`${p.label} — tap to view or save`}>
+                <img src={p.src} alt="" style={{ width: "100%", height: "100%", objectFit: "cover", display: "block" }} />
+                <span style={{ position: "absolute", left: 0, right: 0, bottom: 0, padding: "10px 5px 3px", fontSize: 9.5, fontWeight: 600, color: "#fff", background: "linear-gradient(transparent, rgba(0,0,0,0.7))", textAlign: "left" }}>{p.label}</span>
               </button>
             ))}
           </div>
-        </div>
-      )}
+        ) : (
+          <button onClick={() => completionFileRef.current?.click()} className="mrcap-press" style={{ ...cameraBtnStyle, width: "100%", height: 64, marginTop: 0, color: COLORS.muted }}><Camera size={18} /> No photos yet — add one</button>
+        )}
+      </section>
 
       <PhotoViewer photos={introPhotos} index={viewerIndex} onClose={() => window.history.back()} onNavigate={setViewerIndex} />
-      <button onClick={() => completionFileRef.current?.click()} disabled={uploadingCompletion} className="mrcap-press" style={{ marginTop: 8, display: "flex", alignItems: "center", gap: 6, padding: "7px 11px", borderRadius: 8, border: `1px dashed ${COLORS.gold}`, background: "rgba(201,162,39,0.08)", color: COLORS.gold, fontSize: 11.5, fontWeight: 600, cursor: "pointer" }}>
-        <Camera size={13} /> {uploadingCompletion ? "Uploading…" : "Add Completion Photo"}
-      </button>
       <input ref={completionFileRef} type="file" accept="image/*" multiple style={{ display: "none" }} onChange={(e) => e.target.files.length && addCompletionPhotos(e.target.files)} />
       {damageViewerOpen && job.damageDiagramImage && (
         <PhotoViewer photos={[{ src: job.damageDiagramImage, label: "Damage diagram" }]} index={0} onClose={() => window.history.back()} onNavigate={() => {}} />
       )}
 
-      <div style={{ marginBottom: 18 }}>
-        <div style={labelStyle}>History</div>
-        <div style={{ marginTop: 8, display: "flex", flexDirection: "column", gap: 10 }}>
-          {job.history.slice().reverse().map((h, i) => (
-            <div key={i} style={{ display: "flex", gap: 10 }}>
-              <CheckCircle2 size={15} color={COLORS.green} style={{ flexShrink: 0, marginTop: 2 }} />
-              <div>
-                <div style={{ fontSize: 13, color: COLORS.ink }}><b>{h.label}</b> · {h.by} <span style={{ color: COLORS.muted }}>({ROLE_DEFS[h.role]?.label || h.role})</span></div>
-                {h.note && <div style={{ fontSize: 12.5, color: COLORS.muted }}>{h.note}</div>}
-                <div style={{ fontSize: 11, color: COLORS.muted }}>{fmtTime(h.at)}</div>
-              </div>
-            </div>
-          ))}
-        </div>
-      </div>
+      {(job.description || job.damageNotes) && (
+        <section style={{ ...cardStyle, marginBottom: 16 }}>
+          {job.description && <InfoBlock title="Requested work">{job.description}</InfoBlock>}
+          {job.damageNotes && <InfoBlock title="Damage / walk-around notes">{job.damageNotes}</InfoBlock>}
+        </section>
+      )}
 
-      {!isLast ? (
-        <div style={{ background: COLORS.panel, border: `1px solid ${COLORS.line}`, borderRadius: 13, padding: 15 }}>
-          <div style={{ fontSize: 12.5, color: COLORS.muted, marginBottom: 8, display: "flex", alignItems: "center", gap: 5 }}>
-            <Wrench size={13} /> Next: <b style={{ color: COLORS.ink }}>{nextStage.label}</b>
-          </div>
-          {stage.key === "parts_removal" && (
-            <>
-              <PhotoGrid photos={pendingPhotos} onRemove={(i) => setPendingPhotos((p) => p.filter((_, idx) => idx !== i))} />
-              <input ref={fileRef} type="file" accept="image/*" multiple style={{ display: "none" }} onChange={(e) => e.target.files.length && addPendingPhotos(e.target.files)} />
-              <button onClick={() => fileRef.current.click()} style={cameraBtnStyle}><Camera size={15} /> Add photo</button>
-            </>
+      {job.damageDiagramImage && (
+        <div style={{ marginBottom: 16 }}>
+          <div style={labelStyle}>Body damage — panels & location</div>
+          {job.damagePanels && job.damagePanels.length > 0 && (
+            <div style={{ display: "flex", flexWrap: "wrap", gap: 6, marginTop: 8, marginBottom: 8 }}>
+              {job.damagePanels.map((p) => <Pill key={p} tone="red">{p}</Pill>)}
+            </div>
           )}
-          {stage.key === "service" && !allServicesDone && (
-            <div style={{ fontSize: 12, color: COLORS.red, marginBottom: 8 }}>Check off every service above before advancing.</div>
-          )}
-          <textarea value={note} onChange={(e) => setNote(e.target.value)} placeholder="Add a note (optional)" style={{ ...textareaStyle, minHeight: 50, marginTop: 10 }} />
-          <button onClick={advance} disabled={busy || (stage.key === "service" && !allServicesDone)} className="mrcap-press" style={{ ...primaryBtnStyle, width: "100%", marginTop: 10, opacity: busy || (stage.key === "service" && !allServicesDone) ? 0.5 : 1, position: "relative", overflow: "hidden" }}>
-            <span style={{ position: "relative", zIndex: 1 }}>{busy ? "Saving…" : `Mark done → "${nextStage.label}"`}</span>
-            {!busy && !(stage.key === "service" && !allServicesDone) && <span className="mrcap-sweep" style={{ position: "absolute", inset: 0 }} />}
+          <button onClick={() => setDamageViewerOpen(true)} className="mrcap-press" style={{ display: "block", width: "100%", background: "#fff", borderRadius: 14, border: `1px solid ${COLORS.line}`, padding: 6, cursor: "pointer", marginTop: 8 }}>
+            <img src={job.damageDiagramImage} alt="Damage diagram" style={{ width: "100%", height: "auto", display: "block", borderRadius: 8 }} />
           </button>
         </div>
+      )}
+
+      {job.signature && (
+        <div style={{ marginBottom: 16 }}>
+          <div style={labelStyle}>Customer signature{job.signedAt ? ` · ${fmtTime(job.signedAt)}` : ""}</div>
+          <div style={{ background: "#fff", borderRadius: 14, border: `1px solid ${COLORS.line}`, padding: 8, marginTop: 8 }}>
+            <img src={job.signature} alt="Customer signature" style={{ width: "100%", height: 80, objectFit: "contain" }} />
+          </div>
+        </div>
+      )}
+
+      {/* Smartech's own progress: description, photos, status flag, and
+          comments — visible to any staff viewing this job (not gated to
+          the approval list like the purchases panel below, which is
+          financial data). Photos here are the same ones Smartech
+          uploads from their portal — this IS the "feeds into the main
+          job view" surface for them, see SmartechJobDetail. */}
+      {(job.smartechFlag || job.smartechDescription || (job.smartechPhotos || []).length > 0) && (
+        <section style={{ ...cardStyle, marginBottom: 16 }}>
+          <div style={{ display: "flex", alignItems: "center", gap: 8, marginBottom: 8 }}>
+            <Wrench size={15} color={COLORS.gold} />
+            <div style={{ fontFamily: DISPLAY_FONT, fontWeight: 700, fontSize: 16, color: COLORS.ink }}>Smartech</div>
+            {job.smartechStatus && (
+              <div style={{ marginLeft: "auto", fontSize: 10.5, fontWeight: 700, color: COLORS.successText, textTransform: "uppercase", letterSpacing: 0.6 }}>
+                {job.smartechStatus === "done" ? "Done" : "Ready for Collection"}
+              </div>
+            )}
+          </div>
+          {job.smartechDescription && <div style={{ fontSize: 13, color: COLORS.ink, marginBottom: 10, lineHeight: 1.45 }}>{job.smartechDescription}</div>}
+          {(job.smartechPhotos || []).length > 0 && (
+            <div style={{ marginBottom: 10 }}><PhotoGrid photos={(job.smartechPhotos || []).map((p) => p.url)} /></div>
+          )}
+          {(job.history || []).filter((h) => h.stage === "smartech_comment").slice(-3).reverse().map((c, i) => (
+            <div key={i} style={{ fontSize: 12, color: COLORS.muted, marginTop: 4 }}>
+              <span style={{ color: COLORS.ink }}>{c.note}</span> — {c.by}
+            </div>
+          ))}
+        </section>
+      )}
+
+      {canApproveSmartech(session) && (job.smartechPurchases || []).length > 0 && (
+        <section style={{ ...cardStyle, marginBottom: 16 }}>
+          <div style={{ display: "flex", alignItems: "center", gap: 8, marginBottom: 3 }}>
+            <Receipt size={15} color={COLORS.gold} />
+            <div style={{ fontFamily: DISPLAY_FONT, fontWeight: 700, fontSize: 16, color: COLORS.ink }}>Smartech Purchases</div>
+            <Lock size={12} color={COLORS.muted} style={{ marginLeft: "auto" }} />
+          </div>
+          <div style={{ fontSize: 11, color: COLORS.muted, marginBottom: 12, display: "flex", alignItems: "center", gap: 5, fontStyle: "italic" }}>
+            <Lock size={9} /> Internal reference only — the customer never sees this section or its photos.
+          </div>
+          <SmartechEntryList title="Purchases" entries={job.smartechPurchases} />
+        </section>
+      )}
+
+      {hasPermission(session, team, "statusUpdate") && (
+        <section ref={updateRef} style={{ ...cardStyle, marginBottom: 16, scrollMarginTop: 70 }}>
+          <div style={{ display: "flex", alignItems: "center", gap: 8, marginBottom: 3 }}>
+            <MessageSquare size={15} color={COLORS.gold} />
+            <div style={{ fontFamily: DISPLAY_FONT, fontWeight: 700, fontSize: 16, color: COLORS.ink }}>Admin Update</div>
+          </div>
+          <div style={{ fontSize: 12, color: COLORS.muted, marginBottom: 12, lineHeight: 1.45 }}>
+            Internal only — posts to the Live Updates admin board, not shown to the customer. Pick one or type your own.
+          </div>
+
+          {(job.history || []).filter((h) => h.stage === "progress_update").slice(-3).reverse().length > 0 && (
+            <div style={{ display: "flex", flexDirection: "column", gap: 6, marginBottom: 12 }}>
+              {(job.history || []).filter((h) => h.stage === "progress_update").slice(-3).reverse().map((h, i) => (
+                <div key={i} style={{ background: "rgba(201,162,39,0.08)", borderLeft: `3px solid ${COLORS.gold}`, borderRadius: 10, padding: "9px 12px" }}>
+                  <div style={{ fontSize: 13, color: COLORS.ink, fontWeight: 600 }}>{h.note}</div>
+                  <div style={{ fontSize: 11, color: COLORS.muted, marginTop: 2 }}>{h.by} · {new Date(h.at).toLocaleString()}</div>
+                </div>
+              ))}
+            </div>
+          )}
+
+          {dupeUpdateWarning && (
+            <div style={{ fontSize: 12, color: COLORS.gold, background: "rgba(201,162,39,0.12)", border: "1px solid rgba(201,162,39,0.5)", borderRadius: 10, padding: "8px 11px", marginBottom: 10 }}>
+              {dupeUpdateWarning}
+            </div>
+          )}
+          <div style={{ display: "flex", flexWrap: "wrap", gap: 6, marginBottom: 10 }}>
+            {DISPATCH_UPDATE_PRESETS.map((preset) => (
+              <button
+                key={preset}
+                onClick={() => postAdminUpdate(preset)}
+                disabled={savingStatusNote}
+                className="mrcap-press"
+                style={{ ...selectChipStyle(false), minHeight: 38, fontSize: 12.5, opacity: savingStatusNote ? 0.6 : 1 }}
+              >
+                {preset}
+              </button>
+            ))}
+          </div>
+
+          <div style={{ display: "flex", gap: 8 }}>
+            <input
+              value={customStatusNote}
+              onChange={(e) => setCustomStatusNote(e.target.value)}
+              placeholder="Or type a custom update…"
+              style={{ ...inputStyle, marginTop: 0, flex: 1, minWidth: 0 }}
+              onKeyDown={(e) => { if (e.key === "Enter" && customStatusNote.trim()) postAdminUpdate(customStatusNote); }}
+            />
+            <button
+              onClick={() => postAdminUpdate(customStatusNote)}
+              disabled={savingStatusNote || !customStatusNote.trim()}
+              className="mrcap-press"
+              style={{ ...primaryBtnStyle, minHeight: 46, padding: "0 18px", boxShadow: "none", opacity: savingStatusNote || !customStatusNote.trim() ? 0.45 : 1 }}
+            >
+              Post
+            </button>
+          </div>
+        </section>
+      )}
+
+      {hasPermission(session, team, "markupCalc") && (
+        <section style={{ ...cardStyle, marginBottom: 16 }}>
+          <div style={{ display: "flex", alignItems: "center", gap: 8, marginBottom: 3 }}>
+            <TrendingUp size={15} color={COLORS.gold} />
+            <div style={{ fontFamily: DISPLAY_FONT, fontWeight: 700, fontSize: 16, color: COLORS.ink }}>Markup Calculator</div>
+            <Lock size={12} color={COLORS.muted} style={{ marginLeft: "auto" }} />
+          </div>
+          <div style={{ fontSize: 12, color: COLORS.muted, marginBottom: 4, lineHeight: 1.45 }}>
+            Enter a cost (e.g. a supplier or parts bill) and a markup % — this works out what to charge and saves it with the job.
+          </div>
+          <div style={{ fontSize: 11, color: COLORS.muted, marginBottom: 12, display: "flex", alignItems: "center", gap: 5, fontStyle: "italic" }}>
+            <Lock size={9} /> Internal reference only — the customer never sees this section or its photos.
+          </div>
+
+          {(job.markupEntries || []).length > 0 && (
+            <div style={{ display: "flex", flexDirection: "column", gap: 6, marginBottom: 12 }}>
+              {job.markupEntries.map((e) => (
+                <div key={e.id} style={{ display: "flex", alignItems: "center", gap: 8, background: COLORS.panel2, border: `1px solid ${COLORS.line}`, borderRadius: 12, padding: "9px 6px 9px 11px" }}>
+                  {(e.photos || []).length > 0 && (
+                    <img
+                      src={e.photos[0]}
+                      alt=""
+                      onClick={() => setMarkupPhotoViewer({ photos: e.photos.map((src) => ({ src, label: e.description })), index: 0 })}
+                      style={{ width: 40, height: 40, objectFit: "cover", borderRadius: 8, border: `1px solid ${COLORS.line}`, cursor: "pointer", flexShrink: 0 }}
+                    />
+                  )}
+                  <div style={{ flex: 1, minWidth: 0 }}>
+                    <div style={{ fontSize: 13, color: COLORS.ink, fontWeight: 600 }}>{e.description}</div>
+                    <div style={{ fontSize: 11.5, color: COLORS.muted, marginTop: 1 }}>Cost AED {e.cost.toLocaleString()} + {e.markupPercent}%{(e.photos || []).length > 1 ? ` · ${e.photos.length} photos` : ""}</div>
+                  </div>
+                  <div style={{ fontFamily: MONO_FONT, fontWeight: 600, fontSize: 14, color: COLORS.gold, whiteSpace: "nowrap" }}>AED {e.chargePrice.toLocaleString()}</div>
+                  <button onClick={() => removeMarkupEntry(e.id)} className="mrcap-press" style={{ background: "none", border: "none", color: COLORS.muted, cursor: "pointer", width: 36, height: 36, display: "flex", alignItems: "center", justifyContent: "center", flexShrink: 0 }} title="Remove">
+                    <X size={15} />
+                  </button>
+                </div>
+              ))}
+              <div style={{ display: "flex", justifyContent: "space-between", fontSize: 12.5, color: COLORS.muted, padding: "2px 2px 0" }}>
+                <span>Total to charge</span>
+                <span style={{ fontWeight: 700, color: COLORS.ink, fontFamily: MONO_FONT }}>AED {job.markupEntries.reduce((sum, e) => sum + e.chargePrice, 0).toLocaleString()}</span>
+              </div>
+            </div>
+          )}
+
+          <div style={{ display: "flex", gap: 8, marginBottom: 8 }}>
+            <input value={markupDesc} onChange={(e) => setMarkupDesc(e.target.value)} placeholder="What is this? e.g. Front bumper" style={{ ...inputStyle, marginTop: 0, flex: 1 }} />
+          </div>
+          <div style={{ display: "flex", gap: 8, marginBottom: 8 }}>
+            <input type="number" inputMode="decimal" value={markupCost} onChange={(e) => setMarkupCost(e.target.value)} placeholder="Cost (AED)" style={{ ...inputStyle, marginTop: 0, flex: 1, minWidth: 0 }} />
+            <input type="number" inputMode="decimal" value={markupPercent} onChange={(e) => setMarkupPercent(e.target.value)} placeholder="Markup %" style={{ ...inputStyle, marginTop: 0, flex: 1, minWidth: 0 }} />
+          </div>
+          {markupCost && markupPercent !== "" && Number(markupCost) > 0 && (
+            <div style={{ fontSize: 12.5, color: COLORS.muted, marginBottom: 10 }}>
+              Charge: <span style={{ color: COLORS.gold, fontWeight: 700, fontFamily: MONO_FONT }}>AED {(Number(markupCost) * (1 + Number(markupPercent) / 100)).toLocaleString(undefined, { maximumFractionDigits: 2 })}</span>
+            </div>
+          )}
+
+          <PhotoGrid photos={markupPhotos} onRemove={removeMarkupPhoto} />
+          <input ref={markupFileRef} type="file" accept="image/*" multiple style={{ display: "none" }} onChange={(e) => e.target.files.length && addMarkupPhotos(e.target.files)} />
+          <button
+            onClick={() => markupFileRef.current.click()}
+            className="mrcap-press"
+            style={{ ...cameraBtnStyle, width: "100%", marginTop: 4, marginBottom: 10, color: COLORS.muted, fontSize: 12.5 }}
+          >
+            <Camera size={14} /> {uploadingMarkupPhoto ? "Uploading…" : markupPhotos.length ? "Add Another Bill Photo" : "Attach Bill / Receipt Photo"}
+          </button>
+
+          <button
+            onClick={addMarkupEntry}
+            disabled={savingMarkup || !markupCost || Number(markupCost) <= 0 || markupPercent === ""}
+            className="mrcap-press"
+            style={{ ...secondaryBtnStyle, width: "100%", opacity: savingMarkup || !markupCost || Number(markupCost) <= 0 || markupPercent === "" ? 0.45 : 1 }}
+          >
+            {savingMarkup ? "Saving…" : "Add Entry"}
+          </button>
+        </section>
+      )}
+
+      {markupPhotoViewer && (
+        <PhotoViewer
+          photos={markupPhotoViewer.photos}
+          index={markupPhotoViewer.index}
+          onClose={() => setMarkupPhotoViewer(null)}
+          onNavigate={(i) => setMarkupPhotoViewer((v) => ({ ...v, index: i }))}
+        />
+      )}
+
+      {/* ---- Documents & job management ---- */}
+      {(isFullDashboardRole(session) || (onCreateProforma && canUseBilling(session, team)) || hasPermission(session, team, "editJob") || hasPermission(session, team, "sendBack") || hasPermission(session, team, "delete")) && (
+        <section style={{ marginBottom: 16 }}>
+          <div style={{ ...eyebrowStyle, marginBottom: 8 }}>Documents & actions</div>
+
+          {isFullDashboardRole(session) && (
+            <div style={{ marginBottom: 10 }}>
+              {finalizeError && (
+                <div style={{ fontSize: 12, color: COLORS.dangerText, marginBottom: 8 }}>{finalizeError}</div>
+              )}
+
+              {job.invoiceNo && (
+                <div style={{ fontSize: 11.5, color: COLORS.muted, marginBottom: 8 }}>
+                  Invoice <span style={{ fontFamily: MONO_FONT, color: COLORS.gold }}>{job.invoiceNo}</span> — finalized by {job.invoiceFinalizedBy} on {job.invoiceFinalizedAt ? new Date(job.invoiceFinalizedAt).toLocaleDateString() : ""}
+                </div>
+              )}
+
+              <button
+                onClick={async () => {
+                  setFinalizeError("");
+                  if (!job.invoiceNo) {
+                    setFinalizingInvoice(true);
+                    const result = await finalizeInvoiceNumber(job, session);
+                    setFinalizingInvoice(false);
+                    if (!result.ok) { setFinalizeError(result.error); return; }
+                    setJob(result.job);
+                    const doc = generateJobCardPDF(result.job);
+                    doc.save(`MrCAP-Invoice-${result.invoiceNo}.pdf`);
+                  } else {
+                    // Already finalized — reprint the exact same number, no
+                    // new number is ever consumed for the same job.
+                    const doc = generateJobCardPDF(job);
+                    doc.save(`MrCAP-Invoice-${job.invoiceNo}.pdf`);
+                  }
+                }}
+                disabled={finalizingInvoice}
+                className="mrcap-press"
+                style={{ ...secondaryBtnStyle, display: "flex", alignItems: "center", justifyContent: "center", gap: 8, width: "100%", border: "1px solid rgba(201,162,39,0.55)", color: COLORS.gold, cursor: finalizingInvoice ? "default" : "pointer", opacity: finalizingInvoice ? 0.7 : 1 }}
+              >
+                <FileText size={16} /> {finalizingInvoice ? "Finalizing..." : job.invoiceNo ? "Reprint Invoice" : "Finalize & Generate Invoice"}
+              </button>
+            </div>
+          )}
+
+          {onCreateProforma && canUseBilling(session, team) && (
+            <button onClick={() => onCreateProforma(job)} className="mrcap-press" style={{ ...secondaryBtnStyle, display: "flex", alignItems: "center", justifyContent: "center", gap: 8, width: "100%", marginBottom: 10 }}>
+              <Receipt size={16} color={COLORS.gold} /> Create Proforma for this job
+            </button>
+          )}
+
+          {isFullDashboardRole(session) && (
+            job.onHold ? (
+              <button onClick={takeOffHold} disabled={busy} className="mrcap-press" style={{ ...secondaryBtnStyle, display: "flex", alignItems: "center", justifyContent: "center", gap: 8, width: "100%", border: "1px solid rgba(74,122,87,0.6)", background: "rgba(74,122,87,0.1)", color: COLORS.successText, marginBottom: 10, opacity: busy ? 0.6 : 1 }}>
+                <PauseCircle size={16} /> Take Off Hold
+              </button>
+            ) : showHoldPrompt ? (
+              <div className="mrcap-fade" style={{ padding: "12px 14px", borderRadius: 14, border: "1px solid rgba(201,162,39,0.55)", background: COLORS.panel, marginBottom: 10, display: "flex", flexDirection: "column", gap: 8 }}>
+                <div style={{ fontSize: 13, color: COLORS.ink, fontWeight: 600 }}>Why is this car going on hold?</div>
+                <input autoFocus value={holdNoteInput} onChange={(e) => setHoldNoteInput(e.target.value)} placeholder="e.g. Showroom display — owner's request" style={{ ...inputStyle, marginTop: 0 }} />
+                <div style={{ display: "flex", gap: 8 }}>
+                  <button onClick={() => putOnHold(holdNoteInput)} disabled={busy || !holdNoteInput.trim()} className="mrcap-press" style={{ ...primaryBtnStyle, flex: 1, boxShadow: "none", opacity: busy || !holdNoteInput.trim() ? 0.45 : 1 }}>Confirm On Hold</button>
+                  <button onClick={() => { setShowHoldPrompt(false); setHoldNoteInput(""); }} className="mrcap-press" style={{ ...secondaryBtnStyle, padding: "0 16px" }}>Cancel</button>
+                </div>
+              </div>
+            ) : (
+              <button onClick={() => setShowHoldPrompt(true)} className="mrcap-press" style={{ ...secondaryBtnStyle, display: "flex", alignItems: "center", justifyContent: "center", gap: 8, width: "100%", marginBottom: 10, color: COLORS.gold }}>
+                <PauseCircle size={16} /> Put On Hold
+              </button>
+            )
+          )}
+
+          {(hasPermission(session, team, "editJob") || hasPermission(session, team, "sendBack")) && (
+            <div style={{ display: "flex", gap: 8, marginBottom: 10 }}>
+              {hasPermission(session, team, "editJob") && (
+                <button onClick={() => setEditing(true)} className="mrcap-press" style={{ ...secondaryBtnStyle, flex: 1, display: "flex", alignItems: "center", justifyContent: "center", gap: 7 }}>
+                  <Wrench size={15} color={COLORS.gold} /> Edit Job
+                </button>
+              )}
+              {job.stageIndex > 0 && hasPermission(session, team, "sendBack") && (
+                <button onClick={() => setShowReverseConfirm((v) => !v)} className="mrcap-press" style={{ ...secondaryBtnStyle, flex: 1, display: "flex", alignItems: "center", justifyContent: "center", gap: 7, color: COLORS.dangerText, border: "1px solid rgba(214,106,86,0.4)" }}>
+                  <ChevronLeft size={15} /> Send Back
+                </button>
+              )}
+            </div>
+          )}
+
+          {showReverseConfirm && (
+            <div className="mrcap-fade" style={{ background: "rgba(168,64,47,0.12)", border: "1px solid rgba(168,64,47,0.6)", borderRadius: 14, padding: 14, marginBottom: 10 }}>
+              <div style={{ fontSize: 13, color: COLORS.dangerText, marginBottom: 10 }}>
+                Move this job back from <b>{stage.label}</b> to <b>{STAGES[job.stageIndex - 1].label}</b>?
+              </div>
+              {Object.keys(job.serviceReviewed || {}).length > 0 && (
+                <label style={{ display: "flex", alignItems: "center", gap: 8, marginBottom: 12, fontSize: 12.5, color: COLORS.ink, cursor: "pointer" }}>
+                  <input type="checkbox" checked={clearReviewsOnReverse} onChange={(e) => setClearReviewsOnReverse(e.target.checked)} style={{ width: 18, height: 18, accentColor: COLORS.gold }} />
+                  Also clear existing review sign-off(s)
+                </label>
+              )}
+              <div style={{ display: "flex", gap: 8 }}>
+                <button onClick={() => setShowReverseConfirm(false)} className="mrcap-press" style={{ ...secondaryBtnStyle, flex: 1 }}>Cancel</button>
+                <button onClick={() => reverseStage(clearReviewsOnReverse)} disabled={busy} className="mrcap-press" style={{ ...dangerBtnStyle, flex: 1 }}>
+                  {busy ? "…" : "Confirm"}
+                </button>
+              </div>
+            </div>
+          )}
+
+          {hasPermission(session, team, "delete") && (
+            <button onClick={() => { setShowDeleteConfirm(true); setDeleteConfirmText(""); }} className="mrcap-press" style={{ ...secondaryBtnStyle, display: "flex", alignItems: "center", justifyContent: "center", gap: 7, width: "100%", border: "1px solid rgba(168,64,47,0.55)", background: "rgba(168,64,47,0.08)", color: COLORS.dangerText, marginBottom: 10 }}>
+              <Trash2 size={15} /> Delete Job Card
+            </button>
+          )}
+
+          {showDeleteConfirm && (
+            <div className="mrcap-fade" style={{ background: "#2A1512", border: `1px solid ${COLORS.red}`, borderRadius: 16, padding: 16, marginBottom: 10 }}>
+              <div style={{ display: "flex", alignItems: "center", gap: 8, marginBottom: 10 }}>
+                <ShieldAlert size={20} color={COLORS.dangerText} />
+                <div style={{ fontFamily: DISPLAY_FONT, fontWeight: 700, fontSize: 17, color: COLORS.dangerText }}>This cannot be undone</div>
+              </div>
+              <div style={{ fontSize: 13, color: "#F0C4BA", marginBottom: 12, lineHeight: 1.5 }}>
+                Deleting <b>{job.plate}</b> permanently removes this job card, its photos, and its full history. It will NOT appear in Archive. The deletion itself will be logged with your name and the time, but the job's contents are gone for good.
+              </div>
+              <div style={{ fontSize: 12, color: "#F0C4BA", marginBottom: 8 }}>Type <b>DELETE</b> to confirm:</div>
+              <input
+                value={deleteConfirmText}
+                onChange={(e) => setDeleteConfirmText(e.target.value)}
+                placeholder="DELETE"
+                style={{ width: "100%", boxSizing: "border-box", minHeight: 46, background: "#2A100D", border: `1px solid ${COLORS.red}`, borderRadius: 12, padding: "10px 14px", fontSize: 15, color: "#fff", fontFamily: MONO_FONT, marginBottom: 12, letterSpacing: 1.5 }}
+              />
+              <div style={{ display: "flex", gap: 8 }}>
+                <button onClick={() => setShowDeleteConfirm(false)} className="mrcap-press" style={{ ...secondaryBtnStyle, flex: 1 }}>Cancel</button>
+                <button onClick={handleDelete} disabled={deleteConfirmText !== "DELETE" || deleting} className="mrcap-press" style={{ ...dangerBtnStyle, flex: 1, cursor: deleteConfirmText === "DELETE" ? "pointer" : "not-allowed", opacity: deleteConfirmText === "DELETE" ? 1 : 0.45 }}>
+                  {deleting ? "Deleting…" : "Permanently Delete"}
+                </button>
+              </div>
+            </div>
+          )}
+        </section>
+      )}
+
+      {/* ---- Timeline ---- */}
+      <section style={{ marginBottom: 8 }}>
+        <div style={{ ...eyebrowStyle, marginBottom: 10 }}>History</div>
+        <div style={{ position: "relative", paddingLeft: 20 }}>
+          <div aria-hidden="true" style={{ position: "absolute", left: 5, top: 6, bottom: 6, width: 2, background: COLORS.line, borderRadius: 1 }} />
+          {job.history.slice().reverse().map((h, i) => {
+            const isStage = STAGES.some((s) => s.key === h.stage && s.label === h.label);
+            const dot = h.stage === "reversed" ? COLORS.red : h.stage === "progress_update" ? COLORS.blue : isStage ? COLORS.gold : h.stage === "service" && h.note === "Marked done" ? COLORS.green : COLORS.muted;
+            return (
+              <div key={i} style={{ position: "relative", paddingBottom: 14 }}>
+                <span aria-hidden="true" style={{ position: "absolute", left: -20, top: 4, width: 12, height: 12, borderRadius: "50%", background: i === 0 ? dot : COLORS.paper, border: `2px solid ${dot}`, boxSizing: "border-box" }} />
+                <div style={{ fontSize: 13.5, color: COLORS.ink, lineHeight: 1.35 }}><b style={{ fontWeight: 600 }}>{h.label}</b> · {h.by} <span style={{ color: COLORS.muted }}>({ROLE_DEFS[h.role]?.label || h.role})</span></div>
+                {h.note && <div style={{ fontSize: 12.5, color: COLORS.muted, marginTop: 1, lineHeight: 1.4 }}>{h.note}</div>}
+                <div style={{ fontSize: 11, color: COLORS.muted, marginTop: 2, fontFamily: MONO_FONT }}>{fmtTime(h.at)}</div>
+              </div>
+            );
+          })}
+        </div>
+      </section>
+
+      {!isLast ? (
+        <StickyActionBar>
+          {hasPermission(session, team, "statusUpdate") && (
+            <button onClick={() => updateRef.current?.scrollIntoView({ behavior: "smooth", block: "start" })} className="mrcap-press" aria-label="Post update" title="Post update" style={{ ...secondaryBtnStyle, width: 54, minHeight: 54, padding: 0, background: COLORS.panel, display: "flex", alignItems: "center", justifyContent: "center", flexShrink: 0 }}>
+              <MessageSquare size={20} color={COLORS.gold} />
+            </button>
+          )}
+          <button onClick={advance} disabled={busy || (stage.key === "service" && !allServicesDone)} className="mrcap-press" style={{ ...primaryBtnStyle, flex: 1, minWidth: 0, minHeight: 54, borderRadius: 14, fontSize: 15, display: "flex", alignItems: "center", justifyContent: "center", gap: 8, opacity: busy || (stage.key === "service" && !allServicesDone) ? 0.45 : 1, position: "relative", overflow: "hidden" }}>
+            <span style={{ position: "relative", zIndex: 1, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{busy ? "Saving…" : stage.key === "service" && !allServicesDone ? "Finish every service first" : `Mark done → ${nextStage.label}`}</span>
+            {!busy && !(stage.key === "service" && !allServicesDone) && <ArrowRight size={18} style={{ position: "relative", zIndex: 1, flexShrink: 0 }} />}
+            {!busy && !(stage.key === "service" && !allServicesDone) && <span className="mrcap-sweep" style={{ position: "absolute", inset: 0 }} />}
+          </button>
+        </StickyActionBar>
       ) : (
-        <div style={{ background: "rgba(74,122,87,0.15)", border: `1px solid ${COLORS.green}`, borderRadius: 12, padding: 16, textAlign: "center", color: "#7BC494", fontWeight: 700, fontSize: 14 }}>Vehicle collected — job card closed</div>
+        <div style={{ background: "rgba(74,122,87,0.14)", border: "1px solid rgba(74,122,87,0.6)", borderRadius: 16, padding: 16, textAlign: "center", color: COLORS.successText, fontWeight: 700, fontSize: 14, display: "flex", alignItems: "center", justifyContent: "center", gap: 8 }}><CheckCircle2 size={18} /> Vehicle collected — job card closed</div>
       )}
     </div>
   );
@@ -6411,6 +8811,32 @@ function AccessDenied({ onBack }) {
 
 function InfoBlock({ title, children }) {
   return <div style={{ marginBottom: 12 }}><div style={labelStyle}>{title}</div><div style={{ fontSize: 13.5, color: COLORS.ink, marginTop: 4, lineHeight: 1.4 }}>{children}</div></div>;
+}
+// Horizontal 6-stage stepper for the job screen (design comps): done
+// stages get a gold check, the current one a bright-gold ring.
+function StageStepper({ currentIndex }) {
+  return (
+    <div style={{ position: "relative", display: "grid", gridTemplateColumns: `repeat(${STAGES.length}, minmax(0, 1fr))`, gap: 4 }}>
+      <div aria-hidden="true" style={{ position: "absolute", top: 12, left: `${50 / STAGES.length}%`, right: `${50 / STAGES.length}%`, height: 2, background: COLORS.line }} />
+      <div aria-hidden="true" style={{ position: "absolute", top: 12, left: `${50 / STAGES.length}%`, width: `${(Math.min(currentIndex, STAGES.length - 1) / STAGES.length) * 100}%`, height: 2, background: COLORS.gold, transition: "width 0.4s ease" }} />
+      {STAGES.map((s, i) => {
+        const done = i < currentIndex || (i === currentIndex && i === STAGES.length - 1);
+        const current = i === currentIndex && !done;
+        return (
+          <div key={s.key} title={s.label} style={{ position: "relative", display: "flex", flexDirection: "column", alignItems: "center", gap: 6, minWidth: 0 }}>
+            <span style={{ width: 26, height: 26, borderRadius: 13, boxSizing: "border-box", display: "flex", alignItems: "center", justifyContent: "center", fontSize: 11, fontWeight: 700, fontFamily: MONO_FONT,
+              background: done ? COLORS.gold : current ? "#2A2414" : COLORS.panel,
+              border: done ? "none" : current ? `2px solid ${COLORS.goldBright}` : `1px solid ${COLORS.line}`,
+              color: done ? COLORS.darkText : current ? COLORS.goldBright : COLORS.muted,
+              boxShadow: current ? "0 0 0 4px rgba(232,195,74,0.12)" : "none" }}>
+              {done ? <Check size={14} strokeWidth={3} /> : i + 1}
+            </span>
+            <span style={{ fontSize: 10, color: current ? COLORS.goldBright : COLORS.muted, fontWeight: current ? 600 : 400, textAlign: "center", lineHeight: 1.2, maxWidth: "100%", overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{STAGE_SHORT_LABELS[s.key] || s.label}</span>
+          </div>
+        );
+      })}
+    </div>
+  );
 }
 function StageStrip({ currentIndex }) {
   return (
@@ -6444,24 +8870,21 @@ function ArchiveScreen({ index, onOpen, onBack }) {
         <Lock size={12} /> Visible only to you, Ahmed, Laani, and Suhail
       </div>
       <div style={{ position: "relative", marginBottom: 14 }}>
-        <Search size={15} color={COLORS.muted} style={{ position: "absolute", left: 12, top: 12 }} />
-        <input value={search} onChange={(e) => setSearch(e.target.value)} placeholder="Search plate, customer, model…" style={{ ...inputStyle, marginTop: 0, paddingLeft: 34 }} />
+        <Search size={16} color={COLORS.muted} style={{ position: "absolute", left: 14, top: 15, pointerEvents: "none" }} />
+        <input value={search} onChange={(e) => setSearch(e.target.value)} placeholder="Search plate, customer, model…" style={{ ...inputStyle, marginTop: 0, paddingLeft: 40, background: COLORS.panel }} />
       </div>
 
       {collected.length === 0 && (
-        <div style={{ textAlign: "center", padding: "50px 10px", color: COLORS.muted }}>
-          <Archive size={26} style={{ opacity: 0.4, marginBottom: 8 }} />
-          <div style={{ fontSize: 14 }}>Nothing archived yet.</div>
-        </div>
+        <EmptyState icon={Archive} title="Nothing archived yet." sub={search ? "Try a different search." : "Collected cars move here after their collection day."} />
       )}
 
       <div style={{ display: "flex", flexDirection: "column", gap: 10 }}>
         {collected.map((j) => (
-          <button key={j.id} onClick={() => onOpen(j.id)} className="mrcap-press mrcap-card" style={{ textAlign: "left", background: COLORS.panel, borderTop: `1px solid ${COLORS.line}`, borderRight: `1px solid ${COLORS.line}`, borderBottom: `1px solid ${COLORS.line}`, borderLeft: `3px solid ${COLORS.gold}`, borderRadius: "4px 10px 10px 4px", padding: "13px 14px", cursor: "pointer", display: "flex", flexDirection: "column", gap: 6, width: "100%", boxSizing: "border-box", boxShadow: "0 6px 16px -10px rgba(0,0,0,0.6)" }}>
-            <div style={{ display: "flex", justifyContent: "space-between", alignItems: "flex-start" }}>
-              <div>
-                <div style={{ fontFamily: MONO_FONT, fontWeight: 700, fontSize: 16, color: COLORS.ink, letterSpacing: 1.1 }}>{j.plate || "—"}</div>
-                <div style={{ fontSize: 12.5, color: COLORS.muted, marginTop: 1 }}>{j.makeModel} · {j.customerName}</div>
+          <button key={j.id} onClick={() => onOpen(j.id)} className="mrcap-press mrcap-card" style={{ textAlign: "left", background: COLORS.panel, border: `1px solid ${COLORS.line}`, borderRadius: 16, padding: 14, cursor: "pointer", display: "flex", flexDirection: "column", gap: 8, width: "100%", boxSizing: "border-box", color: COLORS.ink }}>
+            <div style={{ display: "flex", justifyContent: "space-between", alignItems: "flex-start", gap: 10, width: "100%" }}>
+              <div style={{ minWidth: 0 }}>
+                <PlateChip plate={j.plate} />
+                <div style={{ fontSize: 13, color: COLORS.muted, marginTop: 7 }}><span style={{ color: COLORS.ink, fontWeight: 600 }}>{j.makeModel}</span> · {j.customerName}</div>
               </div>
               <Pill tone={isRecentlyCollected(j) ? "yellow" : "green"}>{isRecentlyCollected(j) ? "Today" : "Collected"}</Pill>
             </div>
@@ -6509,18 +8932,23 @@ function CustomersScreen({ onBack, onOpenJob }) {
   if (selected) {
     return (
       <div className="mrcap-view" style={{ padding: "0 18px 30px" }}>
-        <button onClick={() => { setSelected(null); setHistory(null); }} style={{ ...iconBtnStyle, marginBottom: 16 }} className="mrcap-press"><ChevronLeft size={18} color={COLORS.ink} /></button>
+        <button onClick={() => { setSelected(null); setHistory(null); }} style={{ ...iconBtnStyle, width: 44, height: 44, marginBottom: 14 }} className="mrcap-press" aria-label="Back to search"><ChevronLeft size={20} color={COLORS.ink} /></button>
 
-        <div style={{ background: COLORS.panel, border: `1px solid ${COLORS.line}`, borderRadius: 12, padding: 16, marginBottom: 18 }}>
-          <div style={{ fontFamily: DISPLAY_FONT, fontWeight: 600, fontSize: 19, color: COLORS.ink }}>{selected.name}</div>
+        <div className="mrcap-rise" style={{ ...cardStyle, marginBottom: 18, display: "flex", alignItems: "center", gap: 12 }}>
+          <span aria-hidden="true" style={{ width: 46, height: 46, borderRadius: "50%", border: `1px solid ${COLORS.gold}`, background: COLORS.panel2, color: COLORS.gold, fontFamily: DISPLAY_FONT, fontWeight: 700, fontSize: 19, display: "flex", alignItems: "center", justifyContent: "center", flexShrink: 0 }}>{(selected.name || "?").charAt(0).toUpperCase()}</span>
+          <div style={{ flex: 1, minWidth: 0 }}>
+            <div style={{ fontFamily: DISPLAY_FONT, fontWeight: 700, fontSize: 21, color: COLORS.ink, lineHeight: 1.15 }}>{selected.name}</div>
+            {selected.phone && <div style={{ marginTop: 4, fontSize: 13, color: COLORS.muted, fontFamily: MONO_FONT }}>{selected.phone}</div>}
+          </div>
           {selected.phone && (
-            <div style={{ display: "flex", alignItems: "center", gap: 6, marginTop: 6, fontSize: 13, color: COLORS.muted }}>
-              <Phone size={12} /> {selected.phone}
-            </div>
+            <a href={`tel:${selected.phone}`} aria-label="Call customer" title="Call customer" className="mrcap-press" style={{ width: 44, height: 44, borderRadius: 12, border: `1px solid ${COLORS.line}`, background: COLORS.panel2, color: COLORS.ink, display: "flex", alignItems: "center", justifyContent: "center", flexShrink: 0 }}><Phone size={18} /></a>
+          )}
+          {selected.phone && toWhatsAppNumber(selected.phone) && (
+            <a href={`https://wa.me/${toWhatsAppNumber(selected.phone)}`} target="_blank" rel="noopener noreferrer" aria-label="WhatsApp customer" title="WhatsApp customer" className="mrcap-press" style={{ width: 44, height: 44, borderRadius: 12, background: "#25D366", color: COLORS.darkText, display: "flex", alignItems: "center", justifyContent: "center", flexShrink: 0 }}><MessageCircle size={19} /></a>
           )}
         </div>
 
-        {loadingHistory && <div style={{ textAlign: "center", color: COLORS.muted, padding: 30 }}>Loading history…</div>}
+        {loadingHistory && <SkeletonRows count={3} height={72} />}
 
         {!loadingHistory && history && (
           <>
@@ -6528,7 +8956,7 @@ function CustomersScreen({ onBack, onOpenJob }) {
               <div style={labelStyle}>Vehicles ({history.vehicles.length})</div>
               <div style={{ display: "flex", flexWrap: "wrap", gap: 8, marginTop: 8 }}>
                 {history.vehicles.map((v) => (
-                  <Pill key={v.id} tone="blue">{v.plate}{v.make_model ? ` · ${v.make_model}` : ""}</Pill>
+                  <span key={v.id} style={{ display: "inline-flex", alignItems: "center", gap: 8, padding: "6px 10px 6px 6px", borderRadius: 12, background: COLORS.panel, border: `1px solid ${COLORS.line}` }}><PlateChip plate={v.plate} size="sm" />{v.make_model ? <span style={{ fontSize: 12.5, color: COLORS.ink }}>{v.make_model}</span> : null}</span>
                 ))}
                 {history.vehicles.length === 0 && <span style={{ fontSize: 12.5, color: COLORS.muted }}>No vehicles on file yet.</span>}
               </div>
@@ -6540,11 +8968,11 @@ function CustomersScreen({ onBack, onOpenJob }) {
                 {history.jobs.map((j) => {
                   const stage = STAGES[j.stageIndex] || STAGES[0];
                   return (
-                    <button key={j.id} onClick={() => onOpenJob(j.id, j)} className="mrcap-press" style={{ textAlign: "left", background: COLORS.panel, border: `1px solid ${COLORS.line}`, borderLeft: `3px solid ${COLORS.gold}`, borderRadius: "4px 10px 10px 4px", padding: "12px 13px", cursor: "pointer", width: "100%", boxSizing: "border-box" }}>
-                      <div style={{ display: "flex", justifyContent: "space-between", alignItems: "flex-start" }}>
-                        <div>
-                          <div style={{ fontFamily: MONO_FONT, fontWeight: 600, fontSize: 14.5, color: COLORS.ink }}>{j.plate}</div>
-                          <div style={{ fontSize: 12, color: COLORS.muted, marginTop: 1 }}>{j.makeModel}</div>
+                    <button key={j.id} onClick={() => onOpenJob(j.id, j)} className="mrcap-press" style={{ textAlign: "left", background: COLORS.panel, border: `1px solid ${COLORS.line}`, borderRadius: 16, padding: 14, cursor: "pointer", width: "100%", boxSizing: "border-box", color: COLORS.ink }}>
+                      <div style={{ display: "flex", justifyContent: "space-between", alignItems: "flex-start", gap: 10 }}>
+                        <div style={{ minWidth: 0 }}>
+                          <PlateChip plate={j.plate} />
+                          <div style={{ fontSize: 13, color: COLORS.ink, fontWeight: 600, marginTop: 6 }}>{j.makeModel}</div>
                         </div>
                         <Pill tone={stageTone(stage.key)}>{stage.label}</Pill>
                       </div>
@@ -6568,32 +8996,27 @@ function CustomersScreen({ onBack, onOpenJob }) {
     <div className="mrcap-view" style={{ padding: "0 18px 30px" }}>
       <SectionTitle>Customers</SectionTitle>
       <div style={{ position: "relative", marginBottom: 14 }}>
-        <Search size={15} color={COLORS.muted} style={{ position: "absolute", left: 12, top: 12 }} />
-        <input value={search} onChange={(e) => setSearch(e.target.value)} placeholder="Search by name or phone…" style={{ ...inputStyle, marginTop: 0, paddingLeft: 34 }} autoFocus />
+        <Search size={16} color={COLORS.muted} style={{ position: "absolute", left: 14, top: 15, pointerEvents: "none" }} />
+        <input value={search} onChange={(e) => setSearch(e.target.value)} placeholder="Search by name or phone…" style={{ ...inputStyle, marginTop: 0, paddingLeft: 40, background: COLORS.panel }} autoFocus />
       </div>
 
-      {searching && <div style={{ textAlign: "center", color: COLORS.muted, padding: 20, fontSize: 13 }}>Searching…</div>}
+      {searching && <SkeletonRows count={3} height={60} />}
 
       {!searching && search.trim() && results.length === 0 && (
-        <div style={{ textAlign: "center", padding: "40px 10px", color: COLORS.muted }}>
-          <Users size={24} style={{ opacity: 0.4, marginBottom: 8 }} />
-          <div style={{ fontSize: 13.5 }}>No customers found.</div>
-        </div>
+        <EmptyState icon={Users} title="No customers found." sub="Check the spelling, or try their phone number." />
       )}
 
       {!search.trim() && (
-        <div style={{ textAlign: "center", padding: "50px 10px", color: COLORS.muted }}>
-          <Users size={26} style={{ opacity: 0.4, marginBottom: 8 }} />
-          <div style={{ fontSize: 14 }}>Search for a customer by name or phone to see their full vehicle and job history.</div>
-        </div>
+        <EmptyState icon={Users} title="Find a customer" sub="Search by name or phone to see their full vehicle and job history." />
       )}
 
       <div style={{ display: "flex", flexDirection: "column", gap: 8 }}>
         {results.map((c) => (
-          <button key={c.id} onClick={() => openCustomer(c)} className="mrcap-press" style={{ display: "flex", alignItems: "center", justifyContent: "space-between", padding: "13px 14px", borderRadius: 10, border: `1px solid ${COLORS.line}`, background: COLORS.panel, cursor: "pointer", width: "100%", boxSizing: "border-box", textAlign: "left" }}>
-            <div>
-              <div style={{ fontWeight: 600, fontSize: 14.5, color: COLORS.ink }}>{c.name}</div>
-              {c.phone && <div style={{ fontSize: 12, color: COLORS.muted, marginTop: 2 }}>{c.phone}</div>}
+          <button key={c.id} onClick={() => openCustomer(c)} className="mrcap-press" style={{ display: "flex", alignItems: "center", justifyContent: "space-between", gap: 12, minHeight: 60, padding: "10px 14px 10px 10px", borderRadius: 16, border: `1px solid ${COLORS.line}`, background: COLORS.panel, cursor: "pointer", width: "100%", boxSizing: "border-box", textAlign: "left" }}>
+            <span aria-hidden="true" style={{ width: 38, height: 38, borderRadius: "50%", background: COLORS.panel2, border: `1px solid ${COLORS.line}`, color: COLORS.gold, fontWeight: 700, fontSize: 14, display: "flex", alignItems: "center", justifyContent: "center", flexShrink: 0 }}>{(c.name || "?").charAt(0).toUpperCase()}</span>
+            <div style={{ flex: 1, minWidth: 0 }}>
+              <div style={{ fontWeight: 600, fontSize: 14.5, color: COLORS.ink, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{c.name}</div>
+              {c.phone && <div style={{ fontSize: 12.5, color: COLORS.muted, marginTop: 2, fontFamily: MONO_FONT }}>{c.phone}</div>}
             </div>
             <ChevronLeft size={16} color={COLORS.muted} style={{ transform: "rotate(180deg)" }} />
           </button>
@@ -6617,6 +9040,12 @@ function ReportsScreen({ onBack }) {
   const [completionsRange, setCompletionsRange] = useState("30d"); // "7d" | "30d" | "all"
   const [completionsRaw, setCompletionsRaw] = useState([]); // every "Marked done" entry, unfiltered by range
   const [completionsLoading, setCompletionsLoading] = useState(true);
+  // "What got cancelled" — declined quotes and deleted jobs, side by side,
+  // so a manager can see the two ways a job never happens without digging
+  // through the raw Activity Log. Both are read-only, most-recent-first.
+  const [cancelledQuotes, setCancelledQuotes] = useState([]);
+  const [deletedJobs, setDeletedJobs] = useState([]);
+  const [cancelledLoading, setCancelledLoading] = useState(true);
 
   const load = useCallback(async () => {
     setLoading(true);
@@ -6637,6 +9066,19 @@ function ReportsScreen({ onBack }) {
     setByStageTime(st.data || []);
     setCustomerRepeat((cr.data || [])[0] || null);
     setLoading(false);
+  }, []);
+
+  useEffect(() => {
+    (async () => {
+      setCancelledLoading(true);
+      const [q, dj] = await Promise.all([
+        sbFetch("quotes?select=id,plate,make_model,customer_name,updated_at&status=eq.declined&order=updated_at.desc&limit=25"),
+        sbFetch("deletion_log?select=*&order=deleted_at.desc&limit=25"),
+      ]);
+      if (q.ok) setCancelledQuotes(q.data || []);
+      if (dj.ok) setDeletedJobs(dj.data || []);
+      setCancelledLoading(false);
+    })();
   }, []);
 
   useEffect(() => { load(); }, [load]);
@@ -6694,23 +9136,11 @@ function ReportsScreen({ onBack }) {
       {!loading && !error && (
         <>
           <ReportSection title="Jobs completed, by person" icon={<CheckCircle2 size={14} color={COLORS.gold} />}>
-            <div style={{ display: "flex", gap: 6, marginBottom: 14 }}>
-              {[["7d", "7 days"], ["30d", "30 days"], ["all", "All time"]].map(([key, label]) => (
-                <button
-                  key={key}
-                  onClick={() => setCompletionsRange(key)}
-                  className="mrcap-press"
-                  style={{
-                    padding: "5px 12px", borderRadius: 999, fontSize: 11.5, fontWeight: 700, cursor: "pointer",
-                    border: `1px solid ${completionsRange === key ? COLORS.gold : COLORS.line}`,
-                    background: completionsRange === key ? COLORS.gold : "transparent",
-                    color: completionsRange === key ? COLORS.darkText : COLORS.muted,
-                  }}
-                >
-                  {label}
-                </button>
-              ))}
-            </div>
+            <SegmentedControl
+              options={[{ key: "7d", label: "7 days" }, { key: "30d", label: "30 days" }, { key: "all", label: "All time" }]}
+              value={completionsRange}
+              onChange={setCompletionsRange}
+            />
             {completionsLoading ? (
               <SkeletonRows count={3} height={32} />
             ) : completionsByStaff.length === 0 ? (
@@ -6777,6 +9207,40 @@ function ReportsScreen({ onBack }) {
               <ReportEmpty />
             )}
           </ReportSection>
+
+          <ReportSection title="Cancelled quotes" icon={<XCircle size={14} color={COLORS.gold} />}>
+            {cancelledLoading ? (
+              <SkeletonRows count={3} height={32} />
+            ) : cancelledQuotes.length === 0 ? (
+              <ReportEmpty />
+            ) : (
+              cancelledQuotes.map((q) => (
+                <ReportRow
+                  key={q.id}
+                  label={`${q.plate || "—"} · ${q.customer_name || "Unknown"}`}
+                  sub={`${q.make_model || ""}${q.make_model ? " · " : ""}declined ${new Date(q.updated_at).toLocaleDateString([], { month: "short", day: "numeric" })}`}
+                  value=""
+                />
+              ))
+            )}
+          </ReportSection>
+
+          <ReportSection title="Deleted jobs" icon={<Trash2 size={14} color={COLORS.gold} />}>
+            {cancelledLoading ? (
+              <SkeletonRows count={3} height={32} />
+            ) : deletedJobs.length === 0 ? (
+              <ReportEmpty />
+            ) : (
+              deletedJobs.map((d) => (
+                <ReportRow
+                  key={d.id}
+                  label={`${d.plate || "—"} · ${d.customer_name || "Unknown"}`}
+                  sub={`deleted by ${d.deleted_by || "unknown"} · ${new Date(d.deleted_at).toLocaleDateString([], { month: "short", day: "numeric" })}`}
+                  value=""
+                />
+              ))
+            )}
+          </ReportSection>
         </>
       )}
     </div>
@@ -6810,6 +9274,56 @@ function ReportEmpty() {
   return <div style={{ padding: "16px 13px", fontSize: 12.5, color: COLORS.muted, textAlign: "center" }}>No data yet.</div>;
 }
 
+// True iOS-style segmented control: one pill-shaped track, a single
+// highlight that slides to the active option's actual measured width
+// (not an equal-width assumption, so it works whether there are 3
+// options or 7) and scrolls horizontally if the options don't fit
+// instead of wrapping to a second row or clipping.
+function SegmentedControl({ options, value, onChange }) {
+  const btnRefs = useRef({});
+  const [thumb, setThumb] = useState(null);
+
+  useEffect(() => {
+    const el = btnRefs.current[value];
+    if (!el) return;
+    setThumb({ left: el.offsetLeft, width: el.offsetWidth });
+  }, [value, options]);
+
+  return (
+    <div
+      style={{
+        position: "relative", display: "flex", gap: 2, background: COLORS.panel2,
+        borderRadius: 9, padding: 3, marginBottom: 14, overflowX: "auto", WebkitOverflowScrolling: "touch",
+      }}
+    >
+      {thumb && (
+        <div
+          style={{
+            position: "absolute", top: 3, bottom: 3, left: thumb.left, width: thumb.width,
+            background: COLORS.gold, borderRadius: 7, boxShadow: "0 2px 6px rgba(0,0,0,0.35)",
+            transition: "left 0.22s cubic-bezier(0.22,0.61,0.36,1), width 0.22s cubic-bezier(0.22,0.61,0.36,1)",
+          }}
+        />
+      )}
+      {options.map((opt) => (
+        <button
+          key={opt.key}
+          ref={(el) => { btnRefs.current[opt.key] = el; }}
+          onClick={() => onChange(opt.key)}
+          className="mrcap-press"
+          style={{
+            position: "relative", zIndex: 1, flexShrink: 0, padding: "6px 14px", borderRadius: 7,
+            fontSize: 11.5, fontWeight: 700, whiteSpace: "nowrap", cursor: "pointer", border: "none", background: "none",
+            color: value === opt.key ? COLORS.darkText : COLORS.muted,
+          }}
+        >
+          {opt.label}
+        </button>
+      ))}
+    </div>
+  );
+}
+
 /* ---------------- WhatsApp message templates (Suhail-only) ---------------- */
 // One template exists today ("ready for collection"). Modeled as a
 // keyed dict from the start so a second auto-message can be added later
@@ -6824,7 +9338,6 @@ const TEMPLATE_DEFS = [
       { token: "customerName", sample: "Ahmed" },
       { token: "makeModel", sample: "Toyota Land Cruiser" },
       { token: "plate", sample: "A 12345" },
-      { token: "trackingLink", sample: "https://…/?track=…" },
     ],
   },
   {
@@ -6835,7 +9348,6 @@ const TEMPLATE_DEFS = [
       { token: "customerName", sample: "Ahmed" },
       { token: "makeModel", sample: "Toyota Land Cruiser" },
       { token: "plate", sample: "A 12345" },
-      { token: "trackingLink", sample: "https://…/?track=…" },
     ],
   },
   {
@@ -6926,7 +9438,7 @@ function MessageTemplatesScreen({ onBack }) {
       </div>
 
       {error && (
-        <div style={{ background: "rgba(168,64,47,0.15)", border: `1px solid ${COLORS.red}`, borderRadius: 10, padding: "10px 13px", marginBottom: 14, fontSize: 12.5, color: "#E08A78" }}>
+        <div style={{ background: "rgba(168,64,47,0.15)", border: `1px solid ${COLORS.red}`, borderRadius: 10, padding: "10px 13px", marginBottom: 14, fontSize: 12.5, color: COLORS.dangerText }}>
           Couldn't save — check your connection and try again.
         </div>
       )}
@@ -6980,7 +9492,7 @@ function MessageTemplatesScreen({ onBack }) {
                   key={t.token}
                   onClick={() => setDrafts((d) => ({ ...d, [def.key]: (d[def.key] || "") + `{${t.token}}` }))}
                   className="mrcap-press"
-                  style={{ fontSize: 11, fontFamily: "monospace", padding: "4px 9px", borderRadius: 999, border: `1px solid ${COLORS.line}`, background: COLORS.panel2, color: COLORS.gold, cursor: "pointer" }}
+                  style={{ fontSize: 11, fontFamily: MONO_FONT, padding: "4px 9px", borderRadius: 999, border: `1px solid ${COLORS.line}`, background: COLORS.panel2, color: COLORS.gold, cursor: "pointer" }}
                   title={`Insert — sample: ${t.sample}`}
                 >
                   {`{${t.token}}`}
@@ -7116,7 +9628,7 @@ function AnnouncementComposer({ session, team, onBack }) {
       </div>
 
       {error && (
-        <div style={{ background: "rgba(168,64,47,0.15)", border: `1px solid ${COLORS.red}`, borderRadius: 10, padding: "10px 13px", marginBottom: 14, fontSize: 12.5, color: "#E08A78" }}>
+        <div style={{ background: "rgba(168,64,47,0.15)", border: `1px solid ${COLORS.red}`, borderRadius: 10, padding: "10px 13px", marginBottom: 14, fontSize: 12.5, color: COLORS.dangerText }}>
           {error}
         </div>
       )}
@@ -7297,7 +9809,7 @@ function IssueReportsScreen({ onBack }) {
       {loading && <div style={{ padding: "0 0 30px" }}><SkeletonRows count={3} height={72} /></div>}
       {error && (
         <div style={{ background: "rgba(168,64,47,0.15)", border: `1px solid ${COLORS.red}`, borderRadius: 10, padding: 14, marginBottom: 14 }}>
-          <div style={{ fontSize: 13, color: "#E08A78", marginBottom: 8 }}>Couldn't load reports.</div>
+          <div style={{ fontSize: 13, color: COLORS.dangerText, marginBottom: 8 }}>Couldn't load reports.</div>
           <button onClick={load} className="mrcap-press" style={{ ...secondaryBtnStyle, padding: "8px 14px", fontSize: 12.5 }}>Retry</button>
         </div>
       )}
@@ -7469,6 +9981,95 @@ function exportAdminStatsCSV({ rangeLabel, totalRevenue, revenueInRange, activeJ
   URL.revokeObjectURL(url);
 }
 
+// Renders a plain bar chart to a PNG data URL via an offscreen canvas —
+// no charting library needed for one bar chart shape, and jsPDF can only
+// place images/vectors it's handed, not chart data directly. Drawn at
+// 2x pixel density (crisp when placed into a PDF) with the bar's value
+// printed above each bar and its label below, so the image is legible
+// on its own without needing the text table next to it.
+// Rounds the axis top up to a clean 1 / 2 / 2.5 / 5 x 10^n so the four
+// gridlines land on readable numbers (0, 2,500, 5,000 ...) instead of
+// whatever the tallest bar happens to be.
+function niceCeil(v) {
+  if (!(v > 0)) return 1;
+  const pow = Math.pow(10, Math.floor(Math.log10(v)));
+  const n = v / pow;
+  return (n <= 1 ? 1 : n <= 2 ? 2 : n <= 2.5 ? 2.5 : n <= 5 ? 5 : 10) * pow;
+}
+// `highlightLast` draws the final bar in the deeper gold and the rest
+// lighter — for a month-by-month series the current month is the one
+// being read against the others.
+function renderBarChartPNG(rows, { width = 700, height = 260, color = "#C9A227", accent = "#8F6F12", formatValue, highlightLast = false } = {}) {
+  if (!rows || !rows.length) return null;
+  const dpr = 2;
+  const canvas = document.createElement("canvas");
+  canvas.width = width * dpr; canvas.height = height * dpr;
+  const ctx = canvas.getContext("2d");
+  if (!ctx) return null;
+  ctx.scale(dpr, dpr);
+  ctx.fillStyle = "#ffffff"; ctx.fillRect(0, 0, width, height);
+  const FONT = "Helvetica, Arial, sans-serif";
+  const fmt = (v) => (formatValue ? formatValue(v) : Math.round(v).toLocaleString());
+
+  // Money axes round up to a clean 1/2/2.5/5 x 10^n; count axes (jobs per
+  // category) step in whole numbers so no gridline reads "0.25 jobs".
+  const maxVal = Math.max(1, ...rows.map((r) => r.value || 0));
+  const countStep = [1, 2, 5, 10, 20, 25, 50, 100, 200, 250, 500, 1000].find((s) => s * 4 >= maxVal) || Math.ceil(maxVal / 4);
+  const top = formatValue ? niceCeil(maxVal) : countStep * 4;
+  const padL = formatValue ? 78 : 40, padR = 14, padTop = 26, padBottom = 34;
+  const chartW = width - padL - padR;
+  const chartH = height - padTop - padBottom;
+
+  // gridlines, each labelled with the value it stands for
+  ctx.lineWidth = 1;
+  ctx.font = `10px ${FONT}`;
+  ctx.textAlign = "right";
+  for (let i = 0; i <= 4; i++) {
+    const gy = Math.round(padTop + chartH - (chartH * i) / 4) + 0.5;
+    ctx.strokeStyle = i === 0 ? "#bdbdbd" : "#ececec";
+    ctx.beginPath(); ctx.moveTo(padL, gy); ctx.lineTo(width - padR, gy); ctx.stroke();
+    ctx.fillStyle = "#8a8a8a";
+    ctx.fillText(fmt((top * i) / 4), padL - 8, gy + 3.5);
+  }
+
+  const slot = chartW / rows.length;
+  const barW = Math.min(72, slot * 0.62);
+  const maxChars = Math.max(5, Math.floor(slot / 6.4));
+  rows.forEach((r, i) => {
+    const v = r.value || 0;
+    const barH = (v / top) * chartH;
+    const x = padL + i * slot + (slot - barW) / 2;
+    const y = padTop + chartH - barH;
+    const isLast = highlightLast && i === rows.length - 1;
+
+    if (v > 0) {
+      ctx.fillStyle = highlightLast ? (isLast ? accent : color) : color;
+      const rad = Math.min(4, barW / 2, barH);
+      ctx.beginPath();
+      ctx.moveTo(x, y + barH);
+      ctx.lineTo(x, y + rad);
+      ctx.quadraticCurveTo(x, y, x + rad, y);
+      ctx.lineTo(x + barW - rad, y);
+      ctx.quadraticCurveTo(x + barW, y, x + barW, y + rad);
+      ctx.lineTo(x + barW, y + barH);
+      ctx.closePath();
+      ctx.fill();
+
+      ctx.fillStyle = "#1a1a1a";
+      ctx.font = `${isLast ? "bold " : "600 "}11px ${FONT}`;
+      ctx.textAlign = "center";
+      ctx.fillText(fmt(v), x + barW / 2, Math.max(12, y - 7));
+    }
+
+    const label = String(r.label);
+    ctx.fillStyle = isLast ? "#1a1a1a" : "#777";
+    ctx.font = `${isLast ? "bold " : ""}10px ${FONT}`;
+    ctx.textAlign = "center";
+    ctx.fillText(label.length > maxChars ? `${label.slice(0, maxChars - 1)}…` : label, x + barW / 2, height - padBottom + 16);
+  });
+  return canvas.toDataURL("image/png");
+}
+
 // PDF export — a one-page summary, same jsPDF conventions as the quote
 // and invoice PDFs already in this file (logo header, helvetica, gold
 // accents dropped to plain black/grey since this is an internal report).
@@ -7503,7 +10104,28 @@ function exportAdminStatsPDF({ rangeLabel, totalRevenue, revenueInRange, activeJ
   statLine("Collected in range", collectedInRange);
   statLine("Avg turnaround", avgTurnaroundDays != null ? `${avgTurnaroundDays.toFixed(1)} days` : "Not enough data");
 
+  const chart = (title, rows, formatValue, opts = {}) => {
+    const png = renderBarChartPNG(rows, { formatValue, ...opts });
+    if (!png) return;
+    const imgW = pageW - margin * 2;
+    const imgH = imgW * (260 / 700);
+    if (y + 24 + imgH > 780) { doc.addPage(); y = 50; }
+    y += 14;
+    doc.setDrawColor(210); doc.line(margin, y, pageW - margin, y);
+    y += 20;
+    doc.setFont("helvetica", "bold"); doc.setFontSize(11.5); doc.setTextColor(20);
+    doc.text(title, margin, y);
+    y += 10;
+    doc.addImage(png, "PNG", margin, y, imgW, imgH);
+    y += imgH + 4;
+  };
+  chart("Revenue by month", revenueByMonth, fmtAED, { highlightLast: true });
+  chart("Jobs by service category (in range)", byCategory);
+
   const table = (title, rows, formatValue) => {
+    // Never leave a table's heading stranded at the foot of a page with its
+    // rows on the next one — start a fresh page unless heading + a few rows fit.
+    if (y + 12 + 20 + 16 + Math.min(rows.length, 3) * 15 > 780) { doc.addPage(); y = 50; }
     y += 12;
     doc.setDrawColor(210); doc.line(margin, y, pageW - margin, y);
     y += 20;
@@ -7528,15 +10150,6 @@ function exportAdminStatsPDF({ rangeLabel, totalRevenue, revenueInRange, activeJ
   doc.save(`MrCAP-Dashboard-${new Date().toISOString().slice(0, 10)}.pdf`);
 }
 
-// Started as a pure easter egg; now doubles as a real shortcut — tap it
-// (don't drag) to jump straight to the Admin Dashboard from anywhere in
-// the app, and it carries a small red badge mirroring the combined
-// Follow-ups Due + Warranty Expiring Soon count so there's something to
-// glance at even before tapping. A green, wide-winged sports-coupe
-// silhouette (big rear wing, front splitter, wide stance) — original
-// artwork, not a real photo or badge — that can still be dragged
-// anywhere on screen and remembers where you left it via localStorage.
-//
 // Rendered through a portal straight into document.body — NOT as a
 // normal child. .mrcap-view (its would-be parent) has a CSS animation
 // that includes a transform, and per spec any ancestor with a transform
@@ -7546,8 +10159,7 @@ function exportAdminStatsPDF({ rangeLabel, totalRevenue, revenueInRange, activeJ
 // trapped inside that div's box — which is exactly what happened; it
 // was never actually invisible, just positioned against the wrong box.
 // A lightweight bug-report tool, available to everyone (not just
-// Suhail) — floats bottom-left so it never collides with the egg's
-// default bottom-right spot. Deliberately no screenshot capture: a
+// Suhail) — floats bottom-left. Deliberately no screenshot capture: a
 // real screen-grab library adds real fragility (cross-origin content,
 // dynamic layouts) for a 3-month pilot feature that mainly needs to be
 // reliable. Context (which screen, who, device) plus a note is enough
@@ -7586,9 +10198,10 @@ function ReportIssueButton({ session, view }) {
         className="mrcap-press"
         title="Report an issue"
         style={{
-          position: "fixed", left: 16, bottom: 16, width: 44, height: 44, borderRadius: "50%",
-          background: COLORS.panel, border: `1.5px solid ${COLORS.line}`,
-          boxShadow: "0 8px 20px -8px rgba(0,0,0,0.6)",
+          // Lifted clear of the Live reply bar so it never covers the photo button.
+          position: "fixed", left: session && session.viewMode === "pc" && isFullDashboardRole(session) ? 248 : 16, bottom: view === "liveupdates" || view === "smartechchat" ? 172 : "calc(16px + var(--mrcap-fab-lift, 0px))", width: 44, height: 44, borderRadius: "50%",
+          background: "rgba(20,19,17,0.92)", border: `1px solid ${COLORS.line}`,
+          boxShadow: "0 8px 20px -8px rgba(0,0,0,0.7)", transition: "bottom 0.25s ease",
           display: "flex", alignItems: "center", justifyContent: "center",
           cursor: "pointer", zIndex: 998,
         }}
@@ -7618,7 +10231,7 @@ function ReportIssueButton({ session, view }) {
                   style={{ ...textareaStyle, marginTop: 0, minHeight: 90 }}
                   autoFocus
                 />
-                {error && <div style={{ fontSize: 11.5, color: "#E08A78", marginTop: 8 }}>Couldn't send — check your connection and try again.</div>}
+                {error && <div style={{ fontSize: 11.5, color: COLORS.dangerText, marginTop: 8 }}>Couldn't send — check your connection and try again.</div>}
                 <div style={{ display: "flex", gap: 8, marginTop: 12 }}>
                   <button onClick={() => setOpen(false)} className="mrcap-press" style={{ ...secondaryBtnStyle, flex: 1, padding: "11px" }}>Cancel</button>
                   <button onClick={submit} disabled={!note.trim() || submitting} className="mrcap-press" style={{ ...primaryBtnStyle, flex: 2, padding: "11px", opacity: !note.trim() || submitting ? 0.5 : 1 }}>
@@ -7631,122 +10244,6 @@ function ReportIssueButton({ session, view }) {
         </div>
       )}
     </>,
-    document.body
-  );
-}
-
-function DraggablePorscheEgg({ badgeCount, onTap }) {
-  const [pos, setPos] = useState(() => {
-    const size = 60;
-    try {
-      const saved = JSON.parse(window.localStorage.getItem("mrcap_egg_pos"));
-      if (saved && typeof saved.x === "number" && typeof saved.y === "number") {
-        // Clamp against the CURRENT viewport — a position saved before the
-        // portal fix (or on a different-sized screen) could otherwise sit
-        // off-screen forever with no way to find it again.
-        return {
-          x: Math.min(Math.max(8, saved.x), window.innerWidth - size - 8),
-          y: Math.min(Math.max(8, saved.y), window.innerHeight - size - 8),
-        };
-      }
-    } catch { /* fall through to default spot */ }
-    return { x: window.innerWidth - 80, y: 140 };
-  });
-  const draggingRef = useRef(false);
-  const offsetRef = useRef({ x: 0, y: 0 });
-  const posRef = useRef(pos);
-  posRef.current = pos;
-  const startPointRef = useRef({ x: 0, y: 0 });
-  const movedRef = useRef(false);
-
-  const clamp = (x, y) => {
-    const size = 60;
-    return {
-      x: Math.min(Math.max(8, x), window.innerWidth - size - 8),
-      y: Math.min(Math.max(8, y), window.innerHeight - size - 8),
-    };
-  };
-
-  const start = (e) => {
-    draggingRef.current = true;
-    movedRef.current = false;
-    const p = e.touches ? e.touches[0] : e;
-    startPointRef.current = { x: p.clientX, y: p.clientY };
-    offsetRef.current = { x: p.clientX - posRef.current.x, y: p.clientY - posRef.current.y };
-  };
-  const move = (e) => {
-    if (!draggingRef.current) return;
-    if (e.touches) e.preventDefault();
-    const p = e.touches ? e.touches[0] : e;
-    // A few px of wobble shouldn't count as a drag — otherwise a plain
-    // tap (to jump to the dashboard) almost never registers cleanly.
-    if (Math.abs(p.clientX - startPointRef.current.x) > 5 || Math.abs(p.clientY - startPointRef.current.y) > 5) {
-      movedRef.current = true;
-    }
-    setPos(clamp(p.clientX - offsetRef.current.x, p.clientY - offsetRef.current.y));
-  };
-  const end = () => {
-    if (!draggingRef.current) return;
-    draggingRef.current = false;
-    if (movedRef.current) {
-      try { window.localStorage.setItem("mrcap_egg_pos", JSON.stringify(posRef.current)); } catch { /* not worth blocking over */ }
-    } else {
-      onTap?.();
-    }
-  };
-
-  useEffect(() => {
-    window.addEventListener("mousemove", move);
-    window.addEventListener("mouseup", end);
-    window.addEventListener("touchmove", move, { passive: false });
-    window.addEventListener("touchend", end);
-    return () => {
-      window.removeEventListener("mousemove", move);
-      window.removeEventListener("mouseup", end);
-      window.removeEventListener("touchmove", move);
-      window.removeEventListener("touchend", end);
-    };
-  });
-
-  return createPortal(
-    <div
-      onMouseDown={start}
-      onTouchStart={start}
-      title={badgeCount > 0 ? `${badgeCount} need attention — tap for the dashboard` : "Tap for the dashboard"}
-      style={{
-        position: "fixed", left: pos.x, top: pos.y, width: 60, height: 60, borderRadius: "50%",
-        background: `radial-gradient(circle at 34% 28%, ${COLORS.panel2}, ${COLORS.panel})`,
-        border: `1.5px solid ${COLORS.gold}`,
-        boxShadow: "0 10px 26px -8px rgba(0,0,0,0.65), 0 0 0 1px rgba(201,162,39,0.15)",
-        display: "flex", alignItems: "center", justifyContent: "center",
-        cursor: "grab", zIndex: 999, touchAction: "none", userSelect: "none",
-      }}
-    >
-      {badgeCount > 0 && (
-        <div style={{
-          position: "absolute", top: -4, right: -4, minWidth: 18, height: 18, borderRadius: 9, padding: "0 4px",
-          background: COLORS.red, border: `1.5px solid ${COLORS.panel}`, color: "#fff",
-          fontSize: 10.5, fontWeight: 700, display: "flex", alignItems: "center", justifyContent: "center",
-          fontFamily: MONO_FONT, pointerEvents: "none",
-        }}>
-          {badgeCount > 9 ? "9+" : badgeCount}
-        </div>
-      )}
-      <svg width="39" height="39" viewBox="0 0 64 64" fill="none">
-        <g transform="translate(31 35) scale(1.08 0.8) translate(-31 -35)">
-          <rect x="44" y="19" width="2.2" height="8" fill="#161512" />
-          <rect x="53" y="19" width="2.2" height="8" fill="#161512" />
-          <rect x="41.5" y="16" width="16" height="3.6" rx="1" fill="#161512" />
-          <path d="M6 40c0-3 2-5 5-6l6-8c4-5 10-8 17-8h2c7 0 13 3 17 8l6 8c3 1 5 3 5 6v5c0 2-2 4-4 4h-3a6 6 0 1 1-12 0H24a6 6 0 1 1-12 0H8c-2 0-4-2-4-4v-5z" fill="#39B54A" stroke="#161512" strokeWidth="1.4" />
-          <rect x="2" y="37" width="7" height="3" rx="1" fill="#161512" />
-          <path d="M21 25c2-3 6-5 10-5h2c4 0 8 2 10 5l2 5H19l2-5z" fill="#1a1918" />
-          <circle cx="18" cy="45" r="6" fill="#161512" />
-          <circle cx="46" cy="45" r="6" fill="#161512" />
-          <circle cx="18" cy="45" r="2.4" fill="#39B54A" />
-          <circle cx="46" cy="45" r="2.4" fill="#39B54A" />
-        </g>
-      </svg>
-    </div>,
     document.body
   );
 }
@@ -7856,25 +10353,18 @@ function AdminStatsScreen({ team, onBack }) {
 
       {error && (
         <div style={{ background: "rgba(168,64,47,0.15)", border: `1px solid ${COLORS.red}`, borderRadius: 10, padding: 14, marginBottom: 14 }}>
-          <div style={{ fontSize: 13, color: "#E08A78", marginBottom: 8 }}>Couldn't load the dashboard.</div>
+          <div style={{ fontSize: 13, color: COLORS.dangerText, marginBottom: 8 }}>Couldn't load the dashboard.</div>
           <button onClick={load} className="mrcap-press" style={{ ...secondaryBtnStyle, padding: "8px 14px", fontSize: 12.5 }}>Retry</button>
         </div>
       )}
 
       {!loading && !error && (
         <>
-          <div style={{ display: "flex", flexWrap: "wrap", gap: 7, marginBottom: 16 }}>
-            {RANGE_PRESETS.map((r) => (
-              <button
-                key={r.key}
-                onClick={() => setRangeKey(r.key)}
-                className="mrcap-press"
-                style={{ padding: "6px 12px", borderRadius: 999, border: `1.5px solid ${rangeKey === r.key ? COLORS.gold : COLORS.line}`, background: rangeKey === r.key ? COLORS.gold : COLORS.panel2, color: rangeKey === r.key ? COLORS.darkText : COLORS.muted, fontSize: 11.5, fontWeight: 600, cursor: "pointer" }}
-              >
-                {r.label}
-              </button>
-            ))}
-          </div>
+          <SegmentedControl
+            options={RANGE_PRESETS.map((r) => ({ key: r.key, label: r.label }))}
+            value={rangeKey}
+            onChange={setRangeKey}
+          />
 
           <div style={{ display: "flex", flexWrap: "wrap", gap: 10, marginBottom: 22 }}>
             <AdminStatCard icon={<TrendingUp size={13} color={COLORS.gold} />} label="Total Revenue" value={fmtAED(totalRevenue)} sub="All-time, invoiced jobs" />
@@ -7897,7 +10387,7 @@ function AdminStatsScreen({ team, onBack }) {
                   <span style={{ color: COLORS.muted }}>Revenue</span>
                   <span style={{ color: COLORS.ink, fontFamily: MONO_FONT }}>
                     {fmtAED(baseline.revenue)} <span style={{ color: COLORS.gold }}>→</span> {fmtAED(totalRevenue)}
-                    <span style={{ color: totalRevenue >= baseline.revenue ? "#7BC494" : "#E08A78", marginLeft: 6 }}>
+                    <span style={{ color: totalRevenue >= baseline.revenue ? COLORS.successText : COLORS.dangerText, marginLeft: 6 }}>
                       ({totalRevenue - baseline.revenue >= 0 ? "+" : ""}{fmtAED(totalRevenue - baseline.revenue)})
                     </span>
                   </span>
@@ -7906,7 +10396,7 @@ function AdminStatsScreen({ team, onBack }) {
                   <span style={{ color: COLORS.muted }}>Jobs on file</span>
                   <span style={{ color: COLORS.ink, fontFamily: MONO_FONT }}>
                     {baseline.jobCount} <span style={{ color: COLORS.gold }}>→</span> {jobs.length}
-                    <span style={{ color: "#7BC494", marginLeft: 6 }}>(+{jobs.length - baseline.jobCount})</span>
+                    <span style={{ color: COLORS.successText, marginLeft: 6 }}>(+{jobs.length - baseline.jobCount})</span>
                   </span>
                 </div>
                 <div style={{ display: "flex", justifyContent: "space-between", fontSize: 12.5, marginBottom: 12 }}>
@@ -8107,13 +10597,13 @@ function ImportScreen({ session, onBack }) {
       {results && (
         <div>
           <div style={{ background: "rgba(74,122,87,0.15)", border: `1px solid ${COLORS.green}`, borderRadius: 10, padding: 14, marginBottom: 12 }}>
-            <div style={{ fontSize: 14, fontWeight: 700, color: "#7BC494" }}>{results.success} imported successfully</div>
+            <div style={{ fontSize: 14, fontWeight: 700, color: COLORS.successText }}>{results.success} imported successfully</div>
             {results.skipped > 0 && <div style={{ fontSize: 12, color: COLORS.muted, marginTop: 4 }}>{results.skipped} already existed from a previous run — skipped, not duplicated</div>}
             {results.cancelled && <div style={{ fontSize: 11.5, color: COLORS.muted, marginTop: 3 }}>Stopped early — {rows.length - progress} rows not attempted.</div>}
           </div>
           {results.failed.length > 0 && (
             <div style={{ background: "rgba(168,64,47,0.15)", border: `1px solid ${COLORS.red}`, borderRadius: 10, padding: 14, marginBottom: 16 }}>
-              <div style={{ fontSize: 13.5, fontWeight: 700, color: "#E08A78", marginBottom: 8 }}>{results.failed.length} rows failed</div>
+              <div style={{ fontSize: 13.5, fontWeight: 700, color: COLORS.dangerText, marginBottom: 8 }}>{results.failed.length} rows failed</div>
               <div style={{ display: "flex", flexDirection: "column", gap: 6, maxHeight: 240, overflowY: "auto" }}>
                 {results.failed.map((f, i) => (
                   <div key={i} style={{ fontSize: 11, color: COLORS.muted, fontFamily: MONO_FONT }}>
@@ -8175,7 +10665,7 @@ function QuotesScreen({ onBack, onOpen, onNew }) {
           <button key={q.id} onClick={() => onOpen(q.id)} className="mrcap-press" style={{ textAlign: "left", width: "100%", boxSizing: "border-box", background: COLORS.panel, border: `1px solid ${COLORS.line}`, borderLeft: `3px solid ${COLORS.gold}`, borderRadius: "4px 10px 10px 4px", padding: "13px 14px", cursor: "pointer" }}>
             <div style={{ display: "flex", justifyContent: "space-between", alignItems: "flex-start" }}>
               <div>
-                <div style={{ fontFamily: MONO_FONT, fontWeight: 600, fontSize: 15, color: COLORS.ink }}>{q.plate || q.customerName}</div>
+                <div>{q.plate ? <PlateChip plate={q.plate} /> : <span style={{ fontWeight: 600, fontSize: 15, color: COLORS.ink }}>{q.customerName}</span>}</div>
                 <div style={{ fontSize: 12, color: COLORS.muted, marginTop: 1 }}>{q.makeModel} {q.plate ? `· ${q.customerName}` : ""}</div>
               </div>
               <Pill tone={QUOTE_STATUS_TONE[q.status] || "default"}>{QUOTE_STATUS_LABEL[q.status] || q.status}</Pill>
@@ -8282,11 +10772,14 @@ function EditQuoteScreen({ quote, session, onSaved, onCancel }) {
                         </button>
                         {picked && (
                           <div style={{ padding: "5px 9px 0 30px" }}>
-                            <div style={{ display: "flex", alignItems: "center", gap: 6 }}>
+                            <div style={{ display: "flex", alignItems: "center", gap: 6, flexWrap: "wrap" }}>
                               <span style={{ fontSize: 10.5, color: COLORS.muted }}>AED</span>
                               <input type="number" value={treatmentPrices[priceKey] ?? ""} onChange={(e) => setTreatmentPrices((p) => ({ ...p, [priceKey]: e.target.value }))} style={{ width: 90, background: COLORS.panel2, border: `1px solid ${COLORS.line}`, borderRadius: 6, padding: "4px 7px", fontSize: 11.5, color: COLORS.gold, fontFamily: MONO_FONT }} />
                               {t.retail != null && Number(treatmentPrices[priceKey]) !== t.retail && (
                                 <span style={{ fontSize: 10, color: COLORS.muted, textDecoration: "line-through", fontFamily: MONO_FONT }}>AED {t.retail.toLocaleString()}</span>
+                              )}
+                              {isPerPieceTreatment(s.key, t.name) && (
+                                <span style={{ fontSize: 10, color: COLORS.gold }}>per piece — enter the unit price, not the total (quotes don't have a pieces picker yet)</span>
                               )}
                             </div>
                           </div>
@@ -8377,7 +10870,11 @@ function QuoteDetail({ id, session, team, onBack, onConverted }) {
   useEffect(() => { load(); }, [load]);
 
   const setStatus = async (status) => {
-    const updated = { ...quote, status, updatedAt: Date.now() };
+    // Quote acceptance used to be a customer self-service action via the
+    // public link (removed — see PublicQuoteView); now it's staff marking
+    // it here once the customer has confirmed, so this is what stamps
+    // acceptedAt going forward.
+    const updated = { ...quote, status, acceptedAt: status === "accepted" ? Date.now() : null, updatedAt: Date.now() };
     await saveQuote(updated);
     setQuote(updated);
   };
@@ -8421,7 +10918,7 @@ function QuoteDetail({ id, session, team, onBack, onConverted }) {
       <div style={{ background: `linear-gradient(160deg, ${COLORS.panel2}, ${COLORS.panel})`, border: `1px solid ${COLORS.line}`, borderTop: `2px solid ${COLORS.gold}`, borderRadius: 12, padding: "18px 16px 15px", marginBottom: 14 }}>
         <div style={{ display: "flex", justifyContent: "space-between", alignItems: "flex-start" }}>
           <div>
-            <div style={{ fontFamily: MONO_FONT, fontWeight: 600, fontSize: 20, color: COLORS.ink, letterSpacing: 0.5 }}>{quote.plate || "No plate"}</div>
+            <div>{quote.plate ? <PlateChip plate={quote.plate} size="lg" /> : <span style={{ fontFamily: MONO_FONT, fontWeight: 600, fontSize: 20, color: COLORS.ink }}>No plate</span>}</div>
             <div style={{ fontSize: 12.5, color: COLORS.muted, marginTop: 3 }}>{quote.makeModel} · {quote.customerName}</div>
           </div>
           <Pill tone={QUOTE_STATUS_TONE[quote.status] || "default"}>{QUOTE_STATUS_LABEL[quote.status] || quote.status}</Pill>
@@ -8430,7 +10927,7 @@ function QuoteDetail({ id, session, team, onBack, onConverted }) {
           <div style={{ marginTop: 12, fontFamily: MONO_FONT, fontWeight: 700, fontSize: 18, color: COLORS.gold }}>AED {Math.round(total).toLocaleString()}</div>
         )}
         {quote.acceptedAt && (
-          <div style={{ fontSize: 11, color: COLORS.muted, marginTop: 4 }}>Accepted by customer {new Date(quote.acceptedAt).toLocaleString()}</div>
+          <div style={{ fontSize: 11, color: COLORS.muted, marginTop: 4 }}>Marked accepted {new Date(quote.acceptedAt).toLocaleString()}</div>
         )}
       </div>
 
@@ -8442,17 +10939,16 @@ function QuoteDetail({ id, session, team, onBack, onConverted }) {
         <FileText size={15} /> Generate E-Quote (PDF)
       </button>
 
-      {quote.customerPhone && (
-        <>
-          <WhatsAppSendButton
-            phone={quote.customerPhone}
-            templateKey="quote_sent"
-            vars={{ customerName: quote.customerName || "", makeModel: quote.makeModel || "vehicle", plate: quote.plate || "", total: total > 0 ? Math.round(total).toLocaleString() : "0", quoteLink: `${window.location.origin}/?quote=${quote.id}` }}
-            label="Send Quote on WhatsApp"
-          />
-          <CustomerNotifyControl record={quote} templateKey="quote_sent" session={session} onSave={saveQuoteRecord} skippable={false} />
-        </>
-      )}
+      {/* Same fix as JobDetail: CustomerNotifyControl isn't gated on
+          phone — a quote with no number on file should still let staff
+          tick "Customer informed" once it's been sent another way. */}
+      <WhatsAppSendButton
+        phone={quote.customerPhone}
+        templateKey="quote_sent"
+        vars={{ customerName: quote.customerName || "", makeModel: quote.makeModel || "vehicle", plate: quote.plate || "", total: total > 0 ? Math.round(total).toLocaleString() : "0", quoteLink: `${window.location.origin}/?quote=${quote.id}` }}
+        label="Send Quote on WhatsApp"
+      />
+      <CustomerNotifyControl record={quote} templateKey="quote_sent" session={session} onSave={saveQuoteRecord} skippable={false} />
 
       {canEditQuote && quote.status !== "converted" && (
         <button onClick={() => setEditing(true)} className="mrcap-press" style={{ display: "flex", alignItems: "center", justifyContent: "center", gap: 7, width: "100%", padding: "10px", borderRadius: 10, border: `1.5px dashed ${COLORS.gold}`, background: "rgba(201,162,39,0.08)", color: COLORS.gold, fontWeight: 600, fontSize: 12.5, cursor: "pointer", marginBottom: 12 }}>
@@ -8475,7 +10971,7 @@ function QuoteDetail({ id, session, team, onBack, onConverted }) {
       )}
 
       {quote.status === "converted" && (
-        <div style={{ background: "rgba(74,122,87,0.15)", border: `1px solid ${COLORS.green}`, borderRadius: 10, padding: 14, marginBottom: 12, textAlign: "center", color: "#7BC494", fontWeight: 700, fontSize: 13 }}>
+        <div style={{ background: "rgba(74,122,87,0.15)", border: `1px solid ${COLORS.green}`, borderRadius: 10, padding: 14, marginBottom: 12, textAlign: "center", color: COLORS.successText, fontWeight: 700, fontSize: 13 }}>
           Converted to a real job card
         </div>
       )}
@@ -8524,7 +11020,7 @@ function QuoteDetail({ id, session, team, onBack, onConverted }) {
       )}
       {showDeleteConfirm && (
         <div className="mrcap-fade" style={{ background: "rgba(168,64,47,0.12)", border: `1px solid ${COLORS.red}`, borderRadius: 10, padding: 14, marginTop: 10 }}>
-          <div style={{ fontSize: 12.5, color: "#E08A78", marginBottom: 10 }}>Delete this quotation permanently?</div>
+          <div style={{ fontSize: 12.5, color: COLORS.dangerText, marginBottom: 10 }}>Delete this quotation permanently?</div>
           <div style={{ display: "flex", gap: 8 }}>
             <button onClick={() => setShowDeleteConfirm(false)} className="mrcap-press" style={{ ...secondaryBtnStyle, flex: 1, padding: "9px", fontSize: 12.5 }}>Cancel</button>
             <button onClick={handleDelete} className="mrcap-press" style={{ flex: 1, padding: "9px", borderRadius: 9, border: "none", background: COLORS.red, color: "#fff", fontWeight: 700, fontSize: 12.5, cursor: "pointer" }}>Delete</button>
@@ -8539,20 +11035,709 @@ function QuoteDetail({ id, session, team, onBack, onConverted }) {
 // "ceramic_coating"), used for new category/role/treatment ids. Falls
 // back to a short random suffix if the slug is empty (e.g. label was
 // all punctuation) so we never write a blank key.
+/* ---------------- Billing screens ---------------- */
+const billCard = { background: COLORS.panel, border: `1px solid ${COLORS.line}`, borderRadius: 12, padding: 14, marginBottom: 12 };
+const chipBtn = (active, tone = COLORS.gold) => ({
+  padding: "8px 12px", borderRadius: 999, fontSize: 12.5, fontWeight: 600, cursor: "pointer",
+  border: `1.5px solid ${active ? tone : COLORS.line}`, background: active ? tone : COLORS.panel2,
+  color: active ? COLORS.darkText : COLORS.ink,
+});
+const smallLabel = { fontSize: 11, fontWeight: 600, color: COLORS.muted, textTransform: "uppercase", letterSpacing: 0.4 };
+const moneyText = (n) => `AED ${fmtMoney(n)}`;
+
+function BillingStat({ label, value, sub, tone }) {
+  return (
+    <div style={{ flex: 1, minWidth: 0, background: COLORS.panel, border: `1px solid ${COLORS.line}`, borderRadius: 12, padding: "11px 12px" }}>
+      <div style={{ fontSize: 10.5, fontWeight: 600, color: COLORS.muted, textTransform: "uppercase", letterSpacing: 0.4 }}>{label}</div>
+      <div style={{ fontFamily: MONO_FONT, fontWeight: 700, fontSize: 15, color: tone || COLORS.ink, marginTop: 4, overflow: "hidden", textOverflow: "ellipsis" }}>{value}</div>
+      {sub ? <div style={{ fontSize: 10.5, color: COLORS.muted, marginTop: 2 }}>{sub}</div> : null}
+    </div>
+  );
+}
+
+// A proforma's payment state, worked out from its payments.
+function proformaState(p, payments) {
+  const t = docTotals(p);
+  const s = paymentSummary(t.totalIncl, payments);
+  if (p.status === "draft") return { label: "Draft", tone: "default", t, s };
+  if (p.status === "void") return { label: "Void", tone: "red", t, s };
+  if (s.status === "paid") return { label: "Paid", tone: "green", t, s };
+  if (s.status === "part") return { label: "Part paid", tone: "yellow", t, s };
+  return { label: "Unpaid", tone: "blue", t, s };
+}
+
+function BillingScreen({ session, team, setTeam, onBack, onOpen, onNew }) {
+  const [tab, setTab] = useState("proformas");
+  const [list, setList] = useState({ loading: true, proformas: [], payments: [] });
+  const [recon, setRecon] = useState({ loading: true, items: [], entered: [] });
+  const [search, setSearch] = useState("");
+  const [filter, setFilter] = useState("all");
+
+  const reload = useCallback(async () => {
+    const [a, b] = await Promise.all([loadProformaList(), loadReconciliationData()]);
+    setList({ loading: false, ...a });
+    setRecon({ loading: false, ...b });
+  }, []);
+  useEffect(() => { reload(); }, [reload]);
+
+  const paysBy = {};
+  for (const x of list.payments || []) (paysBy[x.proforma_id] ||= []).push(x);
+  const rows = (list.proformas || []).map((p) => ({ p, st: proformaState(p, paysBy[p.id]) }));
+
+  let outstanding = 0; let chequesN = 0; let chequesAmt = 0; let returnedN = 0;
+  for (const r of rows) {
+    if (r.p.status !== "issued") continue;
+    outstanding += r.st.s.balance;
+    if (r.st.s.pendingCheques > 0) { chequesN += 1; chequesAmt += r.st.s.pendingCheques; }
+    if (r.st.s.returnedCheques > 0) returnedN += 1;
+  }
+
+  const q = search.trim().toLowerCase();
+  const shown = rows.filter(({ p, st }) => {
+    if (filter === "draft" && p.status !== "draft") return false;
+    if (filter === "void" && p.status !== "void") return false;
+    if (filter === "unpaid" && !(p.status === "issued" && st.s.status !== "paid")) return false;
+    if (filter === "paid" && !(p.status === "issued" && st.s.status === "paid")) return false;
+    if (!q) return true;
+    return [p.number, p.bill_to?.name, p.bill_to?.phone, p.car?.plate, p.car?.makeModel].some((v) => String(v || "").toLowerCase().includes(q));
+  });
+
+  const pending = (recon.items || []).length;
+  const tabBtn = (key, label, badge) => (
+    <button key={key} onClick={() => setTab(key)} className="mrcap-press" style={{ flex: 1, padding: "9px 6px", borderRadius: 8, border: "none", cursor: "pointer", fontSize: 12.5, fontWeight: 700, background: tab === key ? COLORS.gold : "transparent", color: tab === key ? COLORS.darkText : COLORS.muted }}>
+      {label}{badge ? ` · ${badge}` : ""}
+    </button>
+  );
+
+  return (
+    <div className="mrcap-view" style={{ padding: "0 18px 96px" }}>
+      <SectionTitle>Billing</SectionTitle>
+      <div style={{ display: "flex", gap: 6, background: COLORS.panel2, borderRadius: 10, padding: 3, marginBottom: 14 }}>
+        {tabBtn("proformas", "Proformas")}
+        {tabBtn("reconcile", "First Bit", pending || "")}
+        {session.role === "admin" && tabBtn("access", "Access")}
+      </div>
+
+      {list.stale && <div style={{ fontSize: 11.5, color: COLORS.gold, marginBottom: 10 }}>Offline: showing what was last loaded.</div>}
+      {!list.loading && list.ok === false && (
+        <div style={{ ...billCard, borderColor: COLORS.red, color: COLORS.dangerText, fontSize: 12.5 }}>
+          Couldn't load billing records. {list.error || ""} <button onClick={reload} className="mrcap-press" style={{ marginLeft: 6, color: COLORS.gold, background: "none", border: "none", fontWeight: 700, cursor: "pointer" }}>Try again</button>
+        </div>
+      )}
+
+      {tab === "proformas" && (
+        <>
+          <div style={{ display: "flex", gap: 8, marginBottom: 12 }}>
+            <BillingStat label="Outstanding" value={moneyText(outstanding)} />
+            <BillingStat label="Cheques pending" value={String(chequesN)} sub={chequesN ? moneyText(chequesAmt) : "none"} tone={chequesN ? COLORS.gold : undefined} />
+            <BillingStat label="Returned" value={String(returnedN)} tone={returnedN ? COLORS.dangerText : undefined} />
+          </div>
+          {pending >= RECONCILE_NUDGE_AT && (
+            <button onClick={() => setTab("reconcile")} className="mrcap-press" style={{ ...billCard, width: "100%", textAlign: "left", cursor: "pointer", borderColor: COLORS.gold, background: "rgba(201,162,39,0.1)", color: COLORS.gold, fontSize: 12.5, fontWeight: 700 }}>
+              {pending} documents are waiting to be entered in First Bit. Tap to reconcile.
+            </button>
+          )}
+          <div style={{ position: "relative", marginBottom: 10 }}>
+            <Search size={15} color={COLORS.muted} style={{ position: "absolute", left: 12, top: 12 }} />
+            <input value={search} onChange={(e) => setSearch(e.target.value)} placeholder="Search number, client or plate…" style={{ ...inputStyle, marginTop: 0, paddingLeft: 34 }} />
+          </div>
+          <div style={{ display: "flex", gap: 6, overflowX: "auto", marginBottom: 12, paddingBottom: 2 }}>
+            {[["all", "All"], ["unpaid", "Unpaid"], ["paid", "Paid"], ["draft", "Drafts"], ["void", "Void"]].map(([k, l]) => (
+              <button key={k} onClick={() => setFilter(k)} className="mrcap-press" style={{ ...chipBtn(filter === k), flexShrink: 0 }}>{l}</button>
+            ))}
+          </div>
+          {list.loading && <SkeletonRows count={3} height={78} />}
+          {!list.loading && list.ok !== false && shown.length === 0 && (
+            <div style={{ textAlign: "center", padding: "40px 10px", color: COLORS.muted }}>
+              <Receipt size={26} style={{ opacity: 0.4, marginBottom: 8 }} />
+              <div style={{ fontSize: 14 }}>{rows.length ? "Nothing matches." : "No proformas yet. Tap New Proforma to raise the first one."}</div>
+            </div>
+          )}
+          <div style={{ display: "flex", flexDirection: "column", gap: 10 }}>
+            {shown.map(({ p, st }) => (
+              <button key={p.id} onClick={() => onOpen(p.id)} className="mrcap-press" style={{ textAlign: "left", width: "100%", boxSizing: "border-box", background: COLORS.panel, border: `1px solid ${COLORS.line}`, borderLeft: `3px solid ${p.status === "void" ? COLORS.red : p.status === "draft" ? COLORS.muted : COLORS.gold}`, borderRadius: "4px 10px 10px 4px", padding: "12px 14px", cursor: "pointer", opacity: p.status === "void" ? 0.6 : 1 }}>
+                <div style={{ display: "flex", justifyContent: "space-between", alignItems: "flex-start", gap: 8 }}>
+                  <div style={{ minWidth: 0 }}>
+                    <div style={{ fontFamily: MONO_FONT, fontWeight: 600, fontSize: 14, color: COLORS.ink }}>{p.number || "Draft"}</div>
+                    <div style={{ fontSize: 12.5, color: COLORS.ink, marginTop: 2, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{p.bill_to?.name || "No client yet"}</div>
+                    <div style={{ fontSize: 11.5, color: COLORS.muted, marginTop: 1 }}>{[p.car?.makeModel, p.car?.plate].filter(Boolean).join(" · ")}</div>
+                  </div>
+                  <div style={{ textAlign: "right", flexShrink: 0 }}>
+                    <div style={{ fontFamily: MONO_FONT, fontWeight: 700, fontSize: 14, color: COLORS.gold }}>{moneyText(st.t.totalIncl)}</div>
+                    <div style={{ marginTop: 5 }}><Pill tone={st.tone}>{st.label}</Pill></div>
+                  </div>
+                </div>
+                <div style={{ display: "flex", gap: 6, alignItems: "center", marginTop: 7, flexWrap: "wrap" }}>
+                  <span style={{ fontSize: 11, color: COLORS.muted }}>{fmtTime(new Date(p.issued_at || p.created_at).getTime())}</span>
+                  {p.status === "issued" && st.s.status === "part" && <span style={{ fontSize: 11, color: COLORS.muted }}>· balance {moneyText(st.s.balance)}</span>}
+                  {st.s.pendingCheques > 0 && <Pill tone="yellow">Cheque pending</Pill>}
+                  {st.s.returnedCheques > 0 && <Pill tone="red">Cheque returned</Pill>}
+                </div>
+              </button>
+            ))}
+          </div>
+          <FloatingNewJobButton onClick={onNew} label="New Proforma" />
+        </>
+      )}
+
+      {tab === "reconcile" && <ReconcileTab session={session} recon={recon} onChanged={reload} />}
+      {tab === "access" && session.role === "admin" && <BillingAccessPanel team={team} setTeam={setTeam} />}
+    </div>
+  );
+}
+
+/* ---- Reconcile with First Bit ---- */
+function ReconcileTab({ session, recon, onChanged }) {
+  const [selected, setSelected] = useState(() => new Set());
+  const [ref, setRef] = useState("");
+  const [confirming, setConfirming] = useState(false);
+  const [busy, setBusy] = useState(false);
+  const [msg, setMsg] = useState("");
+  const items = recon.items || [];
+  const picked = items.filter((i) => selected.has(i.key));
+  const exportSet = picked.length ? picked : items;
+
+  const toggle = (key) => setSelected((cur) => { const n = new Set(cur); if (n.has(key)) n.delete(key); else n.add(key); return n; });
+  const allOn = items.length > 0 && picked.length === items.length;
+
+  const download = () => {
+    downloadTextFile(`MrCAP-FirstBit-${localDateKey()}.csv`, reconcileCsv(exportSet));
+  };
+  const mark = async () => {
+    setBusy(true); setMsg("");
+    const res = await markReconciled(picked, ref.trim(), session);
+    setBusy(false);
+    if (!res.ok) { setMsg(res.error || "Couldn't save. Nothing was marked."); return; }
+    setSelected(new Set()); setRef(""); setConfirming(false);
+    onChanged();
+  };
+  const undo = async (row) => { if (await unmarkReconciled(row)) onChanged(); };
+
+  if (recon.loading) return <SkeletonRows count={3} height={70} />;
+  if (recon.ok === false) return <div style={{ ...billCard, color: COLORS.dangerText, fontSize: 12.5 }}>Couldn't load. {recon.error}</div>;
+
+  return (
+    <>
+      <div style={{ ...billCard, borderColor: items.length >= RECONCILE_NUDGE_AT ? COLORS.gold : COLORS.line }}>
+        <div style={{ fontWeight: 700, fontSize: 14, color: COLORS.ink }}>{items.length === 0 ? "Everything is in First Bit." : `${items.length} document${items.length === 1 ? "" : "s"} not yet in First Bit`}</div>
+        <div style={{ fontSize: 12, color: COLORS.muted, marginTop: 4, lineHeight: 1.5 }}>
+          Issued proformas and tax invoices raised here. Download the list, enter them in First Bit, then mark them entered so they drop off this list.
+        </div>
+      </div>
+
+      {items.length > 0 && (
+        <>
+          <div style={{ display: "flex", gap: 8, marginBottom: 10 }}>
+            <button onClick={() => setSelected(allOn ? new Set() : new Set(items.map((i) => i.key)))} className="mrcap-press" style={{ ...chipBtn(false), flexShrink: 0 }}>{allOn ? "Clear" : "Select all"}</button>
+            <button onClick={download} className="mrcap-press" style={{ ...secondaryBtnStyle, flex: 1, padding: "9px", fontSize: 12.5, display: "flex", alignItems: "center", justifyContent: "center", gap: 6 }}>
+              <Download size={14} /> Download CSV ({exportSet.length})
+            </button>
+          </div>
+          <div style={{ display: "flex", flexDirection: "column", gap: 8, marginBottom: 14 }}>
+            {items.map((i) => {
+              const on = selected.has(i.key);
+              return (
+                <button key={i.key} onClick={() => toggle(i.key)} className="mrcap-press" style={{ textAlign: "left", width: "100%", boxSizing: "border-box", display: "flex", gap: 10, alignItems: "center", background: COLORS.panel, border: `1.5px solid ${on ? COLORS.gold : COLORS.line}`, borderRadius: 10, padding: "10px 12px", cursor: "pointer" }}>
+                  <span style={{ width: 18, height: 18, borderRadius: 5, border: `2px solid ${on ? COLORS.gold : COLORS.muted}`, background: on ? COLORS.gold : "transparent", display: "flex", alignItems: "center", justifyContent: "center", flexShrink: 0 }}>{on && <Check size={12} color={COLORS.darkText} />}</span>
+                  <span style={{ flex: 1, minWidth: 0 }}>
+                    <span style={{ display: "flex", justifyContent: "space-between", gap: 8 }}>
+                      <span style={{ fontFamily: MONO_FONT, fontWeight: 600, fontSize: 12.5, color: COLORS.ink }}>{i.number}</span>
+                      <span style={{ fontFamily: MONO_FONT, fontWeight: 700, fontSize: 12.5, color: COLORS.gold }}>AED {i.incl}</span>
+                    </span>
+                    <span style={{ display: "block", fontSize: 11.5, color: COLORS.muted, marginTop: 2, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{i.type} · {i.client}{i.plate ? ` · ${i.plate}` : ""}{i.payment ? ` · ${i.payment}` : ""}</span>
+                  </span>
+                </button>
+              );
+            })}
+          </div>
+
+          <div style={billCard}>
+            <label style={smallLabel}>First Bit reference (optional)</label>
+            <input value={ref} onChange={(e) => setRef(e.target.value)} placeholder="e.g. batch date or First Bit entry number" style={inputStyle} />
+            {msg && <div style={{ color: COLORS.dangerText, fontSize: 12, marginTop: 8 }}>{msg}</div>}
+            {!confirming ? (
+              <button onClick={() => setConfirming(true)} disabled={!picked.length} className="mrcap-press" style={{ ...primaryBtnStyle, width: "100%", marginTop: 12, opacity: picked.length ? 1 : 0.45 }}>
+                Mark {picked.length || ""} as entered in First Bit
+              </button>
+            ) : (
+              <div style={{ marginTop: 12 }}>
+                <div style={{ fontSize: 12.5, color: COLORS.ink, marginBottom: 8 }}>Mark {picked.length} document{picked.length === 1 ? "" : "s"} as entered? They will leave this list.</div>
+                <div style={{ display: "flex", gap: 8 }}>
+                  <button onClick={() => setConfirming(false)} className="mrcap-press" style={{ ...secondaryBtnStyle, flex: 1 }}>Not yet</button>
+                  <button onClick={mark} disabled={busy} className="mrcap-press" style={{ ...primaryBtnStyle, flex: 2, opacity: busy ? 0.6 : 1 }}>{busy ? "Saving…" : "Yes, mark entered"}</button>
+                </div>
+              </div>
+            )}
+          </div>
+        </>
+      )}
+
+      {(recon.entered || []).length > 0 && (
+        <>
+          <div style={{ ...smallLabel, margin: "6px 2px 8px" }}>Recently entered</div>
+          <div style={{ display: "flex", flexDirection: "column", gap: 6 }}>
+            {recon.entered.slice(0, 15).map((r) => (
+              <div key={r.id} style={{ display: "flex", justifyContent: "space-between", alignItems: "center", gap: 8, background: COLORS.panel, border: `1px solid ${COLORS.line}`, borderRadius: 9, padding: "8px 11px" }}>
+                <div style={{ minWidth: 0 }}>
+                  <div style={{ fontFamily: MONO_FONT, fontSize: 12, color: COLORS.ink }}>{r.doc_number}</div>
+                  <div style={{ fontSize: 10.5, color: COLORS.muted }}>{r.first_bit_ref ? `${r.first_bit_ref} · ` : ""}{r.entered_by} · {fmtTime(new Date(r.entered_at).getTime())}</div>
+                </div>
+                {session.role === "admin" && <button onClick={() => undo(r)} className="mrcap-press" style={{ background: "none", border: `1px solid ${COLORS.line}`, borderRadius: 7, padding: "4px 9px", fontSize: 11, color: COLORS.muted, cursor: "pointer" }}>Undo</button>}
+              </div>
+            ))}
+          </div>
+        </>
+      )}
+    </>
+  );
+}
+
+/* ---- Who can use Billing ---- */
+function BillingAccessPanel({ team, setTeam }) {
+  const [busyId, setBusyId] = useState(null);
+  const [error, setError] = useState("");
+  const toggle = async (m) => {
+    setBusyId(m.id); setError("");
+    const next = { ...(m.permissions || {}), billing: !m.permissions?.billing };
+    const res = await gkCall({ path: `team_members?id=eq.${encodeURIComponent(m.id)}`, method: "PATCH", body: { permissions: next, updated_at: nowIso() }, headers: { Prefer: "return=minimal" }, summary: `${next.billing ? "Gave" : "Removed"} Billing access ${next.billing ? "to" : "from"} ${m.name}` });
+    setBusyId(null);
+    if (!res.ok) { setError(res.error); return; }
+    setTeam((cur) => cur.map((x) => (x.id === m.id ? { ...x, permissions: next } : x)));
+  };
+  const always = team.filter((m) => m.role === "admin" || m.role === "accountant");
+  const others = team.filter((m) => m.role !== "admin" && m.role !== "accountant");
+  return (
+    <>
+      <div style={{ ...billCard, fontSize: 12.5, color: COLORS.muted, lineHeight: 1.55 }}>
+        Admins and accountants always have Billing. Switch it on for anyone else below. To add an accountant, use Team, add a member, and choose the Accountant role.
+      </div>
+      {error && <div style={{ color: COLORS.dangerText, fontSize: 12.5, marginBottom: 10 }}>{error}</div>}
+      {always.length > 0 && <div style={{ ...smallLabel, margin: "2px 2px 8px" }}>Always have access</div>}
+      <div style={{ display: "flex", flexDirection: "column", gap: 6, marginBottom: 14 }}>
+        {always.map((m) => (
+          <div key={m.id} style={{ display: "flex", justifyContent: "space-between", alignItems: "center", background: COLORS.panel, border: `1px solid ${COLORS.line}`, borderRadius: 9, padding: "10px 12px" }}>
+            <span style={{ fontSize: 13.5, color: COLORS.ink }}>{m.name}</span>
+            <Pill tone="green">{ROLE_DEFS[m.role]?.label || m.role}</Pill>
+          </div>
+        ))}
+      </div>
+      <div style={{ ...smallLabel, margin: "2px 2px 8px" }}>Everyone else</div>
+      <div style={{ display: "flex", flexDirection: "column", gap: 6 }}>
+        {others.map((m) => {
+          const on = !!m.permissions?.billing;
+          return (
+            <div key={m.id} style={{ display: "flex", justifyContent: "space-between", alignItems: "center", background: COLORS.panel, border: `1px solid ${COLORS.line}`, borderRadius: 9, padding: "8px 12px" }}>
+              <div>
+                <div style={{ fontSize: 13.5, color: COLORS.ink }}>{m.name}</div>
+                <div style={{ fontSize: 11, color: COLORS.muted }}>{ROLE_DEFS[m.role]?.label || m.role}</div>
+              </div>
+              <button onClick={() => toggle(m)} disabled={busyId === m.id} className="mrcap-press" aria-pressed={on} style={{ ...chipBtn(on, COLORS.green), minWidth: 84, opacity: busyId === m.id ? 0.6 : 1 }}>
+                {busyId === m.id ? "…" : on ? "Has access" : "No access"}
+              </button>
+            </div>
+          );
+        })}
+      </div>
+    </>
+  );
+}
+
+/* ---- Create / edit a proforma ---- */
+function ProformaEditor({ seed, session, onCancel, onDone }) {
+  const base = blankProforma();
+  const [p, setP] = useState(() => ({
+    ...base, ...(seed || {}),
+    bill_to: { ...base.bill_to, ...((seed && seed.bill_to) || {}) },
+    car: { ...base.car, ...((seed && seed.car) || {}) },
+    lines: seed && seed.lines && seed.lines.length ? seed.lines : [blankLine()],
+    vat_rate: seed && seed.vat_rate != null ? Number(seed.vat_rate) : VAT_RATE,
+  }));
+  const [saving, setSaving] = useState(false);
+  const [error, setError] = useState("");
+  const [reserved, setReserved] = useState(null);
+  const [confirming, setConfirming] = useState(false);
+
+  // Pre-fill TRN / address / email from this client's last proforma.
+  useEffect(() => {
+    if (!seed || !seed.customer_id) return;
+    (async () => {
+      const last = await loadLastBillTo(seed.customer_id);
+      if (!last) return;
+      setP((cur) => ({ ...cur, bill_to: { ...cur.bill_to, trn: cur.bill_to.trn || last.trn || "", address: cur.bill_to.address || last.address || "", email: cur.bill_to.email || last.email || "" } }));
+    })();
+    // eslint-disable-next-line
+  }, []);
+
+  const setBill = (k, v) => setP((cur) => ({ ...cur, bill_to: { ...cur.bill_to, [k]: v } }));
+  const setCar = (k, v) => setP((cur) => ({ ...cur, car: { ...cur.car, [k]: v } }));
+  const setLine = (i, patch) => setP((cur) => ({ ...cur, lines: cur.lines.map((l, idx) => (idx === i ? { ...l, ...patch } : l)) }));
+  const addLine = () => setP((cur) => ({ ...cur, lines: [...cur.lines, blankLine()] }));
+  const removeLine = (i) => setP((cur) => ({ ...cur, lines: cur.lines.length > 1 ? cur.lines.filter((_, idx) => idx !== i) : [blankLine()] }));
+
+  const totals = computeTotals(p.lines, Number(p.vat_rate));
+  const problems = issueProblems(p);
+  const isRevision = !!p.supersedes;
+
+  const finish = (row) => onDone(row);
+  const saveDraft = async () => {
+    setSaving(true); setError("");
+    const res = await saveProformaDraft(p, session);
+    setSaving(false);
+    if (!res.ok) { setError(res.error); return; }
+    finish(res.row);
+  };
+  const issue = async () => {
+    setSaving(true); setError("");
+    const res = await issueProforma(p, session, reserved);
+    setSaving(false);
+    if (res.id && !p.id) setP((cur) => ({ ...cur, id: res.id }));
+    if (!res.ok) { setError(res.error); if (res.reserved) setReserved(res.reserved); setConfirming(false); return; }
+    finish(res.row);
+  };
+
+  const inp = { ...inputStyle, marginTop: 0 };
+  return (
+    <div className="mrcap-view" style={{ padding: "0 18px 40px" }}>
+      <SectionTitle>{p.id ? "Edit Proforma Draft" : isRevision ? "Revise Proforma" : "New Proforma"}</SectionTitle>
+      {isRevision && <div style={{ ...billCard, fontSize: 12.5, color: COLORS.gold }}>This is a new version. When you issue it, the original is voided and marked as replaced.</div>}
+
+      <Field label="Issued from">
+        <div style={{ display: "flex", gap: 8 }}>
+          {Object.entries(PROFORMA_ISSUERS).map(([k, v]) => (
+            <button key={k} onClick={() => setP((cur) => ({ ...cur, entity: k }))} className="mrcap-press" style={{ ...chipBtn(p.entity === k), flex: 1, borderRadius: 10 }}>{v.label}</button>
+          ))}
+        </div>
+      </Field>
+
+      <div style={billCard}>
+        <div style={{ ...smallLabel, marginBottom: 10 }}>Bill to</div>
+        <Field label="Client name"><input style={inp} value={p.bill_to.name} onChange={(e) => setBill("name", e.target.value)} placeholder="Company or person" /></Field>
+        <Field label="Client TRN (optional)"><input style={{ ...inp, fontFamily: MONO_FONT }} inputMode="numeric" value={p.bill_to.trn} onChange={(e) => setBill("trn", e.target.value.replace(/[^0-9]/g, ""))} placeholder="15-digit TRN, if they have one" /></Field>
+        <Field label="Phone"><input style={inp} type="tel" value={p.bill_to.phone} onChange={(e) => setBill("phone", e.target.value)} /></Field>
+        <Field label="Address (optional)"><input style={inp} value={p.bill_to.address} onChange={(e) => setBill("address", e.target.value)} /></Field>
+        <Field label="Email (optional)"><input style={inp} type="email" value={p.bill_to.email} onChange={(e) => setBill("email", e.target.value)} /></Field>
+        {p.customer_id && <div style={{ fontSize: 11.5, color: COLORS.muted }}>TRN, address and email are filled in from this client's last proforma, and remembered for the next one.</div>}
+      </div>
+
+      <div style={billCard}>
+        <div style={{ ...smallLabel, marginBottom: 10 }}>Vehicle</div>
+        <Field label="Make / model"><input style={inp} value={p.car.makeModel} onChange={(e) => setCar("makeModel", e.target.value)} /></Field>
+        <div style={{ display: "flex", gap: 8 }}>
+          <div style={{ flex: 1 }}><Field label="Year (optional)"><input style={{ ...inp, fontFamily: MONO_FONT }} inputMode="numeric" value={p.car.year || ""} onChange={(e) => setCar("year", e.target.value.replace(/[^0-9]/g, "").slice(0, 4))} placeholder="e.g. 2025" /></Field></div>
+          <div style={{ flex: 1 }}><Field label="Colour"><input style={inp} value={p.car.color} onChange={(e) => setCar("color", e.target.value)} /></Field></div>
+          <div style={{ flex: 1 }}><Field label="Plate no."><input style={{ ...inp, fontFamily: MONO_FONT }} value={p.car.plate} onChange={(e) => setCar("plate", e.target.value.toUpperCase())} /></Field></div>
+        </div>
+        <Field label="VIN (optional)"><input style={{ ...inp, fontFamily: MONO_FONT }} value={p.car.vin} onChange={(e) => setCar("vin", e.target.value.toUpperCase())} /></Field>
+      </div>
+
+      <div style={{ ...smallLabel, margin: "4px 2px 8px" }}>Lines</div>
+      {p.lines.map((l, i) => {
+        const c = totals.rows[i];
+        return (
+          <div key={i} style={billCard}>
+            <div style={{ display: "flex", gap: 8, alignItems: "flex-start" }}>
+              <textarea value={l.desc} onChange={(e) => setLine(i, { desc: e.target.value })} placeholder="Description, e.g. SM BodyRepair/ Front Bumper" rows={2} style={{ ...textareaStyle, marginTop: 0, minHeight: 48, flex: 1 }} />
+              <button onClick={() => removeLine(i)} className="mrcap-press" aria-label="Remove line" style={{ ...iconBtnStyle, flexShrink: 0 }}><Trash2 size={15} color={COLORS.muted} /></button>
+            </div>
+            <div style={{ display: "flex", gap: 8, marginTop: 10 }}>
+              <div style={{ width: 64 }}><label style={smallLabel}>Qty</label><input style={{ ...inp, marginTop: 4 }} type="number" inputMode="decimal" min="0" step="any" value={l.qty} onChange={(e) => setLine(i, { qty: e.target.value })} /></div>
+              <div style={{ width: 74 }}><label style={smallLabel}>Unit</label><input style={{ ...inp, marginTop: 4 }} value={l.uom} onChange={(e) => setLine(i, { uom: e.target.value })} /></div>
+              <div style={{ flex: 1 }}><label style={smallLabel}>Price (excl. VAT)</label><input style={{ ...inp, marginTop: 4, fontFamily: MONO_FONT }} type="number" inputMode="decimal" min="0" step="0.01" value={l.price} onChange={(e) => setLine(i, { price: e.target.value })} /></div>
+            </div>
+            <div style={{ display: "flex", gap: 8, marginTop: 10, alignItems: "flex-end" }}>
+              <div style={{ flex: 1 }}><label style={smallLabel}>Discount</label><input style={{ ...inp, marginTop: 4, fontFamily: MONO_FONT }} type="number" inputMode="decimal" min="0" step="0.01" value={l.discValue} onChange={(e) => setLine(i, { discValue: e.target.value })} placeholder="0" /></div>
+              <div style={{ display: "flex", gap: 4 }}>
+                {[["aed", "AED"], ["pct", "%"]].map(([k, lab]) => <button key={k} onClick={() => setLine(i, { discType: k })} className="mrcap-press" style={{ ...chipBtn((l.discType || "aed") === k), padding: "11px 12px", borderRadius: 10 }}>{lab}</button>)}
+              </div>
+            </div>
+            <div style={{ display: "flex", justifyContent: "space-between", marginTop: 10, fontSize: 12, color: COLORS.muted }}>
+              <span>{c.discount > 0 ? `Discount AED ${fmtMoney(c.discount)} (${fmtPct(c.discountPct)}%)` : "No discount"}</span>
+              <span style={{ fontFamily: MONO_FONT, color: COLORS.ink }}>Line total AED {fmtMoney(c.incl)}</span>
+            </div>
+          </div>
+        );
+      })}
+      <button onClick={addLine} className="mrcap-press" style={{ ...secondaryBtnStyle, width: "100%", marginBottom: 14, display: "flex", alignItems: "center", justifyContent: "center", gap: 6 }}><Plus size={15} /> Add a line</button>
+
+      <Field label="VAT">
+        <div style={{ display: "flex", gap: 8 }}>
+          <button onClick={() => setP((cur) => ({ ...cur, vat_rate: VAT_RATE }))} className="mrcap-press" style={{ ...chipBtn(Number(p.vat_rate) === VAT_RATE), flex: 1, borderRadius: 10 }}>5% VAT</button>
+          <button onClick={() => setP((cur) => ({ ...cur, vat_rate: 0 }))} className="mrcap-press" style={{ ...chipBtn(Number(p.vat_rate) === 0), flex: 1, borderRadius: 10 }}>No VAT</button>
+        </div>
+      </Field>
+
+      <div style={{ ...billCard, borderTop: `2px solid ${COLORS.gold}` }}>
+        {totals.hasDiscount && <TotalRow label="Total discount" value={totals.totalDiscount} />}
+        <TotalRow label="Total (excl. VAT)" value={totals.subtotalExcl} />
+        <TotalRow label={`VAT (${Math.round(Number(p.vat_rate) * 10000) / 100}%)`} value={totals.totalVat} />
+        <div style={{ display: "flex", justifyContent: "space-between", marginTop: 8, paddingTop: 8, borderTop: `1px dashed ${COLORS.line}` }}>
+          <span style={{ fontWeight: 700, color: COLORS.ink }}>Total (incl. VAT)</span>
+          <span style={{ fontFamily: MONO_FONT, fontWeight: 700, fontSize: 17, color: COLORS.gold }}>{moneyText(totals.totalIncl)}</span>
+        </div>
+        <div style={{ fontSize: 11.5, color: COLORS.muted, marginTop: 6 }}>{amountInWords(totals.totalIncl)}</div>
+      </div>
+
+      <Field label="Payment terms">
+        <div style={{ display: "flex", gap: 6, flexWrap: "wrap", marginBottom: 8 }}>
+          {PAYMENT_TERMS_PRESETS.map((t) => <button key={t} onClick={() => setP((cur) => ({ ...cur, payment_terms: t }))} className="mrcap-press" style={chipBtn(p.payment_terms === t)}>{t}</button>)}
+        </div>
+        <input style={inp} value={p.payment_terms || ""} onChange={(e) => setP((cur) => ({ ...cur, payment_terms: e.target.value }))} placeholder="or type your own" />
+      </Field>
+      <Field label="Delivery terms (optional)"><input style={inp} value={p.delivery_terms || ""} onChange={(e) => setP((cur) => ({ ...cur, delivery_terms: e.target.value }))} /></Field>
+      <Field label="Valid until"><input style={inp} type="date" value={p.valid_until || ""} onChange={(e) => setP((cur) => ({ ...cur, valid_until: e.target.value }))} /></Field>
+      <Field label="Notes (printed on the proforma)"><textarea style={textareaStyle} value={p.notes || ""} onChange={(e) => setP((cur) => ({ ...cur, notes: e.target.value }))} /></Field>
+
+      {error && <div style={{ ...billCard, borderColor: COLORS.red, color: COLORS.dangerText, fontSize: 12.5 }}>{error}</div>}
+      {problems.length > 0 && <div style={{ fontSize: 12, color: COLORS.muted, marginBottom: 10 }}>To issue: {problems.join(" ")}</div>}
+
+      {!confirming ? (
+        <div style={{ display: "flex", gap: 8 }}>
+          <button onClick={onCancel} className="mrcap-press" style={{ ...secondaryBtnStyle, flex: 1 }}>Cancel</button>
+          <button onClick={saveDraft} disabled={saving || !String(p.bill_to.name || "").trim()} className="mrcap-press" style={{ ...secondaryBtnStyle, flex: 1, opacity: saving || !String(p.bill_to.name || "").trim() ? 0.5 : 1 }}>Save draft</button>
+          <button onClick={() => { setError(""); setConfirming(true); }} disabled={saving || problems.length > 0} className="mrcap-press" style={{ ...primaryBtnStyle, flex: 1.4, opacity: saving || problems.length ? 0.5 : 1 }}>{reserved ? "Retry issue" : "Issue"}</button>
+        </div>
+      ) : (
+        <div style={billCard}>
+          <div style={{ fontWeight: 700, color: COLORS.ink, marginBottom: 6 }}>Issue this proforma?</div>
+          <div style={{ fontSize: 12.5, color: COLORS.muted, lineHeight: 1.5, marginBottom: 12 }}>
+            It takes the next number and is locked, so it can't be edited afterwards. If something changes you can revise it into a new version.
+          </div>
+          <div style={{ display: "flex", gap: 8 }}>
+            <button onClick={() => setConfirming(false)} disabled={saving} className="mrcap-press" style={{ ...secondaryBtnStyle, flex: 1 }}>Go back</button>
+            <button onClick={issue} disabled={saving} className="mrcap-press" style={{ ...primaryBtnStyle, flex: 2, opacity: saving ? 0.6 : 1 }}>{saving ? "Issuing…" : "Yes, issue it"}</button>
+          </div>
+        </div>
+      )}
+    </div>
+  );
+}
+function TotalRow({ label, value }) {
+  return (
+    <div style={{ display: "flex", justifyContent: "space-between", fontSize: 12.5, color: COLORS.muted, marginBottom: 5 }}>
+      <span>{label}</span><span style={{ fontFamily: MONO_FONT, color: COLORS.ink }}>{moneyText(value)}</span>
+    </div>
+  );
+}
+
+/* ---- One proforma: PDF, payments, revise, void ---- */
+function ProformaDetail({ id, session, team, onBack, onEditDraft, onRevise, onOpenJob, onDeleted }) {
+  const [state, setState] = useState({ loading: true });
+  const [payOpen, setPayOpen] = useState(false);
+  const [pay, setPay] = useState({ method: "cash", amount: "", paid_on: localDateKey(), cheque_no: "", cheque_bank: "", cheque_date: "", note: "" });
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState("");
+  const [voiding, setVoiding] = useState(false);
+  const [voidReason, setVoidReason] = useState("");
+  const [confirmDelete, setConfirmDelete] = useState(false);
+
+  const load = useCallback(async () => {
+    const r = await loadProformaFull(id);
+    setState({ loading: false, ...r });
+  }, [id]);
+  useEffect(() => { load(); }, [load]);
+
+  if (state.loading) return <div style={{ padding: 30, color: COLORS.muted, textAlign: "center" }}>Loading proforma…</div>;
+  if (!state.ok || !state.proforma) return <div style={{ padding: 30, color: COLORS.muted, textAlign: "center" }}>{state.error || "Proforma not found."}</div>;
+
+  const p = state.proforma;
+  const payments = state.payments || [];
+  const st = proformaState(p, payments);
+  const { t, s } = st;
+  const isAdmin = session.role === "admin";
+  const method = (k) => (PAYMENT_METHODS.find((m) => m.key === k) || {}).label || k;
+
+  const openPay = () => { setPay((cur) => ({ ...cur, amount: s.balance > 0 ? String(s.balance) : "" })); setError(""); setPayOpen(true); };
+  const payProblem = !(Number(pay.amount) > 0) ? "Enter an amount." : pay.method === "cheque" && !pay.cheque_no.trim() ? "Enter the cheque number." : "";
+  const savePayment = async () => {
+    setBusy(true); setError("");
+    const res = await recordPayment(p, pay, session);
+    setBusy(false);
+    if (!res.ok) { setError(res.error); return; }
+    setPayOpen(false); setPay({ method: "cash", amount: "", paid_on: localDateKey(), cheque_no: "", cheque_bank: "", cheque_date: "", note: "" });
+    load();
+  };
+  const changeCheque = async (payment, status) => {
+    setBusy(true); setError("");
+    const res = await setChequeStatus(payment, status, p);
+    setBusy(false);
+    if (!res.ok) { setError(res.error); return; }
+    load();
+  };
+  const removePayment = async (payment) => {
+    if (!window.confirm(`Remove this ${method(payment.method)} payment of AED ${fmtMoney(payment.amount)}? This is logged.`)) return;
+    setBusy(true);
+    const ok = await deletePayment(payment, p);
+    setBusy(false);
+    if (!ok) { setError("Couldn't remove the payment."); return; }
+    load();
+  };
+  const doVoid = async () => {
+    setBusy(true); setError("");
+    const res = await voidProforma(p, voidReason.trim(), session);
+    setBusy(false);
+    if (!res.ok) { setError(res.error); return; }
+    setVoiding(false); setVoidReason("");
+    load();
+  };
+  const doDelete = async () => {
+    setBusy(true);
+    const ok = await deleteProformaDraft(p);
+    setBusy(false);
+    if (!ok) { setError("Couldn't delete the draft."); return; }
+    onDeleted();
+  };
+
+  const pdf = () => { const doc = generateProformaPDF(p); doc.save(`MrCAP-Proforma-${p.number || "DRAFT"}.pdf`); };
+  const waText = `Hello ${p.bill_to?.name || ""}, here is proforma ${p.number} for ${[p.car?.makeModel, p.car?.plate].filter(Boolean).join(" ") || "your vehicle"}: AED ${fmtMoney(t.totalIncl)}${p.payment_terms ? ` (${p.payment_terms})` : ""}. Thank you, Mr.CAP.`;
+  const rec = state.reconciliation;
+
+  return (
+    <div className="mrcap-view" style={{ padding: "0 18px 40px" }}>
+      <div style={{ background: `linear-gradient(160deg, ${COLORS.panel2}, ${COLORS.panel})`, border: `1px solid ${COLORS.line}`, borderTop: `2px solid ${p.status === "void" ? COLORS.red : COLORS.gold}`, borderRadius: 12, padding: "16px 16px 14px", marginBottom: 14 }}>
+        <div style={{ display: "flex", justifyContent: "space-between", alignItems: "flex-start", gap: 8 }}>
+          <div style={{ minWidth: 0 }}>
+            <div style={{ fontFamily: MONO_FONT, fontWeight: 700, fontSize: 17, color: COLORS.ink, letterSpacing: 0.3 }}>{p.number || "Draft (not issued)"}</div>
+            <div style={{ fontSize: 13, color: COLORS.ink, marginTop: 4 }}>{p.bill_to?.name}</div>
+            <div style={{ fontSize: 12, color: COLORS.muted, marginTop: 2 }}>{[p.car?.makeModel, p.car?.color, p.car?.plate || p.car?.vin].filter(Boolean).join(" · ")}</div>
+          </div>
+          <Pill tone={st.tone}>{st.label}</Pill>
+        </div>
+        <div style={{ marginTop: 12, fontFamily: MONO_FONT, fontWeight: 700, fontSize: 20, color: COLORS.gold }}>{moneyText(t.totalIncl)}</div>
+        <div style={{ fontSize: 11.5, color: COLORS.muted, marginTop: 3 }}>
+          {t.totalVat > 0 ? `${moneyText(t.subtotalExcl)} + ${moneyText(t.totalVat)} VAT` : "No VAT"}{p.valid_until ? ` · valid until ${formatLongDate(`${p.valid_until}T12:00:00`)}` : ""}
+        </div>
+        {p.status === "void" && <div style={{ marginTop: 10, fontSize: 12.5, color: COLORS.dangerText }}>Void{p.void_reason ? `: ${p.void_reason}` : ""}</div>}
+      </div>
+
+      {error && <div style={{ ...billCard, borderColor: COLORS.red, color: COLORS.dangerText, fontSize: 12.5 }}>{error}</div>}
+
+      <button onClick={pdf} className="mrcap-press" style={{ display: "flex", alignItems: "center", justifyContent: "center", gap: 8, width: "100%", padding: "12px", borderRadius: 10, border: "none", background: COLORS.gold, color: COLORS.darkText, fontWeight: 700, fontSize: 13, cursor: "pointer", marginBottom: 10 }}>
+        <FileText size={15} /> {p.status === "draft" ? "Preview PDF (draft)" : "Download PDF"}
+      </button>
+      {p.status === "issued" && p.bill_to?.phone && (
+        <a href={`https://wa.me/${toWhatsAppNumber(p.bill_to.phone)}?text=${encodeURIComponent(waText)}`} target="_blank" rel="noopener noreferrer" className="mrcap-press" style={{ display: "flex", alignItems: "center", justifyContent: "center", gap: 8, width: "100%", padding: "12px", borderRadius: 10, background: "#25D366", color: "#0D2A17", fontWeight: 700, fontSize: 13, textDecoration: "none", marginBottom: 10, boxSizing: "border-box" }}>
+          <Send size={15} /> Send on WhatsApp
+        </a>
+      )}
+      {p.job_id && onOpenJob && (
+        <button onClick={() => onOpenJob(p.job_id)} className="mrcap-press" style={{ ...secondaryBtnStyle, width: "100%", marginBottom: 10 }}>Open the job card</button>
+      )}
+
+      {p.status === "draft" && (
+        <div style={{ display: "flex", gap: 8, marginBottom: 12 }}>
+          <button onClick={() => onEditDraft(p)} className="mrcap-press" style={{ ...primaryBtnStyle, flex: 2 }}>Edit and issue</button>
+          {!confirmDelete
+            ? <button onClick={() => setConfirmDelete(true)} className="mrcap-press" style={{ ...secondaryBtnStyle, flex: 1 }}>Delete</button>
+            : <button onClick={doDelete} disabled={busy} className="mrcap-press" style={{ ...secondaryBtnStyle, flex: 1, color: COLORS.dangerText, borderColor: COLORS.red }}>Yes, delete</button>}
+        </div>
+      )}
+
+      {p.status === "issued" && (
+        <>
+          <div style={billCard}>
+            <div style={{ display: "flex", gap: 8 }}>
+              <BillingStat label="Collected" value={moneyText(s.collected)} tone={COLORS.successText} />
+              <BillingStat label="Balance" value={moneyText(s.balance)} tone={s.balance > 0 ? COLORS.gold : COLORS.successText} />
+              {s.pendingCheques > 0 && <BillingStat label="Cheques due" value={moneyText(s.pendingCheques)} />}
+            </div>
+            {s.returnedCheques > 0 && <div style={{ marginTop: 10, fontSize: 12.5, color: COLORS.dangerText }}>A cheque of {moneyText(s.returnedCheques)} was returned. It is not counted as paid.</div>}
+          </div>
+
+          <div style={{ ...smallLabel, margin: "4px 2px 8px" }}>Payments</div>
+          {payments.length === 0 && <div style={{ fontSize: 12.5, color: COLORS.muted, marginBottom: 10 }}>No payments yet.</div>}
+          {payments.map((x) => (
+            <div key={x.id} style={billCard}>
+              <div style={{ display: "flex", justifyContent: "space-between", alignItems: "flex-start", gap: 8 }}>
+                <div>
+                  <div style={{ fontSize: 13.5, fontWeight: 600, color: COLORS.ink }}>{method(x.method)} · {moneyText(x.amount)}</div>
+                  <div style={{ fontSize: 11.5, color: COLORS.muted, marginTop: 2 }}>
+                    {formatLongDate(`${x.paid_on}T12:00:00`)}{x.receipt_no ? ` · receipt ${x.receipt_no}` : ""}{x.recorded_by ? ` · ${x.recorded_by}` : ""}
+                  </div>
+                  {x.method === "cheque" && <div style={{ fontSize: 11.5, color: COLORS.muted, marginTop: 2 }}>Cheque {x.cheque_no}{x.cheque_bank ? ` · ${x.cheque_bank}` : ""}{x.cheque_date ? ` · dated ${formatLongDate(`${x.cheque_date}T12:00:00`)}` : ""}</div>}
+                  {x.note && <div style={{ fontSize: 11.5, color: COLORS.muted, marginTop: 2 }}>{x.note}</div>}
+                </div>
+                {x.method === "cheque" && <Pill tone={x.cheque_status === "cleared" ? "green" : x.cheque_status === "returned" ? "red" : "yellow"}>{(CHEQUE_STATUSES.find((c) => c.key === x.cheque_status) || {}).label || x.cheque_status}</Pill>}
+              </div>
+              <div style={{ display: "flex", gap: 6, flexWrap: "wrap", marginTop: 10 }}>
+                {x.method === "cheque" && x.cheque_status === "received" && <button onClick={() => changeCheque(x, "deposited")} disabled={busy} className="mrcap-press" style={chipBtn(false)}>Deposited</button>}
+                {x.method === "cheque" && (x.cheque_status === "received" || x.cheque_status === "deposited") && <button onClick={() => changeCheque(x, "cleared")} disabled={busy} className="mrcap-press" style={chipBtn(false, COLORS.green)}>Cleared</button>}
+                {x.method === "cheque" && (x.cheque_status === "received" || x.cheque_status === "deposited") && <button onClick={() => changeCheque(x, "returned")} disabled={busy} className="mrcap-press" style={{ ...chipBtn(false), color: COLORS.dangerText }}>Returned</button>}
+                {x.receipt_no && <button onClick={() => generateReceiptPDF(p, x, s).save(`MrCAP-Receipt-${x.receipt_no}.pdf`)} className="mrcap-press" style={chipBtn(false)}>Receipt PDF</button>}
+                {isAdmin && <button onClick={() => removePayment(x)} disabled={busy} className="mrcap-press" style={{ ...chipBtn(false), color: COLORS.muted }}>Remove</button>}
+              </div>
+            </div>
+          ))}
+
+          {!payOpen ? (
+            <button onClick={openPay} className="mrcap-press" style={{ ...secondaryBtnStyle, width: "100%", marginBottom: 12, display: "flex", alignItems: "center", justifyContent: "center", gap: 6 }}><Banknote size={15} /> Record a payment</button>
+          ) : (
+            <div style={billCard}>
+              <div style={{ ...smallLabel, marginBottom: 10 }}>Record a payment</div>
+              <div style={{ display: "flex", gap: 6, marginBottom: 12 }}>
+                {PAYMENT_METHODS.map((m) => <button key={m.key} onClick={() => setPay((cur) => ({ ...cur, method: m.key }))} className="mrcap-press" style={{ ...chipBtn(pay.method === m.key), flex: 1, borderRadius: 10 }}>{m.label}</button>)}
+              </div>
+              <Field label="Amount (AED)"><input style={{ ...inputStyle, marginTop: 0, fontFamily: MONO_FONT }} type="number" inputMode="decimal" min="0" step="0.01" value={pay.amount} onChange={(e) => setPay((cur) => ({ ...cur, amount: e.target.value }))} /></Field>
+              <Field label="Date received"><input style={{ ...inputStyle, marginTop: 0 }} type="date" value={pay.paid_on} onChange={(e) => setPay((cur) => ({ ...cur, paid_on: e.target.value }))} /></Field>
+              {pay.method === "cheque" && (
+                <>
+                  <Field label="Cheque number"><input style={{ ...inputStyle, marginTop: 0, fontFamily: MONO_FONT }} value={pay.cheque_no} onChange={(e) => setPay((cur) => ({ ...cur, cheque_no: e.target.value }))} /></Field>
+                  <Field label="Bank"><input style={{ ...inputStyle, marginTop: 0 }} value={pay.cheque_bank} onChange={(e) => setPay((cur) => ({ ...cur, cheque_bank: e.target.value }))} /></Field>
+                  <Field label="Date on the cheque (if post-dated)"><input style={{ ...inputStyle, marginTop: 0 }} type="date" value={pay.cheque_date} onChange={(e) => setPay((cur) => ({ ...cur, cheque_date: e.target.value }))} /></Field>
+                  <div style={{ fontSize: 11.5, color: COLORS.muted, marginBottom: 10 }}>A cheque only counts as paid once you mark it Cleared.</div>
+                </>
+              )}
+              <Field label="Note (optional)"><input style={{ ...inputStyle, marginTop: 0 }} value={pay.note} onChange={(e) => setPay((cur) => ({ ...cur, note: e.target.value }))} /></Field>
+              {payProblem && <div style={{ fontSize: 12, color: COLORS.muted, marginBottom: 8 }}>{payProblem}</div>}
+              <div style={{ display: "flex", gap: 8 }}>
+                <button onClick={() => setPayOpen(false)} className="mrcap-press" style={{ ...secondaryBtnStyle, flex: 1 }}>Cancel</button>
+                <button onClick={savePayment} disabled={busy || !!payProblem} className="mrcap-press" style={{ ...primaryBtnStyle, flex: 2, opacity: busy || payProblem ? 0.5 : 1 }}>{busy ? "Saving…" : "Save payment"}</button>
+              </div>
+            </div>
+          )}
+
+          <div style={{ ...billCard, fontSize: 12.5, color: rec ? COLORS.successText : COLORS.muted }}>
+            {rec ? `Entered in First Bit${rec.first_bit_ref ? ` (${rec.first_bit_ref})` : ""} by ${rec.entered_by}.` : "Not yet entered in First Bit."}
+          </div>
+
+          <div style={{ display: "flex", gap: 8, marginBottom: 10 }}>
+            <button onClick={() => onRevise(proformaRevisionSeed(p))} className="mrcap-press" style={{ ...secondaryBtnStyle, flex: 1 }}>Revise (new version)</button>
+            {!voiding && <button onClick={() => setVoiding(true)} className="mrcap-press" style={{ ...secondaryBtnStyle, flex: 1, color: COLORS.dangerText }}>Void</button>}
+          </div>
+          {voiding && (
+            <div style={billCard}>
+              <div style={{ fontSize: 12.5, color: COLORS.ink, marginBottom: 8 }}>Voiding keeps the number on record and stamps the PDF VOID. Why is it being voided?</div>
+              <input style={{ ...inputStyle, marginTop: 0 }} value={voidReason} onChange={(e) => setVoidReason(e.target.value)} placeholder="Reason" />
+              <div style={{ display: "flex", gap: 8, marginTop: 10 }}>
+                <button onClick={() => { setVoiding(false); setVoidReason(""); }} className="mrcap-press" style={{ ...secondaryBtnStyle, flex: 1 }}>Cancel</button>
+                <button onClick={doVoid} disabled={busy || voidReason.trim().length < 3} className="mrcap-press" style={{ ...primaryBtnStyle, flex: 2, background: COLORS.red, color: "#fff", opacity: busy || voidReason.trim().length < 3 ? 0.5 : 1 }}>Void proforma</button>
+              </div>
+            </div>
+          )}
+        </>
+      )}
+    </div>
+  );
+}
+
 function slugify(label) {
   const base = (label || "").trim().toLowerCase().replace(/[^a-z0-9]+/g, "_").replace(/^_+|_+$/g, "");
   return base || `item_${Math.random().toString(36).slice(2, 7)}`;
 }
 
-/* ---------------- Public links — no login, scoped to one job/quote ---------------- */
-// Reached via ?track=<jobId> or ?quote=<quoteId> in the URL (see the
-// router in main.jsx, which checks for these BEFORE the main app even
-// mounts, so there's no session/team loading overhead for a customer
-// who's just checking on their car). Deliberately minimal selects —
-// only fields safe to hand to a customer, nothing internal (no cost,
-// no markup, no notes, no other customers' data). Job/quote ids are
-// high-entropy UUIDs (gen_random_uuid()), which is what makes a bare
-// link like this reasonable to share at all instead of requiring login.
+/* ---------------- Public links — scoped to one job/quote ---------------- */
+// PublicQuoteView is reached via ?quote=<quoteId> in the URL (see
+// PublicLinkRouter below and the router in main.jsx, which checks for
+// this BEFORE the main app even mounts, so there's no session/team
+// loading overhead for a customer just viewing a price). Deliberately
+// minimal selects — only fields safe to hand to a customer, nothing
+// internal (no cost, no markup, no notes, no other customers' data).
+// It's view-only: accepting a quote is a staff action now (see the
+// status picker on the internal Quotations screen), not something an
+// unauthenticated visitor can trigger.
+//
+// PublicJobTracker (?track=<jobId>) is NOT reached this way anymore —
+// job tracking now requires a staff/Smartech login, so it's rendered
+// from inside GarageApp itself, after the session gate.
 function PublicPageShell({ children }) {
   return (
     <div style={{ minHeight: "100vh", background: COLORS.paper, display: "flex", flexDirection: "column", alignItems: "center", padding: "40px 18px" }}>
@@ -8613,7 +11798,7 @@ function PublicJobTracker({ jobId }) {
           background: isReady ? "rgba(201,162,39,0.12)" : isCollected ? "rgba(74,122,87,0.12)" : COLORS.panel2,
           border: `1px solid ${isReady ? COLORS.gold : isCollected ? COLORS.green : COLORS.line}`,
         }}>
-          <div style={{ fontSize: 14, fontWeight: 700, color: isReady ? COLORS.gold : isCollected ? "#7BC494" : COLORS.ink }}>
+          <div style={{ fontSize: 14, fontWeight: 700, color: isReady ? COLORS.gold : isCollected ? COLORS.successText : COLORS.ink }}>
             {isReady ? "Ready for collection!" : isCollected ? "Collected — thank you!" : (job.customer_status_note || `Currently: ${stage.label}`)}
           </div>
           {!isReady && !isCollected && job.customer_status_note && (
@@ -8633,8 +11818,6 @@ function PublicJobTracker({ jobId }) {
 function PublicQuoteView({ quoteId }) {
   const [status, setStatus] = useState("loading"); // loading | ok | notfound | error
   const [quote, setQuote] = useState(null);
-  const [accepting, setAccepting] = useState(false);
-  const [acceptError, setAcceptError] = useState(false);
 
   const load = useCallback(async () => {
     if (!quoteId) { setStatus("notfound"); return; }
@@ -8645,24 +11828,6 @@ function PublicQuoteView({ quoteId }) {
   }, [quoteId]);
 
   useEffect(() => { load(); }, [load]);
-
-  const accept = async () => {
-    setAccepting(true);
-    setAcceptError(false);
-    // Not a real team member, but sbFetch's activity-log write wants an
-    // actor — this makes it clear in the log that it was the customer
-    // self-accepting via the public link, not a spoofed team action.
-    currentActor = { id: "customer", name: quote.customerName || "Customer", role: "customer" };
-    nextActivitySummary = `Customer accepted quotation via public link (${quote.plate || quote.makeModel || quote.id})`;
-    const { ok } = await sbFetch(`quotes?id=eq.${quoteId}`, {
-      method: "PATCH",
-      headers: { Prefer: "return=minimal" },
-      body: JSON.stringify({ status: "accepted", accepted_at: new Date().toISOString() }),
-    });
-    setAccepting(false);
-    if (ok) { setQuote((q) => ({ ...q, status: "accepted", acceptedAt: Date.now() })); }
-    else setAcceptError(true);
-  };
 
   if (status === "loading") {
     return <PublicPageShell><SkeletonRows count={2} height={56} /></PublicPageShell>;
@@ -8715,21 +11880,13 @@ function PublicQuoteView({ quoteId }) {
 
         {isAccepted ? (
           <div style={{ marginTop: 6, textAlign: "center", padding: "14px 16px", borderRadius: 10, background: "rgba(74,122,87,0.12)", border: `1px solid ${COLORS.green}` }}>
-            <div style={{ fontSize: 14, fontWeight: 700, color: "#7BC494" }}>Accepted — thank you!</div>
+            <div style={{ fontSize: 14, fontWeight: 700, color: COLORS.successText }}>Accepted — thank you!</div>
             <div style={{ fontSize: 11.5, color: COLORS.muted, marginTop: 5 }}>We'll be in touch to book you in.</div>
           </div>
         ) : (
-          <>
-            {acceptError && <div style={{ fontSize: 11.5, color: "#E08A78", marginBottom: 10, textAlign: "center" }}>Couldn't save that — please try again.</div>}
-            <button
-              onClick={accept}
-              disabled={accepting}
-              className="mrcap-press"
-              style={{ ...primaryBtnStyle, width: "100%", marginTop: 6, opacity: accepting ? 0.6 : 1 }}
-            >
-              {accepting ? "Saving…" : "Accept Quotation"}
-            </button>
-          </>
+          <div style={{ marginTop: 6, textAlign: "center", padding: "14px 16px", borderRadius: 10, background: COLORS.panel2, border: `1px solid ${COLORS.line}` }}>
+            <div style={{ fontSize: 12, color: COLORS.muted }}>To accept this quotation, reply to us on WhatsApp or give us a call — we'll confirm it on our end.</div>
+          </div>
         )}
       </div>
     </PublicPageShell>
@@ -8737,13 +11894,750 @@ function PublicQuoteView({ quoteId }) {
 }
 
 // The one thing checked before the real app even mounts — see main.jsx.
+// Only ?quote= takes this pre-login path now; ?track= is handled inside
+// GarageApp itself, behind the staff/Smartech login gate.
 export function PublicLinkRouter() {
   const params = new URLSearchParams(window.location.search);
-  const jobId = params.get("track");
   const quoteId = params.get("quote");
-  if (jobId) return <PublicJobTracker jobId={jobId} />;
   if (quoteId) return <PublicQuoteView quoteId={quoteId} />;
   return null;
+}
+
+/* ---------------- Smartech: Storage + Chat helpers ---------------- */
+const STORAGE_GATEKEEPER_URL = `${SUPABASE_URL}/functions/v1/storage-gatekeeper`;
+
+async function storageCall(payload) {
+  try {
+    const res = await fetch(STORAGE_GATEKEEPER_URL, {
+      method: "POST",
+      headers: { apikey: SUPABASE_KEY, Authorization: `Bearer ${SUPABASE_KEY}`, "Content-Type": "application/json" },
+      body: JSON.stringify(payload),
+    });
+    const text = await res.text();
+    if (!res.ok) return { ok: false, error: text.slice(0, 200) };
+    return { ok: true, ...(text ? JSON.parse(text) : {}) };
+  } catch {
+    return { ok: false, error: "Offline — try again once connected." };
+  }
+}
+// Uploads a compressed photo to the private smartech-media bucket via
+// storage-gatekeeper (the anon key can't write to it directly — same
+// "one choke point holds the real key" pattern as db-gatekeeper).
+// Returns { path, url } — `path` is what gets stored in the DB
+// permanently, `url` is a signed link valid ~1 week.
+async function uploadSmartechPhoto(file, folder) {
+  const dataUrl = await compressImage(file);
+  const res = await storageCall({ action: "upload", bucket: "smartech-media", folder, filename: file.name, base64: dataUrl, contentType: "image/jpeg" });
+  return res.ok ? { path: res.path, url: res.url } : null;
+}
+// Signed URLs expire after ~1 week (see storage-gatekeeper's
+// SIGNED_URL_TTL_SECONDS) — every read path that displays previously-
+// saved smartech-media photos has to re-sign them first, or the image
+// just goes dead a week after upload. `photos` is an array of
+// {path, url, ...} objects; only `path` is trusted as permanent.
+async function refreshSmartechPhotoUrls(photos) {
+  const paths = (photos || []).map((p) => p && p.path).filter(Boolean);
+  if (!paths.length) return photos || [];
+  const res = await storageCall({ action: "sign", bucket: "smartech-media", paths });
+  if (!res.ok) return photos;
+  return (photos || []).map((p) => (p && p.path ? { ...p, url: res.urls?.[p.path] || p.url } : p));
+}
+
+/* ---------------- Smartech Portal ---------------- */
+// A team member with dashboardMode "smartech" (or the older "subcontractor"
+// value — see isSmartechPortal) lands here instead of the normal app —
+// see the branch right after the login gate in GarageApp. Deliberately
+// its own scoped fetch, never the shared `index`/refreshIndex every
+// other screen uses: only jobs assigned to THIS person, on a narrow
+// field list that excludes customer phone, pricing, and other staff's
+// work.
+//
+// Purchases (parts/materials Smartech buys on the shop's behalf) go
+// through a pending -> admin-approved flow (see SmartechApprovalQueue).
+// Only an "approved" entry is ever meant to count as a real internal
+// cost — and it's never read by the invoice/proforma PDF generators, so
+// none of this can reach a customer-facing document. Back-office
+// bookkeeping only. (The old "submit a labour bill" side of this
+// feature was removed entirely — Smartech's own labour charge is
+// agreed and invoiced separately, outside the app.)
+async function fetchSmartechJobs(memberId) {
+  // Two independent places a person can be assigned to the "bodyshop"
+  // service: JobDetail's single-assignee `assigned_to` (also mirrored
+  // into `assigned_team` when set there — see assignService), and the
+  // Dispatch Board's own multi-assignee `assigned_team`, which can be
+  // set WITHOUT ever touching `assigned_to`. So this can't filter on
+  // just one field server-side without silently missing Dispatch-Board-
+  // only assignments — filtered client-side against both instead, same
+  // pattern SmartechApprovalQueue already uses for its own scoped fetch.
+  const { ok, data } = await sbFetch(
+    `jobs?select=id,plate,make_model,stage_index,service_types,treatments,assigned_to,assigned_team,description,damage_notes,jobish_purchases,smartech_description,smartech_photos,smartech_pieces,smartech_status,smartech_status_note,smartech_status_at,smartech_started_at,history,updated_at&order=updated_at.desc&limit=500`
+  );
+  if (!ok || !data) return [];
+  const scoped = data.filter((j) => {
+    // Same "collected" exclusion every other staff member's job list
+    // already applies (SimplifiedDashboard) — without it, every job ever
+    // assigned to this person stays in the list forever.
+    if ((STAGES[j.stage_index] || STAGES[0]).key === "collected") return false;
+    const singleAssignee = (j.assigned_to || {}).bodyshop;
+    const teamAssignees = (j.assigned_team || {}).bodyshop || [];
+    return singleAssignee === memberId || teamAssignees.includes(memberId);
+  });
+  // Re-sign Smartech photo URLs for every job in the scoped list — see
+  // refreshSmartechPhotoUrls.
+  await Promise.all(scoped.map(async (j) => {
+    if ((j.smartech_photos || []).length) j.smartech_photos = await refreshSmartechPhotoUrls(j.smartech_photos);
+  }));
+  return scoped;
+}
+async function submitSmartechPurchase(jobRow, entry) {
+  const nextEntries = [...(jobRow.jobish_purchases || []), entry];
+  const { ok } = await sbFetch(`jobs?id=eq.${jobRow.id}`, {
+    method: "PATCH",
+    headers: { Prefer: "return=minimal" },
+    body: JSON.stringify({ jobish_purchases: nextEntries, updated_at: new Date().toISOString() }),
+  });
+  return ok ? nextEntries : null;
+}
+// Every other direct write the Smartech portal makes to a job — photos,
+// status flag, the start timer, comments — shares this one PATCH helper.
+async function patchSmartechJob(jobId, fields) {
+  const { ok } = await sbFetch(`jobs?id=eq.${jobId}`, {
+    method: "PATCH",
+    headers: { Prefer: "return=minimal" },
+    body: JSON.stringify({ ...fields, updated_at: new Date().toISOString() }),
+  });
+  return ok;
+}
+async function addSmartechPhoto(jobRow, session, file) {
+  const uploaded = await uploadSmartechPhoto(file, jobRow.id);
+  if (!uploaded) return null;
+  const entry = { path: uploaded.path, url: uploaded.url, uploadedAt: Date.now(), uploadedBy: session.name };
+  const nextPhotos = [...(jobRow.smartech_photos || []), entry];
+  return (await patchSmartechJob(jobRow.id, { smartech_photos: nextPhotos })) ? nextPhotos : null;
+}
+// Comments reuse the same history-array pattern the internal Live
+// Updates feed already uses (see postProgressUpdateToJob), just with
+// its own "smartech_comment" stage tag so JobDetail can show them
+// separately from staff progress notes.
+async function postSmartechComment(jobRow, session, note) {
+  const entry = { stage: "smartech_comment", label: "Smartech", by: session.name, role: session.role, note, at: Date.now() };
+  const nextHistory = [...(jobRow.history || []), entry];
+  return (await patchSmartechJob(jobRow.id, { history: nextHistory })) ? nextHistory : null;
+}
+// status is null to clear (tapping an already-active status un-marks it —
+// see markStatus in SmartechJobDetail) or "ready_for_collection"/"done".
+async function setSmartechStatus(jobRow, status) {
+  return patchSmartechJob(jobRow.id, { smartech_status: status, smartech_status_at: status ? new Date().toISOString() : null });
+}
+async function startSmartechTimer(jobRow) {
+  return patchSmartechJob(jobRow.id, { smartech_started_at: new Date().toISOString() });
+}
+
+function SmartechPortal({ session, onLogout }) {
+  const [jobs, setJobs] = useState([]);
+  const [loading, setLoading] = useState(true);
+  const [activeJob, setActiveJob] = useState(null);
+  const [showChat, setShowChat] = useState(false);
+
+  const refresh = useCallback(async () => {
+    setLoading(true);
+    setJobs(await fetchSmartechJobs(session.id));
+    setLoading(false);
+  }, [session.id]);
+
+  useEffect(() => { refresh(); }, [refresh]);
+
+  if (showChat) {
+    return <SmartechChatScreen session={session} onBack={() => setShowChat(false)} />;
+  }
+
+  if (activeJob) {
+    return (
+      <>
+        <SmartechChatBroadcaster session={session} />
+        <SmartechJobDetail
+          session={session}
+          jobRow={activeJob}
+          onBack={() => { setActiveJob(null); refresh(); }}
+          onUpdated={(row) => setActiveJob(row)}
+        />
+      </>
+    );
+  }
+
+  return (
+    <div style={{ minHeight: "100vh", background: COLORS.paper, padding: "20px 16px 60px" }}>
+      <SmartechChatBroadcaster session={session} />
+      <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", marginBottom: 18 }}>
+        <div>
+          <div style={{ fontFamily: DISPLAY_FONT, fontWeight: 700, fontSize: 18, color: COLORS.ink }}>My Jobs</div>
+          <div style={{ fontSize: 11.5, color: COLORS.muted, marginTop: 2 }}>{session.name} · Smartech Portal</div>
+        </div>
+        <div style={{ display: "flex", gap: 8 }}>
+          <button onClick={() => setShowChat(true)} className="mrcap-press" style={{ display: "flex", alignItems: "center", gap: 6, padding: "8px 12px", borderRadius: 8, border: `1px solid ${COLORS.gold}`, background: "rgba(201,162,39,0.1)", color: COLORS.gold, fontSize: 12, fontWeight: 600, cursor: "pointer" }}>
+            <MessageSquare size={13} /> Chat
+          </button>
+          <button onClick={onLogout} className="mrcap-press" style={{ padding: "8px 12px", borderRadius: 8, border: `1px solid ${COLORS.line}`, background: "none", color: COLORS.muted, fontSize: 12, cursor: "pointer" }}>Log out</button>
+        </div>
+      </div>
+
+      {loading ? (
+        <SkeletonRows count={3} height={70} />
+      ) : jobs.length === 0 ? (
+        <EmptyState icon={Hammer} title="No jobs assigned to you right now." sub="New work sent to Smartech will show up here." />
+      ) : (
+        jobs.map((j) => {
+          const stage = STAGES[j.stage_index] || STAGES[0];
+          const pendingCount = (j.jobish_purchases || []).filter((e) => e.status === "pending").length;
+          return (
+            <button key={j.id} onClick={() => { setActiveJob(j); logEvent("view", `Viewed job${j.plate ? ` ${j.plate}` : ""} (${j.id.slice(0, 8)})`); }} className="mrcap-press" style={{ display: "block", width: "100%", textAlign: "left", background: COLORS.panel, border: `1px solid ${COLORS.line}`, borderRadius: 12, padding: 14, marginBottom: 10, cursor: "pointer" }}>
+              <div style={{ fontFamily: DISPLAY_FONT, fontWeight: 700, fontSize: 15, color: COLORS.ink }}>{j.make_model || "Vehicle"}</div>
+              {j.plate ? <div style={{ marginTop: 4 }}><PlateChip plate={j.plate} size="sm" /></div> : null}
+              <div style={{ fontSize: 11.5, color: COLORS.muted, marginTop: 6 }}>
+                {stage.label}
+                {j.smartech_status ? ` · ${j.smartech_status === "done" ? "Marked Done" : "Marked Ready for Collection"}` : ""}
+                {pendingCount ? ` · ${pendingCount} pending` : ""}
+              </div>
+            </button>
+          );
+        })
+      )}
+    </div>
+  );
+}
+
+function SmartechEntryForm({ onSubmit }) {
+  const [amount, setAmount] = useState("");
+  const [description, setDescription] = useState("");
+  const [photo, setPhoto] = useState(null);
+  const [uploading, setUploading] = useState(false);
+  const [saving, setSaving] = useState(false);
+  const [error, setError] = useState("");
+  const fileRef = useRef(null);
+
+  const attach = async (files) => {
+    if (!files || !files[0]) return;
+    setUploading(true);
+    setPhoto(await compressImage(files[0]));
+    setUploading(false);
+  };
+
+  // onSubmit reports back whether it actually saved — this used to clear
+  // the form unconditionally, so a rejected/offline write silently wiped
+  // out what Smartech had just typed with no error shown at all.
+  const submit = async () => {
+    const amt = Number(amount);
+    if (!amt || amt <= 0 || !description.trim()) return;
+    setSaving(true);
+    setError("");
+    const ok = await onSubmit({ amount: amt, description: description.trim(), photo });
+    if (ok) {
+      setAmount(""); setDescription(""); setPhoto(null);
+    } else {
+      setError("Couldn't save — check your connection and try again.");
+    }
+    setSaving(false);
+  };
+
+  return (
+    <div style={{ background: COLORS.panel2, border: `1px solid ${COLORS.line}`, borderRadius: 10, padding: 12, marginBottom: 12 }}>
+      <div style={{ fontSize: 12, fontWeight: 700, color: COLORS.ink, marginBottom: 8 }}>Submit a Purchase (parts/materials bought)</div>
+      <input value={description} onChange={(e) => setDescription(e.target.value)} placeholder="What's this for?" style={{ ...inputStyle, marginTop: 0 }} />
+      <input type="number" value={amount} onChange={(e) => setAmount(e.target.value)} placeholder="Amount (AED)" style={{ ...inputStyle, fontFamily: MONO_FONT }} />
+      {photo && <div style={{ marginTop: 8 }}><PhotoGrid photos={[photo]} onRemove={() => setPhoto(null)} /></div>}
+      <input ref={fileRef} type="file" accept="image/*" capture="environment" style={{ display: "none" }} onChange={(e) => attach(e.target.files)} />
+      <button onClick={() => fileRef.current?.click()} disabled={uploading} className="mrcap-press" style={{ marginTop: 8, display: "flex", alignItems: "center", gap: 6, padding: "7px 11px", borderRadius: 8, border: `1px dashed ${COLORS.gold}`, background: "rgba(201,162,39,0.08)", color: COLORS.gold, fontSize: 11.5, fontWeight: 600, cursor: "pointer" }}>
+        <Camera size={13} /> {uploading ? "Uploading…" : photo ? "Replace Photo" : "Attach Receipt Photo"}
+      </button>
+      {error && <div style={{ fontSize: 11, color: COLORS.red, marginTop: 8 }}>{error}</div>}
+      <button onClick={submit} disabled={saving || !amount || !description.trim()} className="mrcap-press" style={{ ...primaryBtnStyle, width: "100%", marginTop: 10, opacity: saving || !amount || !description.trim() ? 0.6 : 1 }}>
+        {saving ? "Submitting…" : "Submit for Approval"}
+      </button>
+    </div>
+  );
+}
+
+function SmartechEntryList({ title, entries }) {
+  if (!entries || !entries.length) return null;
+  const toneFor = (s) => (s === "approved" ? COLORS.green : s === "rejected" ? COLORS.red : COLORS.gold);
+  return (
+    <div style={{ marginBottom: 14 }}>
+      <div style={{ fontSize: 11, color: COLORS.muted, textTransform: "uppercase", letterSpacing: 0.5, marginBottom: 6 }}>{title}</div>
+      {entries.slice().reverse().map((e) => (
+        <div key={e.id} style={{ display: "flex", alignItems: "center", gap: 8, background: COLORS.panel2, border: `1px solid ${COLORS.line}`, borderRadius: 8, padding: "9px 11px", marginBottom: 6 }}>
+          {e.photo && (
+            <img
+              src={e.photo}
+              alt=""
+              onClick={() => window.open(e.photo, "_blank")}
+              style={{ width: 40, height: 40, objectFit: "cover", borderRadius: 6, border: `1px solid ${COLORS.line}`, cursor: "pointer", flexShrink: 0 }}
+            />
+          )}
+          <div style={{ flex: 1, minWidth: 0 }}>
+            <div style={{ display: "flex", justifyContent: "space-between" }}>
+              <div style={{ fontSize: 12.5, fontWeight: 600, color: COLORS.ink }}>{e.description}</div>
+              <div style={{ fontFamily: MONO_FONT, fontSize: 12.5, color: COLORS.gold, whiteSpace: "nowrap" }}>AED {Math.round(e.amount).toLocaleString()}</div>
+            </div>
+            <div style={{ fontSize: 10.5, color: toneFor(e.status), marginTop: 3, textTransform: "capitalize" }}>{e.status}{e.status === "rejected" && e.rejectionReason ? ` — ${e.rejectionReason}` : ""}{e.createdBy ? ` · ${e.createdBy}` : ""}</div>
+          </div>
+        </div>
+      ))}
+    </div>
+  );
+}
+
+// Ticks a live elapsed label off a start timestamp — Smartech's own
+// timer, independent of the job's real start_time/stop_time used
+// elsewhere in the app, but formatted by the exact same function the
+// Dispatch Board uses for every other "how long has this been running"
+// label (see formatDispatchElapsed) — business hours only (9am-7pm,
+// Mon-Sat), so this stays consistent even if that function ever changes.
+function useElapsedLabel(startedAtMs) {
+  const [, forceTick] = useState(0);
+  useEffect(() => {
+    if (!startedAtMs) return;
+    const t = setInterval(() => forceTick((n) => n + 1), 30000);
+    return () => clearInterval(t);
+  }, [startedAtMs]);
+  if (!startedAtMs) return null;
+  return formatDispatchElapsed(startedAtMs, Date.now());
+}
+
+function SmartechJobDetail({ session, jobRow, onBack, onUpdated }) {
+  const stage = STAGES[jobRow.stage_index] || STAGES[0];
+  const [commentText, setCommentText] = useState("");
+  const [posting, setPosting] = useState(false);
+  const [uploadingPhoto, setUploadingPhoto] = useState(false);
+  const [photoError, setPhotoError] = useState(false);
+  const [busyStatus, setBusyStatus] = useState(false);
+  const [busyTimer, setBusyTimer] = useState(false);
+  const photoRef = useRef(null);
+
+  const startedAtMs = jobRow.smartech_started_at ? new Date(jobRow.smartech_started_at).getTime() : null;
+  const elapsed = useElapsedLabel(startedAtMs);
+
+  const submitPurchase = async ({ amount, description, photo }) => {
+    const entry = { id: uid("jpurch"), amount, description, photo: photo || null, status: "pending", createdAt: Date.now(), createdBy: session.name, createdById: session.id, reviewedAt: null, reviewedBy: null, rejectionReason: null };
+    const next = await submitSmartechPurchase(jobRow, entry);
+    if (next) onUpdated({ ...jobRow, jobish_purchases: next });
+    return !!next;
+  };
+
+  const addPhoto = async (files) => {
+    if (!files || !files[0]) return;
+    setUploadingPhoto(true);
+    setPhotoError(false);
+    const next = await addSmartechPhoto(jobRow, session, files[0]);
+    if (next) onUpdated({ ...jobRow, smartech_photos: next }); else setPhotoError(true);
+    setUploadingPhoto(false);
+  };
+
+  const postComment = async () => {
+    const note = commentText.trim();
+    if (!note) return;
+    setPosting(true);
+    const next = await postSmartechComment(jobRow, session, note);
+    if (next) { onUpdated({ ...jobRow, history: next }); setCommentText(""); }
+    setPosting(false);
+  };
+
+  // Tapping the already-active status clears it (un-mark a mis-tap);
+  // tapping the other one switches to it.
+  const markStatus = async (status) => {
+    const next = jobRow.smartech_status === status ? null : status;
+    setBusyStatus(true);
+    const ok = await setSmartechStatus(jobRow, next);
+    if (ok) onUpdated({ ...jobRow, smartech_status: next, smartech_status_at: next ? new Date().toISOString() : null });
+    setBusyStatus(false);
+  };
+
+  const startTimer = async () => {
+    setBusyTimer(true);
+    const ok = await startSmartechTimer(jobRow);
+    if (ok) onUpdated({ ...jobRow, smartech_started_at: new Date().toISOString() });
+    setBusyTimer(false);
+  };
+
+  const comments = (jobRow.history || []).filter((h) => h.stage === "smartech_comment").slice().reverse();
+
+  return (
+    <div style={{ minHeight: "100vh", background: COLORS.paper, padding: "20px 16px 60px" }}>
+      <button onClick={onBack} className="mrcap-press" style={{ display: "flex", alignItems: "center", gap: 6, padding: "7px 0", background: "none", border: "none", color: COLORS.muted, fontSize: 12.5, cursor: "pointer", marginBottom: 12 }}>
+        <ChevronLeft size={16} /> Back to My Jobs
+      </button>
+
+      <div style={{ background: COLORS.panel, border: `1px solid ${COLORS.line}`, borderRadius: 12, padding: 16, marginBottom: 16 }}>
+        <div style={{ fontFamily: DISPLAY_FONT, fontWeight: 700, fontSize: 17, color: COLORS.ink }}>{jobRow.make_model || "Vehicle"}</div>
+        {jobRow.plate ? <div style={{ marginTop: 6 }}><PlateChip plate={jobRow.plate} /></div> : null}
+        <div style={{ fontSize: 11.5, color: COLORS.muted, marginTop: 6 }}>{stage.label}</div>
+        {jobRow.smartech_description && <div style={{ fontSize: 12.5, color: COLORS.ink, marginTop: 10, fontWeight: 600 }}>{jobRow.smartech_description}</div>}
+        {jobRow.description && <div style={{ fontSize: 12, color: COLORS.muted, marginTop: 6 }}>{jobRow.description}</div>}
+        {jobRow.damage_notes && <div style={{ fontSize: 12, color: COLORS.muted, marginTop: 6 }}>{jobRow.damage_notes}</div>}
+        {/* Piece/panel counts only — never a price (Smartech never sees
+            price). Keyed "serviceKey::name", same as treatmentPrices.
+            This IS the real quantity used in billing (price x qty) for
+            treatments flagged "per piece" from Services & Pricing — see
+            isPerPieceTreatment/treatmentLineTotal — but shows here for
+            whatever's on this job regardless of category, not just
+            body-work ones. */}
+        {Object.entries(jobRow.smartech_pieces || {}).filter(([, n]) => Number(n) > 0).length > 0 && (
+          <div style={{ marginTop: 8, display: "flex", flexWrap: "wrap", gap: 6 }}>
+            {Object.entries(jobRow.smartech_pieces || {}).filter(([, n]) => Number(n) > 0).map(([key, n]) => (
+              <span key={key} style={{ fontSize: 11, fontWeight: 600, color: COLORS.gold, background: "rgba(201,162,39,0.12)", border: `1px solid ${COLORS.gold}`, borderRadius: 999, padding: "3px 9px" }}>
+                {key.split("::")[1] || key} · {n} pcs
+              </span>
+            ))}
+          </div>
+        )}
+      </div>
+
+      {/* Smartech-only start timer — never touches the job's real
+          start_time/stop_time used elsewhere in the app. */}
+      <div style={{ background: COLORS.panel2, border: `1px solid ${COLORS.line}`, borderRadius: 10, padding: 12, marginBottom: 12, display: "flex", alignItems: "center", justifyContent: "space-between" }}>
+        <div>
+          <div style={{ fontSize: 11, color: COLORS.muted, textTransform: "uppercase", letterSpacing: 0.5 }}>Your Timer</div>
+          <div style={{ fontSize: 14, fontWeight: 700, color: COLORS.ink, marginTop: 2 }}>{startedAtMs ? `Running · ${elapsed}` : "Not started"}</div>
+        </div>
+        <button onClick={startTimer} disabled={busyTimer || !!startedAtMs} className="mrcap-press" style={{ padding: "8px 14px", borderRadius: 8, border: "none", background: startedAtMs ? COLORS.panel : COLORS.gold, color: startedAtMs ? COLORS.muted : COLORS.darkText, fontWeight: 700, fontSize: 12.5, cursor: startedAtMs ? "default" : "pointer", opacity: busyTimer ? 0.6 : 1 }}>
+          {startedAtMs ? "Started" : "Start Job"}
+        </button>
+      </div>
+
+      {/* Job photos — Smartech's own progress/completion photos. Also
+          shown on the main job screen (see the Smartech panel on
+          JobDetail), so Ahmed/Laani/admin see them without needing to
+          come into this portal. */}
+      <div style={{ background: COLORS.panel2, border: `1px solid ${COLORS.line}`, borderRadius: 10, padding: 12, marginBottom: 12 }}>
+        <div style={{ fontSize: 11, color: COLORS.muted, textTransform: "uppercase", letterSpacing: 0.5, marginBottom: 8 }}>Job Photos</div>
+        {(jobRow.smartech_photos || []).length > 0 && (
+          <div style={{ marginBottom: 8 }}><PhotoGrid photos={(jobRow.smartech_photos || []).map((p) => p.url)} /></div>
+        )}
+        <input ref={photoRef} type="file" accept="image/*" capture="environment" style={{ display: "none" }} onChange={(e) => addPhoto(e.target.files)} />
+        <button onClick={() => photoRef.current?.click()} disabled={uploadingPhoto} className="mrcap-press" style={{ display: "flex", alignItems: "center", gap: 6, padding: "7px 11px", borderRadius: 8, border: `1px dashed ${COLORS.gold}`, background: "rgba(201,162,39,0.08)", color: COLORS.gold, fontSize: 11.5, fontWeight: 600, cursor: "pointer" }}>
+          <Camera size={13} /> {uploadingPhoto ? "Uploading…" : "Add Photo"}
+        </button>
+        {photoError && <div style={{ fontSize: 11, color: COLORS.red, marginTop: 6 }}>Photo didn't upload — check your connection and try again.</div>}
+      </div>
+
+      {/* Comments — short notes Smartech and admin/Laani/Ahmed both see
+          on this job. Separate from the group chat (Smartech Chat),
+          which isn't tied to any one car. */}
+      <div style={{ background: COLORS.panel2, border: `1px solid ${COLORS.line}`, borderRadius: 10, padding: 12, marginBottom: 12 }}>
+        <div style={{ fontSize: 11, color: COLORS.muted, textTransform: "uppercase", letterSpacing: 0.5, marginBottom: 8 }}>Comments</div>
+        {comments.length === 0 && <div style={{ fontSize: 12, color: COLORS.muted, marginBottom: 8 }}>No comments yet.</div>}
+        {comments.slice(0, 5).map((c, i) => (
+          <div key={i} style={{ fontSize: 12.5, color: COLORS.ink, marginBottom: 6, paddingBottom: 6, borderBottom: i < Math.min(comments.length, 5) - 1 ? `1px solid ${COLORS.line}` : "none" }}>
+            {c.note}
+            <div style={{ fontSize: 10, color: COLORS.muted, marginTop: 2 }}>{c.by} · {new Date(c.at).toLocaleString()}</div>
+          </div>
+        ))}
+        <div style={{ display: "flex", gap: 6, marginTop: 8 }}>
+          <input value={commentText} onChange={(e) => setCommentText(e.target.value)} placeholder="Add a comment…" style={{ ...inputStyle, marginTop: 0, flex: 1 }} />
+          <button onClick={postComment} disabled={posting || !commentText.trim()} className="mrcap-press" style={{ padding: "0 14px", borderRadius: 8, border: "none", background: COLORS.gold, color: COLORS.darkText, fontWeight: 700, fontSize: 12.5, cursor: "pointer", opacity: posting || !commentText.trim() ? 0.6 : 1 }}>Post</button>
+        </div>
+      </div>
+
+      {/* Ready for Collection / Done — a flag Ahmed/Laani/admin see and
+          act on; it never moves the job's real pipeline stage itself. */}
+      <div style={{ background: COLORS.panel2, border: `1px solid ${COLORS.line}`, borderRadius: 10, padding: 12, marginBottom: 16 }}>
+        <div style={{ fontSize: 11, color: COLORS.muted, textTransform: "uppercase", letterSpacing: 0.5, marginBottom: 8 }}>Status</div>
+        {jobRow.smartech_status && (
+          <div style={{ fontSize: 12.5, color: COLORS.green, marginBottom: 8, fontWeight: 600 }}>
+            Marked {jobRow.smartech_status === "done" ? "Done" : "Ready for Collection"} — tap again to un-mark
+          </div>
+        )}
+        <div style={{ display: "flex", gap: 8 }}>
+          <button onClick={() => markStatus("ready_for_collection")} disabled={busyStatus} className="mrcap-press" style={{ flex: 1, padding: "9px", borderRadius: 8, border: `1px solid ${COLORS.gold}`, background: jobRow.smartech_status === "ready_for_collection" ? COLORS.gold : "none", color: jobRow.smartech_status === "ready_for_collection" ? COLORS.darkText : COLORS.gold, fontWeight: 700, fontSize: 12, cursor: "pointer", opacity: busyStatus ? 0.6 : 1 }}>Ready for Collection</button>
+          <button onClick={() => markStatus("done")} disabled={busyStatus} className="mrcap-press" style={{ flex: 1, padding: "9px", borderRadius: 8, border: "none", background: COLORS.green, color: COLORS.darkText, fontWeight: 700, fontSize: 12, cursor: "pointer", opacity: busyStatus ? 0.6 : 1 }}>Mark Done</button>
+        </div>
+      </div>
+
+      <SmartechEntryList title="Your Purchases" entries={jobRow.jobish_purchases} />
+      <SmartechEntryForm onSubmit={submitPurchase} />
+    </div>
+  );
+}
+
+// Admin-only queue of pending Smartech purchases (reachable by any
+// admin, not restricted to Suhail). Fetches only the jsonb column plus
+// job identity — cheap even at this shop's scale — and filters to
+// "pending" entries client-side, the same pattern already used for the
+// Ahmed/Laani review queue on the main dashboard. Approving/rejecting
+// here is the ONLY thing that ever moves an entry out of "pending" —
+// only "approved" entries are meant to be summed anywhere as a real
+// internal cost.
+async function fetchSmartechPendingQueue() {
+  const { ok, data } = await sbFetch(`jobs?select=id,plate,make_model,jobish_purchases,updated_at&order=updated_at.desc&limit=500`);
+  if (!ok || !data) return [];
+  return data.filter((j) => (j.jobish_purchases || []).some((e) => e.status === "pending"));
+}
+async function reviewSmartechPurchase(jobRow, entryId, status, session, rejectionReason) {
+  const nextEntries = (jobRow.jobish_purchases || []).map((e) =>
+    e.id === entryId ? { ...e, status, reviewedAt: Date.now(), reviewedBy: session.name, rejectionReason: rejectionReason || null } : e
+  );
+  const { ok } = await sbFetch(`jobs?id=eq.${jobRow.id}`, {
+    method: "PATCH",
+    headers: { Prefer: "return=minimal" },
+    body: JSON.stringify({ jobish_purchases: nextEntries, updated_at: new Date().toISOString() }),
+  });
+  return ok ? nextEntries : null;
+}
+
+function SmartechApprovalQueue({ session, onBack }) {
+  const [loading, setLoading] = useState(true);
+  const [jobs, setJobs] = useState([]);
+  const [busyId, setBusyId] = useState(null);
+
+  const load = useCallback(async () => {
+    setLoading(true);
+    setJobs(await fetchSmartechPendingQueue());
+    setLoading(false);
+  }, []);
+
+  useEffect(() => { load(); }, [load]);
+
+  const act = async (jobRow, entryId, status) => {
+    let reason = null;
+    if (status === "rejected") {
+      reason = window.prompt("Reason for rejecting (optional):") || null;
+    }
+    setBusyId(entryId);
+    const nextEntries = await reviewSmartechPurchase(jobRow, entryId, status, session, reason);
+    if (nextEntries) {
+      setJobs((cur) => cur
+        .map((j) => (j.id === jobRow.id ? { ...j, jobish_purchases: nextEntries } : j))
+        .filter((j) => (j.jobish_purchases || []).some((e) => e.status === "pending")));
+    }
+    setBusyId(null);
+  };
+
+  const rows = jobs.flatMap((j) => (j.jobish_purchases || []).filter((e) => e.status === "pending").map((e) => ({ job: j, entry: e })));
+
+  return (
+    <div className="mrcap-view" style={{ padding: "0 18px 34px" }}>
+      <button onClick={onBack} className="mrcap-press" style={{ display: "flex", alignItems: "center", gap: 6, padding: "7px 0", background: "none", border: "none", color: COLORS.muted, fontSize: 12.5, cursor: "pointer", marginBottom: 4 }}>
+        <ChevronLeft size={16} /> Back
+      </button>
+      <SectionTitle>Smartech Approvals</SectionTitle>
+      <div style={{ fontSize: 11.5, color: COLORS.muted, marginTop: -10, marginBottom: 16, display: "flex", alignItems: "center", gap: 6 }}>
+        <Lock size={12} /> Internal cost tracking only — never shown on a customer invoice or quote
+      </div>
+
+      {loading && <SkeletonRows count={3} height={80} />}
+
+      {!loading && rows.length === 0 && (
+        <div style={{ textAlign: "center", color: COLORS.muted, padding: 40, fontSize: 13 }}>Nothing pending right now.</div>
+      )}
+
+      {!loading && rows.map(({ job, entry }) => (
+        <div key={entry.id} style={{ background: COLORS.panel, border: `1px solid ${COLORS.line}`, borderRadius: 12, padding: 14, marginBottom: 10 }}>
+          <div style={{ display: "flex", justifyContent: "space-between", alignItems: "flex-start" }}>
+            <div>
+              <div style={{ fontSize: 10.5, color: COLORS.gold, textTransform: "uppercase", letterSpacing: 0.5, fontWeight: 700 }}>Purchase</div>
+              <div style={{ fontSize: 13, fontWeight: 600, color: COLORS.ink, marginTop: 3 }}>{entry.description}</div>
+              <div style={{ fontSize: 11.5, color: COLORS.muted, marginTop: 3 }}>{job.make_model || "Vehicle"} · {job.plate || ""} · by {entry.createdBy || "Smartech"}</div>
+            </div>
+            <div style={{ fontFamily: MONO_FONT, fontWeight: 700, fontSize: 15, color: COLORS.gold }}>AED {Math.round(entry.amount).toLocaleString()}</div>
+          </div>
+          {entry.photo && <div style={{ marginTop: 10 }}><PhotoGrid photos={[entry.photo]} /></div>}
+          <div style={{ display: "flex", gap: 8, marginTop: 12 }}>
+            <button onClick={() => act(job, entry.id, "approved")} disabled={busyId === entry.id} className="mrcap-press" style={{ flex: 1, padding: "9px", borderRadius: 8, border: "none", background: COLORS.green, color: COLORS.darkText, fontWeight: 700, fontSize: 12.5, cursor: "pointer", opacity: busyId === entry.id ? 0.6 : 1 }}>Approve</button>
+            <button onClick={() => act(job, entry.id, "rejected")} disabled={busyId === entry.id} className="mrcap-press" style={{ flex: 1, padding: "9px", borderRadius: 8, border: `1px solid ${COLORS.red}`, background: "none", color: COLORS.red, fontWeight: 700, fontSize: 12.5, cursor: "pointer", opacity: busyId === entry.id ? 0.6 : 1 }}>Reject</button>
+          </div>
+        </div>
+      ))}
+    </div>
+  );
+}
+
+/* ---------------- Smartech Chat ----------------
+   One general, ongoing group thread — Smartech + admin/Laani/Ahmed, not
+   tied to any specific job/car. Reads and writes both go through
+   gkGet/gkCall (see the billing section above) since `messages` has no
+   anon-readable policy (same lockdown as proformas) — only reachable
+   through db-gatekeeper. Polls every 12s, matching the existing Live
+   Updates/Announcements pattern; no Supabase Realtime in this codebase,
+   and a realtime subscription with the anon key couldn't read a
+   gatekeeper-only table anyway. */
+async function loadSmartechMessages() {
+  const res = await gkGet("messages?select=*&order=created_at.desc&limit=200");
+  if (!res.ok) return { ok: false, messages: [] };
+  const messages = (res.data || []).slice().reverse();
+  // Re-sign attachment URLs — see refreshSmartechPhotoUrls.
+  await Promise.all(messages.map(async (m) => {
+    if ((m.attachments || []).length) m.attachments = await refreshSmartechPhotoUrls(m.attachments);
+  }));
+  return { ok: true, messages };
+}
+async function sendSmartechMessage(session, body, attachments) {
+  const res = await gkCall({ path: "messages", method: "POST", body: { sender_id: session.id, sender_name: session.name, sender_role: session.role, body, attachments: attachments || [] }, headers: { Prefer: "return=minimal" }, summary: "Smartech chat message" });
+  if (res.ok) {
+    // Same push-notification path every other one-way alert in the app
+    // uses (see sendPushNotification / SendNotificationScreen) — notify
+    // whichever side didn't just send it. Targets Ahmed/Laani by name
+    // rather than every admin, matching the same named-exception
+    // audience canApproveSmartech/canUseSmartechChat already use for
+    // Smartech-related staff. Fire-and-forget: a push failure should
+    // never make the chat message itself look like it didn't send.
+    let targetMemberIds = ["jobish"];
+    if (isSmartechPortal(session) || session.id === "jobish") {
+      // Everyone who sees the thread in their Live feed: admins + Ahmed/Laani.
+      const admins = await sbFetch("team_members?select=id&role=eq.admin");
+      targetMemberIds = [...new Set([...(admins.ok ? (admins.data || []).map((m) => m.id) : ["owner", "suhail"]), "ahmed", "laani"])];
+    }
+    sendPushNotification({ senderId: session.id, title: `${session.name} · Smartech Chat`, body: body || "Sent a photo", targetMemberIds }).catch(() => {});
+  }
+  return res.ok;
+}
+
+function SmartechChatScreen({ session, onBack }) {
+  const [messages, setMessages] = useState([]);
+  const [loading, setLoading] = useState(true);
+  const [loadError, setLoadError] = useState(false);
+  const [text, setText] = useState("");
+  const [photo, setPhoto] = useState(null);
+  const [uploading, setUploading] = useState(false);
+  const [uploadError, setUploadError] = useState(false);
+  const [sending, setSending] = useState(false);
+  const [sendError, setSendError] = useState(false);
+  const fileRef = useRef(null);
+  // Just displays/refreshes the thread here — the notification chime is
+  // owned exclusively by SmartechChatBroadcaster (mounted app-wide, not
+  // just on this screen) so a new message never chimes twice.
+
+  const refresh = useCallback(async () => {
+    const res = await loadSmartechMessages();
+    setMessages(res.messages);
+    setLoadError(!res.ok);
+    setLoading(false);
+  }, []);
+
+  useEffect(() => {
+    refresh();
+    const t = setInterval(refresh, 12000);
+    return () => clearInterval(t);
+  }, [refresh]);
+
+  const attach = async (files) => {
+    if (!files || !files[0]) return;
+    setUploading(true);
+    setUploadError(false);
+    const uploaded = await uploadSmartechPhoto(files[0], "chat");
+    if (uploaded) setPhoto(uploaded); else setUploadError(true);
+    setUploading(false);
+  };
+
+  const send = async () => {
+    const body = text.trim();
+    if (!body && !photo) return;
+    setSending(true);
+    setSendError(false);
+    const ok = await sendSmartechMessage(session, body, photo ? [photo] : []);
+    if (ok) { setText(""); setPhoto(null); await refresh(); } else { setSendError(true); }
+    setSending(false);
+  };
+
+  return (
+    <div className="mrcap-view" style={{ padding: "0 18px 34px", display: "flex", flexDirection: "column", minHeight: "70vh" }}>
+      <button onClick={onBack} className="mrcap-press" style={{ display: "flex", alignItems: "center", gap: 6, padding: "7px 0", background: "none", border: "none", color: COLORS.muted, fontSize: 12.5, cursor: "pointer", marginBottom: 4 }}>
+        <ChevronLeft size={16} /> Back
+      </button>
+      <SectionTitle>Smartech Chat</SectionTitle>
+      <div style={{ fontSize: 11.5, color: COLORS.muted, marginTop: -10, marginBottom: 16 }}>Straight to the Mr.CAP office (admin, Ahmed, Laani) — one shared thread, not tied to a specific car.</div>
+
+      <div style={{ flex: 1, display: "flex", flexDirection: "column", gap: 8, marginBottom: 14 }}>
+        {loading && <SkeletonRows count={3} height={50} />}
+        {!loading && loadError && <div style={{ textAlign: "center", color: COLORS.red, padding: 30, fontSize: 13 }}>Couldn't load messages — check your connection and try again.</div>}
+        {!loading && !loadError && messages.length === 0 && <div style={{ textAlign: "center", color: COLORS.muted, padding: 30, fontSize: 13 }}>No messages yet.</div>}
+        {!loading && !loadError && messages.map((m) => {
+          const mine = m.sender_id === session.id;
+          return (
+            <div key={m.id} style={{ alignSelf: mine ? "flex-end" : "flex-start", maxWidth: "80%", background: mine ? COLORS.gold : COLORS.panel2, border: `1px solid ${COLORS.line}`, borderRadius: 10, padding: "8px 11px" }}>
+              <div style={{ fontSize: 10, color: mine ? COLORS.darkText : COLORS.muted, fontWeight: 700, marginBottom: 2 }}>{m.sender_name}</div>
+              {m.body && <div style={{ fontSize: 12.5, color: mine ? COLORS.darkText : COLORS.ink }}>{m.body}</div>}
+              {(m.attachments || []).map((a, i) => (
+                <img key={i} src={a.url} alt="" onClick={() => window.open(a.url, "_blank")} style={{ width: 120, height: 120, objectFit: "cover", borderRadius: 8, marginTop: 6, cursor: "pointer", display: "block" }} />
+              ))}
+              <div style={{ fontSize: 9.5, color: mine ? "rgba(30,26,10,0.6)" : COLORS.muted, marginTop: 4 }}>{new Date(m.created_at).toLocaleString()}</div>
+            </div>
+          );
+        })}
+      </div>
+
+      {uploadError && <div style={{ fontSize: 11.5, color: COLORS.red, marginBottom: 6 }}>Photo didn't upload — check your connection and try again.</div>}
+      {sendError && <div style={{ fontSize: 11.5, color: COLORS.red, marginBottom: 6 }}>Message didn't send — check your connection and try again.</div>}
+      {photo && <div style={{ marginBottom: 8 }}><PhotoGrid photos={[photo.url]} onRemove={() => setPhoto(null)} /></div>}
+      <div style={{ display: "flex", gap: 6, alignItems: "center" }}>
+        <input ref={fileRef} type="file" accept="image/*" style={{ display: "none" }} onChange={(e) => attach(e.target.files)} />
+        <button onClick={() => fileRef.current?.click()} disabled={uploading} className="mrcap-press" style={{ padding: 9, borderRadius: 8, border: `1px solid ${COLORS.line}`, background: "none", color: COLORS.muted, cursor: "pointer" }}>
+          <Camera size={16} />
+        </button>
+        <input value={text} onChange={(e) => setText(e.target.value)} placeholder="Message…" style={{ ...inputStyle, marginTop: 0, flex: 1 }} onKeyDown={(e) => { if (e.key === "Enter") send(); }} />
+        <button onClick={send} disabled={sending || (!text.trim() && !photo)} className="mrcap-press" style={{ padding: "0 16px", height: 38, borderRadius: 8, border: "none", background: COLORS.gold, color: COLORS.darkText, fontWeight: 700, fontSize: 12.5, cursor: "pointer", opacity: sending || (!text.trim() && !photo) ? 0.6 : 1 }}>Send</button>
+      </div>
+    </div>
+  );
+}
+
+// Fetches messages newer than sinceMs — deliberately lightweight (just
+// the last 50), same "poll every ~12-15s" pattern as loadRecentUpdates.
+async function loadRecentSmartechMessages(sinceMs) {
+  const res = await gkGet("messages?select=*&order=created_at.desc&limit=50");
+  if (!res.ok) return [];
+  return (res.data || []).filter((m) => new Date(m.created_at).getTime() > sinceMs);
+}
+
+// Mounted once at the root — inside the main Shell for admin/Ahmed/Laani
+// (gated by canUseSmartechChat), and inside SmartechPortal for Smartech —
+// so a chat message chimes and toasts on WHATEVER screen someone is on,
+// not just while SmartechChatScreen itself happens to be open. Exactly
+// the same pattern as LiveUpdateBroadcaster for job progress updates;
+// reuses the same playUpdateChime() sound on purpose, so it reads as
+// "something happened" the same way everywhere in the app.
+function SmartechChatBroadcaster({ session, onOpen }) {
+  const [toasts, setToasts] = useState([]);
+  const lastSeenRef = useRef(Date.now());
+
+  useEffect(() => {
+    const check = async () => {
+      const updates = await loadRecentSmartechMessages(lastSeenRef.current);
+      if (!updates.length) return;
+      // Advance from the messages' own server timestamps, not the
+      // device clock (same reasoning as LiveUpdateBroadcaster) — a
+      // phone whose clock lags the server would otherwise re-chime the
+      // same message repeatedly, and one running ahead could miss
+      // messages silently.
+      lastSeenRef.current = Math.max(...updates.map((m) => new Date(m.created_at).getTime()));
+      const incoming = updates.filter((m) => m.sender_id !== session.id);
+      if (!incoming.length) return;
+      playUpdateChime();
+      setToasts((prev) => [...prev, ...incoming.map((m) => ({ ...m, key: m.id }))]);
+      incoming.forEach((m) => {
+        setTimeout(() => setToasts((prev) => prev.filter((t) => t.key !== m.id)), 7000);
+      });
+    };
+    const interval = setInterval(check, 12000);
+    return () => clearInterval(interval);
+  }, [session.id]);
+
+  if (!toasts.length) return null;
+  return createPortal(
+    <div style={{ position: "fixed", bottom: 18, right: 18, left: 18, zIndex: 9999, display: "flex", flexDirection: "column", alignItems: "flex-end", gap: 8, pointerEvents: "none" }}>
+      {toasts.map((t) => (
+        <button
+          key={t.key}
+          type="button"
+          className="mrcap-fade mrcap-press"
+          onClick={() => { setToasts((prev) => prev.filter((x) => x.key !== t.key)); onOpen && onOpen(); }}
+          style={{ pointerEvents: "auto", maxWidth: 340, width: "100%", textAlign: "left", font: "inherit", cursor: onOpen ? "pointer" : "default", background: COLORS.panel, border: `1px solid ${COLORS.gold}`, borderRadius: 12, padding: "12px 14px", boxShadow: "0 10px 26px rgba(0,0,0,0.5)" }}
+        >
+          <div style={{ fontSize: 12.5, fontWeight: 700, color: COLORS.gold }}>{t.sender_name} · Smartech{onOpen ? " — tap to reply" : ""}</div>
+          <div style={{ fontSize: 13, color: COLORS.ink, marginTop: 3, lineHeight: 1.35 }}>{t.body || "Sent a photo"}</div>
+        </button>
+      ))}
+    </div>,
+    document.body
+  );
 }
 
 /* ---------------- Services & Pricing (admin: add/edit/retire, no redeploy) ---------------- */
@@ -9010,6 +12904,11 @@ function TreatmentEditInline({ treatment, onSaved, onToggleActive, busy }) {
   const [name, setName] = useState(treatment.name);
   const [retail, setRetail] = useState(treatment.retail ?? "");
   const [b2b, setB2b] = useState(treatment.b2b ?? "");
+  // treatment here is a raw Supabase row (snake_case) from
+  // ServicesManagementScreen's loadAllServiceData, not the camelCase
+  // shape loadDynamicServicesAndRoles produces for the app's SERVICES
+  // global — read per_piece, not perPiece.
+  const [perPiece, setPerPiece] = useState(!!treatment.per_piece);
   const [saving, setSaving] = useState(false);
 
   const save = async () => {
@@ -9021,6 +12920,7 @@ function TreatmentEditInline({ treatment, onSaved, onToggleActive, busy }) {
       name: name.trim(),
       retail: retail === "" ? null : Number(retail),
       b2b: b2b === "" ? null : Number(b2b),
+      perPiece,
     });
     setSaving(false);
     setEditing(false);
@@ -9035,9 +12935,15 @@ function TreatmentEditInline({ treatment, onSaved, onToggleActive, busy }) {
           <input value={retail} onChange={(e) => setRetail(e.target.value)} type="number" style={{ ...inputStyle, marginTop: 0, padding: "7px 9px", fontSize: 13 }} placeholder="Retail AED" />
           <input value={b2b} onChange={(e) => setB2b(e.target.value)} type="number" style={{ ...inputStyle, marginTop: 0, padding: "7px 9px", fontSize: 13 }} placeholder="B2B AED" />
         </div>
+        <button onClick={() => setPerPiece((v) => !v)} className="mrcap-press" type="button" style={{ display: "flex", alignItems: "center", gap: 7, padding: "7px 9px", borderRadius: 7, border: `1px solid ${perPiece ? COLORS.gold : COLORS.line}`, background: perPiece ? "rgba(201,162,39,0.12)" : "transparent", cursor: "pointer", width: "100%", boxSizing: "border-box" }}>
+          <div style={{ width: 14, height: 14, borderRadius: 4, border: `2px solid ${perPiece ? COLORS.gold : COLORS.muted}`, background: perPiece ? COLORS.gold : "transparent", display: "flex", alignItems: "center", justifyContent: "center", flexShrink: 0 }}>
+            {perPiece && <Check size={9} color={COLORS.darkText} />}
+          </div>
+          <span style={{ fontSize: 11.5, color: COLORS.ink }}>Sold per piece (shows a qty picker; price x qty = line total)</span>
+        </button>
         <div style={{ display: "flex", gap: 6 }}>
           <button onClick={save} disabled={saving || !name.trim()} className="mrcap-press" style={{ fontSize: 11.5, color: "#fff", background: COLORS.green, border: "none", borderRadius: 8, padding: "7px 10px", cursor: "pointer", fontWeight: 600, opacity: saving ? 0.6 : 1 }}>{saving ? "Saving…" : "Save"}</button>
-          <button onClick={() => { setEditing(false); setName(treatment.name); setRetail(treatment.retail ?? ""); setB2b(treatment.b2b ?? ""); }} className="mrcap-press" style={{ fontSize: 11.5, color: COLORS.muted, background: "none", border: `1px solid ${COLORS.line}`, borderRadius: 8, padding: "7px 10px", cursor: "pointer" }}>Cancel</button>
+          <button onClick={() => { setEditing(false); setName(treatment.name); setRetail(treatment.retail ?? ""); setB2b(treatment.b2b ?? ""); setPerPiece(!!treatment.per_piece); }} className="mrcap-press" style={{ fontSize: 11.5, color: COLORS.muted, background: "none", border: `1px solid ${COLORS.line}`, borderRadius: 8, padding: "7px 10px", cursor: "pointer" }}>Cancel</button>
         </div>
       </div>
     );
@@ -9046,7 +12952,7 @@ function TreatmentEditInline({ treatment, onSaved, onToggleActive, busy }) {
   return (
     <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", padding: "7px 9px", borderRadius: 8, background: COLORS.panel2, opacity: treatment.active ? 1 : 0.55 }}>
       <div>
-        <div style={{ fontSize: 13, color: COLORS.ink }}>{treatment.name}{!treatment.active && <span style={{ color: COLORS.muted }}> · Retired</span>}</div>
+        <div style={{ fontSize: 13, color: COLORS.ink }}>{treatment.name}{!treatment.active && <span style={{ color: COLORS.muted }}> · Retired</span>}{treatment.per_piece && <span style={{ color: COLORS.gold }}> · Per piece</span>}</div>
         <div style={{ fontSize: 11, color: COLORS.muted, fontFamily: MONO_FONT }}>
           {treatment.retail != null ? `Retail ${treatment.retail}` : "Retail —"} · {treatment.b2b != null ? `B2B ${treatment.b2b}` : "B2B —"}
         </div>
@@ -9064,6 +12970,7 @@ function NewTreatmentInline({ categoryKey, nextSort, onCreated }) {
   const [name, setName] = useState("");
   const [retail, setRetail] = useState("");
   const [b2b, setB2b] = useState("");
+  const [perPiece, setPerPiece] = useState(false);
   const [saving, setSaving] = useState(false);
 
   const create = async () => {
@@ -9074,10 +12981,11 @@ function NewTreatmentInline({ categoryKey, nextSort, onCreated }) {
       name: name.trim(),
       retail: retail === "" ? null : Number(retail),
       b2b: b2b === "" ? null : Number(b2b),
+      perPiece,
       sort_order: nextSort,
     });
     setSaving(false);
-    setName(""); setRetail(""); setB2b(""); setOpen(false);
+    setName(""); setRetail(""); setB2b(""); setPerPiece(false); setOpen(false);
     onCreated && onCreated();
   };
 
@@ -9095,9 +13003,15 @@ function NewTreatmentInline({ categoryKey, nextSort, onCreated }) {
         <input value={retail} onChange={(e) => setRetail(e.target.value)} type="number" style={{ ...inputStyle, marginTop: 0, padding: "7px 9px", fontSize: 13 }} placeholder="Retail AED (optional)" />
         <input value={b2b} onChange={(e) => setB2b(e.target.value)} type="number" style={{ ...inputStyle, marginTop: 0, padding: "7px 9px", fontSize: 13 }} placeholder="B2B AED (optional)" />
       </div>
+      <button onClick={() => setPerPiece((v) => !v)} className="mrcap-press" type="button" style={{ display: "flex", alignItems: "center", gap: 7, padding: "7px 9px", borderRadius: 7, border: `1px solid ${perPiece ? COLORS.gold : COLORS.line}`, background: perPiece ? "rgba(201,162,39,0.12)" : "transparent", cursor: "pointer", width: "100%", boxSizing: "border-box" }}>
+        <div style={{ width: 14, height: 14, borderRadius: 4, border: `2px solid ${perPiece ? COLORS.gold : COLORS.muted}`, background: perPiece ? COLORS.gold : "transparent", display: "flex", alignItems: "center", justifyContent: "center", flexShrink: 0 }}>
+          {perPiece && <Check size={9} color={COLORS.darkText} />}
+        </div>
+        <span style={{ fontSize: 11.5, color: COLORS.ink }}>Sold per piece (shows a qty picker; price x qty = line total)</span>
+      </button>
       <div style={{ display: "flex", gap: 6 }}>
         <button onClick={create} disabled={saving || !name.trim()} className="mrcap-press" style={{ fontSize: 11.5, color: "#fff", background: COLORS.green, border: "none", borderRadius: 8, padding: "7px 10px", cursor: "pointer", fontWeight: 600, opacity: saving ? 0.6 : 1 }}>{saving ? "Adding…" : "Add"}</button>
-        <button onClick={() => { setOpen(false); setName(""); setRetail(""); setB2b(""); }} className="mrcap-press" style={{ fontSize: 11.5, color: COLORS.muted, background: "none", border: `1px solid ${COLORS.line}`, borderRadius: 8, padding: "7px 10px", cursor: "pointer" }}>Cancel</button>
+        <button onClick={() => { setOpen(false); setName(""); setRetail(""); setB2b(""); setPerPiece(false); }} className="mrcap-press" style={{ fontSize: 11.5, color: COLORS.muted, background: "none", border: `1px solid ${COLORS.line}`, borderRadius: 8, padding: "7px 10px", cursor: "pointer" }}>Cancel</button>
       </div>
     </div>
   );
@@ -9261,7 +13175,7 @@ function ActivityLogScreen({ onBack }) {
   );
 }
 
-function TeamScreen({ team, setTeam, session, onBack, onImport, onServices, canServices, onActivityLog }) {
+function TeamScreen({ team, setTeam, session, onBack, onImport, onServices, canServices, onActivityLog, onNotify }) {
   const [name, setName] = useState("");
   const [role, setRole] = useState("intake");
   const [editingId, setEditingId] = useState(null);
@@ -9273,26 +13187,46 @@ function TeamScreen({ team, setTeam, session, onBack, onImport, onServices, canS
   // old PIN until they set a new one) and confirms after, same as every
   // other destructive action in this app already does.
   const [confirmResetId, setConfirmResetId] = useState(null);
+  const [confirmRemoveId, setConfirmRemoveId] = useState(null);
   const [busyMemberId, setBusyMemberId] = useState(null);
   const [pinActionDone, setPinActionDone] = useState(null); // { id, label } — brief success flash
   const [dashboardMode, setDashboardMode] = useState("auto"); // for the Add member form
+
+  // Every Team change goes through here. It used to update the screen and
+  // fire the save without looking at the answer, so a save the server
+  // refused (a new hire was the classic case) left the person sitting in the
+  // list until the next reload, when they quietly vanished. Now a failed
+  // save puts the list back and says so.
+  const [teamError, setTeamError] = useState("");
+  const persistTeam = async (next, what) => {
+    const before = team;
+    setTeamError("");
+    setTeam(next);
+    const ok = await saveTeam(next);
+    if (!ok) {
+      setTeam(before);
+      setTeamError(`Couldn't save — ${what} was not saved. Check the connection and try again.`);
+    }
+    return ok;
+  };
 
   const addMember = async () => {
     if (!name.trim()) return;
     const blankPerms = Object.fromEntries(PERMISSIONS.map((p) => [p.key, false]));
     const next = [...team, { id: uid("member"), name: name.trim(), role, pin: null, permissions: { ...blankPerms, newJob: true }, dashboardMode }];
-    setTeam(next);
-    await saveTeam(next);
-    setName("");
-    setDashboardMode("auto");
+    const ok = await persistTeam(next, `${name.trim()}`);
+    if (ok) {
+      setName("");
+      setDashboardMode("auto");
+    }
   };
   const resetPin = async (id) => {
     // Full reset: forces a fresh PIN pick next login, and clears any
     // lockout at the same time so a reset always leaves the account usable.
     setBusyMemberId(id);
     const next = team.map((m) => (m.id === id ? { ...m, pin: null, failed_pin_attempts: 0, pin_locked_at: null, hasPin: false, locked: false, failedAttempts: 0 } : m));
-    setTeam(next);
-    await saveTeam(next);
+    const resetOk = await persistTeam(next, "the PIN reset");
+    if (!resetOk) { setBusyMemberId(null); setConfirmResetId(null); return; }
     setBusyMemberId(null);
     setConfirmResetId(null);
     setPinActionDone({ id, label: "PIN reset — they'll set a new one at next login" });
@@ -9303,40 +13237,64 @@ function TeamScreen({ team, setTeam, session, onBack, onImport, onServices, canS
     // but keeps their existing PIN, so they don't have to re-set it.
     setBusyMemberId(id);
     const next = team.map((m) => (m.id === id ? { ...m, failed_pin_attempts: 0, pin_locked_at: null, locked: false, failedAttempts: 0 } : m));
-    setTeam(next);
-    await saveTeam(next);
+    const unlockOk = await persistTeam(next, "the unlock");
     setBusyMemberId(null);
+    if (!unlockOk) return;
     setPinActionDone({ id, label: "Unlocked — same PIN still works" });
     setTimeout(() => setPinActionDone((cur) => (cur && cur.id === id ? null : cur)), 3000);
   };
   const changeDashboardMode = async (id, mode) => {
     const next = team.map((m) => (m.id === id ? { ...m, dashboardMode: mode } : m));
-    setTeam(next);
-    await saveTeam(next);
+    await persistTeam(next, "the dashboard change");
   };
   const togglePermission = async (id, key) => {
     const next = team.map((m) => (m.id === id ? { ...m, permissions: { ...m.permissions, [key]: !m.permissions?.[key] } } : m));
-    setTeam(next);
-    await saveTeam(next);
+    await persistTeam(next, "the permission change");
   };
   const removeMember = async (id) => {
     if (id === session.id) return;
-    const next = team.filter((m) => m.id !== id);
-    setTeam(next);
-    await saveTeam(next);
+    const target = team.find((m) => m.id === id);
+    if (!target) return;
+    // Never remove the only administrator — nobody would be left who can
+    // manage the team.
+    if (target.role === "admin" && team.filter((m) => m.role === "admin").length <= 1) {
+      setConfirmRemoveId(null);
+      setTeamError("Can't remove the only administrator — make someone else an admin first.");
+      return;
+    }
+    setBusyMemberId(id);
+    setTeamError("");
+    // This used to only hide the person on this screen and re-save everyone
+    // else — the database row was never deleted, so "removed" people came
+    // back on the next reload and could still log in. Now it deletes them.
+    // Their push-notification tokens are removed with them by the database
+    // (cascade); their name stays on old jobs and history.
+    withActivitySummary(`Removed team member ${target.name}`);
+    const removed = await sbFetch(`team_members?id=eq.${encodeURIComponent(id)}`, { method: "DELETE" });
+    setBusyMemberId(null);
+    setConfirmRemoveId(null);
+    if (!removed.ok) {
+      setTeamError(`Couldn't remove ${target.name} — they're still on the team. Check the connection and try again.`);
+      return;
+    }
+    setTeam(team.filter((m) => m.id !== id));
   };
   const startEdit = (m) => { setEditingId(m.id); setEditName(m.name); };
   const saveEdit = async (id) => {
     if (!editName.trim()) return;
     const next = team.map((m) => (m.id === id ? { ...m, name: editName.trim() } : m));
-    setTeam(next);
-    await saveTeam(next);
-    setEditingId(null);
+    const ok = await persistTeam(next, "the new name");
+    if (ok) setEditingId(null);
   };
 
   return (
     <div className="mrcap-view" style={{ padding: "0 18px 30px" }}>
       <SectionTitle>Team</SectionTitle>
+      {teamError && (
+        <div role="alert" className="mrcap-fade" style={{ background: "#3A2420", border: `1px solid ${COLORS.red}`, borderRadius: 10, padding: "10px 12px", marginBottom: 14, fontSize: 12.5, color: "#F0C4BA", fontWeight: 600 }}>
+          {teamError}
+        </div>
+      )}
 
       {canServices && (
         <button onClick={onServices} className="mrcap-press" style={{ display: "flex", alignItems: "center", justifyContent: "center", gap: 8, width: "100%", padding: "11px", borderRadius: 10, border: `1.5px dashed ${COLORS.gold}`, background: "rgba(201,162,39,0.1)", color: COLORS.gold, fontWeight: 600, fontSize: 13, cursor: "pointer", marginBottom: 10 }}>
@@ -9346,6 +13304,11 @@ function TeamScreen({ team, setTeam, session, onBack, onImport, onServices, canS
       {session.id === "owner" && (
         <button onClick={onActivityLog} className="mrcap-press" style={{ display: "flex", alignItems: "center", justifyContent: "center", gap: 8, width: "100%", padding: "11px", borderRadius: 10, border: `1.5px dashed ${COLORS.gold}`, background: "rgba(201,162,39,0.1)", color: COLORS.gold, fontWeight: 600, fontSize: 13, cursor: "pointer", marginBottom: 10 }}>
           <ShieldAlert size={15} /> Activity Log
+        </button>
+      )}
+      {session.role === "admin" && (
+        <button onClick={onNotify} className="mrcap-press" style={{ display: "flex", alignItems: "center", justifyContent: "center", gap: 8, width: "100%", padding: "11px", borderRadius: 10, border: `1.5px dashed ${COLORS.gold}`, background: "rgba(201,162,39,0.1)", color: COLORS.gold, fontWeight: 600, fontSize: 13, cursor: "pointer", marginBottom: 10 }}>
+          <Bell size={15} /> Send Notification
         </button>
       )}
       <button onClick={onImport} className="mrcap-press" style={{ display: "flex", alignItems: "center", justifyContent: "center", gap: 8, width: "100%", padding: "11px", borderRadius: 10, border: `1.5px dashed ${COLORS.gold}`, background: "rgba(201,162,39,0.1)", color: COLORS.gold, fontWeight: 600, fontSize: 13, cursor: "pointer", marginBottom: 18 }}>
@@ -9384,7 +13347,7 @@ function TeamScreen({ team, setTeam, session, onBack, onImport, onServices, canS
                       )}
                       <button onClick={() => setConfirmResetId(m.id)} disabled={busyMemberId === m.id} className="mrcap-press" style={{ fontSize: 11, color: COLORS.muted, background: "none", border: `1px solid ${COLORS.line}`, borderRadius: 7, padding: "5px 7px", cursor: busyMemberId === m.id ? "default" : "pointer", opacity: busyMemberId === m.id ? 0.6 : 1 }}>Reset PIN</button>
                       {m.id !== session.id && (
-                        <button onClick={() => removeMember(m.id)} className="mrcap-press" style={{ fontSize: 11, color: COLORS.red, background: "none", border: `1px solid ${COLORS.line}`, borderRadius: 7, padding: "5px 7px", cursor: "pointer" }}>Remove</button>
+                        <button onClick={() => setConfirmRemoveId(m.id)} disabled={busyMemberId === m.id} className="mrcap-press" style={{ fontSize: 11, color: COLORS.red, background: "none", border: `1px solid ${COLORS.line}`, borderRadius: 7, padding: "5px 7px", cursor: "pointer" }}>Remove</button>
                       )}
                     </div>
                   </>
@@ -9394,6 +13357,17 @@ function TeamScreen({ team, setTeam, session, onBack, onImport, onServices, canS
               {/* Reset PIN is disruptive — they can't log in with their old
                   PIN again until they set a new one — so it asks first
                   instead of firing silently on a single tap. */}
+              {confirmRemoveId === m.id && (
+                <div style={{ padding: "10px 12px", borderBottom: `1px solid ${COLORS.line}`, background: "rgba(168,64,47,0.12)" }}>
+                  <div style={{ fontSize: 12, color: COLORS.ink, marginBottom: 8, lineHeight: 1.45 }}>Remove {m.name}? They won't be able to log in any more. Their name stays on past jobs and history.</div>
+                  <div style={{ display: "flex", gap: 8 }}>
+                    <button onClick={() => removeMember(m.id)} disabled={busyMemberId === m.id} className="mrcap-press" style={{ fontSize: 11.5, color: "#fff", background: COLORS.red, border: "none", borderRadius: 7, padding: "7px 11px", cursor: "pointer", fontWeight: 600 }}>
+                      {busyMemberId === m.id ? "Removing…" : "Yes, remove"}
+                    </button>
+                    <button onClick={() => setConfirmRemoveId(null)} disabled={busyMemberId === m.id} className="mrcap-press" style={{ fontSize: 11.5, color: COLORS.muted, background: "none", border: `1px solid ${COLORS.line}`, borderRadius: 7, padding: "7px 11px", cursor: "pointer" }}>Cancel</button>
+                  </div>
+                </div>
+              )}
               {confirmResetId === m.id && (
                 <div style={{ padding: "10px 12px", borderBottom: `1px solid ${COLORS.line}`, background: "rgba(168,64,47,0.08)" }}>
                   <div style={{ fontSize: 12, color: COLORS.ink, marginBottom: 8 }}>Reset {m.name}'s PIN? They'll pick a new one the next time they log in.</div>
@@ -9408,7 +13382,7 @@ function TeamScreen({ team, setTeam, session, onBack, onImport, onServices, canS
               {pinActionDone && pinActionDone.id === m.id && (
                 <div style={{ padding: "8px 12px", borderBottom: `1px solid ${COLORS.line}`, display: "flex", alignItems: "center", gap: 6, background: "rgba(74,122,87,0.1)" }}>
                   <CheckCircle2 size={13} color={COLORS.green} />
-                  <span style={{ fontSize: 11.5, color: "#7BC494" }}>{pinActionDone.label}</span>
+                  <span style={{ fontSize: 11.5, color: COLORS.successText }}>{pinActionDone.label}</span>
                 </div>
               )}
 
@@ -9474,17 +13448,29 @@ function TeamScreen({ team, setTeam, session, onBack, onImport, onServices, canS
   );
 }
 
-// Three-way picker for how much of the app someone sees: Auto (follow
+// Four-way picker for how much of the app someone sees: Auto (follow
 // their role's usual default), Full Dashboard (admin-style, even for a
 // shop-floor role — e.g. a senior technician who should see everything),
-// or Workshop Floor (the stripped-down view, even for admin/intake —
-// e.g. someone who should only ever see their own assigned jobs).
+// Workshop Floor (the stripped-down view, even for admin/intake — e.g.
+// someone who should only ever see their own assigned jobs), or
+// Smartech Portal (the separately-licensed body-shop vendor — sees only
+// their own assigned jobs, submits purchases for admin approval, and
+// nothing else in the app at all). Writes the new "smartech" value going
+// forward; isSmartechPortal still also recognizes the old "subcontractor"
+// value for any device that hasn't picked this up yet.
 function DashboardModePicker({ value, onChange }) {
   const options = [
     { key: "auto", label: "Auto (by role)" },
     { key: "full", label: "Full Dashboard" },
     { key: "workshop", label: "Workshop Floor" },
+    { key: "smartech", label: "Smartech Portal" },
+    { key: "ppfroom", label: "PPF Room" },
   ];
+  // Cosmetic normalization only — a member row still saved as the old
+  // "subcontractor" value highlights the same as "smartech" here since
+  // isSmartechPortal treats them identically; onChange below always
+  // writes the new value going forward.
+  const normalizedValue = value === "subcontractor" ? "smartech" : value;
   return (
     <div style={{ display: "flex", flexWrap: "wrap", gap: 6 }}>
       {options.map((o) => (
@@ -9495,14 +13481,99 @@ function DashboardModePicker({ value, onChange }) {
           type="button"
           style={{
             padding: "7px 10px", borderRadius: 8, fontSize: 11.5, fontWeight: 600, cursor: "pointer",
-            border: `1.5px solid ${value === o.key ? COLORS.gold : COLORS.line}`,
-            background: value === o.key ? COLORS.gold : COLORS.panel2,
-            color: value === o.key ? COLORS.darkText : COLORS.muted,
+            border: `1.5px solid ${normalizedValue === o.key ? COLORS.gold : COLORS.line}`,
+            background: normalizedValue === o.key ? COLORS.gold : COLORS.panel2,
+            color: normalizedValue === o.key ? COLORS.darkText : COLORS.muted,
           }}
         >
           {o.label}
         </button>
       ))}
+    </div>
+  );
+}
+
+// Admin-only push composer — send to specific employees or blast
+// everyone. The server (send-push-notification) independently re-checks
+// that the sender is actually an admin, so this screen being reachable
+// isn't itself the security boundary — same belt-and-braces pattern as
+// the PIN-overwrite guard.
+function SendNotificationScreen({ team, session, onBack }) {
+  const [audience, setAudience] = useState("everyone"); // 'everyone' | 'specific'
+  const [selectedIds, setSelectedIds] = useState([]);
+  const [title, setTitle] = useState("");
+  const [body, setBody] = useState("");
+  const [sending, setSending] = useState(false);
+  const [result, setResult] = useState(null); // { ok, sent, failed, error }
+
+  const toggleId = (id) => setSelectedIds((cur) => (cur.includes(id) ? cur.filter((x) => x !== id) : [...cur, id]));
+
+  const canSend = title.trim() && body.trim() && (audience === "everyone" || selectedIds.length > 0) && !sending;
+
+  const send = async () => {
+    if (!canSend) return;
+    setSending(true);
+    setResult(null);
+    const res = await sendPushNotification({
+      senderId: session.id,
+      title: title.trim(),
+      body: body.trim(),
+      targetMemberIds: audience === "specific" ? selectedIds : undefined,
+    });
+    setSending(false);
+    setResult(res);
+    if (res.ok) {
+      setTitle("");
+      setBody("");
+      setSelectedIds([]);
+    }
+  };
+
+  return (
+    <div className="mrcap-view" style={{ padding: "0 18px 30px" }}>
+      <SectionTitle>Send Notification</SectionTitle>
+      <div style={{ fontSize: 11.5, color: COLORS.muted, marginBottom: 16 }}>
+        Sends a real push notification straight to the app on their phone — only reaches devices that have opened the app at least once since it was set up.
+      </div>
+
+      <Field label="Send to">
+        <div style={{ display: "flex", gap: 8 }}>
+          <button onClick={() => setAudience("everyone")} className="mrcap-press" style={{ flex: 1, padding: "10px", borderRadius: 9, border: `1.5px solid ${audience === "everyone" ? COLORS.gold : COLORS.line}`, background: audience === "everyone" ? COLORS.gold : COLORS.panel2, color: audience === "everyone" ? COLORS.darkText : COLORS.ink, fontSize: 13, fontWeight: 600, cursor: "pointer" }}>Everyone (blast)</button>
+          <button onClick={() => setAudience("specific")} className="mrcap-press" style={{ flex: 1, padding: "10px", borderRadius: 9, border: `1.5px solid ${audience === "specific" ? COLORS.gold : COLORS.line}`, background: audience === "specific" ? COLORS.gold : COLORS.panel2, color: audience === "specific" ? COLORS.darkText : COLORS.ink, fontSize: 13, fontWeight: 600, cursor: "pointer" }}>Specific people</button>
+        </div>
+      </Field>
+
+      {audience === "specific" && (
+        <Field label={`Recipients${selectedIds.length ? ` (${selectedIds.length} selected)` : ""}`}>
+          <div style={{ display: "flex", flexWrap: "wrap", gap: 6 }}>
+            {team.map((m) => (
+              <button key={m.id} onClick={() => toggleId(m.id)} className="mrcap-press" style={{ padding: "7px 11px", borderRadius: 999, border: `1.5px solid ${selectedIds.includes(m.id) ? COLORS.gold : COLORS.line}`, background: selectedIds.includes(m.id) ? "rgba(201,162,39,0.15)" : COLORS.panel2, color: selectedIds.includes(m.id) ? COLORS.gold : COLORS.muted, fontSize: 12, fontWeight: 600, cursor: "pointer" }}>
+                {m.name}
+              </button>
+            ))}
+          </div>
+        </Field>
+      )}
+
+      <Field label="Title"><input style={inputStyle} value={title} onChange={(e) => setTitle(e.target.value)} placeholder="e.g. Shop closing early Thursday" maxLength={120} /></Field>
+      <Field label="Message"><textarea style={textareaStyle} value={body} onChange={(e) => setBody(e.target.value)} placeholder="What do they need to know?" maxLength={500} /></Field>
+
+      <button onClick={send} disabled={!canSend} className="mrcap-press" style={{ ...primaryBtnStyle, width: "100%", opacity: canSend ? 1 : 0.5, marginTop: 6 }}>
+        {sending ? "Sending…" : audience === "everyone" ? "Send to everyone" : `Send to ${selectedIds.length || 0}`}
+      </button>
+
+      {result && (
+        <div style={{ marginTop: 14, padding: "11px 12px", borderRadius: 10, border: `1px solid ${result.ok ? COLORS.green : COLORS.red}`, background: result.ok ? "rgba(74,122,87,0.12)" : "rgba(168,64,47,0.12)" }}>
+          {result.ok ? (
+            <div style={{ fontSize: 12.5, color: COLORS.successText }}>
+              Sent to {result.sent} device{result.sent === 1 ? "" : "s"}{result.failed ? `, ${result.failed} failed` : ""}.
+              {result.note ? ` ${result.note}` : ""}
+            </div>
+          ) : (
+            <div style={{ fontSize: 12.5, color: COLORS.dangerText }}>{result.error || "Something went wrong sending it."}</div>
+          )}
+        </div>
+      )}
     </div>
   );
 }
@@ -9568,22 +13639,35 @@ async function loadDispatchJobs() {
   // photo/diagram indicator icons are gone from the compact view as a
   // result — the actual images still show fine once a job is opened,
   // via the one-off fetch in loadDispatchJobExtras below.
-  const { ok, data } = await sbFetch(
-    "jobs?select=id,plate,make_model,customer_name,description,damage_notes,priority,location,stage_index,service_types,assigned_to,assigned_team,service_done,service_started,treatments,parts,dispatch_hidden,created_at,updated_at&order=created_at.asc&limit=900"
+  //
+  // `history` IS selected now (plain text entries, no images) — the QC
+  // step, the "no update in 3 hours" check and the Started/QC/Finished
+  // sounds are all derived from it. To keep that affordable every 6s,
+  // Collected jobs are filtered out server-side instead of downloading
+  // every job ever and dropping them here (that used to be up to 900
+  // rows per poll). Returns null (not []) when the fetch fails, so one
+  // dropped request doesn't blank the board and then "re-announce"
+  // every car as new when the next poll succeeds.
+  const { ok, data, stale } = await sbFetch(
+    "jobs?select=id,plate,make_model,color,customer_name,description,damage_notes,priority,location,stage_index,service_types,assigned_to,assigned_team,service_done,service_started,treatments,parts,history,dispatch_hidden,created_at,updated_at&or=(stage_index.neq.5,stage_index.is.null)&order=created_at.asc&limit=900"
   );
-  if (!ok || !data) return [];
-  return data
+  if (!ok || !Array.isArray(data)) return null;
+  const jobs = data
     .filter((r) => r.stage_index !== 5) // 5 = Collected — done, doesn't belong on a live queue
     .map((r) => ({
-      id: r.id, plate: r.plate, makeModel: r.make_model, customerName: r.customer_name,
+      id: r.id, plate: r.plate, makeModel: r.make_model, color: r.color || "", customerName: r.customer_name,
       description: r.description, damageNotes: r.damage_notes,
       damageDiagramImage: null, photos: {}, // filled in on-demand by loadDispatchJobExtras()
       priority: r.priority, location: r.location,
       stageIndex: r.stage_index, serviceTypes: r.service_types || [], assignedTo: r.assigned_to || {}, assignedTeam: r.assigned_team || {},
       serviceDone: r.service_done || {}, serviceStarted: r.service_started || {}, treatments: r.treatments || {},
-      parts: r.parts || [], dispatchHidden: !!r.dispatch_hidden,
+      parts: r.parts || [], history: Array.isArray(r.history) ? r.history : [], dispatchHidden: !!r.dispatch_hidden,
       createdAt: new Date(r.created_at).getTime(), updatedAt: new Date(r.updated_at).getTime(),
     }));
+  // `stale` means this came from the offline-cache fallback in sbFetch,
+  // not a live response — the caller uses it to avoid treating a stale
+  // snapshot as the silent poll baseline (see firstLoadRef in refresh()).
+  return { jobs, stale: !!stale };
 }
 
 // Fetches the heavy fields for exactly one job — called once when its
@@ -9594,50 +13678,134 @@ async function loadDispatchJobExtras(jobId) {
   return { photos: data[0].photos || {}, damageDiagramImage: data[0].damage_diagram_image || null };
 }
 
-function playDispatchBeep() {
-  // New job arrived — a single flat ping, deliberately plain so it's
-  // never confused with the "finished" chime below.
+/* ---------------- Dispatch Board sounds ----------------
+   Sharp and loud on purpose — the board runs on a 60" tablet in a noisy
+   workshop, and the old soft sine pings were easy to miss. Square and
+   sawtooth tones, all routed through one compressor so they can be loud
+   without clipping.
+
+   ONE shared AudioContext for the whole app. The old code created a new
+   context for every single beep; browsers cap how many can exist, so a
+   board left open all day eventually went silent without any error.
+   Sounds are queued back-to-back instead of overlapping, so three things
+   happening in the same poll still read as three separate sounds. */
+let dispatchAudioCtx = null;
+let dispatchAudioInput = null;
+let dispatchAudioNextFree = 0; // AudioContext time the last queued sound finishes
+
+function getDispatchAudio() {
+  if (dispatchAudioCtx) return dispatchAudioCtx;
+  const Ctx = window.AudioContext || window.webkitAudioContext;
+  if (!Ctx) return null;
+  // Before anyone has tapped the page, a new context only starts
+  // "suspended" (plus a console warning) — wait for the first tap.
+  const activation = navigator.userActivation;
+  if (activation && !activation.hasBeenActive) return null;
   try {
-    const Ctx = window.AudioContext || window.webkitAudioContext;
-    if (!Ctx) return;
     const ctx = new Ctx();
-    const osc = ctx.createOscillator();
-    const gain = ctx.createGain();
-    osc.connect(gain);
-    gain.connect(ctx.destination);
-    osc.frequency.value = 780;
-    osc.type = "sine";
-    gain.gain.setValueAtTime(0.001, ctx.currentTime);
-    gain.gain.exponentialRampToValueAtTime(0.28, ctx.currentTime + 0.02);
-    gain.gain.exponentialRampToValueAtTime(0.001, ctx.currentTime + 0.55);
-    osc.start(ctx.currentTime);
-    osc.stop(ctx.currentTime + 0.55);
-  } catch { /* best-effort only — a silent tablet shouldn't block the board */ }
+    const comp = ctx.createDynamicsCompressor();
+    comp.threshold.value = -10;
+    comp.ratio.value = 6;
+    const master = ctx.createGain();
+    master.gain.value = 0.95;
+    comp.connect(master);
+    master.connect(ctx.destination);
+    dispatchAudioCtx = ctx;
+    dispatchAudioInput = comp;
+  } catch { return null; }
+  return dispatchAudioCtx;
 }
 
-// Two soft rising notes — distinct from the flat "new job" beep above
-// and the harsh EOD alarm, so it reads as "someone posted an update"
-// specifically, not confused with either.
+// Called from a tap anywhere on the board: Chrome only lets a page make
+// sound after an interaction, and Android can suspend the context when
+// the screen sleeps.
+function unlockDispatchAudio() {
+  const ctx = getDispatchAudio();
+  if (ctx && ctx.state === "suspended") ctx.resume().catch(() => {});
+}
+
+// Runs fn(ctx) once the shared context is actually running. Skipped
+// outright (not queued) when the browser hasn't allowed sound yet —
+// otherwise the first tap of the morning would play everything missed.
+function withDispatchAudio(fn) {
+  const ctx = getDispatchAudio();
+  if (!ctx) return;
+  const run = () => { try { fn(ctx); } catch { /* best-effort only — a silent tablet shouldn't block the board */ } };
+  if (ctx.state === "running") { run(); return; }
+  ctx.resume().then(() => { if (ctx.state === "running") run(); }).catch(() => {});
+}
+
+function dispatchTone(ctx, start, freq, at, dur, type = "square", vol = 0.5, toFreq = null) {
+  const t = start + at;
+  const osc = ctx.createOscillator();
+  const gain = ctx.createGain();
+  osc.type = type;
+  osc.frequency.setValueAtTime(freq, t);
+  if (toFreq) osc.frequency.linearRampToValueAtTime(toFreq, t + dur);
+  gain.gain.setValueAtTime(0.0001, t);
+  gain.gain.exponentialRampToValueAtTime(vol, t + 0.012);
+  gain.gain.setValueAtTime(vol, t + dur * 0.7);
+  gain.gain.exponentialRampToValueAtTime(0.0001, t + dur);
+  osc.connect(gain);
+  gain.connect(dispatchAudioInput);
+  osc.start(t);
+  osc.stop(t + dur + 0.02);
+  osc.onended = () => { try { osc.disconnect(); gain.disconnect(); } catch { /* already gone */ } };
+}
+
+// Every Dispatch Board sound. `dur` is how long it rings, used to queue
+// the next one after it and to time a spoken line so it doesn't talk
+// over its own chime. Each has a clearly different shape so staff can
+// tell them apart by ear without looking up.
+const DISPATCH_SOUNDS = {
+  newcar:   { dur: 0.6,  play: (c, s) => { [[880, 0], [1175, 0.13], [1568, 0.26]].forEach(([f, a], i) => dispatchTone(c, s, f, a, i === 2 ? 0.32 : 0.11, "square", 0.5)); } },
+  assigned: { dur: 0.42, play: (c, s) => { dispatchTone(c, s, 1320, 0, 0.08, "square", 0.45); dispatchTone(c, s, 1320, 0.12, 0.08, "square", 0.45); dispatchTone(c, s, 1760, 0.24, 0.16, "square", 0.45); } },
+  started:  { dur: 0.25, play: (c, s) => { dispatchTone(c, s, 660, 0, 0.08, "square", 0.4); dispatchTone(c, s, 990, 0.09, 0.14, "square", 0.4); } },
+  late:     { dur: 1.1,  play: (c, s) => { for (let r = 0; r < 2; r++) for (let i = 0; i < 4; i++) dispatchTone(c, s, 1000, r * 0.62 + i * 0.13, 0.07, "square", 0.55); } },
+  stale:    { dur: 1.0,  play: (c, s) => { [0, 0.5].forEach((a) => { dispatchTone(c, s, 740, a, 0.22, "sawtooth", 0.5); dispatchTone(c, s, 494, a + 0.23, 0.24, "sawtooth", 0.5); }); } },
+  qc:       { dur: 0.86, play: (c, s) => { [0, 0.45].forEach((a) => { dispatchTone(c, s, 1046, a, 0.1, "triangle", 0.7); dispatchTone(c, s, 1318, a + 0.1, 0.1, "triangle", 0.7); dispatchTone(c, s, 1568, a + 0.2, 0.2, "triangle", 0.7); }); } },
+  qclate:   { dur: 0.86, play: (c, s) => { [0, 0.34, 0.68].forEach((a) => dispatchTone(c, s, 1568, a, 0.16, "square", 0.45, 1046)); } },
+  fail:     { dur: 0.62, play: (c, s) => { dispatchTone(c, s, 196, 0, 0.6, "sawtooth", 0.6); dispatchTone(c, s, 185, 0, 0.6, "square", 0.35); } },
+  done:     { dur: 0.82, play: (c, s) => { [[784, 0], [988, 0.1], [1175, 0.2]].forEach(([f, a]) => dispatchTone(c, s, f, a, 0.1, "square", 0.5)); dispatchTone(c, s, 1568, 0.3, 0.5, "square", 0.5); dispatchTone(c, s, 2093, 0.3, 0.5, "triangle", 0.3); } },
+  eod:      { dur: 0.92, play: (c, s) => { dispatchTone(c, s, 600, 0, 0.9, "square", 0.55, 1200); dispatchTone(c, s, 1200, 0.45, 0.45, "square", 0.55, 600); } },
+};
+
+// Per-device mute for the board (the header's Sound on/off pill). Stored
+// locally, not shared: muting a phone shouldn't silence the shop TV.
+const DISPATCH_SOUND_KEY = "mrcap_dispatch_sound";
+function isDispatchSoundOn() {
+  try { return window.localStorage.getItem(DISPATCH_SOUND_KEY) !== "off"; } catch { return true; }
+}
+function setDispatchSoundOn(on) {
+  try { window.localStorage.setItem(DISPATCH_SOUND_KEY, on ? "on" : "off"); } catch { /* ignore */ }
+}
+
+function playDispatchSound(name, { force = false } = {}) {
+  if (!force && !isDispatchSoundOn()) return;
+  const sound = DISPATCH_SOUNDS[name];
+  if (!sound) return;
+  withDispatchAudio((ctx) => {
+    const start = Math.max(ctx.currentTime + 0.03, dispatchAudioNextFree);
+    dispatchAudioNextFree = start + sound.dur + 0.18;
+    sound.play(ctx, start);
+  });
+}
+
+// How long until everything already queued has finished ringing — a
+// spoken line waits this long so the voice doesn't talk over the chime.
+function dispatchSoundQueueMs() {
+  if (!dispatchAudioCtx || dispatchAudioCtx.state !== "running") return 0;
+  return Math.max(0, (dispatchAudioNextFree - dispatchAudioCtx.currentTime) * 1000);
+}
+
+// Two soft rising notes — deliberately NOT one of the loud board sounds
+// above: this plays app-wide (every screen) whenever someone posts an
+// update, so it stays gentle. Shares the same single AudioContext.
 function playUpdateChime() {
-  try {
-    const Ctx = window.AudioContext || window.webkitAudioContext;
-    if (!Ctx) return;
-    const ctx = new Ctx();
-    [520, 660].forEach((freq, i) => {
-      const osc = ctx.createOscillator();
-      const gain = ctx.createGain();
-      osc.connect(gain);
-      gain.connect(ctx.destination);
-      osc.frequency.value = freq;
-      osc.type = "sine";
-      const start = ctx.currentTime + i * 0.11;
-      gain.gain.setValueAtTime(0.001, start);
-      gain.gain.exponentialRampToValueAtTime(0.22, start + 0.02);
-      gain.gain.exponentialRampToValueAtTime(0.001, start + 0.3);
-      osc.start(start);
-      osc.stop(start + 0.3);
-    });
-  } catch { /* best-effort only */ }
+  withDispatchAudio((ctx) => {
+    const start = ctx.currentTime + 0.02;
+    [520, 660].forEach((freq, i) => dispatchTone(ctx, start, freq, i * 0.11, 0.3, "sine", 0.22));
+  });
 }
 
 // Fetches only progress-update history entries newer than sinceMs,
@@ -9682,15 +13850,32 @@ function InternalUpdatesWidget({ team, onOpenJob, session, index }) {
     } catch { return Date.now(); }
   })());
 
+  // While the panel is open the page behind it must not move: without this,
+  // wheeling past the end of the feed on a PC scrolled the dashboard instead.
   useEffect(() => {
+    if (!open) return;
+    const prev = document.body.style.overflow;
+    document.body.style.overflow = "hidden";
+    return () => { document.body.style.overflow = prev; };
+  }, [open]);
+
+  useEffect(() => {
+    // Absolute count since last seen (lastSeenRef only moves when the panel
+    // opens), so each poll replaces the badge rather than re-adding the
+    // same updates every 15s. Smartech chat messages count too for the
+    // people who see that thread merged into the feed.
     const check = async () => {
-      const updates = await loadRecentUpdates(lastSeenRef.current);
-      if (updates.length) setUnread((n) => n + updates.length);
+      const since = lastSeenRef.current;
+      const [updates, msgs] = await Promise.all([
+        loadRecentUpdates(since),
+        canUseSmartechChat(session) ? loadRecentSmartechMessages(since) : Promise.resolve([]),
+      ]);
+      setUnread(updates.length + msgs.filter((m) => m.sender_id !== session.id).length);
     };
     check();
     const interval = setInterval(check, 15000);
     return () => clearInterval(interval);
-  }, []);
+  }, [session]);
 
   const openPanel = () => {
     setOpen(true);
@@ -9706,11 +13891,11 @@ function InternalUpdatesWidget({ team, onOpenJob, session, index }) {
         className="mrcap-press"
         title="Internal Updates"
         style={{
-          position: "fixed", right: 16, bottom: "max(18px, calc(env(safe-area-inset-bottom) + 18px))", zIndex: 55,
+          position: "fixed", right: 16, bottom: "calc(max(18px, calc(env(safe-area-inset-bottom) + 18px)) + var(--mrcap-fab-lift, 0px))", zIndex: 55,
           width: 50, height: 50, borderRadius: "50%",
-          border: `1.5px solid ${COLORS.gold}`, background: COLORS.panel, color: COLORS.gold,
+          border: `1.5px solid ${COLORS.gold}`, background: "rgba(20,19,17,0.94)", color: COLORS.gold,
           display: "flex", alignItems: "center", justifyContent: "center",
-          boxShadow: "0 6px 18px rgba(0,0,0,0.35)", cursor: "pointer",
+          boxShadow: "0 8px 22px -6px rgba(0,0,0,0.6)", cursor: "pointer", transition: "bottom 0.25s ease",
         }}
       >
         <MessageSquare size={21} />
@@ -9727,7 +13912,7 @@ function InternalUpdatesWidget({ team, onOpenJob, session, index }) {
       </button>
       {open && createPortal(
         <div onClick={() => setOpen(false)} style={{ position: "fixed", inset: 0, background: "rgba(0,0,0,0.55)", zIndex: 300, display: "flex", justifyContent: "flex-end" }}>
-          <div onClick={(e) => e.stopPropagation()} className="mrcap-fade" style={{ width: "min(420px, 100%)", height: "100%", background: COLORS.paper, borderLeft: `1px solid ${COLORS.line}`, overflowY: "auto" }}>
+          <div onClick={(e) => e.stopPropagation()} className="mrcap-fade" style={{ width: "min(420px, 100%)", height: "100%", background: COLORS.paper, borderLeft: `1px solid ${COLORS.line}`, overflowY: "auto", overscrollBehavior: "contain" }}>
             <div style={{ position: "sticky", top: 0, background: COLORS.paper, borderBottom: `1px solid ${COLORS.line}`, padding: "14px 16px", display: "flex", justifyContent: "space-between", alignItems: "center", zIndex: 1 }}>
               <div style={{ fontFamily: DISPLAY_FONT, fontWeight: 700, fontSize: 15, color: COLORS.ink }}>Internal Updates</div>
               <button onClick={() => setOpen(false)} className="mrcap-press" style={{ background: "none", border: "none", cursor: "pointer", color: COLORS.muted, padding: 4 }}><X size={18} /></button>
@@ -9770,7 +13955,7 @@ function LiveUpdateBroadcaster({ onOpenJob }) {
               key={t.key}
               onClick={() => setSelected(t)}
               className="mrcap-fade mrcap-press"
-              style={{ pointerEvents: "auto", cursor: "pointer", maxWidth: 340, width: "100%", background: COLORS.panel, border: `1px solid ${COLORS.gold}`, borderRadius: 12, padding: "12px 14px", boxShadow: "0 10px 26px rgba(0,0,0,0.5)" }}
+              style={{ pointerEvents: "auto", cursor: "pointer", maxWidth: 340, width: "100%", boxSizing: "border-box", background: "rgba(20,19,17,0.97)", border: `1px solid ${COLORS.line}`, borderLeft: `3px solid ${COLORS.gold}`, borderRadius: 14, padding: "12px 14px", boxShadow: "0 16px 36px -10px rgba(0,0,0,0.75)", backdropFilter: "blur(10px)", WebkitBackdropFilter: "blur(10px)" }}
             >
               <div style={{ fontSize: 12.5, fontWeight: 700, color: COLORS.gold }}>{t.by} · {t.plate}{t.makeModel ? ` (${t.makeModel})` : ""}</div>
               <div style={{ fontSize: 13, color: COLORS.ink, marginTop: 3, lineHeight: 1.35 }}>{t.note}</div>
@@ -9823,77 +14008,31 @@ function fixDispatchPronunciation(text) {
   return out;
 }
 
-// Assignment announcement only (by design — arrival and finished
-// already have their own distinct beep/chime, and voice on top of
-// those too would be noisy). Plays alongside whichever beep is already
-// wired up elsewhere, not instead of it.
-function announceDispatchAssignment(staffName, vehicleLabel) {
-  try {
-    if (!window.speechSynthesis) return;
-    const spokenVehicle = fixDispatchPronunciation(vehicleLabel);
-    const utter = new SpeechSynthesisUtterance(`${staffName}, you've been assigned the ${spokenVehicle}. Please update who will be working on it.`);
-    const voice = getBestDispatchVoice();
-    if (voice) utter.voice = voice;
-    utter.lang = voice?.lang || "en-GB";
-    utter.rate = 1;
-    utter.pitch = 1;
-    utter.volume = 1;
-    window.speechSynthesis.speak(utter);
-  } catch { /* best-effort only — a silent tablet shouldn't block the board */ }
+// Speaks one line on the board's voice, after `delayMs` (so it can wait
+// for its own chime to finish). Honours the board's Sound on/off pill.
+// speechSynthesis queues lines itself, so several in a row never talk
+// over each other.
+function speakDispatch(text, delayMs = 0) {
+  if (!text || !window.speechSynthesis || !isDispatchSoundOn()) return;
+  const say = () => {
+    try {
+      const utter = new SpeechSynthesisUtterance(fixDispatchPronunciation(text));
+      const voice = getBestDispatchVoice();
+      if (voice) utter.voice = voice;
+      utter.lang = voice?.lang || "en-GB";
+      utter.rate = 1;
+      utter.pitch = 1;
+      utter.volume = 1;
+      window.speechSynthesis.speak(utter);
+    } catch { /* best-effort only — a silent tablet shouldn't block the board */ }
+  };
+  if (delayMs > 0) setTimeout(say, delayMs); else say();
 }
 
-function playDispatchDoneChime() {
-  // Job marked finished — a rising two-note chime (like a doorbell "ding
-  // dong" in reverse), intentionally shaped differently from the flat
-  // arrival ping above so the two are easy to tell apart by ear alone
-  // without looking at the screen.
-  try {
-    const Ctx = window.AudioContext || window.webkitAudioContext;
-    if (!Ctx) return;
-    const ctx = new Ctx();
-    const notes = [
-      { freq: 660, start: 0, dur: 0.16 },
-      { freq: 990, start: 0.14, dur: 0.32 },
-    ];
-    notes.forEach(({ freq, start, dur }) => {
-      const osc = ctx.createOscillator();
-      const gain = ctx.createGain();
-      osc.connect(gain);
-      gain.connect(ctx.destination);
-      osc.frequency.value = freq;
-      osc.type = "sine";
-      const t0 = ctx.currentTime + start;
-      gain.gain.setValueAtTime(0.001, t0);
-      gain.gain.exponentialRampToValueAtTime(0.3, t0 + 0.02);
-      gain.gain.exponentialRampToValueAtTime(0.001, t0 + dur);
-      osc.start(t0);
-      osc.stop(t0 + dur);
-    });
-  } catch { /* best-effort only — a silent tablet shouldn't block the board */ }
-}
-
-// 6:45pm "update the app before leaving" reminder — deliberately harsh
-// and attention-grabbing (unlike the other two calm sounds above), a
-// rising-falling siren sweep, loud and at full volume. Meant to be
-// impossible to ignore, not pleasant.
-function playDispatchAlarm() {
-  try {
-    const Ctx = window.AudioContext || window.webkitAudioContext;
-    if (!Ctx) return;
-    const ctx = new Ctx();
-    const osc = ctx.createOscillator();
-    const gain = ctx.createGain();
-    osc.connect(gain);
-    gain.connect(ctx.destination);
-    osc.type = "square";
-    const dur = 0.9;
-    osc.frequency.setValueAtTime(600, ctx.currentTime);
-    osc.frequency.linearRampToValueAtTime(1200, ctx.currentTime + dur / 2);
-    osc.frequency.linearRampToValueAtTime(600, ctx.currentTime + dur);
-    gain.gain.setValueAtTime(0.5, ctx.currentTime);
-    osc.start(ctx.currentTime);
-    osc.stop(ctx.currentTime + dur);
-  } catch { /* best-effort only */ }
+// The assignment call-out — wording unchanged from the original board.
+// Now plays after the "assigned" pips instead of on top of them.
+function announceDispatchAssignment(staffName, vehicleLabel, delayMs = 0) {
+  speakDispatch(`${staffName}, you've been assigned the ${vehicleLabel}. Please update who will be working on it.`, delayMs);
 }
 
 const rowKey = (jobId, categoryKey) => `${jobId}::${categoryKey}`;
@@ -9981,373 +14120,910 @@ function staffForRole(team, role) {
   return team.filter((m) => m.role !== "detailing" && m.role !== "admin" && m.role !== "intake");
 }
 
-function DispatchJobCardImpl({ row, ticketNo, isDone, isStarted, startedAt, now, assignedNames, onClick }) {
-  const { job, categoryLabel } = row;
-  const isPartsRemoval = STAGES[job.stageIndex]?.key === "parts_removal";
-  const isStaleUnassigned = (!assignedNames || assignedNames.length === 0) && !isStarted && !isDone && businessMsElapsed(job.createdAt, now) > STALE_UNASSIGNED_MS;
-  const isStaleInProgress = isStarted && !isDone && startedAt && businessMsElapsed(new Date(startedAt).getTime(), now) > STALE_IN_PROGRESS_MS;
-  const isStale = isStaleUnassigned || isStaleInProgress;
-  const ageTier = dispatchAgeTier(job.createdAt, now);
-  const edgeColor = isStale ? COLORS.red : ageTier.color;
+/* ---- Dispatch Board: per-row state ----------------------------------
+   Every (job, service category) row on the board is in exactly one of
+   these states, worked out fresh from the job's own fields + history on
+   every render (nothing new stored for it in the database):
+
+     new        arrived less than 1 shop hour ago
+     unassigned nobody on it (between "new" and "late")
+     late       nobody on it after 1 shop hour           — pulses, sounds once
+     assigned   someone on it, not started
+     progress   started (redo = the last QC sent it back)
+     stale      started, no update/start for 3 shop hours — pulses, sounds + voice once
+     qc         sent to QC, waiting for Noel/Reagen/Ahmed
+     qclate     waiting on QC more than 30 shop minutes  — pulses, sounds once
+
+   The QC step lives entirely in `history` (no migration): entries with
+   stage "qc", label = the category label and note "Sent to QC" /
+   "QC passed" / "QC failed: <reason>". Only QC entries AFTER the latest
+   "Started" entry for that category count, so re-starting a category
+   (e.g. after "Not started yet") always begins a clean QC cycle. Passing
+   QC is the same service_done + "Marked done" write JobDetail and the
+   old Finished button make, so reports and JobDetail are unaffected. */
+const DISPATCH_NEW_MS = 60 * 60 * 1000; // first shop hour after arrival shows as "New"
+const DISPATCH_QC_LATE_MS = 30 * 60 * 1000; // waiting on QC longer than this pulses
+const DISPATCH_NEW_CAR_WINDOW_MS = 30 * 60 * 1000; // wall-clock: only announce genuinely fresh arrivals
+const QC_APPROVER_IDS = ["noel", "reagen", "ahmed"];
+function isQcApprover(session) { return !!session && QC_APPROVER_IDS.includes(session.id); }
+const QC_FAIL_REASONS = ["Missed a spot", "Swirls or haze left", "Interior not finished", "Fit or gap issue", "Other"];
+
+// The seven colours Mr.CAP can change from the board (key = what's
+// stored in app_settings "dispatch_colors"). Defaults match the approved
+// TV mockup.
+const DISPATCH_THEME = [
+  { key: "new", name: "New car", desc: "First hour after it arrives", def: "#3FD37A", sample: "NEW" },
+  { key: "late", name: "Needs someone", desc: "Nobody assigned after 1 shop hour", def: "#FF9F0A", sample: "NEEDS SOMEONE" },
+  { key: "assigned", name: "Assigned", desc: "Someone is on it, not started", def: "#5AA9E6", sample: "ASSIGNED" },
+  { key: "progress", name: "In progress", desc: "Started, timer running", def: "#C9A227", sample: "IN PROGRESS" },
+  { key: "stale", name: "No update", desc: "No update for 3 shop hours", def: "#FF453A", sample: "NO UPDATE" },
+  { key: "qc", name: "QC", desc: "Ready for or waiting on QC", def: "#A78BFA", sample: "READY FOR QC" },
+  { key: "done", name: "Finished", desc: "The flash when a car passes QC", def: "#E8C34A", sample: "FINISHED" },
+];
+const DISPATCH_HEX_RE = /^#[0-9a-f]{6}$/i;
+const DISPATCH_SWATCHES = ["#3FD37A", "#00C7BE", "#5AA9E6", "#0A84FF", "#A78BFA", "#BF5AF2", "#FF6FB5", "#FF453A", "#FF9F0A", "#FFD60A", "#C9A227", "#E9E4D4"];
+function resolveDispatchColors(saved) {
+  const out = {};
+  for (const t of DISPATCH_THEME) {
+    const v = saved ? saved[t.key] : null;
+    out[t.key] = typeof v === "string" && DISPATCH_HEX_RE.test(v) ? v : t.def;
+  }
+  return out;
+}
+
+const DISPATCH_STATES = {
+  new:        { label: "New", theme: "new", pulse: false },
+  unassigned: { label: "Waiting", theme: null, pulse: false },
+  late:       { label: "Needs someone", theme: "late", pulse: true },
+  assigned:   { label: "Assigned", theme: "assigned", pulse: false },
+  progress:   { label: "In progress", theme: "progress", pulse: false },
+  redo:       { label: "Redo after QC", theme: "progress", pulse: false },
+  stale:      { label: "No update", theme: "stale", pulse: true },
+  qc:         { label: "Ready for QC", theme: "qc", pulse: false },
+  qclate:     { label: "QC waiting", theme: "qc", pulse: true },
+};
+// States that sound (once) the moment a row moves into them.
+const DISPATCH_ATTENTION_STATES = ["late", "stale", "qclate"];
+
+function dispatchMs(v) {
+  if (v === null || v === undefined || v === false || v === true) return null;
+  const t = typeof v === "number" ? v : new Date(v).getTime();
+  return Number.isFinite(t) ? t : null;
+}
+
+// A history entry matches this category if it was tagged with the
+// category's key (new entries); for older entries with no `cat`, fall
+// back to matching on the label text (which is what could get renamed
+// and break this in the first place).
+function dispatchEntryMatchesCat(h, categoryKey, categoryLabel) {
+  return h.cat ? h.cat === categoryKey : h.label === categoryLabel;
+}
+// A progress update with no category tag AND a label that isn't any
+// known service category label is a job-wide update (e.g. posted from
+// the Live Updates composer, which labels the entry with the make/model
+// rather than a category) — it counts as "an update" for every category
+// on the job, not just one.
+function dispatchIsJobWideUpdate(h) {
+  return !h.cat && !SERVICES.some((s) => s.label === h.label);
+}
+function dispatchRowInfo(job, categoryKey, categoryLabel, now) {
+  const history = job.history || [];
+  const assigned = (job.assignedTeam || {})[categoryKey] || [];
+  const startedRaw = (job.serviceStarted || {})[categoryKey];
+  let startIdx = -1;
+  let startEntryAt = null;
+  for (let i = 0; i < history.length; i++) {
+    const h = history[i];
+    if (h && h.stage === "service" && dispatchEntryMatchesCat(h, categoryKey, categoryLabel) && h.note === "Started") { startIdx = i; startEntryAt = dispatchMs(h.at); }
+  }
+  let qc = null;
+  let lastProgressAt = null;
+  for (let i = 0; i < history.length; i++) {
+    const h = history[i];
+    if (!h) continue;
+    if (h.stage === "progress_update") {
+      if (!dispatchEntryMatchesCat(h, categoryKey, categoryLabel) && !dispatchIsJobWideUpdate(h)) continue;
+      const at = dispatchMs(h.at);
+      if (at && (!lastProgressAt || at > lastProgressAt)) lastProgressAt = at;
+    } else if (h.stage === "qc" && dispatchEntryMatchesCat(h, categoryKey, categoryLabel) && i > startIdx) {
+      qc = h;
+    }
+  }
+  const ageMs = businessMsElapsed(job.createdAt, now);
+  const info = { state: "unassigned", assigned, startedAt: null, qcAt: null, lastUpdateAt: null, redoReason: null };
+  if (startedRaw) {
+    // Older rows stored plain `true` instead of a timestamp — fall back to
+    // the matching "Started" history entry, then the last write.
+    const startedAt = dispatchMs(startedRaw) ?? startEntryAt ?? job.updatedAt;
+    info.startedAt = startedAt;
+    if (qc && qc.note === "Sent to QC") {
+      info.qcAt = dispatchMs(qc.at) ?? startedAt;
+      info.state = businessMsElapsed(info.qcAt, now) > DISPATCH_QC_LATE_MS ? "qclate" : "qc";
+      return info;
+    }
+    const failed = qc && typeof qc.note === "string" && qc.note.startsWith("QC failed") ? qc : null;
+    if (failed) info.redoReason = failed.note.replace(/^QC failed:?\s*/, "") || "QC failed";
+    // "Last update" = latest progress update on the job, or the start —
+    // and a QC send-back counts too, so a car that just came back from
+    // QC isn't instantly flagged "no update".
+    info.lastUpdateAt = Math.max(startedAt || 0, lastProgressAt || 0, failed ? (dispatchMs(failed.at) || 0) : 0);
+    info.state = businessMsElapsed(info.lastUpdateAt, now) > STALE_IN_PROGRESS_MS ? "stale" : failed ? "redo" : "progress";
+    return info;
+  }
+  if (!assigned.length) info.state = ageMs > STALE_UNASSIGNED_MS ? "late" : ageMs < DISPATCH_NEW_MS ? "new" : "unassigned";
+  else info.state = ageMs < DISPATCH_NEW_MS ? "new" : "assigned";
+  return info;
+}
+
+// "New car in. Toyota Land Cruiser, for Detailing." — category labels
+// lose their "(Smartech)"-style suffix so the voice doesn't read brackets.
+// (There's no vehicle colour stored anywhere in the app yet, so the
+// mockup's "White ..." part is left out rather than guessed.)
+function dispatchNewCarLine(job) {
+  const cats = (job.serviceTypes || [])
+    .map((k) => (SERVICES.find((s) => s.key === k)?.label || k).replace(/\s*\(.*\)/, ""))
+    .filter(Boolean);
+  const catText = cats.length > 1 ? `${cats.slice(0, -1).join(", ")} and ${cats[cats.length - 1]}` : cats[0];
+  if (job.makeModel) return catText ? `New car in. ${job.makeModel}, for ${catText}.` : `New car in. ${job.makeModel}.`;
+  return catText ? `New car in, for ${catText}.` : "New car in.";
+}
+
+// CSS custom properties for one state colour. Colours are validated
+// #rrggbb, so the translucent variants are just the hex plus an alpha
+// byte (works on older Android Chrome, unlike color-mix()).
+function dispatchColorVars(color) {
+  const c = DISPATCH_HEX_RE.test(color || "") ? color : COLORS.muted;
+  return { "--c": c, "--c16": `${c}29`, "--c45": `${c}73`, "--c60": `${c}99` };
+}
+
+const DISPATCH_AVATAR_COLORS = [
+  ["#4A3418", "#FFC078"], ["#2B2A5C", "#B5B3FF"], ["#12454D", "#7FDDEB"], ["#5A1F3C", "#FFA3CC"],
+  ["#1C4A2A", "#8FE0A5"], ["#4D2A12", "#FFB27F"], ["#3A2F4F", "#D9C2FF"], ["#12384D", "#9AD1F5"],
+  ["#4A4414", "#F0E08A"], ["#4D1717", "#FF9C9C"],
+];
+function DispatchAvatar({ id, name }) {
+  let hash = 0;
+  for (const ch of String(id || name || "?")) hash = (hash * 31 + ch.charCodeAt(0)) >>> 0;
+  const [bg, fg] = DISPATCH_AVATAR_COLORS[hash % DISPATCH_AVATAR_COLORS.length];
+  return <span className="dsp-av" style={{ background: bg, color: fg }} aria-hidden="true">{(name || id || "?").charAt(0).toUpperCase()}</span>;
+}
+
+// Big UAE-style plate for the TV: emirate strip, category, number. Falls
+// back to the whole string on the plate face for VINs / odd imports.
+const DISPATCH_PLATE_EMIRATE = { DXB: "DUBAI", AUH: "A.D.", SHJ: "SHJ", AJM: "AJM", UAQ: "UAQ", RAK: "RAK", FUJ: "FUJ" };
+function DispatchPlate({ plate, large = false }) {
+  const { code, rest } = parsePlate(plate);
+  const m = code ? String(rest || "").match(/^(\S{1,3})\s+(.+)$/) : null;
   return (
-    <div
-      onClick={onClick}
-      className="mrcap-press"
-      style={{
-        background: COLORS.panel, border: `1.5px solid ${edgeColor}`, borderLeft: `4px solid ${edgeColor}`, borderRadius: 11,
-        padding: 12, marginBottom: 9, cursor: "pointer", opacity: isDone ? 0.6 : 1,
-        display: "flex", gap: 12, alignItems: "flex-start",
-      }}
-    >
-      <div style={{
-        flexShrink: 0, width: 44, height: 44, borderRadius: 10, background: COLORS.panel2,
-        display: "flex", flexDirection: "column", alignItems: "center", justifyContent: "center",
-      }}>
-        <div style={{ fontSize: 8.5, fontWeight: 700, color: COLORS.muted, letterSpacing: 0.5 }}>TICKET</div>
-        <div style={{ fontFamily: MONO_FONT, fontSize: 16, fontWeight: 700, color: COLORS.gold }}>{ticketNo}</div>
-      </div>
-      <div style={{ flex: 1, minWidth: 0 }}>
-        <div style={{ display: "flex", justifyContent: "space-between", alignItems: "flex-start", gap: 8 }}>
-          <div style={{ fontFamily: MONO_FONT, fontWeight: 700, fontSize: 14.5, color: COLORS.ink }}>{job.plate}</div>
-          <div style={{ display: "flex", alignItems: "center", gap: 6 }}>
-            {isDone && <CheckCircle2 size={15} color={COLORS.green} />}
-            {!isDone && isStarted && <Clock size={14} color={COLORS.gold} />}
-            {job.damageNotes && <AlertCircle size={14} color={COLORS.red} />}
-            {ageTier.isNew && !isStale && (
-              <span style={{ fontSize: 9, fontWeight: 700, color: "#3fb950", border: `1px solid #3fb950`, borderRadius: 999, padding: "1px 6px" }}>NEW</span>
-            )}
-            {job.priority === "urgent" || job.priority === "high" ? (
-              <span style={{ fontSize: 9.5, fontWeight: 700, color: COLORS.red, border: `1px solid ${COLORS.red}`, borderRadius: 999, padding: "1px 7px", textTransform: "uppercase" }}>{job.priority}</span>
-            ) : null}
-          </div>
-        </div>
-        <div style={{ fontSize: 12.5, color: COLORS.muted, marginTop: 2 }}>{job.makeModel}</div>
-        {dispatchWhatToDo(job, row.categoryKey) ? (
-          <div style={{ fontSize: 12, color: COLORS.ink, marginTop: 6, opacity: 0.85, overflow: "hidden", textOverflow: "ellipsis", display: "-webkit-box", WebkitLineClamp: 2, WebkitBoxOrient: "vertical" }}>{dispatchWhatToDo(job, row.categoryKey)}</div>
-        ) : null}
-        <div style={{ display: "flex", alignItems: "center", gap: 6, marginTop: 8, flexWrap: "wrap" }}>
-          <span style={{
-            fontSize: 10.5, fontWeight: 600, padding: "3px 8px", borderRadius: 999,
-            background: isPartsRemoval ? COLORS.gold : COLORS.panel2,
-            color: isPartsRemoval ? COLORS.darkText : COLORS.muted,
-          }}>{STAGES[job.stageIndex]?.label || "—"}</span>
-          <span style={{ fontSize: 10.5, fontWeight: 600, padding: "3px 8px", borderRadius: 999, background: COLORS.panel2, color: COLORS.ink }}>{categoryLabel}</span>
-        </div>
-        <div style={{ fontSize: 11.5, marginTop: 7, color: isDone ? COLORS.green : isStarted ? COLORS.gold : (assignedNames?.length ? COLORS.goldBright : COLORS.muted) }}>
-          {isDone ? "Finished" : isStarted ? `In progress${formatDispatchElapsed(startedAt, now) ? ` · ${formatDispatchElapsed(startedAt, now)}` : ""}` : assignedNames?.length ? `Assigned: ${assignedNames.join(", ")}` : "Unassigned — tap to assign"}
-        </div>
-        {isStale && (
-          <div style={{ fontSize: 10.5, fontWeight: 700, color: COLORS.red, marginTop: 4 }}>
-            ⚠ {isStaleInProgress ? "In progress a while — check on this" : "Sitting unassigned a while"}
-          </div>
-        )}
+    <span className={`dsp-plate${large ? " dsp-plate-lg" : ""}`} title={plate || ""}>
+      {code && <span className="dsp-plate-em" aria-hidden="true">{DISPATCH_PLATE_EMIRATE[code] || code}</span>}
+      {m && <span className="dsp-plate-code">{m[1]}</span>}
+      <span className="dsp-plate-num">{m ? m[2] : (rest || "—")}</span>
+    </span>
+  );
+}
+
+// Scales a size drawn for the 1080x1920 portrait TV mockup to the space
+// the board actually has. --u is "1px on the TV": the smaller of the
+// board's width/1080 and the screen's height/1920 (so a landscape desktop
+// doesn't get TV-sized text), never below a readable phone minimum.
+const du = (px, min) => `max(${min}px, calc(${px} * var(--u)))`;
+const DISPATCH_COND_FONT = "'IBM Plex Sans Condensed', 'IBM Plex Sans', system-ui, sans-serif";
+const DISPATCH_CSS = `
+${FONT_IMPORT}
+.dsp-u { --u: min(calc(100cqw / 1080), calc(100vh / 1920)); }
+.dsp-root { container-type: inline-size; font-family: ${BODY_FONT}; color: ${COLORS.ink}; }
+.dsp-root.dsp-fill { flex: 1; min-height: 0; overflow-y: auto; overflow-x: hidden; }
+.dsp-kiosk { height: 100vh; height: 100dvh; container-type: inline-size; display: flex; flex-direction: column; overflow: hidden; background: #0b0b0c; font-family: ${BODY_FONT}; color: ${COLORS.ink}; }
+:where(.dsp-board, .dsp-scrim, .dsp-eod, .dsp-toast, .dsp-userbar) * { box-sizing: border-box; }
+:where(.dsp-board, .dsp-scrim, .dsp-eod, .dsp-toast, .dsp-userbar) button { font-family: inherit; color: inherit; cursor: pointer; border: 0; background: none; padding: 0; margin: 0; }
+:where(.dsp-board, .dsp-scrim, .dsp-eod, .dsp-toast, .dsp-userbar) button:focus-visible { outline: 4px solid rgba(232,195,74,0.7); outline-offset: 3px; }
+.dsp-board { display: flex; flex-direction: column; box-sizing: border-box; padding-bottom: 6px; background: radial-gradient(1000px 560px at 50% -6%, rgba(201,162,39,0.14), rgba(10,10,9,0) 62%), ${COLORS.paper}; }
+.dsp-board.dsp-fill { height: 100%; }
+
+.dsp-userbar { flex-shrink: 0; min-height: ${du(64, 44)}; display: flex; align-items: center; justify-content: space-between; gap: 12px; padding: 0 ${du(40, 14)}; border-bottom: 1px solid ${COLORS.line}; font-size: ${du(22, 12)}; color: ${COLORS.muted}; }
+.dsp-userbar b { color: ${COLORS.ink}; }
+.dsp-userbar-sw { height: ${du(44, 30)}; padding: 0 ${du(22, 12)}; border-radius: 999px; border: 1px solid ${COLORS.line}; font-size: ${du(20, 11.5)}; color: ${COLORS.muted}; flex-shrink: 0; }
+
+.dsp-head { padding: ${du(28, 14)} ${du(40, 14)} 0; display: flex; justify-content: space-between; align-items: flex-end; gap: ${du(16, 10)}; flex-wrap: wrap; }
+.dsp-eyebrow { font-size: ${du(22, 11)}; font-weight: 700; letter-spacing: ${du(7, 3)}; color: ${COLORS.gold}; }
+.dsp-title { font-family: ${DISPATCH_COND_FONT}; font-size: ${du(92, 34)}; line-height: 0.95; font-weight: 700; letter-spacing: -1.5px; margin: ${du(4, 2)} 0 0; color: ${COLORS.ink}; }
+.dsp-clock { text-align: right; margin-left: auto; }
+.dsp-clock-t { font-family: ${MONO_FONT}; font-size: ${du(64, 26)}; font-weight: 600; line-height: 1; font-variant-numeric: tabular-nums; }
+.dsp-clock-d { font-size: ${du(22, 12)}; color: ${COLORS.muted}; margin-top: ${du(8, 6)}; display: flex; gap: ${du(10, 6)}; align-items: center; justify-content: flex-end; flex-wrap: wrap; }
+.dsp-snd, .dsp-cust { display: inline-flex; align-items: center; gap: 8px; height: ${du(36, 30)}; padding: 0 ${du(14, 11)}; border-radius: 999px; font-size: ${du(18, 12)}; font-weight: 700; white-space: nowrap; }
+.dsp-snd-on { background: rgba(63,211,122,0.14); color: #3FD37A; }
+.dsp-snd-off { background: rgba(255,69,58,0.16); color: #FF8A80; }
+.dsp-snd-tap { background: rgba(255,159,10,0.16); color: #FFB44D; animation: dspBlink 1.6s ease-in-out infinite; }
+.dsp-cust { background: rgba(201,162,39,0.16); color: ${COLORS.goldBright}; }
+.dsp-cust svg { width: ${du(20, 14)}; height: ${du(20, 14)}; }
+@keyframes dspBlink { 0%, 100% { opacity: 1; } 50% { opacity: 0.55; } }
+
+.dsp-floor { padding: ${du(26, 14)} ${du(40, 14)} 0; }
+.dsp-floor-lab { font-size: ${du(19, 11)}; font-weight: 700; letter-spacing: ${du(3, 1.5)}; color: ${COLORS.muted}; text-transform: uppercase; margin-bottom: ${du(12, 8)}; display: flex; justify-content: space-between; gap: 10px; }
+.dsp-pills { display: grid; grid-template-columns: repeat(5, minmax(0, 1fr)); gap: ${du(12, 6)}; }
+.dsp-pill { background: ${COLORS.panel}; border: 1px solid ${COLORS.line}; border-radius: ${du(22, 12)}; padding: ${du(14, 8)} ${du(16, 9)}; display: flex; align-items: center; gap: ${du(14, 8)}; min-width: 0; }
+.dsp-pill-nm { font-size: ${du(22, 11.5)}; font-weight: 700; white-space: normal; overflow: hidden; display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical; line-height: 1.15; word-break: break-word; }
+.dsp-pill-ct { font-size: ${du(19, 11)}; color: ${COLORS.goldBright}; margin-top: 2px; line-height: 1.25; }
+.dsp-free { font-size: ${du(22, 12.5)}; color: #3FD37A; font-weight: 600; margin-top: ${du(12, 8)}; line-height: 1.4; }
+.dsp-free b { font-weight: 800; letter-spacing: 0.5px; }
+.dsp-free-none { color: ${COLORS.muted}; }
+.dsp-av { width: ${du(52, 30)}; height: ${du(52, 30)}; border-radius: 999px; display: inline-flex; align-items: center; justify-content: center; font-weight: 700; font-size: ${du(22, 13)}; flex-shrink: 0; font-family: ${BODY_FONT}; }
+@container (max-width: 760px) { .dsp-pills { grid-template-columns: repeat(3, minmax(0, 1fr)); } }
+@container (max-width: 460px) { .dsp-pills { grid-template-columns: repeat(2, minmax(0, 1fr)); } }
+
+.dsp-legend { display: flex; justify-content: space-between; align-items: center; gap: ${du(14, 8)}; flex-wrap: wrap; padding: ${du(18, 12)} ${du(40, 14)} 0; }
+.dsp-legend-keys { display: flex; gap: ${du(22, 10)}; row-gap: 6px; flex-wrap: wrap; font-size: ${du(18, 11.5)}; color: ${COLORS.muted}; }
+.dsp-legend-keys span { display: inline-flex; align-items: center; gap: ${du(8, 5)}; }
+.dsp-legend-keys i { width: ${du(14, 9)}; height: ${du(14, 9)}; border-radius: 4px; display: inline-block; }
+.dsp-legend-ctl { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }
+.dsp-alerts { display: inline-flex; align-items: center; gap: 6px; height: ${du(40, 30)}; padding: 0 ${du(14, 10)}; border-radius: 999px; background: rgba(255,69,58,0.16); color: #FF8A80; font-size: ${du(18, 12)}; font-weight: 700; white-space: nowrap; }
+.dsp-sort { display: flex; gap: 4px; background: ${COLORS.panel2}; border-radius: ${du(14, 10)}; padding: 3px; }
+.dsp-sort button { height: ${du(40, 30)}; padding: 0 ${du(16, 11)}; border-radius: ${du(11, 8)}; font-size: ${du(17, 12)}; font-weight: 700; color: ${COLORS.muted}; white-space: nowrap; }
+.dsp-sort button.on { background: ${COLORS.gold}; color: ${COLORS.darkText}; }
+.dsp-alerts-detail { padding: 8px ${du(40, 14)} 0; font-size: ${du(18, 12)}; color: ${COLORS.muted}; display: flex; flex-direction: column; gap: 3px; }
+
+.dsp-unclass { margin: ${du(18, 12)} ${du(30, 12)} 0; background: #1a1408; border: 1px solid rgba(201,162,39,0.33); border-radius: ${du(22, 12)}; padding: ${du(18, 12)}; }
+.dsp-unclass-h { font-size: ${du(20, 12.5)}; font-weight: 700; color: ${COLORS.goldBright}; margin-bottom: ${du(12, 10)}; }
+.dsp-unclass-list { display: flex; gap: ${du(12, 9)}; overflow-x: auto; padding-bottom: 2px; scrollbar-width: none; }
+.dsp-unclass-item { flex-shrink: 0; min-width: ${du(220, 150)}; background: ${COLORS.panel}; border: 1px solid ${COLORS.line}; border-radius: ${du(16, 10)}; padding: ${du(14, 10)}; text-align: left; display: flex; flex-direction: column; gap: 6px; }
+.dsp-unclass-item .m { font-size: ${du(18, 11.5)}; color: ${COLORS.muted}; }
+
+.dsp-cols { flex: 1; min-height: 0; display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: ${du(22, 10)}; padding: ${du(22, 12)} ${du(30, 12)} ${du(30, 14)}; }
+.dsp-fill .dsp-cols { grid-template-rows: minmax(0, 1fr); }
+.dsp-col { display: flex; flex-direction: column; min-height: 0; background: #0F0E0C; border: 1px solid ${COLORS.line}; border-radius: ${du(30, 16)}; overflow: hidden; }
+.dsp-col-h { display: flex; align-items: center; gap: ${du(14, 8)}; padding: ${du(22, 12)} ${du(24, 12)} ${du(18, 10)}; border-bottom: 1px solid ${COLORS.line}; }
+.dsp-dot { width: ${du(18, 10)}; height: ${du(18, 10)}; border-radius: 999px; flex-shrink: 0; }
+.dsp-col-h h2 { margin: 0; font-family: ${DISPATCH_COND_FONT}; font-size: ${du(30, 14)}; font-weight: 700; letter-spacing: -0.3px; flex: 1; min-width: 0; color: ${COLORS.ink}; line-height: 1.05; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.dsp-n { min-width: ${du(52, 28)}; height: ${du(52, 28)}; border-radius: 999px; background: #26231D; font-size: ${du(26, 13)}; font-weight: 700; display: inline-flex; align-items: center; justify-content: center; padding: 0 ${du(14, 8)}; flex-shrink: 0; }
+.dsp-warn { height: ${du(40, 24)}; padding: 0 ${du(14, 8)}; border-radius: 999px; background: rgba(255,69,58,0.16); color: #FF8A80; font-size: ${du(19, 11)}; font-weight: 700; display: inline-flex; align-items: center; white-space: nowrap; flex-shrink: 0; }
+.dsp-list { flex: 1; min-height: 0; overflow-y: auto; padding: ${du(16, 10)}; display: flex; flex-direction: column; gap: ${du(16, 10)}; scrollbar-width: none; }
+.dsp-list::-webkit-scrollbar { display: none; }
+.dsp-empty { color: ${COLORS.muted}; text-align: center; font-size: ${du(28, 13)}; padding: ${du(80, 30)} 0; }
+@container (max-width: 640px) {
+  .dsp-cols { grid-template-columns: minmax(0, 1fr); }
+  .dsp-fill .dsp-cols { grid-template-rows: none; }
+  .dsp-board.dsp-fill { height: auto; }
+  .dsp-list { overflow: visible; flex: none; }
+}
+
+.dsp-card { width: 100%; text-align: left; background: ${COLORS.panel}; border-radius: ${du(26, 14)}; box-shadow: 0 0 0 2px var(--c); overflow: hidden; display: flex; flex-direction: column; flex-shrink: 0; transition: transform 0.12s ease; color: ${COLORS.ink}; }
+.dsp-card:active { transform: scale(0.985); }
+.dsp-band { display: flex; align-items: center; justify-content: space-between; gap: 10px; padding: ${du(12, 7)} ${du(18, 11)}; background: var(--c16); }
+.dsp-st { font-size: ${du(20, 11)}; font-weight: 700; letter-spacing: ${du(1.6, 1)}; color: var(--c); text-transform: uppercase; display: inline-flex; align-items: center; gap: ${du(10, 6)}; min-width: 0; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.dsp-st i { width: ${du(12, 8)}; height: ${du(12, 8)}; border-radius: 999px; background: var(--c); display: inline-block; flex-shrink: 0; }
+.dsp-tk { font-family: ${MONO_FONT}; font-size: ${du(22, 12)}; font-weight: 700; color: ${COLORS.muted}; flex-shrink: 0; }
+.dsp-cbody { padding: ${du(16, 10)} ${du(20, 11)} ${du(18, 11)}; display: flex; flex-direction: column; gap: ${du(10, 6)}; min-width: 0; }
+.dsp-model { font-size: ${du(27, 14)}; font-weight: 600; line-height: 1.2; overflow-wrap: anywhere; }
+.dsp-cat { font-size: ${du(18, 10.5)}; font-weight: 700; color: ${COLORS.muted}; letter-spacing: 1px; text-transform: uppercase; }
+.dsp-todo { font-size: ${du(22, 12.5)}; color: #CFC8B4; line-height: 1.35; display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical; overflow: hidden; }
+.dsp-redo { align-self: flex-start; font-size: ${du(18, 11)}; font-weight: 700; color: #FF8A80; background: rgba(255,69,58,0.14); border-radius: 999px; padding: ${du(5, 3)} ${du(12, 8)}; }
+.dsp-foot { display: flex; align-items: center; justify-content: space-between; gap: 10px; margin-top: ${du(4, 2)}; }
+.dsp-avs { display: flex; }
+.dsp-avs .dsp-av { width: ${du(50, 28)}; height: ${du(50, 28)}; font-size: ${du(21, 12)}; box-shadow: 0 0 0 3px ${COLORS.panel}; }
+.dsp-avs .dsp-av + .dsp-av { margin-left: min(-6px, calc(-10 * var(--u))); }
+.dsp-nobody { font-size: ${du(21, 12)}; color: ${COLORS.muted}; font-weight: 600; }
+.dsp-timer { font-family: ${MONO_FONT}; font-size: ${du(32, 16)}; font-weight: 700; display: inline-flex; align-items: baseline; gap: ${du(8, 5)}; color: var(--c); font-variant-numeric: tabular-nums; white-space: nowrap; flex-shrink: 0; }
+.dsp-timer small { font-family: ${BODY_FONT}; font-size: ${du(17, 10)}; font-weight: 600; color: ${COLORS.muted}; letter-spacing: 0.5px; }
+.dsp-timer-muted { color: ${COLORS.muted}; }
+.dsp-pulse { animation: dspPulse 1.6s ease-in-out infinite; }
+@keyframes dspPulse { 0%, 100% { box-shadow: 0 0 0 2px var(--c), 0 0 0 0 transparent; } 50% { box-shadow: 0 0 0 4px var(--c), 0 0 46px 6px var(--c45); } }
+.dsp-arrive { animation: dspArrive 1.2s ease-out 1; }
+@keyframes dspArrive { 0% { transform: translateY(-30px) scale(0.96); opacity: 0; } 40% { opacity: 1; } 60% { box-shadow: 0 0 0 5px var(--c), 0 0 70px 12px var(--c60); } 100% { transform: none; } }
+.dsp-leaving { animation: dspLeave 1.4s ease-in forwards; pointer-events: none; }
+@keyframes dspLeave { 0% { box-shadow: 0 0 0 5px var(--c), 0 0 80px 16px var(--c60); } 45% { transform: scale(1.02); box-shadow: 0 0 0 5px var(--c), 0 0 80px 16px var(--c60); } 100% { transform: translateX(120%); opacity: 0; } }
+
+.dsp-plate { display: inline-flex; align-items: stretch; height: ${du(58, 30)}; border-radius: ${du(10, 6)}; background: ${COLORS.plate}; color: #15130E; box-shadow: inset 0 0 0 2px #CFC8B4; overflow: hidden; align-self: flex-start; max-width: 100%; flex-shrink: 0; }
+.dsp-plate-em { writing-mode: vertical-rl; transform: rotate(180deg); font-size: ${du(11, 7)}; font-weight: 700; letter-spacing: ${du(1.5, 0.6)}; background: #1d1b16; color: ${COLORS.ink}; padding: 0 ${du(5, 3)}; display: flex; align-items: center; justify-content: center; white-space: nowrap; overflow: hidden; }
+.dsp-plate-code { font-family: ${MONO_FONT}; font-size: ${du(30, 16)}; font-weight: 700; padding: 0 ${du(10, 6)} 0 ${du(12, 7)}; display: flex; align-items: center; border-right: 2px solid #CFC8B4; }
+.dsp-plate-num { font-family: ${MONO_FONT}; font-size: ${du(36, 18)}; font-weight: 700; letter-spacing: ${du(2, 1)}; padding: 0 ${du(14, 8)}; display: flex; align-items: center; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; min-width: 0; }
+.dsp-plate-lg { height: ${du(92, 44)}; border-radius: ${du(14, 8)}; }
+.dsp-plate-lg .dsp-plate-code { font-size: ${du(48, 22)}; padding: 0 ${du(16, 9)} 0 ${du(18, 10)}; }
+.dsp-plate-lg .dsp-plate-num { font-size: ${du(60, 26)}; padding: 0 ${du(22, 12)}; }
+.dsp-plate-lg .dsp-plate-em { font-size: ${du(15, 8)}; padding: 0 ${du(8, 4)}; }
+
+.dsp-hidden { margin: 0 ${du(30, 12)} ${du(20, 14)}; background: #141414; border: 1px solid ${COLORS.line}; border-radius: ${du(22, 12)}; padding: ${du(18, 12)}; }
+.dsp-hidden-h { font-size: ${du(20, 12.5)}; font-weight: 700; color: ${COLORS.muted}; margin-bottom: 10px; }
+.dsp-hidden-row { display: flex; justify-content: space-between; align-items: center; gap: 10px; background: ${COLORS.panel2}; border-radius: ${du(14, 8)}; padding: ${du(12, 9)} ${du(16, 12)}; margin-top: 8px; }
+.dsp-hidden-row .m { font-size: ${du(20, 12)}; color: ${COLORS.muted}; margin-left: 8px; }
+.dsp-hidden-row button { min-height: ${du(52, 30)}; padding: 0 ${du(20, 12)}; border-radius: 999px; box-shadow: inset 0 0 0 1px ${COLORS.gold}; color: ${COLORS.gold}; font-size: ${du(19, 11.5)}; font-weight: 700; flex-shrink: 0; }
+
+.dsp-scrim { position: fixed; inset: 0; background: rgba(0,0,0,0.72); display: flex; align-items: center; justify-content: center; padding: ${du(50, 12)} ${du(40, 10)}; z-index: 200; font-family: ${BODY_FONT}; color: ${COLORS.ink}; }
+.dsp-modal { width: min(100%, max(340px, calc(960 * var(--u)))); max-height: 100%; overflow-y: auto; background: ${COLORS.panel}; border-radius: ${du(44, 20)}; box-shadow: 0 0 0 2px var(--c), 0 50px 140px rgba(0,0,0,0.8); padding: ${du(40, 18)} ${du(46, 16)} ${du(46, 20)}; display: flex; flex-direction: column; gap: ${du(30, 16)}; scrollbar-width: none; }
+.dsp-modal::-webkit-scrollbar { display: none; }
+.dsp-m-top { display: flex; justify-content: space-between; align-items: flex-start; gap: ${du(20, 10)}; }
+.dsp-m-eye { font-size: ${du(22, 11.5)}; font-weight: 700; letter-spacing: ${du(3, 1)}; color: ${COLORS.gold}; text-transform: uppercase; margin-bottom: ${du(14, 8)}; }
+.dsp-m-model { font-size: ${du(38, 17)}; font-weight: 600; margin-top: ${du(16, 8)}; overflow-wrap: anywhere; }
+.dsp-m-meta { font-size: ${du(22, 12)}; color: ${COLORS.muted}; margin-top: ${du(8, 4)}; display: flex; gap: 8px; flex-wrap: wrap; align-items: center; }
+.dsp-m-meta .prio { color: #FF8A80; font-weight: 700; text-transform: uppercase; }
+.dsp-m-title { font-family: ${DISPATCH_COND_FONT}; font-size: ${du(64, 28)}; font-weight: 700; line-height: 1; }
+.dsp-m-sub { font-size: ${du(26, 13)}; color: ${COLORS.muted}; margin-top: ${du(12, 6)}; line-height: 1.4; }
+.dsp-x { width: ${du(96, 44)}; height: ${du(96, 44)}; border-radius: 999px; background: #26231D; display: inline-flex; align-items: center; justify-content: center; flex-shrink: 0; }
+.dsp-x svg { width: ${du(38, 20)}; height: ${du(38, 20)}; }
+.dsp-flow { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: ${du(10, 6)}; }
+.dsp-step { border-radius: ${du(20, 10)}; background: ${COLORS.panel2}; padding: ${du(16, 8)} ${du(18, 9)}; border: 2px solid transparent; min-width: 0; }
+.dsp-step .k { font-size: ${du(17, 9.5)}; font-weight: 700; letter-spacing: ${du(1.5, 0.5)}; color: ${COLORS.muted}; text-transform: uppercase; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.dsp-step .v { font-size: ${du(25, 12.5)}; font-weight: 700; margin-top: 4px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.dsp-step.done .v { color: ${COLORS.muted}; }
+.dsp-step.now { border-color: var(--c); background: var(--c16); }
+.dsp-step.now .k { color: var(--c); }
+.dsp-sec-l { font-size: ${du(21, 11.5)}; font-weight: 700; letter-spacing: ${du(2, 0.6)}; color: ${COLORS.muted}; text-transform: uppercase; margin-bottom: ${du(12, 7)}; display: flex; justify-content: space-between; gap: 4px 10px; flex-wrap: wrap; }
+.dsp-sec-l em { font-style: normal; letter-spacing: 0; text-transform: none; font-weight: 500; }
+.dsp-boxy { background: ${COLORS.panel2}; border-radius: ${du(26, 12)}; padding: ${du(24, 12)} ${du(28, 13)}; font-size: ${du(32, 14.5)}; line-height: 1.4; white-space: pre-wrap; overflow-wrap: anywhere; }
+.dsp-dmg { background: rgba(255,159,10,0.1); box-shadow: inset 0 0 0 2px rgba(255,159,10,0.4); color: #FFD08A; }
+.dsp-sentback { box-shadow: inset 0 0 0 2px rgba(255,69,58,0.5); }
+.dsp-photos { display: flex; gap: ${du(12, 7)}; overflow-x: auto; padding-bottom: 2px; }
+.dsp-photos img { width: ${du(160, 78)}; height: ${du(160, 78)}; object-fit: cover; border-radius: ${du(14, 8)}; border: 1px solid ${COLORS.line}; flex-shrink: 0; }
+.dsp-diagram { width: 100%; height: auto; display: block; border-radius: ${du(14, 8)}; border: 1px solid ${COLORS.line}; }
+.dsp-parts { display: flex; flex-direction: column; gap: ${du(8, 5)}; }
+.dsp-parts div { font-size: ${du(26, 13)}; background: ${COLORS.panel2}; border-radius: ${du(14, 8)}; padding: ${du(14, 8)} ${du(18, 11)}; }
+.dsp-staff { display: flex; flex-wrap: wrap; gap: ${du(14, 7)}; }
+.dsp-sbtn { min-height: ${du(88, 44)}; padding: ${du(8, 4)} ${du(28, 14)} ${du(8, 4)} ${du(14, 6)}; border-radius: 999px; background: ${COLORS.panel2}; display: inline-flex; align-items: center; gap: ${du(16, 8)}; font-size: ${du(32, 14)}; font-weight: 600; box-shadow: 0 0 0 1px ${COLORS.line}; text-align: left; }
+.dsp-sbtn.on { box-shadow: 0 0 0 4px ${COLORS.goldBright}; background: rgba(201,162,39,0.14); }
+.dsp-sbtn:disabled { opacity: 0.4; cursor: default; }
+.dsp-sbtn .dsp-av { width: ${du(60, 32)}; height: ${du(60, 32)}; font-size: ${du(25, 13)}; }
+.dsp-sbtn small { font-size: ${du(22, 11)}; color: ${COLORS.muted}; font-weight: 500; }
+.dsp-acts { display: flex; gap: ${du(16, 8)}; flex-wrap: wrap; }
+.dsp-big { flex: 1 1 ${du(260, 140)}; min-height: ${du(128, 52)}; border-radius: ${du(34, 16)}; font-size: ${du(42, 16)}; font-weight: 800; display: inline-flex; align-items: center; justify-content: center; gap: 16px; padding: 0 ${du(20, 12)}; text-align: center; }
+.dsp-big-gold { background: ${COLORS.gold}; color: #140F00; }
+.dsp-big-qc { background: #A78BFA; color: #160B33; }
+.dsp-big-pass { background: #3FD37A; color: #052B10; }
+.dsp-big-fail { box-shadow: inset 0 0 0 3px #FF453A; color: #FF8A80; }
+.dsp-big-ghost { flex: 0 1 ${du(330, 140)}; background: #26231D; font-size: ${du(30, 14)}; font-weight: 600; }
+.dsp-big-full { flex: 1 1 100%; width: 100%; margin-top: ${du(14, 8)}; min-height: ${du(96, 46)}; }
+.dsp-big:disabled { opacity: 0.35; cursor: default; }
+.dsp-note { font-size: ${du(26, 13)}; color: ${COLORS.muted}; text-align: center; line-height: 1.45; }
+.dsp-note b { color: #A78BFA; }
+.dsp-chips { display: flex; flex-wrap: wrap; gap: ${du(12, 7)}; }
+.dsp-chip { min-height: ${du(76, 40)}; padding: 0 ${du(28, 14)}; border-radius: 999px; background: ${COLORS.panel2}; font-size: ${du(28, 13)}; font-weight: 600; box-shadow: 0 0 0 1px ${COLORS.line}; }
+.dsp-chip:disabled { opacity: 0.5; cursor: default; }
+.dsp-chip-red { box-shadow: inset 0 0 0 2px #FF453A; color: #FF8A80; }
+.dsp-chip-sm { min-height: ${du(60, 34)}; font-size: ${du(22, 12)}; }
+.dsp-textarea { width: 100%; background: ${COLORS.panel2}; border: 1px solid ${COLORS.line}; border-radius: ${du(20, 10)}; padding: ${du(18, 10)}; font-size: ${du(26, 14)}; color: ${COLORS.ink}; font-family: inherit; resize: vertical; margin-top: ${du(12, 8)}; }
+.dsp-post { margin-top: ${du(10, 8)}; width: 100%; min-height: ${du(80, 42)}; border-radius: ${du(22, 10)}; background: ${COLORS.gold}; color: ${COLORS.darkText}; font-size: ${du(28, 13.5)}; font-weight: 700; }
+.dsp-post:disabled { opacity: 0.5; cursor: default; }
+.dsp-menu { background: ${COLORS.panel2}; border-radius: ${du(26, 12)}; overflow: hidden; }
+.dsp-menu button { width: 100%; min-height: ${du(96, 48)}; padding: 0 ${du(30, 14)}; font-size: ${du(30, 14)}; display: flex; align-items: center; justify-content: space-between; text-align: left; gap: 10px; }
+.dsp-menu button + button { border-top: 1px solid ${COLORS.line}; }
+.dsp-menu button:disabled { opacity: 0.5; cursor: default; }
+.dsp-menu .danger { color: #FF7B70; }
+.dsp-menu svg { width: ${du(28, 16)}; height: ${du(28, 16)}; flex-shrink: 0; color: ${COLORS.muted}; }
+
+.dsp-cz-row { display: flex; flex-direction: column; gap: ${du(14, 10)}; background: ${COLORS.panel2}; border-radius: ${du(26, 14)}; padding: ${du(22, 12)} ${du(24, 12)}; }
+.dsp-cz-top { display: flex; align-items: center; gap: ${du(18, 10)}; }
+.dsp-cz-prev { width: ${du(210, 104)}; flex-shrink: 0; border-radius: ${du(18, 10)}; background: ${COLORS.panel}; box-shadow: 0 0 0 3px var(--c); overflow: hidden; }
+.dsp-cz-prev span { display: block; padding: ${du(10, 5)} ${du(14, 7)}; background: var(--c16); color: var(--c); font-size: ${du(18, 9)}; font-weight: 700; letter-spacing: ${du(1.4, 0.5)}; text-transform: uppercase; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.dsp-cz-prev b { display: block; padding: ${du(10, 5)} ${du(14, 7)}; font-family: ${MONO_FONT}; font-size: ${du(26, 13)}; color: var(--c); }
+.dsp-cz-name { font-size: ${du(30, 15)}; font-weight: 700; }
+.dsp-cz-desc { font-size: ${du(21, 12)}; color: ${COLORS.muted}; margin-top: 2px; }
+.dsp-cz-clash { font-size: ${du(20, 12)}; color: #FFB44D; font-weight: 600; margin-top: 4px; }
+.dsp-cz-sw { display: flex; flex-wrap: wrap; gap: ${du(12, 8)}; align-items: center; }
+.dsp-cz-sw .sw { width: ${du(60, 34)}; height: ${du(60, 34)}; border-radius: 999px; box-shadow: inset 0 0 0 2px rgba(255,255,255,0.2); }
+.dsp-cz-sw .sw.on { box-shadow: 0 0 0 4px ${COLORS.panel2}, 0 0 0 7px ${COLORS.ink}; }
+.dsp-cz-pick { position: relative; width: ${du(60, 34)}; height: ${du(60, 34)}; border-radius: 999px; background: conic-gradient(#ff453a, #ffd60a, #3fd37a, #00c7be, #0a84ff, #bf5af2, #ff453a); overflow: hidden; cursor: pointer; flex-shrink: 0; }
+.dsp-cz-pick input { position: absolute; inset: 0; width: 100%; height: 100%; opacity: 0; cursor: pointer; border: 0; padding: 0; }
+
+.dsp-toast { position: fixed; left: 0; right: 0; bottom: ${du(56, 18)}; display: flex; justify-content: center; z-index: 400; pointer-events: none; padding: 0 12px; font-family: ${BODY_FONT}; color: ${COLORS.ink}; }
+.dsp-toast > div { pointer-events: auto; min-height: ${du(96, 48)}; padding: ${du(10, 8)} ${du(14, 8)} ${du(10, 8)} ${du(38, 18)}; border-radius: ${du(48, 24)}; background: rgba(38,35,29,0.97); box-shadow: 0 0 0 2px var(--c), 0 24px 60px rgba(0,0,0,0.6); font-size: ${du(32, 13.5)}; font-weight: 600; display: flex; align-items: center; gap: ${du(26, 12)}; max-width: min(100%, max(340px, calc(960 * var(--u)))); }
+.dsp-toast > div.noundo { padding-right: ${du(38, 18)}; }
+.dsp-toast button { min-height: ${du(72, 36)}; padding: 0 ${du(32, 14)}; border-radius: 999px; background: #26231D; color: ${COLORS.goldBright}; font-size: ${du(30, 13)}; font-weight: 700; flex-shrink: 0; }
+
+.dsp-eod { position: fixed; inset: 0; z-index: 300; background: rgba(20,4,4,0.96); display: flex; flex-direction: column; padding: ${du(60, 22)} ${du(50, 16)} ${du(50, 18)}; gap: ${du(26, 12)}; animation: dspEodEdge 1s steps(2) infinite; font-family: ${BODY_FONT}; color: ${COLORS.ink}; }
+@keyframes dspEodEdge { 0% { box-shadow: inset 0 0 0 ${du(18, 8)} #FF2D20; } 100% { box-shadow: inset 0 0 0 ${du(18, 8)} #5a0c07; } }
+.dsp-eod.dsp-eod-clear { animation: none; box-shadow: inset 0 0 0 ${du(18, 8)} #3FD37A; background: rgba(3,20,10,0.96); }
+.dsp-eod-eye { font-size: ${du(24, 12)}; font-weight: 700; letter-spacing: ${du(4, 2)}; color: #FFB4AA; }
+.dsp-eod-clear .dsp-eod-eye, .dsp-eod-clear .dsp-eod-sub { color: #A6F0C2; }
+.dsp-eod h2 { margin: 0; font-family: ${DISPATCH_COND_FONT}; font-size: ${du(84, 30)}; line-height: 1; color: #fff; }
+.dsp-eod-sub { font-size: ${du(30, 14)}; color: #FFB4AA; }
+.dsp-eod-warn { align-self: flex-start; font-size: ${du(24, 12.5)}; font-weight: 700; color: #fff; background: rgba(0,0,0,0.3); border-radius: 999px; padding: ${du(8, 5)} ${du(18, 12)}; }
+.dsp-prog { height: ${du(20, 10)}; border-radius: 999px; background: rgba(255,255,255,0.12); overflow: hidden; flex-shrink: 0; }
+.dsp-prog i { display: block; height: 100%; background: #3FD37A; transition: width 0.4s ease; }
+.dsp-eod-list { flex: 1; min-height: 0; overflow-y: auto; display: flex; flex-direction: column; gap: ${du(14, 10)}; scrollbar-width: none; }
+.dsp-eod-item { background: rgba(0,0,0,0.4); border-radius: ${du(26, 14)}; padding: ${du(20, 12)} ${du(22, 12)}; display: flex; flex-direction: column; gap: ${du(14, 10)}; box-shadow: 0 0 0 2px rgba(255,69,58,0.5); flex-shrink: 0; }
+.dsp-eod-item.ok { box-shadow: 0 0 0 2px rgba(63,211,122,0.6); opacity: 0.55; }
+.dsp-eod-row { display: flex; align-items: center; gap: ${du(18, 10)}; min-width: 0; }
+.dsp-eod-model { font-size: ${du(26, 14)}; font-weight: 600; }
+.dsp-eod-why { font-size: ${du(24, 12.5)}; color: #FFB4AA; font-weight: 600; }
+.dsp-eod-item.ok .dsp-eod-why { color: #3FD37A; }
+.dsp-eod-btns { display: flex; gap: ${du(12, 8)}; flex-wrap: wrap; }
+.dsp-eod-btns button { min-height: ${du(72, 42)}; padding: 0 ${du(26, 14)}; border-radius: 999px; background: rgba(255,255,255,0.1); font-size: ${du(26, 13)}; font-weight: 700; color: #fff; }
+.dsp-eod-btns button.p { background: #3FD37A; color: #052B10; }
+.dsp-eod-btns button:disabled { opacity: 0.5; cursor: default; }
+.dsp-eod-dis { align-self: center; min-height: ${du(72, 42)}; padding: 0 ${du(30, 16)}; border-radius: 999px; background: rgba(255,255,255,0.08); font-size: ${du(24, 12.5)}; color: #FFB4AA; flex-shrink: 0; }
+
+@media (prefers-reduced-motion: reduce) {
+  .dsp-pulse, .dsp-arrive, .dsp-leaving, .dsp-snd-tap, .dsp-eod { animation: none; }
+  .dsp-card { transition: none; }
+}
+`;
+
+// Formats an elapsed shop-hours span for the card timer ("23m", "1h 12m").
+function dispatchElapsed(fromMs, now) {
+  return formatDispatchElapsed(fromMs, now) || "0m";
+}
+
+function DispatchJobCardImpl({ rowId, jobId, ticketNo, plate, model, carColor, categoryLabel, todo, stateLabel, color, pulse, timerLabel, timerText, timerMuted, redoReason, people, arriving, leaving, onOpen }) {
+  const cls = `dsp-card${pulse ? " dsp-pulse" : ""}${arriving ? " dsp-arrive" : ""}${leaving ? " dsp-leaving" : ""}`;
+  return (
+    <button type="button" className={cls} style={dispatchColorVars(color)} onClick={() => onOpen(rowId, jobId)} aria-label={`${stateLabel}: ${plate || "no plate"}${model ? `, ${model}` : ""}, ${categoryLabel}. Tap to open.`}>
+      <span className="dsp-band">
+        <span className="dsp-st"><i />{stateLabel}</span>
+        <span className="dsp-tk">#{ticketNo}</span>
+      </span>
+      <span className="dsp-cbody">
+        <DispatchPlate plate={plate} />
+        {model ? <span className="dsp-model">{model}{carColor ? ` · ${carColor}` : ""}</span> : null}
+        <span className="dsp-cat">{categoryLabel}</span>
+        {todo ? <span className="dsp-todo">{todo}</span> : null}
+        {redoReason ? <span className="dsp-redo">Sent back: {redoReason}</span> : null}
+        <span className="dsp-foot">
+          {people.length
+            ? <span className="dsp-avs">{people.slice(0, 3).map((p) => <DispatchAvatar key={p.id} id={p.id} name={p.name} />)}</span>
+            : <span className="dsp-nobody">Nobody yet · tap to assign</span>}
+          <span className={`dsp-timer${timerMuted ? " dsp-timer-muted" : ""}`}>{timerLabel ? <small>{timerLabel}</small> : null}{timerText}</span>
+        </span>
+      </span>
+    </button>
+  );
+}
+// Every prop is a primitive (or compared by content), and the parent
+// passes a stable onOpen — so a card only re-renders when something it
+// actually shows changed: its state, colour (including a Mr.CAP colour
+// change or live preview), timer text, people, or the arrive/leave flash.
+// No customer name on the card: it's on a 60" screen in the workshop.
+const DispatchJobCard = memo(DispatchJobCardImpl, (prev, next) => (
+  prev.rowId === next.rowId && prev.jobId === next.jobId && prev.ticketNo === next.ticketNo &&
+  prev.plate === next.plate && prev.model === next.model && prev.carColor === next.carColor && prev.categoryLabel === next.categoryLabel &&
+  prev.todo === next.todo && prev.stateLabel === next.stateLabel && prev.color === next.color &&
+  prev.pulse === next.pulse && prev.timerLabel === next.timerLabel && prev.timerText === next.timerText &&
+  prev.timerMuted === next.timerMuted && prev.redoReason === next.redoReason &&
+  prev.arriving === next.arriving && prev.leaving === next.leaving && prev.onOpen === next.onOpen &&
+  prev.people.map((p) => `${p.id}:${p.name}`).join(",") === next.people.map((p) => `${p.id}:${p.name}`).join(",")
+));
+
+// Header clock — its own tiny component with its own timer, so ticking
+// the time doesn't re-render the whole board.
+function DispatchClock({ children }) {
+  const [now, setNow] = useState(() => new Date());
+  useEffect(() => {
+    const t = setInterval(() => setNow(new Date()), 10000);
+    return () => clearInterval(t);
+  }, []);
+  return (
+    <div className="dsp-clock">
+      <div className="dsp-clock-t">{now.toLocaleTimeString("en-GB", { hour: "2-digit", minute: "2-digit" })}</div>
+      <div className="dsp-clock-d">
+        {children}
+        <span>{now.toLocaleDateString("en-GB", { weekday: "short", day: "numeric", month: "short" })}</span>
       </div>
     </div>
   );
 }
-// Custom comparator: `row.job` staying the SAME reference (from the
-// smart-merge in refresh() below) is what actually lets this skip
-// re-rendering on most polls. assignedNames is a fresh array every
-// render regardless, so it's compared by content instead of reference.
-const DispatchJobCard = memo(DispatchJobCardImpl, (prev, next) => (
-  prev.row.job === next.row.job && prev.row.categoryKey === next.row.categoryKey &&
-  prev.ticketNo === next.ticketNo && prev.isDone === next.isDone && prev.isStarted === next.isStarted &&
-  prev.startedAt === next.startedAt && prev.now === next.now &&
-  (prev.assignedNames || []).join(",") === (next.assignedNames || []).join(",")
-));
 
-// End-of-day "update the app" reminder — full-screen, flashing red,
-// impossible to dismiss accidentally (needs exactly 5 taps). Fires once
-// at 6:45pm local time and stays dismissed for the rest of that day,
-// tracked in localStorage by date string so a page refresh mid-alarm
-// doesn't bring it back, but it's fresh again tomorrow.
-function DispatchEndOfDayReminder({ onDismiss, unclassifiedCount }) {
+// True while the browser still won't let this page make sound (nobody
+// has tapped it since it loaded — typical right after the TV reboots).
+function dispatchAudioBlocked() {
+  const activation = navigator.userActivation;
+  if (activation && !activation.hasBeenActive) return true;
+  return !!dispatchAudioCtx && dispatchAudioCtx.state !== "running";
+}
+
+// Sound on/off pill. Amber "Tap for sound" means sound is on but the
+// browser is still blocking it until someone touches the screen.
+function DispatchSoundPill() {
+  const [on, setOn] = useState(isDispatchSoundOn);
+  const [blocked, setBlocked] = useState(dispatchAudioBlocked);
+  useEffect(() => {
+    const t = setInterval(() => setBlocked(dispatchAudioBlocked()), 2000);
+    return () => clearInterval(t);
+  }, []);
+  const tap = () => {
+    if (on && blocked) {
+      unlockDispatchAudio();
+      playDispatchSound("started");
+      setBlocked(false);
+      return;
+    }
+    const next = !on;
+    setDispatchSoundOn(next);
+    setOn(next);
+    if (next) { unlockDispatchAudio(); playDispatchSound("started"); }
+    else { try { window.speechSynthesis?.cancel(); } catch { /* ignore */ } }
+  };
+  const mode = !on ? "off" : blocked ? "tap" : "on";
+  return (
+    <button type="button" onClick={tap} className={`dsp-snd dsp-snd-${mode}`} aria-pressed={on} title={mode === "off" ? "Turn sound on" : "Turn sound off"}>
+      {mode === "off" ? "Sound off" : mode === "tap" ? "Tap for sound" : "Sound on"}
+    </button>
+  );
+}
+
+// Closes a board pop-up on Escape (desktop use).
+function useDispatchEscape(onClose) {
+  const ref = useRef(onClose);
+  ref.current = onClose;
+  useEffect(() => {
+    const onKey = (e) => { if (e.key === "Escape") ref.current(); };
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  }, []);
+}
+
+// Mr.CAP-only colour customiser. Edits a draft that the board shows live
+// (the parent renders with the draft while this is open); nothing is
+// written until "Save for every screen", which stores only the states
+// that differ from the defaults.
+function DispatchColorCustomiser({ saved, draft, setDraft, onCancel, onSave, saving }) {
+  useDispatchEscape(onCancel);
+  const savedColors = resolveDispatchColors(saved);
+  const draftColors = resolveDispatchColors(draft);
+  const changed = DISPATCH_THEME.some((t) => draftColors[t.key].toLowerCase() !== savedColors[t.key].toLowerCase());
+  const pick = (key, color) => setDraft((d) => ({ ...(d || {}), [key]: color }));
+  return createPortal(
+    <div className="dsp-u dsp-scrim" onClick={onCancel}>
+      <div className="dsp-modal" style={dispatchColorVars(COLORS.line)} role="dialog" aria-modal="true" aria-label="Board colours" onClick={(e) => e.stopPropagation()}>
+        <div className="dsp-m-top">
+          <div>
+            <div className="dsp-m-eye">Mr.CAP only</div>
+            <div className="dsp-m-title">Board colours</div>
+            <div className="dsp-m-sub">Tap a colour to try it on the board. Nothing changes on other screens until you save.</div>
+          </div>
+          <button type="button" className="dsp-x" onClick={onCancel} aria-label="Close"><X color={COLORS.ink} strokeWidth={2.6} /></button>
+        </div>
+        {DISPATCH_THEME.map((t) => {
+          const cur = draftColors[t.key];
+          const clash = DISPATCH_THEME.find((o) => o.key !== t.key && draftColors[o.key].toLowerCase() === cur.toLowerCase());
+          return (
+            <div key={t.key} className="dsp-cz-row">
+              <div className="dsp-cz-top">
+                <div className="dsp-cz-prev" style={dispatchColorVars(cur)}><span>{t.sample}</span><b>1h 12m</b></div>
+                <div style={{ minWidth: 0 }}>
+                  <div className="dsp-cz-name">{t.name}</div>
+                  <div className="dsp-cz-desc">{t.desc}</div>
+                  {clash && <div className="dsp-cz-clash">Same as {clash.name}. Staff won't be able to tell them apart.</div>}
+                </div>
+              </div>
+              <div className="dsp-cz-sw">
+                {DISPATCH_SWATCHES.map((c) => (
+                  <button key={c} type="button" className={`sw${c.toLowerCase() === cur.toLowerCase() ? " on" : ""}`} style={{ background: c }} onClick={() => pick(t.key, c)} aria-label={`${t.name} ${c}`} aria-pressed={c.toLowerCase() === cur.toLowerCase()} />
+                ))}
+                <label className="dsp-cz-pick" title="Any colour">
+                  <input type="color" value={cur.toLowerCase()} onChange={(e) => { if (DISPATCH_HEX_RE.test(e.target.value)) pick(t.key, e.target.value.toUpperCase()); }} aria-label={`Pick any colour for ${t.name}`} />
+                </label>
+                {cur.toLowerCase() !== t.def.toLowerCase() && (
+                  <button type="button" className="dsp-chip dsp-chip-sm" onClick={() => pick(t.key, t.def)}>Default</button>
+                )}
+              </div>
+            </div>
+          );
+        })}
+        <div className="dsp-acts">
+          <button type="button" className="dsp-big dsp-big-gold" disabled={!changed || saving} onClick={onSave}>{saving ? "Saving…" : "Save for every screen"}</button>
+          <button type="button" className="dsp-big dsp-big-ghost" onClick={() => setDraft({})}>Reset all</button>
+        </div>
+      </div>
+    </div>,
+    document.body
+  );
+}
+
+// End-of-day checklist (6:45pm) — replaces the old "tap 5 times" red
+// screen. Lists every car on the board that needs a word before people
+// leave; each button makes the real write (a progress update with that
+// text, or the actual QC / finish), and the item clears. When the list
+// is empty it turns green and closes itself. Siren 3x on open, then once
+// every 20s while anything is left. "Dismiss anyway" still needs 5 taps.
+function DispatchEndOfDayChecklist({ views, session, unclassifiedCount, onAction, onDismiss }) {
+  const approver = isQcApprover(session);
+  // Snapshot of what needed doing when it opened — the list shouldn't
+  // grow or reshuffle under someone's finger while they work through it.
+  const [items] = useState(() => {
+    const now = Date.now();
+    const out = [];
+    for (const v of views) {
+      const { info, row } = v;
+      const base = { key: v.key, plate: row.job.plate, model: row.job.makeModel, categoryLabel: row.categoryLabel };
+      if (info.state === "qc" || info.state === "qclate") {
+        out.push({ ...base, why: `Waiting for QC · ${dispatchElapsed(info.qcAt, now)}`, opts: approver ? ["Passed", "Check first thing tomorrow"] : ["Check first thing tomorrow"] });
+      } else if (info.startedAt) {
+        out.push({ ...base, why: `In progress · last update ${dispatchElapsed(info.lastUpdateAt, now)} ago`, opts: ["Continue tomorrow", "Waiting on parts", "Send to QC"] });
+      } else if (!info.assigned.length) {
+        out.push({ ...base, why: "Nobody assigned", opts: ["Start tomorrow morning", "Waiting on customer approval"] });
+      }
+    }
+    return out;
+  });
+  const [done, setDone] = useState({});
+  const [busyKey, setBusyKey] = useState(null);
   const [taps, setTaps] = useState(0);
-  const [flashOn, setFlashOn] = useState(true);
+  const liveKeys = new Set(views.map((v) => v.key));
+  // A car finished/moved elsewhere while this was open counts as handled.
+  const okText = (it) => done[it.key] || (!liveKeys.has(it.key) ? "Finished" : null);
+  const total = items.length;
+  const okCount = items.filter((it) => okText(it)).length;
+  const allDone = okCount === total;
+  const remainingRef = useRef(total - okCount);
+  remainingRef.current = total - okCount;
+  const onDismissRef = useRef(onDismiss);
+  onDismissRef.current = onDismiss;
 
   useEffect(() => {
-    playDispatchAlarm();
-    const soundLoop = setInterval(playDispatchAlarm, 1100);
-    const flashLoop = setInterval(() => setFlashOn((f) => !f), 400);
-    return () => { clearInterval(soundLoop); clearInterval(flashLoop); };
+    if (remainingRef.current > 0) { playDispatchSound("eod"); playDispatchSound("eod"); playDispatchSound("eod"); }
+    const t = setInterval(() => { if (remainingRef.current > 0) playDispatchSound("eod"); }, 20000);
+    return () => clearInterval(t);
   }, []);
+  const cheeredRef = useRef(false);
+  useEffect(() => {
+    if (!allDone) return undefined;
+    if (total > 0 && !cheeredRef.current) { cheeredRef.current = true; playDispatchSound("done"); }
+    const t = setTimeout(() => onDismissRef.current(), 3500);
+    return () => clearTimeout(t);
+  }, [allDone, total]);
 
-  const handleTap = () => {
+  const act = async (it, option) => {
+    if (busyKey) return;
+    setBusyKey(it.key);
+    const ok = await onAction(it.key, option);
+    setBusyKey(null);
+    if (ok) setDone((d) => ({ ...d, [it.key]: option }));
+  };
+  const tapDismiss = () => {
     const next = taps + 1;
     if (next >= 5) { onDismiss(); return; }
     setTaps(next);
   };
 
   return createPortal(
-    <div
-      onClick={handleTap}
-      style={{
-        position: "fixed", inset: 0, zIndex: 999, cursor: "pointer",
-        background: flashOn ? "#c81e1e" : "#3d0808",
-        display: "flex", flexDirection: "column", alignItems: "center", justifyContent: "center",
-        padding: 24, textAlign: "center", transition: "background 0.15s linear",
-      }}
-    >
-      <div style={{ fontSize: 15, fontWeight: 700, color: "#fff", opacity: 0.85, letterSpacing: 1, marginBottom: 14 }}>
-        END OF DAY
-      </div>
-      <div style={{ fontFamily: DISPLAY_FONT, fontWeight: 700, fontSize: 34, color: "#fff", lineHeight: 1.25, maxWidth: 480 }}>
-        Please update the app before leaving...
-      </div>
+    <div className={`dsp-u dsp-eod${allDone ? " dsp-eod-clear" : ""}`} role="alertdialog" aria-modal="true" aria-label="End of day checklist">
+      <div className="dsp-eod-eye">6:45 PM · END OF DAY</div>
+      <h2>{allDone ? "Board is up to date." : "Update these cars before you leave"}</h2>
+      <div className="dsp-eod-sub">{allDone ? "Thanks. Closing in a moment." : `${okCount} of ${total} done. Each one clears as you fix it.`}</div>
       {unclassifiedCount > 0 && (
-        <div style={{ marginTop: 18, fontSize: 15, fontWeight: 700, color: "#fff", opacity: 0.9, background: "rgba(0,0,0,0.2)", borderRadius: 999, padding: "6px 16px" }}>
-          ⚠ {unclassifiedCount} job{unclassifiedCount === 1 ? "" : "s"} still need{unclassifiedCount === 1 ? "s" : ""} a service type
-        </div>
+        <div className="dsp-eod-warn">⚠ {unclassifiedCount} job{unclassifiedCount === 1 ? "" : "s"} still need{unclassifiedCount === 1 ? "s" : ""} a service type</div>
       )}
-      <div style={{ marginTop: 34, fontSize: 16, fontWeight: 700, color: "#fff" }}>
-        Tap {5 - taps} more time{5 - taps === 1 ? "" : "s"} to dismiss
+      <div className="dsp-prog"><i style={{ width: `${total ? (okCount / total) * 100 : 100}%` }} /></div>
+      <div className="dsp-eod-list">
+        {items.map((it) => {
+          const ok = okText(it);
+          return (
+            <div key={it.key} className={`dsp-eod-item${ok ? " ok" : ""}`}>
+              <div className="dsp-eod-row">
+                <DispatchPlate plate={it.plate} />
+                <div style={{ minWidth: 0 }}>
+                  <div className="dsp-eod-model">{it.model || it.categoryLabel}</div>
+                  <div className="dsp-eod-why">{ok ? `Done: ${ok}` : `${it.categoryLabel} · ${it.why}`}</div>
+                </div>
+              </div>
+              {!ok && (
+                <div className="dsp-eod-btns">
+                  {it.opts.map((o, k) => (
+                    <button key={o} type="button" className={k === 0 ? "p" : ""} disabled={!!busyKey} onClick={() => act(it, o)}>
+                      {busyKey === it.key ? "Saving…" : o}
+                    </button>
+                  ))}
+                </div>
+              )}
+            </div>
+          );
+        })}
       </div>
-      <div style={{ display: "flex", gap: 8, marginTop: 16 }}>
-        {[0, 1, 2, 3, 4].map((i) => (
-          <div key={i} style={{ width: 14, height: 14, borderRadius: "50%", background: i < taps ? "#fff" : "rgba(255,255,255,0.3)" }} />
-        ))}
-      </div>
+      {!allDone && (
+        <button type="button" className="dsp-eod-dis" onClick={tapDismiss}>
+          Dismiss anyway · tap {5 - taps} more time{5 - taps === 1 ? "" : "s"}
+        </button>
+      )}
     </div>,
     document.body
   );
 }
 
-function DispatchDetailModal({ row, ticketNo, isDone, isStarted, startedAt, now, assignedIds, assignedNames, staffOptions, moveOptions, canWriteUpdate, canManageVisibility, onClose, onToggleDone, onToggleStarted, onAssign, onMove, onAddUpdate, onToggleHidden, saving }) {
+// Centre pop-up for one (job, category) row: where it is in the flow,
+// what to do, damage, photos, parts, who's on it, the one big action for
+// its current state, quick updates, move / hide. Everything the old
+// sheet could do is still here.
+function DispatchDetailModal({ row, info, color, ticketNo, now, session, team, assignedIds, staffOptions, moveOptions, canWriteUpdate, canManageVisibility, canFinishDirect, onClose, onStart, onUnstart, onSendToQc, onPassQc, onFailQc, onFinishDirect, onAssign, onMove, onAddUpdate, onToggleHidden, saving }) {
   const { job, categoryLabel, categoryKey } = row;
   const isUnclassified = categoryKey === "_none";
   const [updateText, setUpdateText] = useState("");
+  const [failPick, setFailPick] = useState(false);
+  const [moveOpen, setMoveOpen] = useState(isUnclassified);
+  useDispatchEscape(onClose);
+  const approver = isQcApprover(session);
+  const state = info ? info.state : null;
+  const meta = state ? DISPATCH_STATES[state] : null;
+  const started = !!info?.startedAt;
+  const inQc = state === "qc" || state === "qclate";
+  const nameOf = (id) => team.find((m) => m.id === id)?.name || id;
+  const steps = info ? [
+    { k: "Assigned", v: assignedIds.length ? assignedIds.map(nameOf).join(", ") : "Nobody yet", s: started ? "done" : "now" },
+    { k: "In progress", v: started ? dispatchElapsed(info.startedAt, now) : "Not started", s: inQc ? "done" : started ? "now" : "" },
+    { k: "QC", v: inQc ? `Waiting ${dispatchElapsed(info.qcAt, now)}` : info.redoReason ? "Sent back" : "—", s: inQc ? "now" : "" },
+    { k: "Finished", v: "—", s: "" },
+  ] : [];
+  const todo = isUnclassified
+    ? "This job hasn't been assigned a service type yet. Pick one below."
+    : ((job.treatments || {})[categoryKey]?.length ? job.treatments[categoryKey].join(", ") : "No specific treatments selected for this category.");
+  const photos = [...(job.photos?.intake || []), ...(job.photos?.parts_removal || [])];
+
   return createPortal(
-    <div onClick={onClose} style={{ position: "fixed", inset: 0, background: "rgba(0,0,0,0.6)", zIndex: 200, display: "flex", alignItems: "center", justifyContent: "center", padding: 18 }}>
-      <div onClick={(e) => e.stopPropagation()} style={{ background: COLORS.panel, border: `1px solid ${COLORS.line}`, borderRadius: 16, padding: 22, maxWidth: 420, width: "100%", maxHeight: "86vh", overflowY: "auto" }}>
-        <div style={{ display: "flex", justifyContent: "space-between", alignItems: "flex-start" }}>
-          <div>
-            <div style={{ fontSize: 11, fontWeight: 700, color: COLORS.gold, letterSpacing: 0.5 }}>TICKET #{ticketNo}</div>
-            <div style={{ fontFamily: MONO_FONT, fontWeight: 700, fontSize: 19, color: COLORS.ink, marginTop: 2 }}>{job.plate}</div>
-            <div style={{ fontSize: 13, color: COLORS.muted, marginTop: 2 }}>{job.makeModel}{job.customerName ? ` · ${job.customerName}` : ""}</div>
+    <div className="dsp-u dsp-scrim" onClick={onClose}>
+      <div className="dsp-modal" style={dispatchColorVars(color)} role="dialog" aria-modal="true" aria-label={`${job.plate || "Car"} details`} onClick={(e) => e.stopPropagation()}>
+        <div className="dsp-m-top">
+          <div style={{ minWidth: 0 }}>
+            <div className="dsp-m-eye">
+              Ticket #{ticketNo}{!isUnclassified ? ` · ${categoryLabel}` : " · No service type yet"}
+              {meta ? <> · <span style={{ color }}>{meta.label}</span></> : null}
+            </div>
+            <DispatchPlate plate={job.plate} large />
+            {job.makeModel ? <div className="dsp-m-model">{job.makeModel}{job.color ? ` · ${job.color}` : ""}</div> : null}
+            <div className="dsp-m-meta">
+              <span>{STAGES[job.stageIndex]?.label || "—"}</span>
+              {job.location ? <span>· {job.location}</span> : null}
+              {job.priority ? <span className={["high", "urgent"].includes(String(job.priority).toLowerCase()) ? "prio" : ""}>· {job.priority}</span> : null}
+            </div>
           </div>
-          <button onClick={onClose} className="mrcap-press" style={{ background: "none", border: "none", cursor: "pointer", padding: 4 }}><X size={20} color={COLORS.muted} /></button>
+          <button type="button" className="dsp-x" onClick={onClose} aria-label="Close"><X color={COLORS.ink} strokeWidth={2.6} /></button>
         </div>
 
-        <div style={{ display: "flex", gap: 6, flexWrap: "wrap", marginTop: 14 }}>
-          <span style={{ fontSize: 11, fontWeight: 600, padding: "4px 10px", borderRadius: 999, background: COLORS.panel2, color: COLORS.ink }}>{STAGES[job.stageIndex]?.label || "—"}</span>
-          {!isUnclassified && (
-            <span style={{ fontSize: 11, fontWeight: 600, padding: "4px 10px", borderRadius: 999, background: COLORS.panel2, color: COLORS.ink }}>{categoryLabel}</span>
-          )}
-          {job.priority ? (
-            <span style={{ fontSize: 11, fontWeight: 700, padding: "4px 10px", borderRadius: 999, color: COLORS.red, border: `1px solid ${COLORS.red}`, textTransform: "uppercase" }}>{job.priority}</span>
-          ) : null}
+        {!isUnclassified && (
+          <div className="dsp-flow">
+            {steps.map((st) => (
+              <div key={st.k} className={`dsp-step ${st.s}`}><div className="k">{st.k}</div><div className="v">{st.v}</div></div>
+            ))}
+          </div>
+        )}
+
+        <div>
+          <div className="dsp-sec-l">What to do</div>
+          <div className="dsp-boxy">{todo}</div>
         </div>
 
-        {job.location ? (
-          <div style={{ fontSize: 12.5, color: COLORS.muted, marginTop: 12 }}>Location: <span style={{ color: COLORS.ink }}>{job.location}</span></div>
+        {!isUnclassified && job.description ? (
+          <div>
+            <div className="dsp-sec-l">Description</div>
+            <div className="dsp-boxy">{job.description}</div>
+          </div>
         ) : null}
 
-        <div style={{ marginTop: 14 }}>
-          <div style={{ fontSize: 11.5, fontWeight: 700, color: COLORS.muted, textTransform: "uppercase", letterSpacing: 0.5, marginBottom: 5 }}>What to do</div>
-          <div style={{ fontSize: 14, color: COLORS.ink, lineHeight: 1.5, background: COLORS.panel2, borderRadius: 10, padding: 12 }}>
-            {isUnclassified
-              ? "This job hasn't been assigned a service type yet — pick one below."
-              : ((job.treatments || {})[categoryKey]?.length ? (job.treatments[categoryKey]).join(", ") : "No specific treatments selected for this category.")}
+        {!isUnclassified && job.damageNotes ? (
+          <div>
+            <div className="dsp-sec-l" style={{ color: "#FFB44D" }}>Damage noted at intake</div>
+            <div className="dsp-boxy dsp-dmg">{job.damageNotes}</div>
           </div>
-        </div>
+        ) : null}
 
-        {!isUnclassified && job.description && (
-          <div style={{ marginTop: 14 }}>
-            <div style={{ fontSize: 11.5, fontWeight: 700, color: COLORS.muted, textTransform: "uppercase", letterSpacing: 0.5, marginBottom: 5 }}>Description</div>
-            <div style={{ fontSize: 14, color: COLORS.ink, lineHeight: 1.5, background: COLORS.panel2, borderRadius: 10, padding: 12 }}>{job.description}</div>
+        {!isUnclassified && info?.redoReason && !inQc ? (
+          <div>
+            <div className="dsp-sec-l" style={{ color: "#FF8A80" }}>Sent back from QC</div>
+            <div className="dsp-boxy dsp-sentback">{info.redoReason}</div>
           </div>
-        )}
+        ) : null}
 
-        {!isUnclassified && job.damageNotes && (
-          <div style={{ marginTop: 14 }}>
-            <div style={{ fontSize: 11.5, fontWeight: 700, color: COLORS.red, textTransform: "uppercase", letterSpacing: 0.5, marginBottom: 5 }}>⚠ Walk-around / Damage Notes</div>
-            <div style={{ fontSize: 14, color: COLORS.ink, lineHeight: 1.5, background: "rgba(200,60,60,0.1)", border: `1px solid ${COLORS.red}55`, borderRadius: 10, padding: 12 }}>{job.damageNotes}</div>
-          </div>
-        )}
-
-        {!isUnclassified && (job.photos?.intake?.length > 0 || job.photos?.parts_removal?.length > 0) && (
-          <div style={{ marginTop: 14 }}>
-            <div style={{ fontSize: 11.5, fontWeight: 700, color: COLORS.muted, textTransform: "uppercase", letterSpacing: 0.5, marginBottom: 5 }}>Photos</div>
-            <div style={{ display: "flex", gap: 7, overflowX: "auto", paddingBottom: 2 }}>
-              {[...(job.photos.intake || []), ...(job.photos.parts_removal || [])].map((src, i) => (
-                <img key={i} src={src} alt="" style={{ width: 78, height: 78, objectFit: "cover", borderRadius: 8, border: `1px solid ${COLORS.line}`, flexShrink: 0 }} />
-              ))}
-            </div>
+        {!isUnclassified && photos.length > 0 && (
+          <div>
+            <div className="dsp-sec-l">Photos</div>
+            <div className="dsp-photos">{photos.map((src, i) => <img key={i} src={src} alt="" />)}</div>
           </div>
         )}
 
         {!isUnclassified && job.damageDiagramImage && (
-          <div style={{ marginTop: 14 }}>
-            <div style={{ fontSize: 11.5, fontWeight: 700, color: COLORS.muted, textTransform: "uppercase", letterSpacing: 0.5, marginBottom: 5 }}>Damage Diagram</div>
-            <img src={job.damageDiagramImage} alt="Damage diagram" style={{ width: "100%", height: "auto", display: "block", borderRadius: 8, border: `1px solid ${COLORS.line}` }} />
+          <div>
+            <div className="dsp-sec-l">Damage diagram</div>
+            <img className="dsp-diagram" src={job.damageDiagramImage} alt="Damage diagram" />
           </div>
         )}
 
         {!isUnclassified && (job.parts || []).length > 0 && (
-          <div style={{ marginTop: 14 }}>
-            <div style={{ fontSize: 11.5, fontWeight: 700, color: COLORS.muted, textTransform: "uppercase", letterSpacing: 0.5, marginBottom: 5 }}>Parts on the invoice</div>
-            <div style={{ display: "flex", flexDirection: "column", gap: 5 }}>
-              {job.parts.map((p) => (
-                <div key={p.id} style={{ fontSize: 13, color: COLORS.ink, background: COLORS.panel2, borderRadius: 8, padding: "8px 11px" }}>
-                  {p.description || "Unnamed part"}{p.qty > 1 ? ` × ${p.qty}` : ""}
-                </div>
-              ))}
+          <div>
+            <div className="dsp-sec-l">Parts on the invoice</div>
+            <div className="dsp-parts">
+              {job.parts.map((p, i) => <div key={p.id || i}>{p.description || "Unnamed part"}{p.qty > 1 ? ` × ${p.qty}` : ""}</div>)}
             </div>
           </div>
         )}
 
         {!isUnclassified && (
-          <div style={{ marginTop: 14 }}>
-            <div style={{ fontSize: 11.5, fontWeight: 700, color: COLORS.muted, textTransform: "uppercase", letterSpacing: 0.5, marginBottom: 7 }}>
-              {assignedNames?.length ? `Assigned to ${assignedNames.join(", ")} — tap to add/remove (max 3)` : "Tap up to 3 names to assign"}
-            </div>
-            <div style={{ display: "flex", flexWrap: "wrap", gap: 7 }}>
-              {staffOptions.length === 0 ? (
-                <div style={{ fontSize: 12, color: COLORS.muted }}>No staff with this role yet — add them under Team.</div>
-              ) : (
-                staffOptions.map((m) => {
-                  const isSelected = (assignedIds || []).includes(m.id);
-                  const atCap = !isSelected && (assignedIds || []).length >= 3;
+          <div>
+            <div className="dsp-sec-l">Who's on it <em>tap to add or remove · up to 3</em></div>
+            {staffOptions.length === 0 ? (
+              <div className="dsp-note" style={{ textAlign: "left" }}>No staff with this role yet. Add them under Team.</div>
+            ) : (
+              <div className="dsp-staff">
+                {staffOptions.map((m) => {
+                  const isOn = assignedIds.includes(m.id);
+                  const atCap = !isOn && assignedIds.length >= 3;
                   return (
-                    <button
-                      key={m.id}
-                      onClick={() => { if (!atCap) onAssign(row, m.id); }}
-                      disabled={atCap}
-                      className="mrcap-press"
-                      style={{
-                        padding: "8px 12px", borderRadius: 999,
-                        border: `1.5px solid ${isSelected ? COLORS.gold : COLORS.line}`,
-                        background: isSelected ? COLORS.gold : COLORS.panel2,
-                        color: isSelected ? COLORS.darkText : COLORS.ink,
-                        fontSize: 12.5, fontWeight: 600, cursor: atCap ? "default" : "pointer",
-                        opacity: atCap ? 0.4 : 1,
-                      }}
-                    >
-                      {m.name}{m.specialty ? <span style={{ opacity: 0.75, fontWeight: 500 }}> — {m.specialty}</span> : null}
+                    <button key={m.id} type="button" className={`dsp-sbtn${isOn ? " on" : ""}`} disabled={atCap} aria-pressed={isOn} onClick={() => { if (!atCap) onAssign(row, m.id); }}>
+                      <DispatchAvatar id={m.id} name={m.name} />
+                      <span>{m.name}{m.specialty ? <small> · {m.specialty}</small> : null}</span>
                     </button>
                   );
-                })
-              )}
-            </div>
+                })}
+              </div>
+            )}
           </div>
         )}
 
-        <div style={{ marginTop: 14 }}>
-          <div style={{ fontSize: 11.5, fontWeight: 700, color: COLORS.muted, textTransform: "uppercase", letterSpacing: 0.5, marginBottom: 7 }}>
-            {isUnclassified ? "Set the service type — tap one" : "Move to a different section — tap where it should go"}
+        {!isUnclassified && (inQc ? (
+          approver ? (
+            failPick ? (
+              <div>
+                <div className="dsp-sec-l">What needs fixing?</div>
+                <div className="dsp-chips">
+                  {QC_FAIL_REASONS.map((r) => (
+                    <button key={r} type="button" className="dsp-chip dsp-chip-red" disabled={saving} onClick={() => { setFailPick(false); onFailQc(row, r); }}>{r}</button>
+                  ))}
+                </div>
+                <button type="button" className="dsp-big dsp-big-ghost dsp-big-full" onClick={() => setFailPick(false)}>Cancel</button>
+              </div>
+            ) : (
+              <div className="dsp-acts">
+                <button type="button" className="dsp-big dsp-big-pass" disabled={saving} onClick={() => onPassQc(row)}>Pass QC · Finished</button>
+                <button type="button" className="dsp-big dsp-big-fail" disabled={saving} onClick={() => setFailPick(true)}>Send back</button>
+              </div>
+            )
+          ) : (
+            <div className="dsp-note">Waiting for <b>Noel, Reagen or Ahmed</b> to check it.<br />You are signed in as {session.name}.</div>
+          )
+        ) : started ? (
+          <div className="dsp-acts">
+            <button type="button" className="dsp-big dsp-big-qc" disabled={saving} onClick={() => onSendToQc(row)}>Send to QC</button>
+            <button type="button" className="dsp-big dsp-big-ghost" disabled={saving} onClick={() => onUnstart(row)}>Not started yet</button>
           </div>
-          <div style={{ display: "flex", flexWrap: "wrap", gap: 7 }}>
-            {moveOptions.map((s) => (
-              <button
-                key={s.key}
-                onClick={() => onMove(row, s.key)}
-                disabled={saving}
-                className="mrcap-press"
-                style={{
-                  padding: "8px 12px", borderRadius: 999, border: `1.5px solid ${COLORS.line}`,
-                  background: COLORS.panel2, color: COLORS.ink, fontSize: 12.5, fontWeight: 600,
-                  cursor: saving ? "default" : "pointer", opacity: saving ? 0.6 : 1,
-                }}
-              >
-                {s.label}
-              </button>
-            ))}
-          </div>
-        </div>
-
-        {!isUnclassified && (
-          <div style={{ display: "flex", gap: 8, marginTop: 18 }}>
-            <button
-              onClick={() => onToggleStarted(row, !isStarted)}
-              disabled={saving || isDone}
-              className="mrcap-press"
-              style={{
-                flex: 1, padding: "13px 12px", borderRadius: 11, border: `1.5px solid ${isStarted ? COLORS.gold : COLORS.line}`,
-                background: isStarted ? `${COLORS.gold}22` : COLORS.panel2, color: isStarted ? COLORS.goldBright : COLORS.ink,
-                fontSize: 13.5, fontWeight: 700, cursor: saving || isDone ? "default" : "pointer", opacity: saving || isDone ? 0.5 : 1,
-                display: "flex", alignItems: "center", justifyContent: "center", gap: 7,
-              }}
-            >
-              <Clock size={16} />
-              {isStarted ? `In Progress${formatDispatchElapsed(startedAt, now) ? ` · ${formatDispatchElapsed(startedAt, now)} — tap to undo` : " — tap to undo"}` : "Start"}
-            </button>
-            <button
-              onClick={() => onToggleDone(row, !isDone)}
-              disabled={saving}
-              className="mrcap-press"
-              style={{
-                flex: 1, padding: "13px 12px", borderRadius: 11, border: "none",
-                background: isDone ? COLORS.panel2 : COLORS.gold, color: isDone ? COLORS.ink : COLORS.darkText,
-                fontSize: 13.5, fontWeight: 700, cursor: saving ? "default" : "pointer", opacity: saving ? 0.6 : 1,
-                display: "flex", alignItems: "center", justifyContent: "center", gap: 7,
-              }}
-            >
-              <CheckCircle2 size={16} />
-              {isDone ? "Finished — tap to undo" : "Mark Finished"}
+        ) : (
+          <div className="dsp-acts">
+            <button type="button" className="dsp-big dsp-big-gold" disabled={saving || !assignedIds.length} onClick={() => onStart(row)}>
+              {assignedIds.length ? "Start work" : "Assign someone first"}
             </button>
           </div>
-        )}
+        ))}
 
-        {!isUnclassified && isStarted && !isDone && canWriteUpdate && (
-          <div style={{ marginTop: 16 }}>
-            <div style={{ fontSize: 11.5, fontWeight: 700, color: COLORS.muted, textTransform: "uppercase", letterSpacing: 0.5, marginBottom: 7 }}>
-              Post a progress update — shows on the admin Live Updates board
-            </div>
-            <div style={{ display: "flex", flexWrap: "wrap", gap: 7, marginBottom: 9 }}>
+        {!isUnclassified && started && !inQc && (
+          <div>
+            <div className="dsp-sec-l">Quick update <em>clears the "no update" warning · shows on Live Updates</em></div>
+            <div className="dsp-chips">
               {DISPATCH_UPDATE_PRESETS.map((preset) => (
-                <button
-                  key={preset}
-                  onClick={() => { if (saving) return; onAddUpdate(row, preset); }}
-                  disabled={saving}
-                  className="mrcap-press"
-                  style={{
-                    padding: "7px 11px", borderRadius: 999, border: `1.5px solid ${COLORS.line}`,
-                    background: COLORS.panel2, color: COLORS.ink, fontSize: 11.5, fontWeight: 600,
-                    cursor: saving ? "default" : "pointer", opacity: saving ? 0.6 : 1,
-                  }}
-                >
-                  {preset}
-                </button>
+                <button key={preset} type="button" className="dsp-chip" disabled={saving} onClick={() => onAddUpdate(row, preset)}>{preset}</button>
               ))}
             </div>
-            <textarea
-              value={updateText}
-              onChange={(e) => setUpdateText(e.target.value)}
-              placeholder="Or type something not covered above…"
-              rows={2}
-              style={{
-                width: "100%", background: COLORS.panel2, border: `1px solid ${COLORS.line}`, borderRadius: 10,
-                padding: 10, fontSize: 13.5, color: COLORS.ink, fontFamily: "inherit", resize: "vertical", boxSizing: "border-box",
-              }}
-            />
-            <button
-              onClick={() => { if (!updateText.trim()) return; onAddUpdate(row, updateText.trim()); setUpdateText(""); }}
-              disabled={saving || !updateText.trim()}
-              className="mrcap-press"
-              style={{
-                marginTop: 8, width: "100%", padding: "11px 12px", borderRadius: 10, border: "none",
-                background: COLORS.gold, color: COLORS.darkText, fontSize: 13, fontWeight: 700,
-                cursor: saving || !updateText.trim() ? "default" : "pointer", opacity: saving || !updateText.trim() ? 0.5 : 1,
-              }}
-            >
-              Post Update
-            </button>
+            {canWriteUpdate && (
+              <>
+                <textarea className="dsp-textarea" value={updateText} onChange={(e) => setUpdateText(e.target.value)} placeholder="Or type something not covered above…" rows={2} />
+                <button type="button" className="dsp-post" disabled={saving || !updateText.trim()} onClick={() => { if (!updateText.trim()) return; onAddUpdate(row, updateText.trim()); setUpdateText(""); }}>Post update</button>
+              </>
+            )}
           </div>
         )}
 
-        {canManageVisibility && (
-          <button
-            onClick={() => onToggleHidden(job, true)}
-            disabled={saving}
-            className="mrcap-press"
-            style={{
-              marginTop: 18, width: "100%", padding: "10px 12px", borderRadius: 10,
-              border: `1px solid ${COLORS.line}`, background: "transparent", color: COLORS.muted,
-              fontSize: 12, fontWeight: 600, cursor: saving ? "default" : "pointer",
-            }}
-          >
-            Hide this car from the Dispatch Board
-          </button>
+        {moveOpen && (
+          <div>
+            <div className="dsp-sec-l">{isUnclassified ? "Set the service type · tap one" : "Move to"}</div>
+            <div className="dsp-chips">
+              {moveOptions.map((s) => (
+                <button key={s.key} type="button" className="dsp-chip" disabled={saving} onClick={() => onMove(row, s.key)}>{s.label}</button>
+              ))}
+            </div>
+          </div>
+        )}
+
+        {(!isUnclassified || canManageVisibility) && (
+          <div className="dsp-menu">
+            {!isUnclassified && (
+              <button type="button" onClick={() => setMoveOpen((v) => !v)} aria-expanded={moveOpen}>
+                Move to another service
+                {moveOpen ? <ChevronUp /> : <ChevronDown />}
+              </button>
+            )}
+            {!isUnclassified && canFinishDirect && !inQc && (
+              <button type="button" disabled={saving} onClick={() => onFinishDirect(row)}>
+                Mark finished without QC
+                <CheckCircle2 />
+              </button>
+            )}
+            {canManageVisibility && (
+              <button type="button" className="danger" disabled={saving} onClick={() => onToggleHidden(job, true)}>Hide this car from the board</button>
+            )}
+          </div>
         )}
       </div>
     </div>,
@@ -10355,12 +15031,14 @@ function DispatchDetailModal({ row, ticketNo, isDone, isStarted, startedAt, now,
   );
 }
 
-function DispatchBoard({ team, session }) {
+function DispatchBoard({ team, session, fill = false }) {
   const [jobs, setJobs] = useState([]);
   const [loading, setLoading] = useState(true);
   const [selectedRowKey, setSelectedRowKey] = useState(null);
   const loadedExtrasRef = useRef(new Set()); // job ids we've already fetched photos/diagram for this session
-  const openRow = (key, jobId) => {
+  // Stable identity (no deps) so the memoised cards never re-render just
+  // because the board did.
+  const openRow = useCallback((key, jobId) => {
     setSelectedRowKey(key);
     if (loadedExtrasRef.current.has(jobId)) return;
     loadedExtrasRef.current.add(jobId);
@@ -10368,20 +15046,38 @@ function DispatchBoard({ team, session }) {
       if (!extras) return;
       setJobs((prev) => prev.map((j) => (j.id === jobId ? { ...j, photos: extras.photos, damageDiagramImage: extras.damageDiagramImage } : j)));
     });
-  };
+  }, []);
   const [saving, setSaving] = useState(false);
-  const [dupeUpdateToast, setDupeUpdateToast] = useState("");
-  // Shown when a tap-to-assign write fails to actually save (e.g. a weak
-  // phone connection dropping the request). Previously this failed
-  // completely silently — the tap looked like it worked until the next
-  // poll quietly reverted it a few seconds later with no explanation.
-  const [assignErrorToast, setAssignErrorToast] = useState("");
+  // One toast slot (bottom centre, like the TV mockup) for confirmations,
+  // "already posted" and — in red — any write that failed to save. Failed
+  // saves used to fail silently until the next poll reverted them.
+  const [toast, setToast] = useState(null); // { text, color, undo }
+  const toastTimerRef = useRef(null);
+  const showToast = useCallback((text, color, undo = null, ms = 6000) => {
+    clearTimeout(toastTimerRef.current);
+    setToast({ text, color, undo });
+    toastTimerRef.current = setTimeout(() => setToast(null), ms);
+  }, []);
+  const showError = (text) => showToast(text, "#FF453A");
+  useEffect(() => () => clearTimeout(toastTimerRef.current), []);
   const [nowTick, setNowTick] = useState(() => Date.now());
   const [showAlertsDetail, setShowAlertsDetail] = useState(false);
   const [sortOrder, setSortOrder] = useState("oldest"); // "oldest" | "newest" | "priority"
   const [showEndOfDayReminder, setShowEndOfDayReminder] = useState(false);
-  const prevCountRef = useRef(null);
+  const [savedColors, setSavedColors] = useState({});
+  const [colorDraft, setColorDraft] = useState(null); // non-null while Mr.CAP's colour pop-up is open (live preview)
+  const [savingColors, setSavingColors] = useState(false);
+  const [arrivingKeys, setArrivingKeys] = useState({}); // rowKey -> true for the 1.2s "just arrived" flash
+  const [leavingKeys, setLeavingKeys] = useState({}); // rowKey -> true for the 1.4s "finished" flash before it drops off
+  const leaveTimersRef = useRef({});
+  useEffect(() => () => { Object.values(leaveTimersRef.current).forEach(clearTimeout); }, []);
   const firstLoadRef = useRef(true);
+  // Bumped at the start of every refresh() call so a slow poll that
+  // resolves after a later, faster one started can tell it's out of
+  // order and bail instead of applying stale data over fresher data.
+  const reqIdRef = useRef(0);
+  const teamRef = useRef(team);
+  teamRef.current = team;
   // Set to a future timestamp right after any local write (assign,
   // toggle, move, etc.) — refresh() skips applying its result until
   // that time passes, so a poll landing between "tap" and "server
@@ -10390,7 +15086,7 @@ function DispatchBoard({ team, session }) {
   const suppressRefreshUntilRef = useRef(0);
   const markLocalWrite = () => { suppressRefreshUntilRef.current = Date.now() + 4000; };
 
-  // Fires the end-of-day reminder once at 6:45pm local time, then stays
+  // Fires the end-of-day checklist once at 6:45pm local time, then stays
   // dismissed for the rest of that calendar day (localStorage-tracked
   // by date string, not just in-memory, so a refresh mid-alarm doesn't
   // bring it back) — but resets automatically the next day.
@@ -10404,6 +15100,7 @@ function DispatchBoard({ team, session }) {
     }
     const check = () => {
       const now = new Date();
+      if (now.getDay() === 0) return; // shop's closed Sundays — no EOD checklist to run
       const todayKey = localDateKey(now);
       const alreadyDismissed = window.localStorage?.getItem("mrcap_eod_reminder_dismissed") === todayKey;
       if (!alreadyDismissed && now.getHours() === 18 && now.getMinutes() === 45) {
@@ -10421,43 +15118,128 @@ function DispatchBoard({ team, session }) {
   };
 
   // Forces a re-render every 30s purely so elapsed-time labels ("23m")
-  // stay roughly current without needing a full data refetch.
+  // stay roughly current without needing a full data refetch. (refresh()
+  // below also bumps it the moment any row changes state.)
   useEffect(() => {
     const t = setInterval(() => setNowTick(Date.now()), 30000);
     return () => clearInterval(t);
   }, []);
 
-  const prevAssignedRef = useRef({}); // `${jobId}::${categoryKey}` -> array of assigned ids, as of the last poll
+  // Mr.CAP's board colours: loaded on mount, re-read every minute and
+  // whenever the screen wakes, so the shop TV picks up a change on its
+  // own. A failed read (null) keeps the current colours.
+  useEffect(() => {
+    let alive = true;
+    const load = async () => {
+      const loaded = await loadDispatchColors();
+      if (!alive || !loaded) return;
+      setSavedColors((prev) => (JSON.stringify(prev) === JSON.stringify(loaded) ? prev : loaded));
+    };
+    load();
+    const t = setInterval(load, 60000);
+    const onVisible = () => { if (document.visibilityState === "visible") load(); };
+    document.addEventListener("visibilitychange", onVisible);
+    return () => { alive = false; clearInterval(t); document.removeEventListener("visibilitychange", onVisible); };
+  }, []);
+  const colorSource = colorDraft || savedColors;
+  const themeColors = useMemo(() => resolveDispatchColors(colorSource), [colorSource]);
+
+  // What the last poll saw, per job/row — used to work out what CHANGED
+  // since then, so every screen with the board open (not just the one
+  // that was tapped) plays the right sound. All of these are seeded
+  // silently on the first load, so opening the board never replays the
+  // day's events.
+  const prevAssignedRef = useRef({}); // rowKey -> assigned ids
+  const seenJobIdsRef = useRef(new Set()); // job ids on the board last poll
+  const historyLenRef = useRef({}); // job id -> history length (history is append-only)
+  const rowStateRef = useRef({}); // rowKey -> state (new / late / stale / qc ...)
   const refresh = useCallback(async () => {
-    const data = await loadDispatchJobs();
+    const reqId = ++reqIdRef.current;
+    const result = await loadDispatchJobs();
+    if (!result) return; // fetch failed — keep what's on screen, try again next poll
+    // A newer poll already started (and, being a 6s interval racing a
+    // variable-latency fetch, may well finish first) — this response is
+    // out of order, discard it rather than applying stale data on top
+    // of whatever the newer one already applied.
+    if (reqId !== reqIdRef.current) return;
+    const { jobs: data, stale } = result;
     if (Date.now() < suppressRefreshUntilRef.current) return; // a local write is still settling — don't clobber it
-    // Announce newly-added assignees on EVERY device that has the board
-    // open — not just whichever device did the tapping. This is what
-    // makes a remote assignment actually announce out loud on a tablet
-    // sitting near the person being assigned, instead of only on the
-    // assigner's own screen. Skipped on the very first load so opening
-    // the board doesn't announce every existing assignment at once.
-    if (!firstLoadRef.current) {
-      for (const job of data) {
-        for (const categoryKey of job.serviceTypes) {
-          const key = `${job.id}::${categoryKey}`;
-          const before = prevAssignedRef.current[key] || [];
-          const after = job.assignedTeam[categoryKey] || [];
-          const newlyAdded = after.filter((id) => !before.includes(id));
-          for (const id of newlyAdded) {
-            const staffName = team.find((m) => m.id === id)?.name || id;
-            announceDispatchAssignment(staffName, job.makeModel || job.plate);
-          }
+    const now = Date.now();
+    // A stale (offline-cache) response must never become the silent
+    // "first load" baseline — if it did, the first genuinely-fresh poll
+    // after reconnecting would get diffed against this stale snapshot
+    // and announce every change that piled up while offline as if it
+    // had just happened. Treat every stale poll as "first" (no sounds,
+    // no diffing) and only let firstLoadRef actually flip once a
+    // non-stale response lands.
+    const first = firstLoadRef.current || stale;
+    const currentTeam = teamRef.current;
+    const nameOf = (id) => currentTeam.find((m) => m.id === id)?.name || id;
+    const sounds = new Set();
+    const newCars = [];
+    const assignLines = [];
+    const spoken = [];
+    const nextAssigned = {};
+    const nextHistoryLen = {};
+    const nextRowState = {};
+    let stateChanged = false;
+    for (const job of data) {
+      const known = seenJobIdsRef.current.has(job.id);
+      const vehicle = job.makeModel || job.plate || "car";
+      // Assignment call-outs on EVERY device that has the board open —
+      // this is what makes a remote assignment announce out loud on the
+      // tablet near the person being assigned.
+      for (const categoryKey of job.serviceTypes) {
+        const key = rowKey(job.id, categoryKey);
+        const after = job.assignedTeam[categoryKey] || [];
+        nextAssigned[key] = after;
+        if (first) continue;
+        const before = prevAssignedRef.current[key] || [];
+        for (const id of after.filter((x) => !before.includes(x))) {
+          sounds.add("assigned");
+          assignLines.push([nameOf(id), job.makeModel || job.plate]);
+        }
+      }
+      // Brand-new car on the board.
+      if (!first && !known && !job.dispatchHidden && now - job.createdAt < DISPATCH_NEW_CAR_WINDOW_MS) newCars.push(job);
+      // Started / sent to QC / QC failed / finished — read straight off
+      // the history entries added since the last poll (or since this
+      // device's own write, which already played its sound).
+      const len = job.history.length;
+      nextHistoryLen[job.id] = len;
+      const prevLen = historyLenRef.current[job.id];
+      if (!first && known && !job.dispatchHidden && typeof prevLen === "number" && len > prevLen) {
+        for (const h of job.history.slice(prevLen)) {
+          if (!h) continue;
+          if (h.stage === "service" && h.note === "Started") sounds.add("started");
+          else if (h.stage === "service" && h.note === "Marked done") sounds.add("done");
+          else if (h.stage === "qc" && h.note === "Sent to QC") { sounds.add("qc"); spoken.push(`${vehicle} is ready for QC.`); }
+          else if (h.stage === "qc" && typeof h.note === "string" && h.note.startsWith("QC failed")) sounds.add("fail");
+        }
+      }
+      if (job.dispatchHidden) continue;
+      // Needs someone / no update / QC waiting: sound ONCE, at the
+      // moment a row moves into that state (by time passing or by data),
+      // never again for as long as it stays there.
+      for (const categoryKey of job.serviceTypes) {
+        if (job.serviceDone[categoryKey]) continue;
+        const label = SERVICES.find((s) => s.key === categoryKey)?.label || categoryKey;
+        const key = rowKey(job.id, categoryKey);
+        const { state } = dispatchRowInfo(job, categoryKey, label, now);
+        nextRowState[key] = state;
+        const prevState = rowStateRef.current[key];
+        if (prevState !== state) stateChanged = true;
+        if (first || prevState === undefined || prevState === state) continue;
+        if (DISPATCH_ATTENTION_STATES.includes(state)) {
+          sounds.add(state);
+          if (state === "stale") spoken.push(`${vehicle} has had no update in over three hours.`);
         }
       }
     }
-    const nextAssignedMap = {};
-    for (const job of data) {
-      for (const categoryKey of job.serviceTypes) {
-        nextAssignedMap[`${job.id}::${categoryKey}`] = job.assignedTeam[categoryKey] || [];
-      }
-    }
-    prevAssignedRef.current = nextAssignedMap;
+    seenJobIdsRef.current = new Set(data.map((j) => j.id));
+    prevAssignedRef.current = nextAssigned;
+    historyLenRef.current = nextHistoryLen;
+    rowStateRef.current = nextRowState;
     setJobs((prev) => {
       const prevById = new Map(prev.map((j) => [j.id, j]));
       return data.map((incoming) => {
@@ -10476,12 +15258,26 @@ function DispatchBoard({ team, session }) {
       });
     });
     setLoading(false);
-    if (!firstLoadRef.current && prevCountRef.current !== null && data.length > prevCountRef.current) {
-      playDispatchBeep();
+    if (!stale) firstLoadRef.current = false;
+    if (first) return;
+    if (stateChanged) setNowTick(now);
+    if (newCars.length) {
+      sounds.add("newcar");
+      const arriving = {};
+      newCars.forEach((job) => job.serviceTypes.forEach((k) => { arriving[rowKey(job.id, k)] = true; }));
+      setArrivingKeys((prev) => ({ ...prev, ...arriving }));
+      setTimeout(() => setArrivingKeys((prev) => {
+        const next = { ...prev };
+        Object.keys(arriving).forEach((k) => { delete next[k]; });
+        return next;
+      }), 1300);
     }
-    firstLoadRef.current = false;
-    prevCountRef.current = data.length;
-  }, [team]);
+    ["newcar", "assigned", "started", "qc", "fail", "done", "late", "stale", "qclate"].forEach((s) => { if (sounds.has(s)) playDispatchSound(s); });
+    const voiceDelay = dispatchSoundQueueMs() + 150;
+    newCars.forEach((job) => speakDispatch(dispatchNewCarLine(job), voiceDelay));
+    assignLines.forEach(([name, vehicle]) => announceDispatchAssignment(name, vehicle, voiceDelay));
+    spoken.forEach((line) => speakDispatch(line, voiceDelay));
+  }, []);
 
   useEffect(() => {
     refresh();
@@ -10497,6 +15293,51 @@ function DispatchBoard({ team, session }) {
     return () => clearInterval(interval);
   }, [refresh]);
 
+  // Every history-appending write on the board goes through here: re-read
+  // the fields it touches FRESH from the server right before writing (the
+  // board's copy can be seconds old, and two people act around the same
+  // time), build the patch from that, PATCH, and say so if it fails. If
+  // the fresh read itself fails it stops rather than writing — the old
+  // code fell back to an EMPTY history there, which (e.g. offline, where
+  // the write gets queued) would have wiped the job's whole history.
+  const entry = (stage, label, note, catKey) => ({ stage, label, ...(catKey ? { cat: catKey } : {}), by: session.name, role: session.role, note, at: Date.now() });
+  const writeJob = async (job, select, build, { summary, failText }) => {
+    markLocalWrite();
+    setSaving(true);
+    const { ok: fetchOk, data, stale } = await sbFetch(`jobs?id=eq.${job.id}&select=${select}`);
+    if (stale) {
+      setSaving(false);
+      showError("No connection — not saved, try again");
+      return null;
+    }
+    const current = fetchOk && Array.isArray(data) && data[0] ? data[0] : null;
+    if (!current) {
+      setSaving(false);
+      showError(`${failText} — couldn't load the latest version of it. Check your connection and try again.`);
+      return null;
+    }
+    const patch = build(current);
+    if (!patch) { setSaving(false); return null; }
+    if (summary) withActivitySummary(summary);
+    const { ok } = await sbFetch(`jobs?id=eq.${job.id}`, {
+      method: "PATCH",
+      headers: { Prefer: "return=minimal" },
+      body: JSON.stringify({ ...patch, updated_at: new Date().toISOString() }),
+      noQueue: true,
+    });
+    markLocalWrite(); // hold the poll off a little past the save itself, not just past the tap
+    setSaving(false);
+    if (!ok) {
+      showError(`${failText} — check your connection and try again.`);
+      return null;
+    }
+    // This device plays its own sound straight away; tell the poll those
+    // entries are already accounted for so it doesn't play them again.
+    if (Array.isArray(patch.history)) historyLenRef.current[job.id] = patch.history.length;
+    return patch;
+  };
+  const applyLocal = (jobId, fields) => setJobs((prev) => prev.map((j) => (j.id === jobId ? { ...j, ...fields } : j)));
+
   // Multi-select, capped at 3 per (job, category) — separate field from
   // the single-assignee `assigned_to` JobDetail still uses, so that
   // screen's own assignment picker is completely unaffected by this.
@@ -10504,107 +15345,153 @@ function DispatchBoard({ team, session }) {
   const toggleTeamAssign = async (row, memberId) => {
     markLocalWrite();
     const { job, categoryKey } = row;
-    const current = job.assignedTeam[categoryKey] || [];
-    const isRemoving = current.includes(memberId);
-    if (!isRemoving && current.length >= DISPATCH_MAX_ASSIGNEES) return; // cap reached — no-op
-    const nextList = isRemoving ? current.filter((id) => id !== memberId) : [...current, memberId];
-    const nextAssignedTeam = { ...job.assignedTeam, [categoryKey]: nextList };
+    const localCurrent = job.assignedTeam[categoryKey] || [];
+    const isRemoving = localCurrent.includes(memberId);
+    if (!isRemoving && localCurrent.length >= DISPATCH_MAX_ASSIGNEES) return; // cap reached — no-op
+    const optimisticList = isRemoving ? localCurrent.filter((id) => id !== memberId) : [...localCurrent, memberId];
+    const optimisticAssignedTeam = { ...job.assignedTeam, [categoryKey]: optimisticList };
     const previousAssignedTeam = job.assignedTeam; // kept so we can revert cleanly if the save fails
-    setJobs((prev) => prev.map((j) => (j.id === job.id ? { ...j, assignedTeam: nextAssignedTeam } : j)));
+    setJobs((prev) => prev.map((j) => (j.id === job.id ? { ...j, assignedTeam: optimisticAssignedTeam } : j)));
     const staffName = team.find((m) => m.id === memberId)?.name || memberId;
-    withActivitySummary(isRemoving
-      ? `Dispatch board: removed ${staffName} from ${categoryKey} on ${job.plate}`
-      : `Dispatch board: added ${staffName} to ${categoryKey} on ${job.plate}`);
-    // No immediate local announcement here anymore — every open device
-    // (including this one) picks up the new assignment on its next poll
-    // and announces it then. That's what makes a remote assignment
-    // actually announce out loud on a tablet sitting near the person
-    // being assigned, instead of only confirming on the assigner's own
-    // screen while everyone else hears nothing.
-    const { ok } = await sbFetch(`jobs?id=eq.${job.id}`, {
-      method: "PATCH",
-      headers: { Prefer: "return=minimal" },
-      body: JSON.stringify({ assigned_team: nextAssignedTeam }),
+    // No immediate local announcement — every open device (including
+    // this one) picks up the new assignment on its next poll and plays
+    // the pips + call-out then, so it's heard on the TV too.
+    // Re-read assigned_team fresh (same helper every other board write
+    // uses) and toggle on THAT value, not the possibly-stale local copy —
+    // two people tapping assign around the same time must not clobber
+    // each other.
+    const patch = await writeJob(job, "assigned_team", (cur) => {
+      const freshCurrent = (cur.assigned_team || {})[categoryKey] || [];
+      const removing = freshCurrent.includes(memberId);
+      if (!removing && freshCurrent.length >= DISPATCH_MAX_ASSIGNEES) return null; // cap reached on the fresh value — no-op
+      const nextList = removing ? freshCurrent.filter((id) => id !== memberId) : [...freshCurrent, memberId];
+      return { assigned_team: { ...(cur.assigned_team || {}), [categoryKey]: nextList } };
+    }, {
+      summary: isRemoving
+        ? `Dispatch board: removed ${staffName} from ${categoryKey} on ${job.plate}`
+        : `Dispatch board: added ${staffName} to ${categoryKey} on ${job.plate}`,
+      failText: `Couldn't save ${isRemoving ? "removing" : "assigning"} ${staffName}`,
     });
-    if (!ok) {
-      // Revert the optimistic update immediately and say so, rather than
-      // letting it silently snap back on the next 6s poll with nothing
-      // shown — that gap is exactly what made this look like it "worked"
-      // on a phone with a flaky connection.
+    if (!patch) {
+      // Revert the optimistic update immediately (covers both a genuine
+      // save failure, which writeJob has already reported, and the
+      // fresh-value cap no-op above) rather than letting it silently snap
+      // back on the next 6s poll.
       setJobs((prev) => prev.map((j) => (j.id === job.id ? { ...j, assignedTeam: previousAssignedTeam } : j)));
-      setAssignErrorToast(`Couldn't save ${isRemoving ? "removing" : "assigning"} ${staffName} — check your connection and try again.`);
-      setTimeout(() => setAssignErrorToast(""), 6000);
-    }
-  };
-
-  // Mirrors JobDetail's toggleServiceDone exactly (same serviceDone shape,
-  // same history entry shape) so a job marked finished here shows up
-  // correctly there too. Re-fetches history fresh right before writing
-  // rather than trusting the board's lightweight copy, so two people
-  // acting around the same time don't clobber each other's history.
-  const toggleDone = async (row, nowDone) => {
-    markLocalWrite();
-    setSaving(true);
-    const { job, categoryKey, categoryLabel } = row;
-    const { ok: fetchOk, data } = await sbFetch(`jobs?id=eq.${job.id}&select=service_done,history`);
-    const current = fetchOk && data && data[0] ? data[0] : { service_done: job.serviceDone, history: [] };
-    const nextServiceDone = { ...(current.service_done || {}), [categoryKey]: nowDone };
-    const nextHistory = [
-      ...(current.history || []),
-      { stage: "service", label: categoryLabel, by: session.name, role: session.role, note: nowDone ? "Marked done" : "Un-marked", at: Date.now() },
-    ];
-    withActivitySummary(`Dispatch board: ${nowDone ? "marked" : "un-marked"} ${categoryLabel} done on ${job.plate}`);
-    const { ok } = await sbFetch(`jobs?id=eq.${job.id}`, {
-      method: "PATCH",
-      headers: { Prefer: "return=minimal" },
-      body: JSON.stringify({ service_done: nextServiceDone, history: nextHistory, updated_at: new Date().toISOString() }),
-    });
-    setSaving(false);
-    if (!ok) {
-      // Previously this applied the optimistic update regardless of
-      // whether the save succeeded — on a dropped connection it looked
-      // done until the next 6s poll quietly reverted it with no
-      // explanation, same failure shape as the assignment bug.
-      setAssignErrorToast(`Couldn't save ${nowDone ? "marking" : "un-marking"} ${categoryLabel} done on ${job.plate} — check your connection and try again.`);
-      setTimeout(() => setAssignErrorToast(""), 6000);
       return;
     }
-    setJobs((prev) => prev.map((j) => (j.id === job.id ? { ...j, serviceDone: nextServiceDone } : j)));
-    if (nowDone) playDispatchDoneChime();
+    applyLocal(job.id, { assignedTeam: patch.assigned_team });
   };
 
-  // Same shape and same history trail as toggleDone, kept as a fully
-  // separate field/state — a job can be started without being finished,
-  // and (deliberately) can even be marked finished without ever having
-  // been flagged started, for whoever just fixes something quick.
-  // Stores the actual start timestamp (not just true/false) so the
-  // board can show real elapsed time. A truthy value still means
-  // "started" everywhere else that checks it — this is a superset of
-  // the old boolean shape, nothing else needs to change.
+  // Start / "Not started yet". Stores the actual start timestamp (not
+  // just true/false) so the board can show real elapsed time; a truthy
+  // value still means "started" everywhere else that checks it. The
+  // "Started" history entry is also what opens a fresh QC cycle.
   const toggleStarted = async (row, nowStarted) => {
-    markLocalWrite();
-    setSaving(true);
     const { job, categoryKey, categoryLabel } = row;
-    const { ok: fetchOk, data } = await sbFetch(`jobs?id=eq.${job.id}&select=service_started,history`);
-    const current = fetchOk && data && data[0] ? data[0] : { service_started: job.serviceStarted, history: [] };
-    const nextServiceStarted = { ...(current.service_started || {}), [categoryKey]: nowStarted ? new Date().toISOString() : false };
-    const nextHistory = [
-      ...(current.history || []),
-      { stage: "service", label: categoryLabel, by: session.name, role: session.role, note: nowStarted ? "Started" : "Un-started", at: Date.now() },
-    ];
-    withActivitySummary(`Dispatch board: ${nowStarted ? "started" : "un-started"} ${categoryLabel} on ${job.plate}`);
-    const { ok } = await sbFetch(`jobs?id=eq.${job.id}`, {
-      method: "PATCH",
-      headers: { Prefer: "return=minimal" },
-      body: JSON.stringify({ service_started: nextServiceStarted, history: nextHistory, updated_at: new Date().toISOString() }),
+    const patch = await writeJob(job, "service_started,history", (cur) => ({
+      service_started: { ...(cur.service_started || {}), [categoryKey]: nowStarted ? new Date().toISOString() : false },
+      history: [...(cur.history || []), entry("service", categoryLabel, nowStarted ? "Started" : "Un-started", categoryKey)],
+    }), {
+      summary: `Dispatch board: ${nowStarted ? "started" : "un-started"} ${categoryLabel} on ${job.plate}`,
+      failText: `Couldn't save ${nowStarted ? "starting" : "un-starting"} ${categoryLabel} on ${job.plate}`,
     });
-    setSaving(false);
-    if (!ok) {
-      setAssignErrorToast(`Couldn't save ${nowStarted ? "starting" : "un-starting"} ${categoryLabel} on ${job.plate} — check your connection and try again.`);
-      setTimeout(() => setAssignErrorToast(""), 6000);
-      return;
-    }
-    setJobs((prev) => prev.map((j) => (j.id === job.id ? { ...j, serviceStarted: nextServiceStarted } : j)));
+    if (!patch) return false;
+    applyLocal(job.id, { serviceStarted: patch.service_started, history: patch.history });
+    if (nowStarted) playDispatchSound("started");
+    return true;
+  };
+
+  const sendToQc = async (row) => {
+    const { job, categoryKey, categoryLabel } = row;
+    const patch = await writeJob(job, "history", (cur) => ({
+      history: [...(cur.history || []), entry("qc", categoryLabel, "Sent to QC", categoryKey)],
+    }), { summary: `Dispatch board: sent ${categoryLabel} on ${job.plate} to QC`, failText: `Couldn't send ${job.plate} to QC` });
+    if (!patch) return false;
+    applyLocal(job.id, { history: patch.history });
+    playDispatchSound("qc");
+    speakDispatch(`${job.makeModel || job.plate} is ready for QC.`, dispatchSoundQueueMs() + 150);
+    setSelectedRowKey((k) => (k === rowKey(job.id, row.categoryKey) ? null : k));
+    showToast(`${job.plate} sent to QC`, themeColors.qc);
+    return true;
+  };
+
+  const failQc = async (row, reason) => {
+    if (!isQcApprover(session)) return false;
+    const { job, categoryKey, categoryLabel } = row;
+    const patch = await writeJob(job, "history", (cur) => ({
+      history: [...(cur.history || []), entry("qc", categoryLabel, `QC failed: ${reason}`, categoryKey)],
+    }), { summary: `Dispatch board: ${session.name} sent ${categoryLabel} on ${job.plate} back from QC (${reason})`, failText: `Couldn't send ${job.plate} back` });
+    if (!patch) return false;
+    applyLocal(job.id, { history: patch.history });
+    playDispatchSound("fail");
+    showToast(`Sent back: ${reason}`, themeColors.stale);
+    return true;
+  };
+
+  // Finished (after QC or directly): plays the fanfare, flashes the card
+  // gold for 1.4s, then lets it drop off the board. Undo is offered for
+  // a few seconds in the toast.
+  const finishLocally = (row, patch, text, undoBackToQc) => {
+    const { job, categoryKey } = row;
+    const key = rowKey(job.id, categoryKey);
+    setSelectedRowKey((k) => (k === key ? null : k));
+    applyLocal(job.id, { history: patch.history });
+    setLeavingKeys((prev) => ({ ...prev, [key]: true }));
+    playDispatchSound("done");
+    clearTimeout(leaveTimersRef.current[key]);
+    leaveTimersRef.current[key] = setTimeout(() => {
+      delete leaveTimersRef.current[key];
+      applyLocal(job.id, { serviceDone: patch.service_done });
+      setLeavingKeys((prev) => { const next = { ...prev }; delete next[key]; return next; });
+    }, 1400);
+    showToast(text, themeColors.done, () => undoFinish(row, undoBackToQc));
+  };
+
+  // Pass = the existing mark-finished write (service_done + "Marked
+  // done", exactly what JobDetail writes) plus a "QC passed" entry saying
+  // who checked it.
+  const passQc = async (row) => {
+    if (!isQcApprover(session)) return false;
+    const { job, categoryKey, categoryLabel } = row;
+    const patch = await writeJob(job, "service_done,history", (cur) => ({
+      service_done: { ...(cur.service_done || {}), [categoryKey]: true },
+      history: [...(cur.history || []), entry("qc", categoryLabel, "QC passed", categoryKey), entry("service", categoryLabel, "Marked done", categoryKey)],
+    }), { summary: `Dispatch board: ${session.name} passed QC on ${categoryLabel} for ${job.plate}`, failText: `Couldn't save passing QC on ${job.plate}` });
+    if (!patch) return false;
+    finishLocally(row, patch, `Finished ${job.plate} · passed by ${session.name}`, true);
+    return true;
+  };
+
+  // Kept from the old Finished button so nothing that used to be possible
+  // is lost ("for whoever just fixes something quick") — now limited to
+  // the QC approvers and admins, since finishing is QC's call.
+  const canFinishDirect = isQcApprover(session) || session.role === "admin";
+  const finishDirect = async (row) => {
+    if (!canFinishDirect) return false;
+    const { job, categoryKey, categoryLabel } = row;
+    const patch = await writeJob(job, "service_done,history", (cur) => ({
+      service_done: { ...(cur.service_done || {}), [categoryKey]: true },
+      history: [...(cur.history || []), entry("service", categoryLabel, "Marked done", categoryKey)],
+    }), { summary: `Dispatch board: marked ${categoryLabel} done on ${job.plate}`, failText: `Couldn't save marking ${categoryLabel} done on ${job.plate}` });
+    if (!patch) return false;
+    finishLocally(row, patch, `Finished ${job.plate}`, false);
+    return true;
+  };
+
+  const undoFinish = async (row, backToQc) => {
+    const { job, categoryKey, categoryLabel } = row;
+    const key = rowKey(job.id, categoryKey);
+    clearTimeout(leaveTimersRef.current[key]);
+    delete leaveTimersRef.current[key];
+    setLeavingKeys((prev) => { const next = { ...prev }; delete next[key]; return next; });
+    const patch = await writeJob(job, "service_done,history", (cur) => ({
+      service_done: { ...(cur.service_done || {}), [categoryKey]: false },
+      history: [...(cur.history || []), entry("service", categoryLabel, "Un-marked", categoryKey), ...(backToQc ? [entry("qc", categoryLabel, "Sent to QC", categoryKey)] : [])],
+    }), { summary: `Dispatch board: un-marked ${categoryLabel} done on ${job.plate}`, failText: `Couldn't undo finishing ${job.plate}` });
+    if (!patch) return;
+    applyLocal(job.id, { serviceDone: patch.service_done, history: patch.history });
+    setToast(null);
   };
 
   // Moves a job from one service category to another — this is how a
@@ -10614,88 +15501,59 @@ function DispatchBoard({ team, session }) {
   // different kind of work needs a fresh assignment, not a carried-over
   // one from whoever was doing the old job).
   const moveCategory = async (row, newCategoryKey) => {
-    markLocalWrite();
-    setSaving(true);
     const { job, categoryKey, categoryLabel } = row;
     const newLabel = SERVICES.find((s) => s.key === newCategoryKey)?.label || newCategoryKey;
-    const { ok: fetchOk, data } = await sbFetch(`jobs?id=eq.${job.id}&select=service_types,assigned_to,assigned_team,service_done,service_started,history`);
-    const current = fetchOk && data && data[0]
-      ? data[0]
-      : { service_types: job.serviceTypes, assigned_to: job.assignedTo, assigned_team: job.assignedTeam, service_done: job.serviceDone, service_started: job.serviceStarted, history: [] };
-    const nextServiceTypes = (current.service_types || []).filter((k) => k !== categoryKey);
-    if (!nextServiceTypes.includes(newCategoryKey)) nextServiceTypes.push(newCategoryKey);
-    const nextAssignedTo = { ...(current.assigned_to || {}) }; delete nextAssignedTo[categoryKey];
-    const nextAssignedTeam = { ...(current.assigned_team || {}) }; delete nextAssignedTeam[categoryKey];
-    const nextServiceDone = { ...(current.service_done || {}) }; delete nextServiceDone[categoryKey];
-    const nextServiceStarted = { ...(current.service_started || {}) }; delete nextServiceStarted[categoryKey];
-    const nextHistory = [
-      ...(current.history || []),
-      { stage: "service", label: `${categoryLabel} → ${newLabel}`, by: session.name, role: session.role, note: "Moved", at: Date.now() },
-    ];
-    withActivitySummary(`Dispatch board: moved ${job.plate} from ${categoryLabel} to ${newLabel}`);
-    const { ok } = await sbFetch(`jobs?id=eq.${job.id}`, {
-      method: "PATCH",
-      headers: { Prefer: "return=minimal" },
-      body: JSON.stringify({
+    const patch = await writeJob(job, "service_types,assigned_to,assigned_team,service_done,service_started,history", (cur) => {
+      const nextServiceTypes = (cur.service_types || []).filter((k) => k !== categoryKey);
+      if (!nextServiceTypes.includes(newCategoryKey)) nextServiceTypes.push(newCategoryKey);
+      const nextAssignedTo = { ...(cur.assigned_to || {}) }; delete nextAssignedTo[categoryKey];
+      const nextAssignedTeam = { ...(cur.assigned_team || {}) }; delete nextAssignedTeam[categoryKey];
+      const nextServiceDone = { ...(cur.service_done || {}) }; delete nextServiceDone[categoryKey];
+      const nextServiceStarted = { ...(cur.service_started || {}) }; delete nextServiceStarted[categoryKey];
+      return {
         service_types: nextServiceTypes, assigned_to: nextAssignedTo, assigned_team: nextAssignedTeam, service_done: nextServiceDone,
-        service_started: nextServiceStarted, history: nextHistory, updated_at: new Date().toISOString(),
-      }),
+        service_started: nextServiceStarted, history: [...(cur.history || []), entry("service", `${categoryLabel} → ${newLabel}`, "Moved")],
+      };
+    }, { summary: `Dispatch board: moved ${job.plate} from ${categoryLabel} to ${newLabel}`, failText: `Couldn't move ${job.plate} to ${newLabel}` });
+    if (!patch) return;
+    applyLocal(job.id, {
+      serviceTypes: patch.service_types, assignedTo: patch.assigned_to, assignedTeam: patch.assigned_team,
+      serviceDone: patch.service_done, serviceStarted: patch.service_started, history: patch.history,
     });
-    setSaving(false);
-    if (!ok) {
-      setAssignErrorToast(`Couldn't move ${job.plate} to ${newLabel} — check your connection and try again.`);
-      setTimeout(() => setAssignErrorToast(""), 6000);
-      return;
-    }
-    setJobs((prev) => prev.map((j) => (j.id === job.id
-      ? { ...j, serviceTypes: nextServiceTypes, assignedTo: nextAssignedTo, assignedTeam: nextAssignedTeam, serviceDone: nextServiceDone, serviceStarted: nextServiceStarted }
-      : j)));
     setSelectedRowKey(null); // the old (job, category) row this modal was showing no longer exists
+    showToast(`Moved ${job.plate} to ${newLabel}`, COLORS.gold, null, 3500);
   };
 
-  // Restricted by name, not a general permission. Originally Ahmed and
-  // Noel; Regan added alongside Noel now that Regan's scope of work
-  // includes Dispatch Board oversight (making sure the board's kept
-  // updated, and covering Noel's detailing/QC work). Written as its own
-  // history entry type ("progress_update") so the Live Updates admin
-  // board can pull just these out of the mix without picking up every
-  // Started/Finished/Moved/Assigned entry too.
-  const canWriteUpdate = ["ahmed", "noel", "regan"].includes((session.name || "").toLowerCase());
+  // Free-text updates stay restricted to these three (by id — the name
+  // check used "regan", but the live name is "Reagen", so Reagen could
+  // never post). The quick-update presets are open to whoever is working
+  // the board: they're fixed wording, and they're how a tech clears the
+  // "no update" warning on their own car. Written as their own history
+  // entry type ("progress_update") so the Live Updates admin board can
+  // pull just these out.
+  const canWriteUpdate = ["ahmed", "noel", "reagen"].includes(session.id) || ["ahmed", "noel", "reagen"].includes((session.name || "").toLowerCase());
   // Same 30s dupe gate as the JobDetail Admin Update box — stops a
   // double-tap on the same preset (e.g. "Started work" twice) from
   // logging twice, checked against the freshly-fetched history so it
   // still catches a duplicate posted from another device moments ago.
+  // Returns "ok", "dupe" or false.
   const DISPATCH_DUPE_UPDATE_WINDOW_MS = 30000;
-  const addProgressUpdate = async (row, text) => {
-    markLocalWrite();
-    setSaving(true);
-    const { job, categoryLabel } = row;
-    const { ok: fetchOk, data } = await sbFetch(`jobs?id=eq.${job.id}&select=history`);
-    const current = fetchOk && data && data[0] ? data[0] : { history: [] };
-    const recentSame = (current.history || [])
-      .filter((h) => h.stage === "progress_update" && h.note === text)
-      .slice(-1)[0];
-    if (recentSame && Date.now() - recentSame.at < DISPATCH_DUPE_UPDATE_WINDOW_MS) {
-      setSaving(false);
-      setDupeUpdateToast(`Already posted "${text}" on ${job.plate} — wait a moment before posting it again.`);
-      setTimeout(() => setDupeUpdateToast(""), 3000);
-      return;
+  const addProgressUpdate = async (row, text, { quiet = false } = {}) => {
+    const { job, categoryKey, categoryLabel } = row;
+    let dupe = false;
+    const patch = await writeJob(job, "history", (cur) => {
+      const recentSame = (cur.history || []).filter((h) => h && h.stage === "progress_update" && h.note === text).slice(-1)[0];
+      if (recentSame && Date.now() - recentSame.at < DISPATCH_DUPE_UPDATE_WINDOW_MS) { dupe = true; return null; }
+      return { history: [...(cur.history || []), entry("progress_update", categoryLabel, text, categoryKey)] };
+    }, { summary: `Dispatch board: ${session.name} posted an update on ${job.plate}`, failText: `Couldn't post the update on ${job.plate}` });
+    if (dupe) {
+      if (!quiet) showToast(`Already posted "${text}" on ${job.plate} — wait a moment before posting it again.`, COLORS.gold, null, 3000);
+      return "dupe";
     }
-    const nextHistory = [
-      ...(current.history || []),
-      { stage: "progress_update", label: categoryLabel, by: session.name, role: session.role, note: text, at: Date.now() },
-    ];
-    withActivitySummary(`Dispatch board: ${session.name} posted an update on ${job.plate}`);
-    const { ok } = await sbFetch(`jobs?id=eq.${job.id}`, {
-      method: "PATCH",
-      headers: { Prefer: "return=minimal" },
-      body: JSON.stringify({ history: nextHistory, updated_at: new Date().toISOString() }),
-    });
-    setSaving(false);
-    if (!ok) {
-      setAssignErrorToast(`Couldn't post the update on ${job.plate} — check your connection and try again.`);
-      setTimeout(() => setAssignErrorToast(""), 6000);
-    }
+    if (!patch) return false;
+    applyLocal(job.id, { history: patch.history });
+    if (!quiet) showToast(`Posted "${text}" on ${job.plate}`, themeColors.progress, null, 3500);
+    return "ok";
   };
 
   // Fully manual by request — no automatic location-based hiding.
@@ -10703,39 +15561,45 @@ function DispatchBoard({ team, session }) {
   // flag. Hides the *whole job* from the board, not just one category.
   const canManageVisibility = canManageDispatchVisibility(session);
   const toggleDispatchHidden = async (job, hide) => {
-    markLocalWrite();
-    setSaving(true);
-    const { ok: fetchOk, data } = await sbFetch(`jobs?id=eq.${job.id}&select=history`);
-    const current = fetchOk && data && data[0] ? data[0] : { history: [] };
-    const nextHistory = [
-      ...(current.history || []),
-      { stage: "dispatch_visibility", label: job.plate, by: session.name, role: session.role, note: hide ? "Hidden from Dispatch Board" : "Shown on Dispatch Board again", at: Date.now() },
-    ];
-    withActivitySummary(`Dispatch board: ${session.name} ${hide ? "hid" : "unhid"} ${job.plate}`);
-    setJobs((prev) => prev.map((j) => (j.id === job.id ? { ...j, dispatchHidden: hide } : j)));
-    const { ok } = await sbFetch(`jobs?id=eq.${job.id}`, {
-      method: "PATCH",
-      headers: { Prefer: "return=minimal" },
-      body: JSON.stringify({ dispatch_hidden: hide, history: nextHistory, updated_at: new Date().toISOString() }),
-    });
-    setSaving(false);
-    if (!ok) {
-      // This one applies its optimistic update before the write (unlike
-      // the others above), so on failure it needs an actual revert, not
-      // just skipping the update.
-      setJobs((prev) => prev.map((j) => (j.id === job.id ? { ...j, dispatchHidden: !hide } : j)));
-      setAssignErrorToast(`Couldn't ${hide ? "hide" : "unhide"} ${job.plate} — check your connection and try again.`);
-      setTimeout(() => setAssignErrorToast(""), 6000);
-      return;
-    }
+    applyLocal(job.id, { dispatchHidden: hide }); // optimistic — reverted below if the save fails
+    const patch = await writeJob(job, "history", (cur) => ({
+      dispatch_hidden: hide,
+      history: [...(cur.history || []), entry("dispatch_visibility", job.plate, hide ? "Hidden from Dispatch Board" : "Shown on Dispatch Board again")],
+    }), { summary: `Dispatch board: ${session.name} ${hide ? "hid" : "unhid"} ${job.plate}`, failText: `Couldn't ${hide ? "hide" : "unhide"} ${job.plate}` });
+    if (!patch) { applyLocal(job.id, { dispatchHidden: !hide }); return; }
+    applyLocal(job.id, { history: patch.history });
     if (hide) setSelectedRowKey(null); // it's about to disappear from the visible columns
   };
 
-  // ticket number in that column. Finished rows are dropped entirely —
-  // once cleared, it comes off the board rather than sitting there
-  // dimmed. Jobs with no service type yet ("_none") go into their own
-  // "needs classification" bucket rather than being dumped into a
-  // colored column with a meaningless badge.
+  // The 6:45 checklist's buttons, by item key + option text.
+  const runEndOfDayAction = async (key, option) => {
+    const row = rowsByKey[key];
+    if (!row) return true; // already gone from the board — nothing left to do
+    if (option === "Send to QC") return sendToQc(row);
+    if (option === "Passed") return passQc(row);
+    const res = await addProgressUpdate(row, option, { quiet: true });
+    return res === "ok" || res === "dupe";
+  };
+
+  const saveColors = async () => {
+    if (!colorDraft) return;
+    const resolved = resolveDispatchColors(colorDraft);
+    const changedOnly = {};
+    DISPATCH_THEME.forEach((t) => { if (resolved[t.key].toLowerCase() !== t.def.toLowerCase()) changedOnly[t.key] = resolved[t.key].toUpperCase(); });
+    setSavingColors(true);
+    withActivitySummary("Dispatch board: changed the board colours");
+    const ok = await saveDispatchColors(changedOnly, session);
+    setSavingColors(false);
+    if (!ok) { showError("Couldn't save the colours — check your connection and try again."); return; }
+    setSavedColors(changedOnly);
+    setColorDraft(null);
+    showToast("Colours saved. Every screen picks them up within a minute.", resolved.done);
+  };
+
+  // Finished rows are dropped entirely — once cleared, it comes off the
+  // board rather than sitting there dimmed. Jobs with no service type
+  // yet ("_none") go into their own "needs classification" strip rather
+  // than being dumped into a coloured column.
   const allRows = [];
   const hiddenJobs = []; // manually hidden jobs — shown in their own management panel, not the columns
   for (const job of jobs) {
@@ -10758,226 +15622,278 @@ function DispatchBoard({ team, session }) {
   }
 
   const rowsByKey = {};
-  allRows.forEach((r) => { rowsByKey[rowKey(r.job.id, r.categoryKey)] = r; });
-
-  const unclassifiedRows = allRows.filter((r) => r.categoryKey === "_none");
-  const detailingRows = allRows.filter((r) => r.role === "detailing");
-  const otherRows = allRows.filter((r) => r.role !== "detailing" && r.categoryKey !== "_none");
-
-  // Staff workload glance — how many active (not-done) rows each
-  // person currently carries across both columns, computed from what's
-  // already loaded (no extra fetch). Sorted busiest-first.
-  const workloadByStaff = {};
+  const views = []; // every classified row with its derived state
   for (const r of allRows) {
-    for (const id of r.job.assignedTeam[r.categoryKey] || []) {
-      const staffName = team.find((m) => m.id === id)?.name || id;
-      workloadByStaff[staffName] = (workloadByStaff[staffName] || 0) + 1;
+    const key = rowKey(r.job.id, r.categoryKey);
+    rowsByKey[key] = r;
+    if (r.categoryKey === "_none") continue;
+    views.push({ key, row: r, info: dispatchRowInfo(r.job, r.categoryKey, r.categoryLabel, nowTick) });
+  }
+  const unclassifiedRows = allRows.filter((r) => r.categoryKey === "_none");
+  const detailingViews = views.filter((v) => v.row.role === "detailing");
+  const otherViews = views.filter((v) => v.row.role !== "detailing");
+  const nameOf = (id) => team.find((m) => m.id === id)?.name || id;
+  const colorFor = (v) => {
+    if (leavingKeys[v.key]) return themeColors.done;
+    const theme = DISPATCH_STATES[v.info.state].theme;
+    return theme ? themeColors[theme] : COLORS.muted;
+  };
+
+  // "On the floor": everyone with a car, busiest first, as pills; with
+  // up to ~17 techs, the free ones are one compact green line instead.
+  const workload = {};
+  for (const v of views) {
+    const working = !!v.info.startedAt && v.info.state !== "qc" && v.info.state !== "qclate";
+    for (const id of v.info.assigned) {
+      const e = workload[id] || (workload[id] = { cars: 0, working: false });
+      e.cars += 1;
+      if (working) e.working = true;
     }
   }
-  const workloadSorted = Object.entries(workloadByStaff).sort((a, b) => b[1] - a[1]);
+  const busy = Object.entries(workload)
+    .map(([id, e]) => ({ id, name: nameOf(id), ...e }))
+    .sort((a, b) => b.cars - a.cars || a.name.localeCompare(b.name));
+  const freeNames = team
+    .filter((m) => !["admin", "intake", "accountant"].includes(m.role) && !isSmartechPortal(m) && !workload[m.id])
+    .map((m) => m.name);
 
-  // Unified alerts count — the three separate signals that used to be
-  // scattered (stale-unassigned border, stale-in-progress border, the
-  // classification strip) rolled into one glanceable number. Same
-  // thresholds as the per-card borders, just tallied.
-  let staleUnassignedCount = 0;
-  let staleInProgressCount = 0;
-  for (const r of allRows) {
-    if (r.categoryKey === "_none") continue;
-    const assignedIds = r.job.assignedTeam[r.categoryKey] || [];
-    const startedAt = r.job.serviceStarted[r.categoryKey];
-    const isDone = r.job.serviceDone[r.categoryKey];
-    if (isDone) continue;
-    if (!startedAt && assignedIds.length === 0 && businessMsElapsed(r.job.createdAt, nowTick) > STALE_UNASSIGNED_MS) staleUnassignedCount += 1;
-    else if (startedAt && businessMsElapsed(new Date(startedAt).getTime(), nowTick) > STALE_IN_PROGRESS_MS) staleInProgressCount += 1;
-  }
-  const totalAlerts = staleUnassignedCount + staleInProgressCount + unclassifiedRows.length;
+  // One glanceable alerts number: needs someone + no update + QC waiting
+  // + no service type — the same states the cards pulse for.
+  const alertCounts = { late: 0, stale: 0, qclate: 0 };
+  views.forEach((v) => { if (v.info.state in alertCounts) alertCounts[v.info.state] += 1; });
+  const totalAlerts = alertCounts.late + alertCounts.stale + alertCounts.qclate + unclassifiedRows.length;
 
   const selectedRow = selectedRowKey ? rowsByKey[selectedRowKey] : null;
+  const selectedView = selectedRow ? views.find((v) => v.key === selectedRowKey) || null : null;
 
-  const Column = ({ title, accent, rowsForColumn }) => (
-    <div style={{ flex: 1, minWidth: 0, display: "flex", flexDirection: "column", background: "#101215", border: `1px solid ${COLORS.line}`, borderRadius: 14, overflow: "hidden" }}>
-      <div style={{ padding: "14px 16px", borderBottom: `2px solid ${accent}`, display: "flex", alignItems: "center", justifyContent: "space-between" }}>
-        <div style={{ fontFamily: DISPLAY_FONT, fontWeight: 700, fontSize: 17, color: accent }}>{title}</div>
-        <div style={{ fontSize: 12, fontWeight: 700, color: accent, background: `${accent}22`, borderRadius: 999, padding: "2px 10px" }}>{rowsForColumn.length}</div>
-      </div>
-      <div style={{ padding: 14, overflowY: "auto", flex: 1, minHeight: 200 }}>
-        {rowsForColumn.length === 0 ? (
-          <div style={{ textAlign: "center", color: COLORS.muted, fontSize: 13, marginTop: 30 }}>Nothing here right now</div>
-        ) : (
-          rowsForColumn.map((r, i) => {
-            const key = rowKey(r.job.id, r.categoryKey);
-            return (
-              <DispatchJobCard
-                key={key}
-                row={r}
-                ticketNo={i + 1}
-                isDone={!!r.job.serviceDone[r.categoryKey]}
-                isStarted={!!r.job.serviceStarted[r.categoryKey]}
-                startedAt={r.job.serviceStarted[r.categoryKey] || null}
-                now={nowTick}
-                assignedNames={(r.job.assignedTeam[r.categoryKey] || []).map((id) => team.find((m) => m.id === id)?.name || id)}
-                onClick={() => openRow(key, r.job.id)}
-              />
-            );
-          })
-        )}
-      </div>
-    </div>
-  );
+  const renderCard = (v, i) => {
+    const { info, row } = v;
+    const meta = DISPATCH_STATES[info.state];
+    const leaving = !!leavingKeys[v.key];
+    let timerLabel = "";
+    let timerText;
+    let timerMuted = false;
+    if (info.state === "qc" || info.state === "qclate") { timerLabel = "WAITING"; timerText = dispatchElapsed(info.qcAt, nowTick); }
+    else if (info.startedAt) {
+      if (info.state === "stale") { timerLabel = "LAST UPDATE"; timerText = dispatchElapsed(info.lastUpdateAt, nowTick); }
+      else timerText = dispatchElapsed(info.startedAt, nowTick);
+    } else { timerLabel = "IN"; timerText = dispatchElapsed(row.job.createdAt, nowTick); timerMuted = true; }
+    return (
+      <DispatchJobCard
+        key={v.key}
+        rowId={v.key}
+        jobId={row.job.id}
+        ticketNo={i + 1}
+        plate={row.job.plate}
+        model={row.job.makeModel || ""}
+        carColor={row.job.color || ""}
+        categoryLabel={row.categoryLabel}
+        todo={dispatchWhatToDo(row.job, row.categoryKey) || ""}
+        stateLabel={leaving ? "Finished" : meta.label}
+        color={colorFor(v)}
+        pulse={meta.pulse && !leaving}
+        timerLabel={timerLabel}
+        timerText={timerText}
+        timerMuted={timerMuted}
+        redoReason={info.redoReason || ""}
+        people={info.assigned.map((id) => ({ id, name: nameOf(id) }))}
+        arriving={!!arrivingKeys[v.key]}
+        leaving={leaving}
+        onOpen={openRow}
+      />
+    );
+  };
+  const renderColumn = (title, dot, list) => {
+    const warn = list.filter((v) => DISPATCH_STATES[v.info.state].pulse).length;
+    return (
+      <section className="dsp-col" aria-label={title}>
+        <div className="dsp-col-h">
+          <span className="dsp-dot" style={{ background: dot }} />
+          <h2>{title}</h2>
+          {warn > 0 && <span className="dsp-warn">{warn} need{warn === 1 ? "s" : ""} a look</span>}
+          <span className="dsp-n">{list.length}</span>
+        </div>
+        <div className="dsp-list">
+          {list.length === 0
+            ? <div className="dsp-empty">{loading ? "Loading…" : "All clear."}</div>
+            : list.map(renderCard)}
+        </div>
+      </section>
+    );
+  };
 
   const selectedTicketNo = selectedRow
-    ? (selectedRow.categoryKey === "_none" ? unclassifiedRows : selectedRow.role === "detailing" ? detailingRows : otherRows).findIndex((r) => rowKey(r.job.id, r.categoryKey) === selectedRowKey) + 1
+    ? (selectedRow.categoryKey === "_none"
+      ? unclassifiedRows.findIndex((r) => rowKey(r.job.id, r.categoryKey) === selectedRowKey)
+      : (selectedRow.role === "detailing" ? detailingViews : otherViews).findIndex((v) => v.key === selectedRowKey)) + 1
     : null;
 
   return (
-    <div className="mrcap-view" style={{ padding: 16, display: "flex", flexDirection: "column", gap: 14, minHeight: "calc(100vh - 80px)" }}>
-      {dupeUpdateToast && createPortal(
-        <div style={{ position: "fixed", bottom: 18, right: 18, left: 18, zIndex: 9999, display: "flex", justifyContent: "flex-end", pointerEvents: "none" }}>
-          <div style={{ maxWidth: 340, width: "100%", background: COLORS.panel, border: `1px solid ${COLORS.gold}`, borderRadius: 12, padding: "12px 14px", boxShadow: "0 10px 26px rgba(0,0,0,0.5)", color: COLORS.gold, fontSize: 12.5, fontWeight: 600 }}>
-            {dupeUpdateToast}
-          </div>
-        </div>,
-        document.body
-      )}
-      {assignErrorToast && createPortal(
-        <div style={{ position: "fixed", top: 18, right: 18, left: 18, zIndex: 9999, display: "flex", justifyContent: "flex-end", pointerEvents: "none" }}>
-          <div style={{ maxWidth: 340, width: "100%", background: COLORS.panel, border: `1px solid ${COLORS.red}`, borderRadius: 12, padding: "12px 14px", boxShadow: "0 10px 26px rgba(0,0,0,0.5)", color: COLORS.red, fontSize: 12.5, fontWeight: 600 }}>
-            {assignErrorToast}
-          </div>
-        </div>,
-        document.body
-      )}
-      <div style={{ display: "flex", justifyContent: "space-between", alignItems: "flex-end", flexWrap: "wrap", gap: 10 }}>
-        <div style={{ display: "flex", alignItems: "center", gap: 12 }}>
-          <div style={{ width: 46, height: 46, borderRadius: 11, background: "#fff", display: "flex", alignItems: "center", justifyContent: "center", padding: "7px 9px", boxSizing: "border-box", flexShrink: 0, border: `1px solid ${COLORS.line}`, boxShadow: `0 0 0 1px rgba(74,100,120,0.35), 0 8px 20px -10px rgba(0,0,0,0.6)` }}>
-            <img src={LOGO_LOCKUP_SRC} alt="Mr.CAP. / Beneloom" style={{ width: "100%", height: "100%", objectFit: "contain" }} />
-          </div>
+    <div className={`mrcap-view dsp-root dsp-u${fill ? " dsp-fill" : ""}`} onClickCapture={unlockDispatchAudio}>
+      <style>{DISPATCH_CSS}</style>
+      <div className={`dsp-board${fill ? " dsp-fill" : ""}`}>
+        <header className="dsp-head">
           <div>
-          <div style={{ display: "flex", alignItems: "center", gap: 10 }}>
-            <div style={{ fontFamily: DISPLAY_FONT, fontWeight: 700, fontSize: 20, color: COLORS.ink }}>Dispatch Board</div>
-            {totalAlerts > 0 && (
-              <button
-                onClick={() => setShowAlertsDetail((v) => !v)}
-                className="mrcap-press"
-                style={{ display: "flex", alignItems: "center", gap: 5, background: "rgba(168,64,47,0.15)", border: `1px solid ${COLORS.red}`, borderRadius: 999, padding: "3px 10px 3px 8px", cursor: "pointer" }}
-              >
-                <AlertCircle size={12} color={COLORS.red} />
-                <span style={{ fontSize: 12, fontWeight: 700, color: COLORS.red }}>{totalAlerts} alert{totalAlerts === 1 ? "" : "s"}</span>
+            <div className="dsp-eyebrow">MR.CAP.</div>
+            <h1 className="dsp-title">Dispatch</h1>
+          </div>
+          <DispatchClock>
+            {isSuperAdmin(session) && (
+              <button type="button" className="dsp-cust" onClick={() => { setSelectedRowKey(null); setColorDraft({ ...savedColors }); }}>
+                <Palette /> Colours
               </button>
             )}
-          </div>
-          <div style={{ fontSize: 12, color: COLORS.muted, marginTop: 2 }}>
-            {loading ? "Loading…" : `${sortOrder === "priority" ? "Priority" : sortOrder === "oldest" ? "Oldest" : "Newest"} first · updates automatically · last checked ${new Date().toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" })}`}
-          </div>
-          {showAlertsDetail && totalAlerts > 0 && (
-            <div className="mrcap-fade" style={{ marginTop: 8, fontSize: 12, color: COLORS.muted, display: "flex", flexDirection: "column", gap: 3 }}>
-              {staleUnassignedCount > 0 && <div>• {staleUnassignedCount} sitting unassigned too long</div>}
-              {staleInProgressCount > 0 && <div>• {staleInProgressCount} in progress too long — check on these</div>}
-              {unclassifiedRows.length > 0 && <div>• {unclassifiedRows.length} still need a service type</div>}
+            <DispatchSoundPill />
+          </DispatchClock>
+        </header>
+
+        <div className="dsp-floor">
+          <div className="dsp-floor-lab"><span>On the floor</span><span>cars each</span></div>
+          {busy.length > 0 ? (
+            <div className="dsp-pills">
+              {busy.map((p) => (
+                <div key={p.id} className="dsp-pill">
+                  <DispatchAvatar id={p.id} name={p.name} />
+                  <div style={{ minWidth: 0 }}>
+                    <div className="dsp-pill-nm">{p.name}</div>
+                    <div className="dsp-pill-ct">{p.cars} car{p.cars === 1 ? "" : "s"}{p.working ? " · working" : ""}</div>
+                  </div>
+                </div>
+              ))}
             </div>
+          ) : (
+            <div className="dsp-free dsp-free-none">{loading ? "Loading…" : "Nobody has a car assigned right now."}</div>
           )}
+          {freeNames.length > 0 && <div className="dsp-free"><b>Free:</b> {freeNames.join(", ")}</div>}
         </div>
-        </div>
-        <div style={{ display: "flex", gap: 6, background: COLORS.panel2, borderRadius: 10, padding: 3 }}>
-          {["oldest", "newest", "priority"].map((opt) => (
-            <button
-              key={opt}
-              onClick={() => setSortOrder(opt)}
-              className="mrcap-press"
-              style={{
-                padding: "7px 14px", borderRadius: 8, border: "none", cursor: "pointer",
-                background: sortOrder === opt ? COLORS.gold : "transparent",
-                color: sortOrder === opt ? COLORS.darkText : COLORS.muted,
-                fontSize: 12.5, fontWeight: 700, textTransform: "capitalize",
-              }}
-            >
-              {opt === "priority" ? "Priority first" : `${opt} first`}
-            </button>
-          ))}
-        </div>
-      </div>
-      {workloadSorted.length > 0 && (
-        <div style={{ display: "flex", gap: 7, overflowX: "auto", paddingBottom: 2 }}>
-          {workloadSorted.map(([name, count]) => (
-            <div key={name} style={{ flexShrink: 0, fontSize: 12, color: COLORS.ink, background: COLORS.panel2, border: `1px solid ${COLORS.line}`, borderRadius: 999, padding: "6px 12px" }}>
-              <span style={{ fontWeight: 700 }}>{name}</span> <span style={{ color: COLORS.muted }}>· {count} active</span>
-            </div>
-          ))}
-        </div>
-      )}
-      {unclassifiedRows.length > 0 && (
-        <div style={{ background: "#1a1408", border: `1px solid ${COLORS.gold}55`, borderRadius: 12, padding: 14 }}>
-          <div style={{ fontSize: 12.5, fontWeight: 700, color: COLORS.goldBright, marginBottom: 10 }}>
-            ⚠ {unclassifiedRows.length} job{unclassifiedRows.length === 1 ? "" : "s"} need{unclassifiedRows.length === 1 ? "s" : ""} a service type — tap to classify
+
+        <div className="dsp-legend">
+          <div className="dsp-legend-keys">
+            {[["new", "New"], ["late", "Needs someone"], ["assigned", "Assigned"], ["progress", "In progress"], ["stale", "No update"], ["qc", "QC"]].map(([k, l]) => (
+              <span key={k}><i style={{ background: themeColors[k] }} />{l}</span>
+            ))}
           </div>
-          <div style={{ display: "flex", gap: 9, overflowX: "auto", paddingBottom: 2 }}>
-            {unclassifiedRows.map((r) => (
-              <div
-                key={rowKey(r.job.id, r.categoryKey)}
-                onClick={() => openRow(rowKey(r.job.id, r.categoryKey), r.job.id)}
-                className="mrcap-press"
-                style={{
-                  flexShrink: 0, minWidth: 160, background: COLORS.panel, border: `1px solid ${COLORS.line}`,
-                  borderRadius: 10, padding: 10, cursor: "pointer",
-                }}
-              >
-                <div style={{ fontFamily: MONO_FONT, fontWeight: 700, fontSize: 13, color: COLORS.ink }}>{r.job.plate}</div>
-                <div style={{ fontSize: 11.5, color: COLORS.muted }}>{r.job.makeModel}</div>
+          <div className="dsp-legend-ctl">
+            {totalAlerts > 0 && (
+              <button type="button" className="dsp-alerts" onClick={() => setShowAlertsDetail((v) => !v)} aria-expanded={showAlertsDetail}>
+                <AlertCircle size={14} /> {totalAlerts} alert{totalAlerts === 1 ? "" : "s"}
+              </button>
+            )}
+            <div className="dsp-sort" role="group" aria-label="Sort">
+              {["oldest", "newest", "priority"].map((opt) => (
+                <button key={opt} type="button" className={sortOrder === opt ? "on" : ""} aria-pressed={sortOrder === opt} onClick={() => setSortOrder(opt)}>
+                  {opt === "priority" ? "Priority first" : opt === "oldest" ? "Oldest first" : "Newest first"}
+                </button>
+              ))}
+            </div>
+          </div>
+        </div>
+        {showAlertsDetail && totalAlerts > 0 && (
+          <div className="dsp-alerts-detail mrcap-fade">
+            {alertCounts.late > 0 && <div>• {alertCounts.late} sitting with nobody assigned for over an hour</div>}
+            {alertCounts.stale > 0 && <div>• {alertCounts.stale} in progress with no update for 3+ hours — check on these</div>}
+            {alertCounts.qclate > 0 && <div>• {alertCounts.qclate} waiting on QC for over 30 minutes</div>}
+            {unclassifiedRows.length > 0 && <div>• {unclassifiedRows.length} still need a service type</div>}
+          </div>
+        )}
+
+        {unclassifiedRows.length > 0 && (
+          <div className="dsp-unclass">
+            <div className="dsp-unclass-h">
+              ⚠ {unclassifiedRows.length} job{unclassifiedRows.length === 1 ? "" : "s"} need{unclassifiedRows.length === 1 ? "s" : ""} a service type — tap to classify
+            </div>
+            <div className="dsp-unclass-list">
+              {unclassifiedRows.map((r) => (
+                <button key={rowKey(r.job.id, r.categoryKey)} type="button" className="dsp-unclass-item" onClick={() => openRow(rowKey(r.job.id, r.categoryKey), r.job.id)}>
+                  <DispatchPlate plate={r.job.plate} />
+                  {r.job.makeModel ? <span className="m">{r.job.makeModel}</span> : null}
+                </button>
+              ))}
+            </div>
+          </div>
+        )}
+
+        <div className="dsp-cols">
+          {renderColumn("Detailing", COLORS.gold, detailingViews)}
+          {renderColumn("Body · Dent · PPF", COLORS.blueText, otherViews)}
+        </div>
+
+        {canManageVisibility && hiddenJobs.length > 0 && (
+          <div className="dsp-hidden">
+            <div className="dsp-hidden-h">Hidden from board ({hiddenJobs.length}) — visible only to you</div>
+            {hiddenJobs.map((job) => (
+              <div key={job.id} className="dsp-hidden-row">
+                <div style={{ minWidth: 0 }}>
+                  <PlateChip plate={job.plate} size="sm" />
+                  <span className="m">{job.makeModel}{job.location ? ` · ${job.location}` : ""}</span>
+                </div>
+                <button type="button" disabled={saving} onClick={() => toggleDispatchHidden(job, false)}>Show again</button>
               </div>
             ))}
           </div>
-        </div>
-      )}
-      <div style={{ display: "flex", gap: 14, flex: 1, minHeight: 0, flexWrap: "wrap" }}>
-        <Column title="Detailing" accent={COLORS.red} rowsForColumn={detailingRows} />
-        <Column title="Denting / Bodyshop / PPF" accent={COLORS.blue} rowsForColumn={otherRows} />
+        )}
       </div>
+
       {selectedRow && (
         <DispatchDetailModal
+          key={selectedRowKey}
           row={selectedRow}
+          info={selectedView ? selectedView.info : null}
+          color={selectedView ? colorFor(selectedView) : COLORS.line}
           ticketNo={selectedTicketNo}
-          isDone={!!selectedRow.job.serviceDone[selectedRow.categoryKey]}
-          isStarted={!!selectedRow.job.serviceStarted[selectedRow.categoryKey]}
-          startedAt={selectedRow.job.serviceStarted[selectedRow.categoryKey] || null}
           now={nowTick}
+          session={session}
+          team={team}
           assignedIds={selectedRow.job.assignedTeam[selectedRow.categoryKey] || []}
-          assignedNames={(selectedRow.job.assignedTeam[selectedRow.categoryKey] || []).map((id) => team.find((m) => m.id === id)?.name || id)}
           staffOptions={staffForRole(team, selectedRow.role)}
           moveOptions={SERVICES.filter((s) => s.key !== selectedRow.categoryKey)}
           canWriteUpdate={canWriteUpdate}
           canManageVisibility={canManageVisibility}
+          canFinishDirect={canFinishDirect}
           onClose={() => setSelectedRowKey(null)}
-          onToggleDone={toggleDone}
-          onToggleStarted={toggleStarted}
+          onStart={(row) => toggleStarted(row, true)}
+          onUnstart={(row) => toggleStarted(row, false)}
+          onSendToQc={sendToQc}
+          onPassQc={passQc}
+          onFailQc={failQc}
+          onFinishDirect={finishDirect}
           onAssign={toggleTeamAssign}
           onMove={moveCategory}
-          onAddUpdate={addProgressUpdate}
+          onAddUpdate={(row, text) => addProgressUpdate(row, text)}
           onToggleHidden={toggleDispatchHidden}
           saving={saving}
         />
       )}
-      {canManageVisibility && hiddenJobs.length > 0 && (
-        <div style={{ background: "#141414", border: `1px solid ${COLORS.line}`, borderRadius: 12, padding: 14, marginTop: 4 }}>
-          <div style={{ fontSize: 12.5, fontWeight: 700, color: COLORS.muted, marginBottom: 10 }}>
-            Hidden from board ({hiddenJobs.length}) — visible only to you
-          </div>
-          <div style={{ display: "flex", flexDirection: "column", gap: 8 }}>
-            {hiddenJobs.map((job) => (
-              <div key={job.id} style={{ display: "flex", justifyContent: "space-between", alignItems: "center", background: COLORS.panel2, borderRadius: 8, padding: "9px 12px" }}>
-                <div>
-                  <span style={{ fontFamily: MONO_FONT, fontWeight: 700, fontSize: 13, color: COLORS.ink }}>{job.plate}</span>
-                  <span style={{ fontSize: 12, color: COLORS.muted, marginLeft: 8 }}>{job.makeModel}{job.location ? ` · ${job.location}` : ""}</span>
-                </div>
-                <button onClick={() => toggleDispatchHidden(job, false)} className="mrcap-press" style={{ padding: "5px 12px", borderRadius: 999, border: `1px solid ${COLORS.gold}`, background: "transparent", color: COLORS.gold, fontSize: 11.5, fontWeight: 700, cursor: "pointer" }}>
-                  Show again
-                </button>
-              </div>
-            ))}
-          </div>
-        </div>
+      {colorDraft && isSuperAdmin(session) && (
+        <DispatchColorCustomiser
+          saved={savedColors}
+          draft={colorDraft}
+          setDraft={setColorDraft}
+          onCancel={() => setColorDraft(null)}
+          onSave={saveColors}
+          saving={savingColors}
+        />
       )}
-      {showEndOfDayReminder && <DispatchEndOfDayReminder onDismiss={dismissEndOfDayReminder} unclassifiedCount={unclassifiedRows.length} />}
+      {toast && createPortal(
+        <div className="dsp-u dsp-toast" role="status">
+          <div className={toast.undo ? "" : "noundo"} style={dispatchColorVars(toast.color)}>
+            <span>{toast.text}</span>
+            {toast.undo && (
+              <button type="button" onClick={() => { const undo = toast.undo; setToast(null); undo(); }}>Undo</button>
+            )}
+          </div>
+        </div>,
+        document.body
+      )}
+      {showEndOfDayReminder && !loading && (
+        <DispatchEndOfDayChecklist
+          views={views}
+          session={session}
+          unclassifiedCount={unclassifiedRows.length}
+          onAction={runEndOfDayAction}
+          onDismiss={dismissEndOfDayReminder}
+        />
+      )}
     </div>
   );
 }
@@ -11002,7 +15918,8 @@ const PROGRESS_UPDATE_DUPE_WINDOW_MS = 30000;
 async function postProgressUpdateToJob(jobId, text, session) {
   const trimmed = (text || "").trim();
   if (!trimmed || !jobId || !session) return { ok: false };
-  const { ok, data } = await sbFetch(`jobs?id=eq.${jobId}&select=history,plate,make_model`);
+  const { ok, data, stale } = await sbFetch(`jobs?id=eq.${jobId}&select=history,plate,make_model`);
+  if (stale) return { ok: false };
   const current = ok && data && data[0] ? data[0] : null;
   if (!current) return { ok: false };
   const recentSame = (current.history || [])
@@ -11017,6 +15934,7 @@ async function postProgressUpdateToJob(jobId, text, session) {
     method: "PATCH",
     headers: { Prefer: "return=minimal" },
     body: JSON.stringify({ history: nextHistory, updated_at: new Date().toISOString() }),
+    noQueue: true,
   });
   if (!writeOk) return { ok: false };
   return { ok: true, entry: { jobId, plate: current.plate, makeModel: current.make_model, ...entry } };
@@ -11175,106 +16093,293 @@ function PostUpdateComposer({ jobId, session, onPosted }) {
   );
 }
 
+// One feed for everything happening on the floor: car progress notes AND
+// (for admins/Ahmed/Laani — see canUseSmartechChat) the Smartech chat
+// thread, merged by time, oldest at top like a chat, with ONE reply box
+// pinned at the bottom. "To Smartech" replies go straight into the
+// thread; "Car update" posts a progress note to a picked car. No separate
+// chat screen or bubble to open.
+function feedDayLabel(ms) {
+  const key = localDateKey(new Date(ms));
+  if (key === localDateKey()) return "Today";
+  if (key === localDateKey(new Date(Date.now() - 86400000))) return "Yesterday";
+  return new Date(ms).toLocaleDateString([], { weekday: "short", day: "numeric", month: "short" });
+}
+
 function LiveUpdatesBoard({ team, onOpenJob, session, index }) {
+  const chatOn = canUseSmartechChat(session) && !isSmartechPortal(session);
   const [updates, setUpdates] = useState([]);
+  const [messages, setMessages] = useState([]);
+  const [chatLoadError, setChatLoadError] = useState(false);
   const [digest, setDigest] = useState(null);
   const [loading, setLoading] = useState(true);
   const [selected, setSelected] = useState(null);
+  const [filter, setFilter] = useState("all"); // all | smartech | cars
+  const [mode, setMode] = useState(chatOn ? "smartech" : "car");
   const [composerJob, setComposerJob] = useState(null); // {id, plate, makeModel} once a car is picked
+  const [text, setText] = useState("");
+  const [photo, setPhoto] = useState(null);
+  const [uploading, setUploading] = useState(false);
+  const [sending, setSending] = useState(false);
+  const [chatError, setChatError] = useState("");
+  const fileRef = useRef(null);
+  const endRef = useRef(null);
+  const lastKeyRef = useRef("");
 
   const refresh = useCallback(async () => {
-    const result = await loadLiveUpdates();
+    const [result, chat] = await Promise.all([
+      loadLiveUpdates(),
+      chatOn ? loadSmartechMessages() : Promise.resolve({ ok: true, messages: [] }),
+    ]);
     setUpdates(result.updates);
     setDigest(result.digest);
+    // A failed chat poll keeps what's on screen rather than blanking it.
+    if (chat.ok) setMessages(chat.messages);
+    setChatLoadError(!chat.ok);
     setLoading(false);
-  }, []);
+  }, [chatOn]);
 
   useEffect(() => {
     refresh();
-    const interval = setInterval(refresh, 15000);
+    const interval = setInterval(refresh, 12000);
     return () => clearInterval(interval);
   }, [refresh]);
 
+  const feed = useMemo(() => {
+    const items = [];
+    if (filter !== "smartech") updates.forEach((u, i) => items.push({ kind: "car", at: u.at, key: `u-${u.jobId}-${u.at}-${i}`, u }));
+    if (chatOn && filter !== "cars") messages.forEach((m) => items.push({ kind: "msg", at: new Date(m.created_at).getTime(), key: `m-${m.id}`, m }));
+    items.sort((a, b) => a.at - b.at);
+    const recent = items.slice(-150);
+    let prevDay = "";
+    return recent.map((it) => {
+      const day = localDateKey(new Date(it.at));
+      const showDay = day !== prevDay;
+      prevDay = day;
+      return { ...it, showDay };
+    });
+  }, [updates, messages, filter, chatOn]);
+
+  // Keep the newest item in view like a chat: always on first load, on a
+  // filter switch, or after you send; otherwise only if you're already
+  // near the bottom (so reading back through history isn't yanked away).
+  useEffect(() => {
+    const last = feed.length ? feed[feed.length - 1] : null;
+    if (!last || last.key === lastKeyRef.current) return;
+    const el = endRef.current;
+    if (!el) return;
+    const first = !lastKeyRef.current;
+    const nearBottom = el.getBoundingClientRect().top < window.innerHeight + 400;
+    const mine = last.kind === "msg" && last.m.sender_id === session?.id;
+    lastKeyRef.current = last.key;
+    if (first || nearBottom || mine) el.scrollIntoView({ block: "end", behavior: first ? "auto" : "smooth" });
+  }, [feed, session?.id]);
+
+  const switchFilter = (f) => {
+    lastKeyRef.current = "";
+    setFilter(f);
+    if (f === "smartech" && chatOn) setMode("smartech");
+    if (f === "cars") setMode("car");
+  };
+
+  const attach = async (files) => {
+    if (!files || !files[0]) return;
+    setUploading(true);
+    setChatError("");
+    const uploaded = await uploadSmartechPhoto(files[0], "chat");
+    if (uploaded) setPhoto(uploaded); else setChatError("Photo didn't upload — check your connection and try again.");
+    setUploading(false);
+    if (fileRef.current) fileRef.current.value = "";
+  };
+
+  const sendChat = async () => {
+    const body = text.trim();
+    if ((!body && !photo) || sending) return;
+    setSending(true);
+    setChatError("");
+    const ok = await sendSmartechMessage(session, body, photo ? [photo] : []);
+    if (ok) { setText(""); setPhoto(null); await refresh(); } else { setChatError("Message didn't send — check your connection and try again."); }
+    setSending(false);
+  };
+
+  const tabBtn = (key, label) => (
+    <button
+      key={key}
+      onClick={() => switchFilter(key)}
+      className="mrcap-press"
+      style={{ flex: 1, height: 36, borderRadius: 9, border: "none", cursor: "pointer", fontSize: 12.5, fontWeight: filter === key ? 700 : 500, background: filter === key ? COLORS.panel2 : "transparent", color: filter === key ? COLORS.ink : COLORS.muted }}
+    >
+      {label}
+    </button>
+  );
+  const modeBtn = (key, label) => (
+    <button
+      key={key}
+      onClick={() => setMode(key)}
+      className="mrcap-press"
+      style={{ height: 30, padding: "0 12px", borderRadius: 999, cursor: "pointer", fontSize: 11.5, fontWeight: mode === key ? 700 : 500, border: mode === key ? "none" : `1px solid ${COLORS.line}`, background: mode === key ? COLORS.gold : "transparent", color: mode === key ? COLORS.darkText : COLORS.muted }}
+    >
+      {label}
+    </button>
+  );
+
   return (
-    <div className="mrcap-view" style={{ padding: 16, display: "flex", flexDirection: "column", gap: 14, minHeight: "calc(100vh - 80px)" }}>
-      <div>
-        <div style={{ fontFamily: DISPLAY_FONT, fontWeight: 700, fontSize: 20, color: COLORS.ink }}>Live Updates</div>
-        <div style={{ fontSize: 12, color: COLORS.muted, marginTop: 2 }}>
-          {loading ? "Loading…" : "Progress notes from Ahmed and Noel · updates automatically"}
-        </div>
-      </div>
-
-      {session && (
-        <div style={{ background: COLORS.panel, border: `1px solid ${COLORS.line}`, borderRadius: 12, padding: 14, maxWidth: 640 }}>
-          <div style={{ fontSize: 11.5, fontWeight: 700, color: COLORS.muted, textTransform: "uppercase", letterSpacing: 0.5, marginBottom: 8 }}>
-            Post an update
+    <div className="mrcap-view" style={{ padding: "16px 16px 0", display: "flex", flexDirection: "column", gap: 12, minHeight: "calc(100vh - 80px)", boxSizing: "border-box" }}>
+      <div style={{ display: "flex", justifyContent: "space-between", alignItems: "flex-end", gap: 12, maxWidth: 640, width: "100%" }}>
+        <div>
+          <div style={{ fontFamily: DISPLAY_FONT, fontWeight: 700, fontSize: 22, color: COLORS.ink }}>Live</div>
+          <div style={{ display: "flex", alignItems: "center", gap: 6, fontSize: 12, color: COLORS.muted, marginTop: 2 }}>
+            <span style={{ width: 7, height: 7, borderRadius: 4, background: loading ? COLORS.muted : COLORS.green }} />
+            {loading ? "Loading…" : "Updating automatically"}
           </div>
-          {!composerJob ? (
-            <LiveUpdatesCarPicker index={index} onPick={(j) => setComposerJob(j)} />
-          ) : (
-            <div>
-              <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", marginBottom: 10 }}>
-                <div>
-                  <span style={{ fontFamily: MONO_FONT, fontWeight: 700, fontSize: 13, color: COLORS.ink }}>{composerJob.plate}</span>
-                  <span style={{ fontSize: 12, color: COLORS.muted, marginLeft: 8 }}>{composerJob.makeModel}</span>
-                </div>
-                <button onClick={() => setComposerJob(null)} className="mrcap-press" style={{ background: "none", border: "none", color: COLORS.muted, fontSize: 11.5, cursor: "pointer", textDecoration: "underline" }}>Change car</button>
-              </div>
-              <PostUpdateComposer jobId={composerJob.id} session={session} onPosted={() => { refresh(); }} />
-            </div>
-          )}
         </div>
-      )}
-
-      {digest && (
-        <div style={{ background: COLORS.panel, border: `1px solid ${COLORS.gold}55`, borderRadius: 14, padding: 16, maxWidth: 640 }}>
-          <div style={{ fontSize: 11.5, fontWeight: 700, color: COLORS.gold, textTransform: "uppercase", letterSpacing: 0.5, marginBottom: 10 }}>Today's Digest</div>
-          <div style={{ display: "flex", gap: 24, flexWrap: "wrap", marginBottom: digest.byStaff.length ? 12 : 0 }}>
+        {digest && (
+          <div style={{ display: "flex", gap: 16, textAlign: "right" }}>
             <div>
-              <div style={{ fontFamily: MONO_FONT, fontWeight: 700, fontSize: 26, color: COLORS.ink }}>{digest.finishedToday}</div>
-              <div style={{ fontSize: 11, color: COLORS.muted }}>jobs finished today</div>
+              <div style={{ fontFamily: MONO_FONT, fontWeight: 700, fontSize: 18, color: COLORS.ink }}>{digest.finishedToday}</div>
+              <div style={{ fontSize: 10.5, color: COLORS.muted }}>done today</div>
             </div>
             <div>
-              <div style={{ fontFamily: MONO_FONT, fontWeight: 700, fontSize: 26, color: COLORS.ink }}>{digest.avgLabel || "—"}</div>
-              <div style={{ fontSize: 11, color: COLORS.muted }}>avg time per job</div>
+              <div style={{ fontFamily: MONO_FONT, fontWeight: 700, fontSize: 18, color: COLORS.ink }}>{digest.avgLabel || "—"}</div>
+              <div style={{ fontSize: 10.5, color: COLORS.muted }}>avg / job</div>
             </div>
           </div>
-          {digest.byStaff.length > 0 && (
-            <div style={{ display: "flex", flexWrap: "wrap", gap: 8 }}>
-              {digest.byStaff.map(([name, count]) => (
-                <div key={name} style={{ fontSize: 12, color: COLORS.ink, background: COLORS.panel2, borderRadius: 999, padding: "5px 12px" }}>
-                  <span style={{ fontWeight: 700 }}>{name}</span> — {count}
-                </div>
-              ))}
-            </div>
-          )}
-        </div>
-      )}
-
-      <div style={{ display: "flex", flexDirection: "column", gap: 10, maxWidth: 640 }}>
-        {updates.length === 0 ? (
-          <div style={{ textAlign: "center", color: COLORS.muted, fontSize: 13, marginTop: 40 }}>No updates posted yet</div>
-        ) : (
-          updates.map((u, i) => (
-            <div
-              key={`${u.jobId}-${u.at}-${i}`}
-              onClick={() => setSelected(u)}
-              className="mrcap-press"
-              style={{ background: COLORS.panel, border: `1px solid ${COLORS.line}`, borderRadius: 12, padding: 14, cursor: "pointer" }}
-            >
-              <div style={{ display: "flex", justifyContent: "space-between", alignItems: "flex-start", gap: 10 }}>
-                <div>
-                  <span style={{ fontFamily: MONO_FONT, fontWeight: 700, fontSize: 14, color: COLORS.ink }}>{u.plate}</span>
-                  <span style={{ fontSize: 12.5, color: COLORS.muted, marginLeft: 8 }}>{u.makeModel}</span>
-                </div>
-                <div style={{ fontSize: 11, color: COLORS.muted, flexShrink: 0 }}>{new Date(u.at).toLocaleString([], { month: "short", day: "numeric", hour: "2-digit", minute: "2-digit" })}</div>
-              </div>
-              <div style={{ fontSize: 14, color: COLORS.ink, marginTop: 8, lineHeight: 1.4 }}>{u.note}</div>
-              <div style={{ fontSize: 11.5, color: COLORS.goldBright, marginTop: 8, fontWeight: 600 }}>{u.by} · {u.categoryLabel}</div>
-            </div>
-          ))
         )}
       </div>
+
+      {digest && digest.byStaff.length > 0 && (
+        <div style={{ display: "flex", flexWrap: "wrap", gap: 6, maxWidth: 640 }}>
+          {digest.byStaff.map(([name, count]) => (
+            <div key={name} style={{ fontSize: 11.5, color: COLORS.ink, background: COLORS.panel, border: `1px solid ${COLORS.line}`, borderRadius: 999, padding: "4px 11px" }}>
+              <span style={{ fontWeight: 700 }}>{name}</span> · {count}
+            </div>
+          ))}
+        </div>
+      )}
+
+      {chatOn && (
+        <div style={{ display: "flex", gap: 3, padding: 3, borderRadius: 12, background: COLORS.panel, border: `1px solid ${COLORS.line}`, maxWidth: 640 }}>
+          {tabBtn("all", "All")}
+          {tabBtn("smartech", "Smartech")}
+          {tabBtn("cars", "Car updates")}
+        </div>
+      )}
+
+      <div style={{ display: "flex", flexDirection: "column", gap: 10, maxWidth: 640, width: "100%" }}>
+        {chatOn && chatLoadError && filter !== "cars" && (
+          <div style={{ fontSize: 11.5, color: COLORS.red }}>Couldn't load Smartech messages — retrying automatically.</div>
+        )}
+        {!loading && feed.length === 0 && (
+          <div style={{ textAlign: "center", color: COLORS.muted, fontSize: 13, margin: "40px 0" }}>
+            {filter === "smartech" ? "No Smartech messages yet" : "No updates posted yet"}
+          </div>
+        )}
+        {feed.map((it) => (
+          <Fragment key={it.key}>
+            {it.showDay && (
+              <div style={{ alignSelf: "center", fontSize: 10.5, color: COLORS.muted, letterSpacing: 0.8, textTransform: "uppercase", margin: "4px 0" }}>{feedDayLabel(it.at)}</div>
+            )}
+            {it.kind === "car" ? (
+              <div
+                onClick={() => setSelected(it.u)}
+                className="mrcap-press"
+                style={{ background: COLORS.panel, border: `1px solid ${COLORS.line}`, borderRadius: 14, padding: "12px 14px", cursor: "pointer" }}
+              >
+                <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", gap: 10 }}>
+                  <div style={{ display: "flex", alignItems: "center", gap: 8, minWidth: 0 }}>
+                    <span style={{ fontFamily: MONO_FONT, fontWeight: 700, fontSize: 12.5, color: COLORS.darkText, background: "#F2EEE3", borderRadius: 5, padding: "2px 7px", flexShrink: 0 }}>{it.u.plate}</span>
+                    <span style={{ fontSize: 12, color: COLORS.muted, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{it.u.makeModel}</span>
+                  </div>
+                  <div style={{ fontSize: 11, color: COLORS.muted, flexShrink: 0 }}>{new Date(it.u.at).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" })}</div>
+                </div>
+                <div style={{ fontSize: 14, color: COLORS.ink, marginTop: 7, lineHeight: 1.4 }}>{it.u.note}</div>
+                <div style={{ fontSize: 11.5, color: COLORS.gold, marginTop: 6, fontWeight: 600 }}>{it.u.by} · {it.u.categoryLabel}</div>
+              </div>
+            ) : (() => {
+              const m = it.m;
+              const mine = m.sender_id === session?.id;
+              const fromSmartech = m.sender_id === "jobish" || m.sender_role === "bodyshop";
+              return (
+                <div style={{ display: "flex", gap: 8, alignItems: "flex-end", alignSelf: mine ? "flex-end" : "flex-start", maxWidth: "82%" }}>
+                  {!mine && (
+                    <span style={{ flexShrink: 0, width: 30, height: 30, borderRadius: 15, background: COLORS.panel2, border: `1px solid ${fromSmartech ? COLORS.gold : COLORS.line}`, color: fromSmartech ? COLORS.gold : COLORS.ink, fontSize: 12, fontWeight: 700, display: "flex", alignItems: "center", justifyContent: "center" }}>
+                      {(m.sender_name || "?").slice(0, 1).toUpperCase()}
+                    </span>
+                  )}
+                  <div style={{ background: mine ? COLORS.gold : COLORS.panel2, border: mine ? "none" : `1px solid ${fromSmartech ? "#3A3526" : COLORS.line}`, borderRadius: mine ? "16px 16px 4px 16px" : "16px 16px 16px 4px", padding: "9px 12px", minWidth: 0 }}>
+                    {!mine && (
+                      <div style={{ display: "flex", gap: 6, alignItems: "center", marginBottom: 3 }}>
+                        <span style={{ fontSize: 11.5, fontWeight: 700, color: fromSmartech ? COLORS.gold : COLORS.ink }}>{m.sender_name}</span>
+                        {fromSmartech && <span style={{ fontSize: 9, fontWeight: 700, letterSpacing: 0.6, color: COLORS.darkText, background: COLORS.gold, borderRadius: 4, padding: "1px 5px" }}>SMARTECH</span>}
+                      </div>
+                    )}
+                    {m.body && <div style={{ fontSize: 13.5, lineHeight: 1.4, color: mine ? COLORS.darkText : COLORS.ink, whiteSpace: "pre-wrap", overflowWrap: "anywhere" }}>{m.body}</div>}
+                    {(m.attachments || []).map((a, i) => (
+                      <img key={i} src={a.url} alt="Photo from chat" onClick={() => window.open(a.url, "_blank")} style={{ width: 160, height: 120, objectFit: "cover", borderRadius: 10, marginTop: 6, cursor: "pointer", display: "block" }} />
+                    ))}
+                    <div style={{ fontSize: 10, color: mine ? "rgba(13,12,8,0.65)" : COLORS.muted, marginTop: 4 }}>
+                      {mine ? `${m.sender_name} · ` : ""}{new Date(m.created_at).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" })}
+                    </div>
+                  </div>
+                </div>
+              );
+            })()}
+          </Fragment>
+        ))}
+        <div ref={endRef} style={{ height: 1 }} />
+      </div>
+
+      <div style={{ flex: 1 }} />
+
+      {session && (
+        <div style={{ position: "sticky", bottom: 0, zIndex: 5, background: COLORS.paper, borderTop: `1px solid ${COLORS.line}`, padding: "10px 0 max(12px, env(safe-area-inset-bottom))" }}>
+          <div style={{ maxWidth: 640 }}>
+            {chatOn && (
+              <div style={{ display: "flex", gap: 6, marginBottom: 8 }}>
+                {modeBtn("smartech", "To Smartech")}
+                {modeBtn("car", composerJob ? `Car update · ${composerJob.plate}` : "Car update")}
+              </div>
+            )}
+            {mode === "smartech" && chatOn ? (
+              <div>
+                {chatError && <div style={{ fontSize: 11.5, color: COLORS.red, marginBottom: 6 }}>{chatError}</div>}
+                {photo && <div style={{ marginBottom: 8 }}><PhotoGrid photos={[photo.url]} onRemove={() => setPhoto(null)} /></div>}
+                <div style={{ display: "flex", gap: 8, alignItems: "center" }}>
+                  <input ref={fileRef} type="file" accept="image/*" style={{ display: "none" }} onChange={(e) => attach(e.target.files)} />
+                  <button onClick={() => fileRef.current?.click()} disabled={uploading} aria-label="Attach photo" className="mrcap-press" style={{ width: 44, height: 44, flexShrink: 0, borderRadius: 12, border: `1px solid ${COLORS.line}`, background: COLORS.panel2, color: COLORS.muted, cursor: "pointer", display: "flex", alignItems: "center", justifyContent: "center", opacity: uploading ? 0.5 : 1 }}>
+                    <Camera size={18} />
+                  </button>
+                  <input
+                    value={text}
+                    onChange={(e) => setText(e.target.value)}
+                    placeholder={uploading ? "Uploading photo…" : "Reply to Smartech…"}
+                    aria-label="Message Smartech"
+                    style={{ ...inputStyle, marginTop: 0, flex: 1, height: 44, borderRadius: 22, padding: "0 16px" }}
+                    onKeyDown={(e) => { if (e.key === "Enter") sendChat(); }}
+                  />
+                  <button onClick={sendChat} disabled={sending || uploading || (!text.trim() && !photo)} aria-label="Send" className="mrcap-press" style={{ width: 44, height: 44, flexShrink: 0, borderRadius: 22, border: "none", background: COLORS.gold, color: COLORS.darkText, cursor: "pointer", display: "flex", alignItems: "center", justifyContent: "center", opacity: sending || uploading || (!text.trim() && !photo) ? 0.5 : 1 }}>
+                    <Send size={17} />
+                  </button>
+                </div>
+              </div>
+            ) : !composerJob ? (
+              <LiveUpdatesCarPicker index={index} onPick={(j) => setComposerJob(j)} />
+            ) : (
+              <div>
+                <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", marginBottom: 8 }}>
+                  <div>
+                    <span style={{ fontFamily: MONO_FONT, fontWeight: 700, fontSize: 13, color: COLORS.ink }}>{composerJob.plate}</span>
+                    <span style={{ fontSize: 12, color: COLORS.muted, marginLeft: 8 }}>{composerJob.makeModel}</span>
+                  </div>
+                  <button onClick={() => setComposerJob(null)} className="mrcap-press" style={{ background: "none", border: "none", color: COLORS.muted, fontSize: 11.5, cursor: "pointer", textDecoration: "underline" }}>Change car</button>
+                </div>
+                <PostUpdateComposer jobId={composerJob.id} session={session} onPosted={() => { lastKeyRef.current = ""; refresh(); }} />
+              </div>
+            )}
+          </div>
+        </div>
+      )}
+
       {selected && (
         <UpdatePreviewModal
           update={selected}
@@ -11327,17 +16432,890 @@ function UpdatePreviewModal({ update, onClose, onOpenJob, session, onPosted }) {
   );
 }
 
+/* ================================================================
+   PPF ROOM — scope editor (job card), kiosk (tablet), office view
+   (job card) and the reviewer-step extension for Ahmed's approval.
+   Diagram geometry/constants come from ./ppfDiagram.js; everything
+   here is app wiring: data shapes, saveJob calls, history entries.
+================================================================ */
+
+// ---- normalized "car" shape ppfDiagram.js's functions expect ----
+function ppfCarFromJob(job) {
+  const sc = job.ppfScope || null;
+  return {
+    bodyShape: job.bodyType || "",
+    tintBooked: !!(sc && sc.extras && sc.extras.tint),
+    spare: !!(sc && sc.spare),
+    extras: (sc && sc.extras) || {},
+    scope: { preset: (sc && sc.preset) || "custom", edited: !!(sc && sc.edited), z: (sc && sc.zones) || {} },
+  };
+}
+function ppfDoneSet(job) {
+  const z = (job.ppfProgress && job.ppfProgress.zones) || {};
+  return new Set(Object.keys(z).filter((k) => z[k] && z[k].doneAt && !z[k].skipped));
+}
+function ppfSkippedSet(job) {
+  const z = (job.ppfProgress && job.ppfProgress.zones) || {};
+  return new Set(Object.keys(z).filter((k) => z[k] && z[k].skipped));
+}
+const PPF_STATE_LABEL = { waiting_scope: "Waiting for Ahmed", not_started: "Not started", in_progress: "In progress", ready: "All done", with_ahmed: "With Ahmed" };
+function ppfKioskStatus(job) {
+  if (!job.ppfScope) return "waiting_scope";
+  if (job.serviceDone && job.serviceDone.ppf) return "with_ahmed";
+  if (!job.ppfProgress || !job.ppfProgress.startedAt) return "not_started";
+  const car = ppfCarFromJob(job);
+  const t = ppfComputeTotals(car, ppfDoneSet(job), ppfSkippedSet(job));
+  return (t.total > 0 && t.done === t.total) ? "ready" : "in_progress";
+}
+// sedan/coupe: 2-2.5 shop-days; SUV/pickup: 3-4 shop-days. A shop-day is
+// the same 10-hour open window (9am-7pm) businessMsElapsed already uses.
+function ppfTargetHours(bodyType) {
+  const wide = bodyType === "suv" || bodyType === "pickup";
+  return wide ? { min: 30, max: 40 } : { min: 20, max: 25 };
+}
+function ppfWhatBookedLabel(job, matcher) {
+  const picks = (job.treatments || {}).ppf || [];
+  return picks.find((t) => matcher.test(t)) || null;
+}
+// Tint defaults ON when a Window Tinting treatment is booked; foilwork
+// (labelled by whichever of these was actually booked) defaults ON when
+// FoilWork / a sticker install / a PPF removal is booked.
+function ppfDefaultExtras(job) {
+  const tint = !!ppfWhatBookedLabel(job, /window tint/i);
+  const foilLabel = ppfWhatBookedLabel(job, /foilwork|sticker installation|ppf removal/i);
+  return { tint, foilwork: !!foilLabel, foilworkLabel: foilLabel || "FoilWork", doorCups: false };
+}
+
+// ---- audio / haptics (only ever started by a tap, same as the mockup) ----
+let ppfAudioCtx = null;
+function ppfCtx() { if (!ppfAudioCtx) { try { ppfAudioCtx = new (window.AudioContext || window.webkitAudioContext)(); } catch { ppfAudioCtx = null; } } return ppfAudioCtx; }
+function ppfTone(freq, dur, type, peak, delay) {
+  const a = ppfCtx(); if (!a) return;
+  try {
+    if (a.state === "suspended") a.resume();
+    const t0 = a.currentTime + (delay || 0), osc = a.createOscillator(), gain = a.createGain();
+    osc.type = type || "sine"; osc.frequency.setValueAtTime(freq, t0);
+    gain.gain.setValueAtTime(0.0001, t0);
+    gain.gain.exponentialRampToValueAtTime(peak || 0.2, t0 + 0.012);
+    gain.gain.exponentialRampToValueAtTime(0.0001, t0 + dur);
+    osc.connect(gain); gain.connect(a.destination);
+    osc.start(t0); osc.stop(t0 + dur + 0.02);
+  } catch { /* ignore */ }
+}
+function ppfPlayDing() { ppfTone(880, 0.16, "sine", 0.22, 0); ppfTone(1320, 0.14, "sine", 0.16, 0.05); }
+function ppfPlayUndo() { ppfTone(320, 0.14, "triangle", 0.18, 0); }
+function ppfPlayChime() { ppfTone(660, 0.18, "sine", 0.2, 0); ppfTone(990, 0.18, "sine", 0.18, 0.09); ppfTone(1320, 0.24, "sine", 0.18, 0.18); }
+function ppfPlayStart() { ppfTone(520, 0.12, "square", 0.12, 0); ppfTone(780, 0.14, "square", 0.1, 0.08); }
+function ppfVibrate(ms) { try { if (navigator.vibrate) navigator.vibrate(ms); } catch { /* ignore */ } }
+
+// ---- one-time DOM setup: SVG <defs> (icons/patterns) + diagram CSS ----
+let ppfDefsInjected = false;
+function injectPPFSvgDefsOnce() {
+  if (ppfDefsInjected || typeof document === "undefined") return;
+  if (document.getElementById("ppf-svg-defs-root")) { ppfDefsInjected = true; return; }
+  const div = document.createElement("div");
+  div.id = "ppf-svg-defs-root";
+  div.style.cssText = "position:absolute;width:0;height:0;overflow:hidden;";
+  div.innerHTML = PPF_SVG_DEFS;
+  document.body.appendChild(div);
+  ppfDefsInjected = true;
+}
+const PPF_ROOM_CSS = `
+.ppfr-bp{ position:relative; border-radius:16px; border:1px solid #1F3D60; background:linear-gradient(165deg,#0B1E33,#0E2742); overflow:hidden; }
+.ppfr-bp-scroll{ overflow-x:auto; overflow-y:hidden; -webkit-overflow-scrolling:touch; transition:filter .2s ease; }
+.ppfr-bp-scroll svg.bp-svg{ display:block; width:100%; height:auto; max-height:66vh; }
+.ppfr-bp.locked .ppfr-bp-scroll{ filter:grayscale(.7) brightness(.55); pointer-events:none; }
+.ppfr-start-overlay{ position:absolute; inset:0; display:flex; align-items:center; justify-content:center; z-index:5; background:rgba(6,14,26,.4); }
+.ppfr-start-btn{ width:150px; height:150px; border-radius:50%; background:radial-gradient(circle at 35% 30%, #E8C34A, #C9A227 60%, #9C7D1A); border:none; color:#1a1608; font-weight:700; font-size:22px; display:flex; flex-direction:column; align-items:center; justify-content:center; gap:8px; cursor:pointer; box-shadow:0 10px 30px rgba(0,0,0,.5); font-family:'IBM Plex Sans Condensed','IBM Plex Sans',sans-serif; }
+.ppfr-card{ transition:transform .1s ease; }
+.ppfr-card:active{ transform:scale(.97); }
+@keyframes ppfrPulse{ 0%,100%{ box-shadow:0 0 0 0 rgba(74,122,87,.55);} 50%{ box-shadow:0 0 0 12px rgba(74,122,87,0);} }
+.ppfr-finish-pulse{ animation:ppfrPulse 1.6s ease-in-out infinite; }
+@media (max-width:760px){ .ppfr-bp-scroll svg.bp-svg{ min-width:760px; } }
+`;
+let ppfRoomStylesInjected = false;
+function injectPPFRoomStyles() {
+  if (ppfRoomStylesInjected || typeof document === "undefined") return;
+  if (document.getElementById("ppf-room-styles")) { ppfRoomStylesInjected = true; return; }
+  const style = document.createElement("style");
+  style.id = "ppf-room-styles";
+  style.textContent = PPF_ROOM_CSS;
+  document.head.appendChild(style);
+  ppfRoomStylesInjected = true;
+}
+function usePPFRoomSetup() {
+  useEffect(() => { injectPPFDiagramStyles(); injectPPFRoomStyles(); injectPPFSvgDefsOnce(); }, []);
+}
+
+// ---- diagram panel: renders buildSheet() and delegates taps ----
+function PPFDiagramPanel({ car, mode, progress, onZoneTap, locked, minHeight, overlay }) {
+  const svg = useMemo(() => buildSheet(car, mode, progress), [car.bodyShape, car.tintBooked, car.spare, JSON.stringify(car.scope.z), mode, progress && progress.done && Array.from(progress.done).join(","), progress && progress.skipped && Array.from(progress.skipped).join(",")]);
+  const onClick = (e) => {
+    if (!onZoneTap) return;
+    const el = e.target.closest && e.target.closest("[data-zone]");
+    if (!el) return;
+    onZoneTap(el.getAttribute("data-zone"));
+  };
+  if (!car.bodyShape) {
+    return <div style={{ ...cardStyle, textAlign: "center", color: COLORS.muted, fontSize: 13, padding: 24 }}>Body shape not set yet.</div>;
+  }
+  return (
+    <div className={`ppfr-bp${locked ? " locked" : ""}`} style={{ minHeight: minHeight || undefined }}>
+      <div className="ppfr-bp-scroll" onClick={onClick} dangerouslySetInnerHTML={{ __html: svg }} />
+      {overlay && <div className="ppfr-start-overlay">{overlay}</div>}
+    </div>
+  );
+}
+
+// ---- body-shape picker for legacy jobs with no bodyType set ----
+function PPFBodyShapePicker({ value, onSelect, disabled }) {
+  return (
+    <div style={{ display: "grid", gridTemplateColumns: "repeat(4, 1fr)", gap: 8 }}>
+      {BODY_TYPES.map((b) => (
+        <button
+          key={b.key}
+          type="button"
+          disabled={disabled}
+          onClick={() => onSelect(b.key)}
+          className="mrcap-press"
+          style={{ background: value === b.key ? "#211c0c" : COLORS.panel2, border: `2px solid ${value === b.key ? COLORS.gold : COLORS.line}`, borderRadius: 14, padding: "12px 6px", display: "flex", flexDirection: "column", alignItems: "center", gap: 6, cursor: disabled ? "default" : "pointer" }}
+        >
+          <BodyTypeIcon type={b.key} color={value === b.key ? COLORS.goldBright : COLORS.ink} />
+          <span style={{ fontFamily: DISPLAY_FONT, fontWeight: 700, fontSize: 13, color: value === b.key ? COLORS.goldBright : COLORS.ink }}>{b.label}</span>
+        </button>
+      ))}
+    </div>
+  );
+}
+
+/* ---------------- PPF scope editor (Ahmed, on the job card) ----------------
+   Editable by admins + role "intake"; read-only preview for everyone else
+   (they get PPFOfficeView instead — see JobDetail). Every tap edits local
+   draft state; "Send to PPF Room" is the one thing that actually saves. */
+function PPFScopeEditor({ job, session, team, onSaved }) {
+  usePPFRoomSetup();
+  const canEdit = session.role === "admin" || session.role === "intake";
+  const defaults = ppfDefaultExtras(job);
+  const [bodyType, setBodyType] = useState(job.bodyType || "");
+  const [scope, setScope] = useState(() => job.ppfScope ? { preset: job.ppfScope.preset, edited: !!job.ppfScope.edited, z: { ...(job.ppfScope.zones || {}) } } : { preset: "partial_front", edited: false, z: {} });
+  const [extras, setExtras] = useState(() => job.ppfScope ? { ...defaults, ...(job.ppfScope.extras || {}) } : defaults);
+  const [spare, setSpare] = useState(!!(job.ppfScope && job.ppfScope.spare));
+  const [note, setNote] = useState((job.ppfScope && job.ppfScope.note) || "");
+  const [collapsed, setCollapsed] = useState(!!job.ppfScope);
+  const [saving, setSaving] = useState(false);
+  const [hint, setHint] = useState(null); // { label, count, oftenSkipped, avgDays, avgFilm, typicalKeys, perPanelFallback }
+  const [savingBodyType, setSavingBodyType] = useState(false);
+
+  useEffect(() => {
+    let cancelled = false;
+    (async () => {
+      if (!job.make) { setHint(null); return; }
+      const enc = (s) => encodeURIComponent(s);
+      let rows = [];
+      let label = null;
+      if (job.make && job.model) {
+        const { ok, data } = await sbFetch(`jobs?select=id,make,model,body_type,ppf_scope,ppf_progress&make=eq.${enc(job.make)}&model=eq.${enc(job.model)}&ppf_progress-%3Ereview=not.is.null&limit=50`);
+        if (ok && data && data.length) { rows = data; label = `${job.make} ${job.model}`.trim(); }
+      }
+      if (!rows.length && (bodyType || job.bodyType)) {
+        const bt = bodyType || job.bodyType;
+        const { ok, data } = await sbFetch(`jobs?select=id,make,model,body_type,ppf_scope,ppf_progress&body_type=eq.${enc(bt)}&ppf_progress-%3Ereview=not.is.null&limit=80`);
+        if (ok && data && data.length) { rows = data; label = `${BODY_TYPE_LABEL[bt] || bt}`; }
+      }
+      if (cancelled) return;
+      if (!rows.length) { setHint(null); return; }
+      const reviews = rows.map((r) => (r.ppf_progress || {}).review).filter(Boolean);
+      if (!reviews.length) { setHint(null); return; }
+      // most-common actual panels (present in >=50% of reviewed jobs)
+      const freq = {};
+      reviews.forEach((rv) => (rv.actualKeys || []).forEach((k) => { freq[k] = (freq[k] || 0) + 1; }));
+      const half = reviews.length / 2;
+      const typicalKeys = Object.keys(freq).filter((k) => freq[k] >= half);
+      // often-skipped panels (present as skipped in >=30% of jobs, min 2)
+      const skipFreq = {};
+      rows.forEach((r) => {
+        const zones = ((r.ppf_progress || {}).zones) || {};
+        Object.keys(zones).forEach((k) => { if (zones[k] && zones[k].skipped) skipFreq[k] = (skipFreq[k] || 0) + 1; });
+      });
+      const oftenSkipped = Object.keys(skipFreq).filter((k) => skipFreq[k] >= Math.max(2, rows.length * 0.3)).sort((a, b) => skipFreq[b] - skipFreq[a]).slice(0, 4).map((k) => zoneName(k, bodyType || job.bodyType || rows[0].body_type));
+      // avg shop-days (business hours / 10h day)
+      const days = reviews.map((rv, i) => {
+        const pr = (rows[i].ppf_progress) || {};
+        if (!pr.startedAt || !pr.finishedAt) return null;
+        return businessMsElapsed(new Date(pr.startedAt).getTime(), new Date(pr.finishedAt).getTime()) / 3600000 / 10;
+      }).filter((d) => d != null && d > 0);
+      const avgDays = days.length ? (days.reduce((a, b) => a + b, 0) / days.length) : null;
+      // avg film metres + metres/panel fallback
+      const films = reviews.filter((rv) => rv.filmMetres != null).map((rv) => Number(rv.filmMetres));
+      const avgFilm = films.length ? (films.reduce((a, b) => a + b, 0) / films.length) : null;
+      const perPanel = reviews.filter((rv) => rv.filmMetres != null && (rv.actualKeys || []).length > 0)
+        .map((rv) => Number(rv.filmMetres) / rv.actualKeys.length);
+      const perPanelFallback = perPanel.length ? { rate: perPanel.reduce((a, b) => a + b, 0) / perPanel.length, n: perPanel.length } : null;
+      setHint({ label, count: rows.length, oftenSkipped, avgDays, avgFilm, typicalKeys, perPanelFallback });
+    })();
+    return () => { cancelled = true; };
+  }, [job.make, job.model, bodyType, job.bodyType]);
+
+  const effectiveBodyType = bodyType || job.bodyType || "";
+  const carDraft = { bodyShape: effectiveBodyType, tintBooked: extras.tint, spare, extras, scope };
+
+  const chooseBodyType = async (bt) => {
+    setBodyType(bt);
+    setSavingBodyType(true);
+    const updated = { ...job, bodyType: bt, updatedAt: Date.now() };
+    const saved = await saveJob(updated);
+    setSavingBodyType(false);
+    onSaved(updated, saved);
+  };
+
+  const applyPreset = (p) => {
+    setScope({ preset: p, edited: false, z: presetZones(p, { bodyShape: effectiveBodyType, spare }) });
+    ppfTone2();
+  };
+  function ppfTone2() { try { ppfPlayDing(); } catch { /* ignore */ } }
+
+  const toggleZone = (key) => {
+    if (!canEdit) return;
+    setScope((s) => {
+      const next = nextZoneState({ scope: s }, key);
+      const z = { ...s.z };
+      if (next) z[key] = next; else delete z[key];
+      return { preset: s.preset === "custom" ? "custom" : s.preset, edited: s.preset !== "custom" ? true : s.edited, z };
+    });
+    ppfVibrate(8);
+  };
+
+  const useTypical = () => {
+    if (!hint || !hint.typicalKeys) return;
+    const z = {};
+    hint.typicalKeys.forEach((k) => { z[k] = "full"; });
+    setScope({ preset: "custom", edited: true, z });
+  };
+
+  const send = async () => {
+    setSaving(true);
+    const n = scopeKeys({ bodyShape: effectiveBodyType, spare, scope }).length;
+    const ppfScope = {
+      preset: scope.preset, edited: scope.edited, zones: scope.z,
+      extras: { tint: extras.tint, foilwork: extras.foilwork, doorCups: extras.doorCups },
+      spare, note, setBy: session.name, setAt: Date.now(),
+    };
+    const label = scopeLabel({ bodyShape: effectiveBodyType, spare, scope });
+    const updated = {
+      ...job,
+      bodyType: effectiveBodyType || job.bodyType,
+      ppfScope,
+      history: [...(job.history || []), { stage: "ppf_scope", label: "PPF Room", by: session.name, role: session.role, note: `PPF scope set: ${label} · ${n} panel${n === 1 ? "" : "s"}`, at: Date.now() }],
+      updatedAt: Date.now(),
+    };
+    const saved = await saveJob(updated);
+    setSaving(false);
+    setCollapsed(true);
+    onSaved(updated, saved);
+  };
+
+  const n = scopeKeys({ bodyShape: effectiveBodyType, spare, scope }).length;
+
+  if (collapsed) {
+    return (
+      <section style={{ ...cardStyle, marginBottom: 16 }}>
+        <button onClick={() => setCollapsed(false)} className="mrcap-press" style={{ width: "100%", background: "none", border: "none", padding: 0, cursor: "pointer", textAlign: "left" }}>
+          <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", gap: 8 }}>
+            <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
+              <ShieldCheck size={16} color={COLORS.gold} />
+              <div style={{ fontFamily: DISPLAY_FONT, fontWeight: 700, fontSize: 15, color: COLORS.ink }}>PPF scope</div>
+            </div>
+            <ChevronDown size={16} color={COLORS.muted} />
+          </div>
+          <div style={{ fontSize: 12.5, color: COLORS.muted, marginTop: 6 }}>
+            {job.ppfScope ? `${scopeLabel({ bodyShape: effectiveBodyType, spare, scope })} · ${n} panel${n === 1 ? "" : "s"}` : "Not set yet"}
+          </div>
+        </button>
+      </section>
+    );
+  }
+
+  return (
+    <section style={{ ...cardStyle, marginBottom: 16 }}>
+      <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", gap: 8, marginBottom: 10 }}>
+        <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
+          <ShieldCheck size={16} color={COLORS.gold} />
+          <div style={{ fontFamily: DISPLAY_FONT, fontWeight: 700, fontSize: 16, color: COLORS.ink }}>PPF scope</div>
+        </div>
+        {job.ppfScope && <button onClick={() => setCollapsed(true)} className="mrcap-press" style={{ background: "none", border: "none", color: COLORS.muted, cursor: "pointer", padding: 4 }}><ChevronUp size={16} /></button>}
+      </div>
+      {!canEdit && <div style={{ fontSize: 12, color: COLORS.muted, marginBottom: 10 }}>Read-only — only admins and intake can edit the scope.</div>}
+
+      {!effectiveBodyType ? (
+        <div>
+          <div style={{ fontSize: 13, color: COLORS.muted, marginBottom: 10 }}>Body shape wasn't set at intake — pick it to open the scope diagram.</div>
+          <PPFBodyShapePicker value={bodyType} onSelect={chooseBodyType} disabled={!canEdit || savingBodyType} />
+        </div>
+      ) : (
+        <fieldset disabled={!canEdit} style={{ border: "none", padding: 0, margin: 0 }}>
+          <div style={{ display: "flex", flexWrap: "wrap", gap: 6, marginBottom: 10 }}>
+            {PRESET_ORDER.map((p) => {
+              const on = scope.edited ? p === "custom" : scope.preset === p;
+              const label = (p === "custom" && scope.edited) ? "Custom (edited)" : PRESETS[p].label;
+              return (
+                <button key={p} type="button" onClick={() => applyPreset(p)} className="mrcap-press" style={{ background: on ? COLORS.gold : COLORS.panel2, border: `1px solid ${on ? COLORS.gold : COLORS.line}`, color: on ? COLORS.darkText : COLORS.ink, borderRadius: 999, padding: "8px 14px", fontFamily: DISPLAY_FONT, fontWeight: 700, fontSize: 13, cursor: canEdit ? "pointer" : "default" }}>
+                  {label}
+                </button>
+              );
+            })}
+          </div>
+
+          {hint && (
+            <div style={{ background: "rgba(201,162,39,0.08)", border: `1px solid ${COLORS.goldDeep}`, borderRadius: 12, padding: "10px 12px", marginBottom: 10, fontSize: 12.5, color: COLORS.ink, lineHeight: 1.5 }}>
+              <div>Past {hint.label} jobs ({hint.count}): {hint.typicalKeys.length ? `usually ${hint.typicalKeys.length} panels` : "not enough data yet"}
+                {hint.oftenSkipped.length ? ` · often skipped: ${hint.oftenSkipped.join(", ")}` : ""}
+                {hint.avgDays ? ` · avg ${hint.avgDays.toFixed(1)} shop-days` : ""}
+                {hint.avgFilm ? ` · avg ${hint.avgFilm.toFixed(1)} m film` : ""}
+              </div>
+              {!hint.avgFilm && hint.perPanelFallback && (
+                <div style={{ marginTop: 4, color: COLORS.muted }}>est. ~{(hint.perPanelFallback.rate * n).toFixed(1)} m film ({hint.perPanelFallback.rate.toFixed(1)} m/panel from {hint.perPanelFallback.n} {BODY_TYPE_LABEL[effectiveBodyType] || ""} jobs)</div>
+              )}
+              {canEdit && hint.typicalKeys.length > 0 && (
+                <button type="button" onClick={useTypical} className="mrcap-press" style={{ marginTop: 8, background: COLORS.panel2, border: `1px solid ${COLORS.gold}`, color: COLORS.goldBright, borderRadius: 8, padding: "6px 12px", fontSize: 12, fontWeight: 700, cursor: "pointer" }}>Use typical</button>
+              )}
+            </div>
+          )}
+
+          <div style={{ marginBottom: 10 }}>
+            <PPFDiagramPanel car={carDraft} mode="scope" onZoneTap={toggleZone} minHeight={260} />
+          </div>
+
+          <div style={{ display: "flex", justifyContent: "space-between", alignItems: "flex-end", gap: 10, marginBottom: 10, flexWrap: "wrap" }}>
+            <div>
+              <div style={{ fontFamily: DISPLAY_FONT, fontWeight: 700, fontSize: 26, color: COLORS.ink }}><span style={{ color: COLORS.goldBright }}>{n}</span> panel{n === 1 ? "" : "s"} to do</div>
+              <div style={{ fontFamily: MONO_FONT, fontSize: 12.5, color: COLORS.muted, marginTop: 4 }}>{ppfBreakdown({ bodyShape: effectiveBodyType, spare, scope })}</div>
+            </div>
+          </div>
+          <div style={{ fontSize: 11.5, color: COLORS.muted, marginBottom: 10 }}>Tap a panel to add or remove it. Bonnet and front fenders: Off → Full → ½ (front 40%) → Off.</div>
+
+          <div style={{ display: "flex", flexWrap: "wrap", gap: 6, marginBottom: 10 }}>
+            <button type="button" onClick={() => setExtras((x) => ({ ...x, tint: !x.tint }))} className="mrcap-press" style={extraChipStyle(extras.tint)}>{extras.tint ? "✓ " : "+ "}Window tint · 4 glass areas</button>
+            <button type="button" onClick={() => setExtras((x) => ({ ...x, foilwork: !x.foilwork }))} className="mrcap-press" style={extraChipStyle(extras.foilwork)}>{extras.foilwork ? "✓ " : "+ "}{extras.foilworkLabel || "FoilWork"} (whole job)</button>
+            <button type="button" onClick={() => setExtras((x) => ({ ...x, doorCups: !x.doorCups }))} className="mrcap-press" style={extraChipStyle(extras.doorCups)}>{extras.doorCups ? "✓ " : "+ "}Door cups & edges</button>
+          </div>
+
+          {effectiveBodyType === "suv" && (
+            <div style={{ marginBottom: 10 }}>
+              <button type="button" onClick={() => setSpare((s) => !s)} className="mrcap-press" style={extraChipStyle(spare)}>{spare ? "✓ " : "+ "}Spare wheel on back</button>
+            </div>
+          )}
+
+          <textarea value={note} onChange={(e) => setNote(e.target.value)} placeholder="Note for the PPF team (optional)" style={{ width: "100%", minHeight: 64, background: COLORS.panel2, border: `1px solid ${COLORS.line}`, borderRadius: 10, color: COLORS.ink, padding: 10, fontFamily: BODY_FONT, fontSize: 13.5, marginBottom: 10, boxSizing: "border-box" }} />
+
+          {canEdit && (
+            <button type="button" onClick={send} disabled={saving || n === 0} className="mrcap-press" style={{ ...primaryBtnStyle, width: "100%", opacity: (saving || n === 0) ? 0.6 : 1 }}>
+              {saving ? "Sending…" : "Send to PPF Room"}
+            </button>
+          )}
+        </fieldset>
+      )}
+    </section>
+  );
+}
+function extraChipStyle(on) {
+  return { background: on ? "#2a2410" : COLORS.panel2, border: `1px solid ${on ? COLORS.gold : COLORS.line}`, color: on ? COLORS.goldBright : COLORS.ink, borderRadius: 10, padding: "8px 12px", fontSize: 12.5, fontWeight: 600, cursor: "pointer" };
+}
+
+/* ---------------- Office view (read-only, job card) ---------------- */
+function PPFOfficeView({ job, team }) {
+  usePPFRoomSetup();
+  if (!job.ppfScope) {
+    return (
+      <section style={{ ...cardStyle, marginBottom: 16 }}>
+        <div style={{ display: "flex", alignItems: "center", gap: 8, marginBottom: 6 }}><ShieldCheck size={16} color={COLORS.muted} /><div style={{ fontFamily: DISPLAY_FONT, fontWeight: 700, fontSize: 15, color: COLORS.ink }}>PPF Room</div></div>
+        <div style={{ fontSize: 12.5, color: COLORS.muted }}>Scope not set yet — waiting on Ahmed.</div>
+      </section>
+    );
+  }
+  const car = ppfCarFromJob(job);
+  const doneSet = ppfDoneSet(job), skippedSet = ppfSkippedSet(job);
+  const t = ppfComputeTotals(car, doneSet, skippedSet);
+  const status = ppfKioskStatus(job);
+  const keys = scopeKeys(car);
+  const pr = job.ppfProgress || {};
+  const started = pr.startedAt || null;
+  const workedMs = started ? businessMsElapsed(new Date(started).getTime(), pr.finishedAt ? new Date(pr.finishedAt).getTime() : Date.now()) : 0;
+  const workedHours = workedMs / 3600000;
+  const target = ppfTargetHours(job.bodyType);
+  const overTarget = started && !pr.finishedAt && workedHours > target.max;
+  const review = pr.review || null;
+  const ppfTeam = (team || []).filter((m) => m.role === "ppf");
+  const log = (pr.log || []).slice().reverse().slice(0, 20);
+  return (
+    <section style={{ ...cardStyle, marginBottom: 16 }}>
+      <div style={{ display: "flex", alignItems: "center", gap: 8, marginBottom: 10 }}>
+        <ShieldCheck size={16} color={COLORS.gold} />
+        <div style={{ fontFamily: DISPLAY_FONT, fontWeight: 700, fontSize: 16, color: COLORS.ink }}>PPF Room</div>
+        <span style={{ marginLeft: "auto" }}><Pill tone={status === "ready" || status === "with_ahmed" ? "green" : status === "in_progress" ? "yellow" : "default"}>{PPF_STATE_LABEL[status]}</Pill></span>
+      </div>
+
+      <div style={{ marginBottom: 10 }}>
+        <PPFDiagramPanel car={car} mode="ro" progress={{ done: doneSet, skipped: skippedSet }} minHeight={220} />
+      </div>
+
+      <div style={{ fontFamily: MONO_FONT, fontWeight: 700, fontSize: 15, color: COLORS.ink, marginBottom: 4 }}>{t.done} of {t.total}</div>
+      <div style={{ fontSize: 12.5, color: COLORS.muted, marginBottom: 10 }}>{scopeLabel(car)} · {keys.length} panel{keys.length === 1 ? "" : "s"}</div>
+      <div style={{ display: "flex", flexWrap: "wrap", gap: 4, marginBottom: 10 }}>
+        {keys.map((k) => (
+          <span key={k} style={{ fontSize: 11, background: COLORS.panel2, border: `1px solid ${COLORS.line}`, borderRadius: 999, padding: "3px 9px", color: doneSet.has(k) ? COLORS.successText : skippedSet.has(k) ? COLORS.muted : COLORS.ink }}>
+            {doneSet.has(k) ? "✓ " : skippedSet.has(k) ? "⊘ " : ""}{zoneName(k, job.bodyType)}{car.scope.z[k] === "partial" ? " (½)" : ""}
+          </span>
+        ))}
+      </div>
+      {(car.extras.tint || car.extras.foilwork || car.extras.doorCups) && (
+        <div style={{ fontSize: 12.5, color: COLORS.ink, marginBottom: 10 }}>
+          Also: {[car.extras.tint && "Window tint (4)", car.extras.foilwork && "FoilWork", car.extras.doorCups && "Door cups & edges"].filter(Boolean).join(" · ")}
+        </div>
+      )}
+      {job.ppfScope.note && <div style={{ fontSize: 12.5, color: COLORS.muted, marginBottom: 10 }}>Note: "{job.ppfScope.note}"</div>}
+
+      <div style={{ display: "flex", flexWrap: "wrap", gap: 8, marginBottom: 10 }}>
+        <div style={{ flex: 1, minWidth: 130, background: COLORS.panel2, border: `1px solid ${COLORS.line}`, borderRadius: 10, padding: "8px 10px" }}>
+          <div style={{ fontSize: 10.5, color: COLORS.muted, textTransform: "uppercase" }}>Started</div>
+          <div style={{ fontFamily: MONO_FONT, fontSize: 12.5, color: COLORS.ink }}>{started ? fmtTime(new Date(started).getTime()) : "Not started yet"}</div>
+        </div>
+        <div style={{ flex: 1, minWidth: 130, background: COLORS.panel2, border: `1px solid ${COLORS.line}`, borderRadius: 10, padding: "8px 10px" }}>
+          <div style={{ fontSize: 10.5, color: COLORS.muted, textTransform: "uppercase" }}>Work time (shop hours)</div>
+          <div style={{ fontFamily: MONO_FONT, fontSize: 12.5, color: COLORS.ink }}>{Math.floor(workedHours)}h {Math.round((workedHours % 1) * 60)}m</div>
+          <div style={{ fontSize: 10.5, color: COLORS.muted, marginTop: 4 }}>Target: {BODY_TYPE_LABEL[job.bodyType] || ""} {target.min / 10}–{target.max / 10} days</div>
+          {overTarget && <Pill tone="red">Over target</Pill>}
+        </div>
+      </div>
+
+      {review && (
+        <div style={{ background: COLORS.panel2, border: `1px solid ${COLORS.line}`, borderRadius: 10, padding: "8px 10px", marginBottom: 10 }}>
+          <div style={{ fontSize: 10.5, color: COLORS.muted, textTransform: "uppercase" }}>Film used</div>
+          <div style={{ fontFamily: MONO_FONT, fontSize: 13, color: COLORS.ink }}>
+            {review.filmMetres != null ? `${Number(review.filmMetres).toFixed(1)} m (${review.rollWidth || "?"} m roll)` : "Not recorded"}
+          </div>
+        </div>
+      )}
+
+      {ppfTeam.length > 0 && (
+        <div style={{ marginBottom: 10 }}>
+          <div style={{ fontSize: 10.5, color: COLORS.muted, textTransform: "uppercase", marginBottom: 4 }}>PPF team credit</div>
+          <div style={{ display: "flex", gap: 6 }}>
+            {ppfTeam.map((m) => <span key={m.id} title={m.name} style={{ width: 30, height: 30, borderRadius: "50%", background: COLORS.panel, border: `1px solid ${COLORS.goldDeep}`, color: COLORS.goldBright, display: "flex", alignItems: "center", justifyContent: "center", fontWeight: 700, fontSize: 12.5, fontFamily: DISPLAY_FONT }}>{m.name[0]}</span>)}
+          </div>
+        </div>
+      )}
+
+      {log.length > 0 && (
+        <div>
+          <div style={{ fontSize: 10.5, color: COLORS.muted, textTransform: "uppercase", marginBottom: 4 }}>Activity</div>
+          <ul style={{ listStyle: "none", margin: 0, padding: 0, display: "flex", flexDirection: "column", gap: 4, maxHeight: 200, overflowY: "auto" }}>
+            {log.map((a, i) => (
+              <li key={i} style={{ display: "flex", gap: 8, fontSize: 12, borderBottom: `1px solid ${COLORS.line}`, paddingBottom: 4 }}>
+                <span style={{ color: a.action === "undone" ? COLORS.dangerText : COLORS.successText, fontWeight: 600 }}>
+                  {a.key === "job" ? (a.action === "started" ? "▶ Job started" : "✓ Sent to Ahmed") : `${a.action === "done" ? "✓" : a.action === "skipped" ? "⊘" : "↶"} ${zoneName(a.key, job.bodyType)}`}
+                </span>
+                <span style={{ marginLeft: "auto", color: COLORS.muted, fontFamily: MONO_FONT, fontSize: 11 }}>{fmtTime(a.at)}</span>
+              </li>
+            ))}
+          </ul>
+        </div>
+      )}
+    </section>
+  );
+}
+
+/* ---------------- Reviewer step extension (Ahmed's approval) ----------------
+   Swapped in for the plain "Confirm review" button when s.key === "ppf". */
+function PPFReviewerPanel({ job, onApprove }) {
+  usePPFRoomSetup();
+  const car = ppfCarFromJob(job);
+  const doneSet = ppfDoneSet(job);
+  const [actualKeys, setActualKeys] = useState(() => Array.from(doneSet));
+  const [note, setNote] = useState("");
+  const [filmMetres, setFilmMetres] = useState("");
+  const [rollWidth, setRollWidth] = useState(() => { try { return window.localStorage.getItem("mrcap_ppf_roll_width") || "1.52"; } catch { return "1.52"; } });
+  const [customRoll, setCustomRoll] = useState("");
+  const [submitting, setSubmitting] = useState(false);
+
+  const setRoll = (v) => { setRollWidth(v); try { window.localStorage.setItem("mrcap_ppf_roll_width", v); } catch { /* ignore */ } };
+
+  const actualSet = new Set(actualKeys);
+  const toggleActual = (key) => {
+    setActualKeys((cur) => cur.includes(key) ? cur.filter((k) => k !== key) : [...cur, key]);
+  };
+  const step = (delta) => setFilmMetres((v) => { const n = Math.max(0, Math.round(((Number(v) || 0) + delta) * 2) / 2); return String(n); });
+
+  const submit = async () => {
+    setSubmitting(true);
+    const rw = rollWidth === "other" ? (Number(customRoll) || null) : Number(rollWidth);
+    await onApprove({ actualKeys, note, filmMetres: filmMetres !== "" ? Number(filmMetres) : null, rollWidth: rw });
+    setSubmitting(false);
+  };
+
+  return (
+    <div>
+      <div style={{ marginBottom: 8 }}>
+        <PPFDiagramPanel car={{ ...car, scope: { z: scopeKeys(car).reduce((o, k) => ({ ...o, [k]: car.scope.z[k] || "full" }), {}) } }} mode="tablet" progress={{ done: actualSet }} onZoneTap={toggleActual} minHeight={220} />
+      </div>
+      <div style={{ fontSize: 11.5, color: COLORS.muted, marginBottom: 10 }}>Tap panels to correct the actual set — pre-filled from what the tablet marked done.</div>
+
+      <div style={{ marginBottom: 10 }}>
+        <div style={{ fontSize: 11, color: COLORS.muted, textTransform: "uppercase", marginBottom: 6 }}>Film used (metres, optional)</div>
+        <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
+          <button type="button" onClick={() => step(-0.5)} className="mrcap-press" style={{ width: 44, height: 44, borderRadius: 10, background: COLORS.panel2, border: `1px solid ${COLORS.line}`, color: COLORS.ink, fontSize: 20, fontWeight: 700, cursor: "pointer" }}>−</button>
+          <input type="number" step="0.5" min="0" value={filmMetres} onChange={(e) => setFilmMetres(e.target.value)} placeholder="0.0" style={{ width: 90, textAlign: "center", background: COLORS.panel2, border: `1px solid ${COLORS.line}`, borderRadius: 10, padding: "10px 6px", fontFamily: MONO_FONT, fontSize: 16, color: COLORS.ink }} />
+          <button type="button" onClick={() => step(0.5)} className="mrcap-press" style={{ width: 44, height: 44, borderRadius: 10, background: COLORS.panel2, border: `1px solid ${COLORS.line}`, color: COLORS.ink, fontSize: 20, fontWeight: 700, cursor: "pointer" }}>+</button>
+          <select value={rollWidth} onChange={(e) => setRoll(e.target.value)} style={{ marginLeft: "auto", background: COLORS.panel2, border: `1px solid ${COLORS.line}`, borderRadius: 10, padding: "10px 8px", color: COLORS.ink, fontSize: 13 }}>
+            <option value="1.52">1.52 m roll</option>
+            <option value="1.22">1.22 m roll</option>
+            <option value="other">Other</option>
+          </select>
+          {rollWidth === "other" && <input type="number" step="0.01" value={customRoll} onChange={(e) => setCustomRoll(e.target.value)} placeholder="m" style={{ width: 60, background: COLORS.panel2, border: `1px solid ${COLORS.line}`, borderRadius: 10, padding: "10px 6px", color: COLORS.ink, fontSize: 13 }} />}
+        </div>
+      </div>
+
+      <textarea value={note} onChange={(e) => setNote(e.target.value)} placeholder="Comment (optional)" style={{ width: "100%", minHeight: 56, background: COLORS.panel2, border: `1px solid ${COLORS.line}`, borderRadius: 10, color: COLORS.ink, padding: 10, fontFamily: BODY_FONT, fontSize: 13, marginBottom: 10, boxSizing: "border-box" }} />
+
+      <button onClick={submit} disabled={submitting} className="mrcap-press" style={{ ...primaryBtnStyle, width: "100%", minHeight: 42, padding: "8px", fontSize: 13, opacity: submitting ? 0.6 : 1 }}>
+        {submitting ? "Saving…" : "Confirm review"}
+      </button>
+    </div>
+  );
+}
+
+/* ---------------- PPF Room kiosk (tablet, standalone screen) ---------------- */
+function PPFRoomKiosk({ session, onLogout }) {
+  usePPFRoomSetup();
+  const [jobs, setJobs] = useState([]);
+  const [loading, setLoading] = useState(true);
+  const [openId, setOpenId] = useState(null);
+  const [openJob, setOpenJob] = useState(null);
+  const [justDone, setJustDone] = useState(null);
+  const [sheet, setSheet] = useState(null); // { type: "undo"|"finish"|"success", key }
+  const wakeLockRef = useRef(null);
+
+  const refresh = useCallback(async () => {
+    const { ok, data } = await sbFetch(`jobs?select=id,plate,make,model,body_type,service_types,service_done,service_reviewed,treatments,ppf_scope,ppf_progress,stage_index,updated_at&order=updated_at.desc&limit=900`);
+    if (!ok || !data) { setLoading(false); return; }
+    const scoped = data.filter((r) => {
+      if ((STAGES[r.stage_index] || STAGES[0]).key === "collected") return false;
+      if (!(r.service_types || []).includes("ppf")) return false;
+      if ((r.service_reviewed || {}).ppf) return false;
+      return true;
+    }).map((r) => ({
+      id: r.id, plate: r.plate, make: r.make || "", model: r.model || "", bodyType: r.body_type || "",
+      serviceTypes: r.service_types || [], serviceDone: r.service_done || {}, treatments: r.treatments || {},
+      ppfScope: r.ppf_scope || null, ppfProgress: r.ppf_progress || null,
+    }));
+    setJobs(scoped);
+    setLoading(false);
+  }, []);
+
+  useEffect(() => { refresh(); }, [refresh]);
+  useEffect(() => {
+    if (openId) return; // never clobber a car that's open with unsaved taps
+    const t = setInterval(refresh, 15000);
+    return () => clearInterval(t);
+  }, [openId, refresh]);
+
+  useEffect(() => {
+    let released = false;
+    const request = async () => {
+      try {
+        if ("wakeLock" in navigator) {
+          wakeLockRef.current = await navigator.wakeLock.request("screen");
+        }
+      } catch { /* tolerate rejection — not fatal */ }
+    };
+    request();
+    const onVisible = () => { if (document.visibilityState === "visible" && !released) request(); };
+    document.addEventListener("visibilitychange", onVisible);
+    return () => {
+      released = true;
+      document.removeEventListener("visibilitychange", onVisible);
+      try { wakeLockRef.current && wakeLockRef.current.release(); } catch { /* ignore */ }
+    };
+  }, []);
+
+  const openCar = async (id) => {
+    setOpenId(id);
+    const j = await loadJob(id);
+    setOpenJob(j);
+  };
+  const backToList = () => { setOpenId(null); setOpenJob(null); refresh(); };
+
+  if (openId) {
+    return (
+      <PPFRoomCarScreen
+        jobId={openId}
+        job={openJob}
+        onJobChange={setOpenJob}
+        onBack={backToList}
+        sheet={sheet}
+        setSheet={setSheet}
+        justDone={justDone}
+        setJustDone={setJustDone}
+      />
+    );
+  }
+
+  return (
+    <div style={{ padding: "18px 18px 40px", maxWidth: 1100, margin: "0 auto" }}>
+      <div style={{ display: "flex", alignItems: "center", gap: 12, marginBottom: 18, flexWrap: "wrap" }}>
+        <ShieldCheck size={26} color={COLORS.gold} />
+        <div style={{ fontFamily: DISPLAY_FONT, fontWeight: 700, fontSize: 24, color: COLORS.ink, letterSpacing: 1 }}>PPF ROOM</div>
+        <span style={{ marginLeft: "auto" }}><Pill>{session.name}</Pill></span>
+        <button onClick={onLogout} className="mrcap-press" style={{ background: COLORS.panel2, border: `1px solid ${COLORS.line}`, color: COLORS.muted, borderRadius: 10, padding: "8px 14px", fontSize: 12.5, cursor: "pointer" }}>Log out</button>
+      </div>
+      {loading ? (
+        <div style={{ color: COLORS.muted, textAlign: "center", padding: 40 }}>Loading…</div>
+      ) : jobs.length === 0 ? (
+        <div style={{ color: COLORS.muted, textAlign: "center", padding: 40 }}>No PPF jobs right now.</div>
+      ) : (
+        <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fill, minmax(240px, 1fr))", gap: 14 }}>
+          {jobs.map((j) => <PPFRoomCarCard key={j.id} job={j} onOpen={() => openCar(j.id)} />)}
+        </div>
+      )}
+    </div>
+  );
+}
+
+function PPFRoomCarCard({ job, onOpen }) {
+  const status = ppfKioskStatus(job);
+  const disabled = status === "waiting_scope";
+  const car = ppfCarFromJob(job);
+  const t = ppfComputeTotals(car, ppfDoneSet(job), ppfSkippedSet(job));
+  const pct = t.total ? Math.round((t.done / t.total) * 100) : 0;
+  const ringColor = status === "in_progress" ? COLORS.gold : status === "ready" ? COLORS.green : status === "with_ahmed" ? COLORS.blue : COLORS.muted;
+  const borderColor = status === "in_progress" ? COLORS.gold : status === "ready" ? COLORS.green : status === "with_ahmed" ? COLORS.blue : COLORS.line;
+  const treatments = job.treatments && job.treatments.ppf ? job.treatments.ppf : [];
+  const tint = /window tint/i.test(treatments.join(" "));
+  const whole = /foilwork|sticker installation|ppf removal/i.test(treatments.join(" "));
+  return (
+    <button onClick={disabled ? undefined : onOpen} disabled={disabled} className="ppfr-card mrcap-press" style={{ textAlign: "left", background: COLORS.panel2, border: `1px solid ${COLORS.line}`, borderLeft: `6px solid ${borderColor}`, borderRadius: 16, padding: 14, cursor: disabled ? "default" : "pointer", opacity: disabled ? 0.6 : 1, display: "flex", flexDirection: "column", gap: 10 }}>
+      <div style={{ display: "flex", justifyContent: "space-between", alignItems: "flex-start", gap: 8 }}>
+        <PlateChip plate={job.plate} size="md" />
+        <div style={{ display: "flex", gap: 6 }}>
+          <ShieldCheck size={16} color={COLORS.muted} />
+          {tint && <Palette size={16} color={COLORS.muted} />}
+          {whole && <Sparkles size={16} color={COLORS.muted} />}
+        </div>
+      </div>
+      <div>
+        <div style={{ fontFamily: DISPLAY_FONT, fontWeight: 700, fontSize: 18, color: COLORS.ink }}>{job.make || "—"}</div>
+        <div style={{ fontSize: 13, color: COLORS.muted }}>{job.model || ""}</div>
+      </div>
+      <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", gap: 10 }}>
+        <span style={{ fontFamily: DISPLAY_FONT, fontWeight: 700, fontSize: 13, textTransform: "uppercase", letterSpacing: 0.5, color: ringColor }}>{PPF_STATE_LABEL[status]}</span>
+        <div style={{ width: 52, height: 52, borderRadius: "50%", flexShrink: 0, background: `conic-gradient(${ringColor} calc(${pct} * 3.6deg), ${COLORS.line} 0)`, display: "flex", alignItems: "center", justifyContent: "center" }}>
+          <div style={{ width: 38, height: 38, borderRadius: "50%", background: COLORS.panel2, display: "flex", alignItems: "center", justifyContent: "center", fontFamily: MONO_FONT, fontWeight: 700, fontSize: 11, color: COLORS.ink }}>{t.done}/{t.total}</div>
+        </div>
+      </div>
+    </button>
+  );
+}
+
+function PPFRoomCarScreen({ jobId, job, onJobChange, onBack, sheet, setSheet, justDone, setJustDone }) {
+  if (!job) return <div style={{ padding: 40, textAlign: "center", color: COLORS.muted }}>Loading…</div>;
+  const car = ppfCarFromJob(job);
+  const doneSet = ppfDoneSet(job);
+  const skippedSet = ppfSkippedSet(job);
+  const totals = ppfComputeTotals(car, doneSet, skippedSet);
+  const pct = totals.total ? Math.round((totals.done / totals.total) * 100) : 0;
+  const started = !!(job.ppfProgress && job.ppfProgress.startedAt);
+  const allResolved = totals.total > 0 && totals.done === totals.total;
+  const lastKey = job.ppfProgress && job.ppfProgress.history && job.ppfProgress.history.length ? job.ppfProgress.history[job.ppfProgress.history.length - 1] : null;
+
+  const persist = async (updated, playSound) => {
+    onJobChange(updated);
+    if (playSound) playSound();
+    const saved = await saveJob(updated);
+    if (saved) onJobChange((cur) => (cur && cur.id === updated.id ? { ...cur, _base: updated._base } : cur));
+  };
+
+  const start = () => {
+    const now = Date.now();
+    const updated = {
+      ...job,
+      ppfProgress: { startedAt: now, zones: {}, history: [], log: [{ key: "job", action: "started", at: now }] },
+      history: [...(job.history || []), { stage: "ppf_room", label: "PPF Room", by: "PPF Room", role: "ppf", note: "PPF started", at: now }],
+      updatedAt: now,
+    };
+    ppfVibrate(14);
+    persist(updated, ppfPlayStart);
+  };
+
+  const resolveZone = (key, action) => {
+    const now = Date.now();
+    const pr = job.ppfProgress || { startedAt: Date.now(), zones: {}, history: [], log: [] };
+    const zones = { ...(pr.zones || {}) };
+    let history = (pr.history || []).slice();
+    if (action === "done") { zones[key] = { doneAt: now }; history.push(key); }
+    else if (action === "skipped") { zones[key] = { doneAt: now, skipped: true }; history.push(key); }
+    else { delete zones[key]; const idx = history.lastIndexOf(key); if (idx > -1) history.splice(idx, 1); }
+    const log = [...(pr.log || []), { key, action: action === "done" ? "done" : action === "skipped" ? "skipped" : "undone", at: now }];
+    const updated = { ...job, ppfProgress: { ...pr, zones, history, log }, updatedAt: now };
+    return updated;
+  };
+
+  const tapZone = (key) => {
+    if (!isZoneActive(car, key) || !started) return;
+    if (doneSet.has(key) || skippedSet.has(key)) { setSheet({ type: "undo", key }); return; }
+    const updated = resolveZone(key, "done");
+    setJustDone(key);
+    ppfVibrate(18);
+    setTimeout(() => setJustDone(null), 340);
+    persist(updated, ppfPlayDing).then(() => {
+      const t2 = ppfComputeTotals(ppfCarFromJob(updated), ppfDoneSet(updated), ppfSkippedSet(updated));
+      if (t2.total > 0 && t2.done === t2.total) setTimeout(ppfPlayChime, 220);
+    });
+  };
+
+  const undoFooter = () => {
+    if (!lastKey) return;
+    const updated = resolveZone(lastKey, "undo");
+    ppfVibrate(10);
+    persist(updated, ppfPlayUndo);
+  };
+
+  const closeSheet = () => setSheet(null);
+  const sheetNotDone = () => { if (sheet && sheet.key) { const u = resolveZone(sheet.key, "undo"); persist(u, ppfPlayUndo); } closeSheet(); };
+  const sheetNotNeeded = () => { if (sheet && sheet.key) { const u = resolveZone(sheet.key, "skipped"); persist(u, ppfPlayDing); } closeSheet(); };
+
+  const finish = () => setSheet({ type: "finish" });
+  const confirmFinish = async () => {
+    const now = Date.now();
+    const pr = job.ppfProgress || {};
+    const updated = {
+      ...job,
+      ppfProgress: { ...pr, finishedAt: now, log: [...(pr.log || []), { key: "job", action: "finished", at: now }] },
+      serviceDone: { ...job.serviceDone, ppf: true },
+      history: [...(job.history || []), { stage: "ppf_room", label: "PPF Room", by: "PPF Room", role: "ppf", note: "PPF finished — sent to Ahmed", at: now }],
+      updatedAt: now,
+    };
+    onJobChange(updated);
+    ppfPlayChime(); ppfVibrate(30);
+    await saveJob(updated);
+    setSheet({ type: "success" });
+  };
+
+  return (
+    <div style={{ padding: "14px 14px 30px", maxWidth: 1100, margin: "0 auto" }}>
+      <div style={{ display: "flex", alignItems: "center", gap: 12, marginBottom: 12, flexWrap: "wrap" }}>
+        <button onClick={onBack} className="mrcap-press" style={{ width: 56, height: 56, borderRadius: 14, background: COLORS.panel2, border: `1px solid ${COLORS.line}`, display: "flex", alignItems: "center", justifyContent: "center", cursor: "pointer", flexShrink: 0 }}><ChevronLeft size={26} color={COLORS.ink} /></button>
+        <PlateChip plate={job.plate} size="md" />
+        <div style={{ minWidth: 0 }}>
+          <div style={{ fontFamily: DISPLAY_FONT, fontWeight: 700, fontSize: 17, color: COLORS.ink }}>{job.make}</div>
+          <div style={{ fontSize: 12.5, color: COLORS.muted }}>{job.model}</div>
+        </div>
+        <span style={{ marginLeft: "auto" }}><Pill>{job.ppfScope ? scopeLabel(car) : "—"}</Pill></span>
+      </div>
+
+      <div style={{ display: "flex", gap: 12, alignItems: "stretch", flexWrap: "wrap" }}>
+        <div style={{ flex: "1 1 500px", minWidth: 0 }}>
+          <PPFDiagramPanel
+            car={car} mode="tablet" progress={{ done: doneSet, skipped: skippedSet }} onZoneTap={tapZone} locked={!started} minHeight={320}
+            overlay={!started ? (
+              <button onClick={start} className="ppfr-start-btn mrcap-press">
+                <Check size={36} /> START
+              </button>
+            ) : null}
+          />
+        </div>
+        {(car.extras.foilwork || car.extras.doorCups) && (
+          <div style={{ flex: "0 0 180px", display: "flex", flexDirection: "column", gap: 10 }}>
+            {car.extras.foilwork && (
+              <button onClick={() => tapZone("foilwork")} className="mrcap-press" style={wholeTileStyle(doneSet.has("foilwork") || skippedSet.has("foilwork"))}>
+                <Sparkles size={40} /><div style={{ fontFamily: DISPLAY_FONT, fontWeight: 700, fontSize: 18 }}>FoilWork</div><div style={{ fontSize: 11 }}>Whole job</div>
+              </button>
+            )}
+            {car.extras.doorCups && (
+              <button onClick={() => tapZone("door_cups")} className="mrcap-press" style={wholeTileStyle(doneSet.has("door_cups") || skippedSet.has("door_cups"))}>
+                <ShieldCheck size={40} /><div style={{ fontFamily: DISPLAY_FONT, fontWeight: 700, fontSize: 18 }}>Door cups</div><div style={{ fontSize: 11 }}>Whole job</div>
+              </button>
+            )}
+          </div>
+        )}
+      </div>
+
+      <div style={{ display: "flex", gap: 10, marginTop: 14, flexWrap: "wrap" }}>
+        <button onClick={undoFooter} disabled={!lastKey || !started} className="mrcap-press" style={{ display: "flex", alignItems: "center", gap: 10, minHeight: 72, minWidth: 160, background: COLORS.panel2, border: `2px solid ${COLORS.goldDeep}`, borderRadius: 16, padding: "10px 16px", cursor: (!lastKey || !started) ? "default" : "pointer", opacity: (!lastKey || !started) ? 0.4 : 1 }}>
+          <RotateCcw size={28} color={COLORS.goldBright} />
+          <span style={{ textAlign: "left" }}>
+            <span style={{ display: "block", fontFamily: DISPLAY_FONT, fontWeight: 700, fontSize: 18, color: COLORS.ink }}>UNDO</span>
+            <span style={{ display: "block", fontSize: 12, color: COLORS.muted }}>{lastKey ? zoneName(lastKey, job.bodyType) : "—"}</span>
+          </span>
+        </button>
+        {allResolved && started ? (
+          <button onClick={finish} className="ppfr-finish-pulse mrcap-press" style={{ flex: 1, minHeight: 72, borderRadius: 16, background: COLORS.green, border: "none", color: "#06210f", fontFamily: DISPLAY_FONT, fontWeight: 700, fontSize: 20, cursor: "pointer", display: "flex", alignItems: "center", justifyContent: "center", gap: 8 }}>
+            <Check size={26} /> FINISH
+          </button>
+        ) : (
+          <div style={{ flex: 1, minWidth: 200, display: "flex", alignItems: "center", gap: 14, background: COLORS.panel2, border: `1px solid ${COLORS.line}`, borderRadius: 16, padding: "10px 16px" }}>
+            <div style={{ flex: 1, height: 16, borderRadius: 999, background: COLORS.line, overflow: "hidden" }}><div style={{ height: "100%", width: `${pct}%`, background: COLORS.gold, borderRadius: 999, transition: "width .25s ease" }} /></div>
+            <span style={{ fontFamily: MONO_FONT, fontWeight: 700, fontSize: 18, color: COLORS.ink, whiteSpace: "nowrap" }}>{totals.done} / {totals.total}</span>
+          </div>
+        )}
+      </div>
+
+      {sheet && sheet.type === "undo" && (
+        <PPFSheetOverlay onClose={closeSheet}>
+          <RotateCcw size={48} color={COLORS.goldBright} />
+          <div style={{ fontFamily: DISPLAY_FONT, fontWeight: 700, fontSize: 20, color: COLORS.ink }}>{zoneName(sheet.key, job.bodyType)}</div>
+          <div style={{ display: "flex", gap: 8, width: "100%" }}>
+            <button onClick={sheetNotDone} className="mrcap-press" style={{ flex: 1, minHeight: 64, borderRadius: 12, background: COLORS.red, border: "none", color: "#fff0ec", fontWeight: 700, fontSize: 14, cursor: "pointer" }}>↶ Not done</button>
+            <button onClick={sheetNotNeeded} className="mrcap-press" style={{ flex: 1, minHeight: 64, borderRadius: 12, background: COLORS.panel2, border: `1px solid ${COLORS.line}`, color: COLORS.ink, fontWeight: 700, fontSize: 14, cursor: "pointer" }}>⊘ Not needed</button>
+            <button onClick={closeSheet} className="mrcap-press" style={{ flex: 1, minHeight: 64, borderRadius: 12, background: COLORS.green, border: "none", color: "#06210f", fontWeight: 700, fontSize: 14, cursor: "pointer" }}>✓ Keep</button>
+          </div>
+        </PPFSheetOverlay>
+      )}
+      {sheet && sheet.type === "finish" && (
+        <PPFSheetOverlay onClose={closeSheet}>
+          <ShieldCheck size={48} color={COLORS.green} />
+          <div style={{ fontFamily: DISPLAY_FONT, fontWeight: 700, fontSize: 20, color: COLORS.ink }}>All done?</div>
+          <div style={{ fontSize: 13, color: COLORS.muted }}>Send to Ahmed for checking</div>
+          <div style={{ display: "flex", gap: 8, width: "100%" }}>
+            <button onClick={closeSheet} className="mrcap-press" style={{ flex: 1, minHeight: 64, borderRadius: 12, background: COLORS.panel2, border: `1px solid ${COLORS.line}`, color: COLORS.ink, fontWeight: 700, fontSize: 14, cursor: "pointer" }}>Not yet</button>
+            <button onClick={confirmFinish} className="mrcap-press" style={{ flex: 1, minHeight: 64, borderRadius: 12, background: COLORS.green, border: "none", color: "#06210f", fontWeight: 700, fontSize: 14, cursor: "pointer" }}>Yes</button>
+          </div>
+        </PPFSheetOverlay>
+      )}
+      {sheet && sheet.type === "success" && (
+        <PPFSheetOverlay onClose={onBack}>
+          <CheckCircle2 size={64} color={COLORS.green} />
+          <div style={{ fontFamily: DISPLAY_FONT, fontWeight: 700, fontSize: 20, color: COLORS.ink }}>Sent to Ahmed</div>
+          <div style={{ fontSize: 13, color: COLORS.muted }}>Ahmed checks next</div>
+          <button onClick={onBack} className="mrcap-press" style={{ ...primaryBtnStyle, width: "100%" }}>Back to cars</button>
+        </PPFSheetOverlay>
+      )}
+    </div>
+  );
+}
+function wholeTileStyle(completed) {
+  return { minHeight: 120, background: completed ? "rgba(63,178,106,.35)" : "linear-gradient(165deg,#0B1E33,#0E2742)", border: `3px ${completed ? "solid" : "dashed"} ${completed ? "#3FE07A" : "#DDE8F5"}`, borderRadius: 16, color: "#DDE8F5", display: "flex", flexDirection: "column", alignItems: "center", justifyContent: "center", gap: 8, cursor: "pointer", padding: 16 };
+}
+function PPFSheetOverlay({ children, onClose }) {
+  return (
+    <div onMouseDown={(e) => { if (e.target === e.currentTarget) onClose(); }} style={{ position: "fixed", inset: 0, background: "rgba(6,6,5,.72)", display: "flex", alignItems: "center", justifyContent: "center", zIndex: 200, padding: 16 }}>
+      <div style={{ background: COLORS.panel, border: `1px solid ${COLORS.line}`, borderRadius: 18, padding: "24px 20px", maxWidth: 420, width: "100%", textAlign: "center", display: "flex", flexDirection: "column", alignItems: "center", gap: 14 }}>
+        {children}
+      </div>
+    </div>
+  );
+}
+
 /* ---------------- Dispatch Kiosk (standalone entry point) ----------------
    Reachable directly at /dispatch — bypasses the normal staff-PIN login
    entirely. Regular staff just tap their name and go straight in, no
-   PIN, fast for a shared tablet passed between people all day. The four
-   people who can also manage what shows on the board (AJF, Ahmed,
-   Laani, Mr Cap — see canManageDispatchVisibility) get an extra PIN
-   step using their real, existing PIN — same credential as the full
-   app, not a new shared code — which unlocks the admin controls
-   (hide/show, etc.) right there on the tablet. Session persists in its
-   own localStorage key, separate from the main app's session, so
-   logging into one doesn't affect the other. */
+   PIN, fast for a shared tablet passed between people all day. QC
+   approvers (Noel, Reagen, Ahmed) and admins — by id, see the
+   KIOSK_PIN_IDS list in `pick` below — get an extra PIN step using
+   their real, existing PIN — same credential as the full app, not a
+   new shared code — which unlocks QC actions and (for the subset who
+   also pass canManageDispatchVisibility) the board-visibility controls
+   right there on the tablet. Session persists in its own localStorage
+   key, separate from the main app's session, so logging into one
+   doesn't affect the other. */
 export function DispatchKiosk() {
   const [team, setTeam] = useState(DEFAULT_TEAM);
   const [ready, setReady] = useState(false);
@@ -11355,9 +17333,23 @@ export function DispatchKiosk() {
 
   useEffect(() => {
     (async () => {
-      setTeam(await loadTeam());
+      // Same dynamic categories/roles load the main app does on mount, so
+      // the TV shows whatever category names are currently configured
+      // instead of the hardcoded defaults (which is also what QC-state
+      // matching by category key relies on lining up).
+      const [t] = await Promise.all([loadTeam(), loadDynamicServicesAndRoles()]);
+      setTeam(t);
       setReady(true);
     })();
+    // This tablet stays open all day — pick up anyone added since it loaded
+    // whenever the screen wakes, instead of only after a manual reload.
+    const onVisible = async () => {
+      if (document.visibilityState !== "visible") return;
+      const fresh = await refreshTeam();
+      if (fresh) setTeam(fresh);
+    };
+    document.addEventListener("visibilitychange", onVisible);
+    return () => document.removeEventListener("visibilitychange", onVisible);
   }, []);
 
   // Auto-logout around 9pm (shop closes at 7) — checked on mount and
@@ -11368,7 +17360,7 @@ export function DispatchKiosk() {
       checkAutoLogout("mrcap_kiosk", !!session, () => {
         setSession(null);
         try { window.localStorage.removeItem("mrcap_kiosk_session"); } catch { /* ignore */ }
-      });
+      }, session?.dashboardMode);
     };
     check();
     const t = setInterval(check, 5 * 60 * 1000);
@@ -11383,8 +17375,12 @@ export function DispatchKiosk() {
   };
 
   const pick = (member) => {
-    const needsPin = ["ajf", "ahmed", "laani", "mr.cap"].includes((member.name || "").toLowerCase());
-    // Gate on the admin name list alone now, not member.pin's presence
+    // QC approvers and admins by id — a name can be renamed (e.g. "Lani"
+    // vs. "laani") but the id is stable. Anyone whose role is "admin"
+    // also needs the PIN, even if their id isn't in the fixed list.
+    const KIOSK_PIN_IDS = ["noel", "reagen", "ahmed", "laani", "suhail", "owner"];
+    const needsPin = KIOSK_PIN_IDS.includes(member.id) || member.role === "admin";
+    // Gate on the id/role list alone now, not member.pin's presence
     // — that field is never fetched anymore (verify-pin checks it
     // server-side instead), so it would always be falsy here.
     if (needsPin) {
@@ -11429,19 +17425,23 @@ export function DispatchKiosk() {
   }
 
   if (session) {
+    // Exactly one screen tall: the board fills whatever is left under the
+    // user bar and scrolls its two columns inside themselves, so the
+    // header, clock and workload strip stay in view on the TV. (On a
+    // narrow phone the board stacks the columns and scrolls as a whole.)
     return (
-      <div style={{ minHeight: "100vh", background: "#0b0b0c" }}>
-        <div style={{ height: 3, background: COLORS.blue }} />
-        <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", padding: "10px 16px", borderBottom: `1px solid ${COLORS.line}` }}>
-          <div style={{ fontSize: 12, color: COLORS.muted }}>Working the board as <span style={{ color: COLORS.ink, fontWeight: 700 }}>{session.name}</span></div>
-          <button onClick={switchUser} className="mrcap-press" style={{ fontSize: 11.5, color: COLORS.muted, background: "none", border: `1px solid ${COLORS.line}`, borderRadius: 999, padding: "5px 12px", cursor: "pointer" }}>
+      <div className="dsp-u dsp-kiosk">
+        <div style={{ height: 3, background: COLORS.blue, flexShrink: 0 }} />
+        <div className="dsp-userbar">
+          <div>Working the board as <b>{session.name}</b></div>
+          <button type="button" onClick={switchUser} className="dsp-userbar-sw">
             Switch user
           </button>
         </div>
         {showMorningReminder && <MorningReminderBanner onDismiss={() => { setShowMorningReminder(false); dismissMorningReminder("mrcap_kiosk"); }} />}
         <AnnouncementBanner session={session} />
         <LiveUpdateBroadcaster />
-        <DispatchBoard team={team} session={session} />
+        <DispatchBoard team={team} session={session} fill />
       </div>
     );
   }
@@ -11458,7 +17458,7 @@ export function DispatchKiosk() {
             <div key={i} style={{ width: 10, height: 10, borderRadius: "50%", background: i < pin.length ? COLORS.blue : "transparent", border: `1.5px solid ${i < pin.length ? COLORS.blue : COLORS.muted}` }} />
           ))}
         </div>
-        <div style={{ display: "grid", gridTemplateColumns: "repeat(3, 1fr)", gap: 12, maxWidth: 240, margin: "0 auto", opacity: locked ? 0.35 : 1, pointerEvents: locked ? "none" : "auto" }}>
+        <div style={{ display: "grid", gridTemplateColumns: "repeat(3, 1fr)", gap: 12, maxWidth: 276, margin: "0 auto", opacity: locked ? 0.35 : 1, pointerEvents: locked ? "none" : "auto" }}>
           {[1, 2, 3, 4, 5, 6, 7, 8, 9].map((n) => (
             <button key={n} onClick={() => press(String(n))} style={keyBtnStyle} className="mrcap-press">{n}</button>
           ))}
@@ -11486,7 +17486,12 @@ export function DispatchKiosk() {
         <div style={{ fontSize: 12.5, color: COLORS.muted, marginTop: 6 }}>Tap your name — no PIN needed</div>
       </div>
       <div style={{ display: "flex", flexDirection: "column", gap: 8, maxWidth: 420, margin: "0 auto" }}>
-        {team.map((m) => (
+        {/* Smartech-portal members are deliberately never offered here —
+            this kiosk's whole login is "tap your name, no PIN" for
+            non-admins, which would otherwise let anyone standing at this
+            tablet open the full shop-wide board as them, defeating the
+            point of their locked-down portal entirely. */}
+        {team.filter((m) => !isSmartechPortal(m)).map((m) => (
           <button
             key={m.id}
             onClick={() => pick(m)}
