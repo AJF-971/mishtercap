@@ -552,6 +552,8 @@ export function scopeKeys(car) {
 }
 export function scopeLabel(car) {
   const s = car.scope || {};
+  // Tint-only jobs: no film panels at all, just the 4 glass areas.
+  if (car.tintBooked && !scopeKeys(car).length) return "Tint only";
   if (s.edited) return "Custom (edited)";
   if (s.preset === "custom") {
     const ks = scopeKeys(car);

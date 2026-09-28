@@ -9,7 +9,9 @@ import GarageApp, { PublicLinkRouter, DispatchKiosk } from "./GarageApp.jsx";
 // handled inside GarageApp itself (see the isSmartechPortal /
 // trackJobId check right after the session gate).
 const params = new URLSearchParams(window.location.search);
-const isPublicLink = params.has("quote");
+// ?approve= is the customer's job-card approval link (sent on WhatsApp
+// right after intake) — same no-login treatment as ?quote=.
+const isPublicLink = params.has("quote") || params.has("approve");
 // The shop-floor tablet bookmarks straight to /dispatch — its own
 // login (tap your name, no PIN unless you're one of the four admins),
 // completely separate from the main staff-PIN-gated app.
