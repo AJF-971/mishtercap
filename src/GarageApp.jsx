@@ -12,7 +12,7 @@ import {
 import { jsPDF } from "jspdf";
 import { Capacitor } from "@capacitor/core";
 import { PushNotifications } from "@capacitor/push-notifications";
-import { Bell } from "lucide-react";
+import { Bell, Copy } from "lucide-react";
 import { Receipt, Banknote } from "lucide-react";
 import {
   VAT_RATE_DEFAULT, r2, computeTotals, fmtMoney, fmtPct, amountInWords, proformaNumber, receiptNumber, proformaCounterKey,
@@ -1052,6 +1052,7 @@ const DEFAULT_WHATSAPP_TEMPLATES = {
   ready_for_collection: "Hi {customerName}, your {makeModel} ({plate}) is ready for collection at Mr.CAP. Thank you!",
   job_started: "Hi {customerName}, we've received your {makeModel} ({plate}) at Mr.CAP. and work is underway.",
   quote_sent: "Hi {customerName}, here's your quote from Mr.CAP. for your {makeModel} ({plate}): AED {total}. View it here: {quoteLink} — reply here or call us to accept.",
+  job_approval: "Hi {customerName}, here's your Mr.CAP. job card for your {makeModel} ({plate}) — total AED {total}. Please review and tap Approve here: {approvalLink}",
   follow_up: "Hi {customerName}, just checking in on your {makeModel} ({plate}) — {reason}. Let us know if you'd like to book it in with Mr.CAP.",
   warranty_reminder: "Hi {customerName}, a friendly reminder that the warranty on your {makeModel} ({plate}) work with Mr.CAP. expires on {expiryDate}. Reach out if you'd like it looked at before then.",
   google_review: "Hi {customerName}, thank you for trusting Mr.CAP. with your {makeModel}! If you had a great experience, we'd really appreciate a quick Google review: {reviewLink}",
@@ -1222,7 +1223,7 @@ function WhatsAppSendButton({ phone, templateKey, vars, label, small }) {
       className="mrcap-press"
       style={small
         ? { display: "inline-flex", alignItems: "center", gap: 5, padding: "6px 10px", borderRadius: 8, border: "none", background: "#25D366", color: "#0D2A17", fontWeight: 700, fontSize: 11, cursor: "pointer", textDecoration: "none", flexShrink: 0 }
-        : { display: "flex", alignItems: "center", justifyContent: "center", gap: 8, width: "100%", padding: "12px", borderRadius: 10, border: "none", background: "#25D366", color: "#0D2A17", fontWeight: 700, fontSize: 13, cursor: "pointer", marginBottom: 12, textDecoration: "none" }}
+        : { display: "flex", alignItems: "center", justifyContent: "center", gap: 8, width: "100%", boxSizing: "border-box", padding: "12px", borderRadius: 10, border: "none", background: "#25D366", color: "#0D2A17", fontWeight: 700, fontSize: 13, cursor: "pointer", marginBottom: 12, textDecoration: "none" }}
       onClick={(e) => e.stopPropagation()}
     >
       <Send size={small ? 12 : 15} /> {label}
@@ -1519,6 +1520,13 @@ function rowToJob(r) {
     warrantyExpiry: r.warranty_expiry || null, followupDate: r.followup_date || null, followupNote: r.followup_note || null,
     customerStatusNote: r.customer_status_note || null, customerStatusUpdatedAt: r.customer_status_updated_at ? new Date(r.customer_status_updated_at).getTime() : null,
     customerNotify: r.customer_notify || {},
+    // Customer approval of the job card (see sendJobForApproval). The
+    // decision itself is only ever written server-side by the job-approval
+    // edge function; the app just sends and reads.
+    approvalToken: r.approval_token || null, approvalSnapshot: r.approval_snapshot || null,
+    approvalStatus: r.approval_status || null, approvalNote: r.approval_note || null,
+    approvalSentAt: r.approval_sent_at ? new Date(r.approval_sent_at).getTime() : null,
+    approvalDecidedAt: r.approval_decided_at ? new Date(r.approval_decided_at).getTime() : null,
     createdBy: r.created_by, createdAt: new Date(r.created_at).getTime(), updatedAt: new Date(r.updated_at).getTime(),
   };
   // Snapshot of what the server held when this job was loaded — saveJob
@@ -1574,6 +1582,16 @@ function jobToRow(job) {
     warranty_expiry: job.warrantyExpiry || null, followup_date: job.followupDate || null, followup_note: job.followupNote || null,
     customer_status_note: job.customerStatusNote || null, customer_status_updated_at: job.customerStatusUpdatedAt ? new Date(job.customerStatusUpdatedAt).toISOString() : null,
     customer_notify: job.customerNotify || {},
+    // Only present once a job card has actually been sent for approval, so
+    // jobs that never were (and every insert) don't touch these columns at
+    // all. The decision fields are deliberately never written from here —
+    // only job-approval sets them, so a stale device can't overwrite a
+    // customer's answer.
+    ...(job.approvalToken ? {
+      approval_token: job.approvalToken, approval_snapshot: job.approvalSnapshot || null,
+      approval_status: job.approvalStatus || null,
+      approval_sent_at: job.approvalSentAt ? new Date(job.approvalSentAt).toISOString() : null,
+    } : {}),
     created_by: job.createdBy, updated_at: new Date().toISOString(),
   };
 }
@@ -1925,6 +1943,89 @@ function buildInvoiceLineItems(job) {
   return { rows, grandTotal };
 }
 
+/* ---------------- Customer approval of the job card ----------------
+   Right after a job card is saved, staff WhatsApp the customer a link
+   (?approve=<token>) showing the job card with Approve / Decline. What the
+   customer sees is a frozen snapshot taken at send time — built from the
+   same buildInvoiceLineItems the printed invoice uses — so an answer
+   always refers to exactly what was sent. Changing prices afterwards
+   means resending (new token, back to pending). The customer's answer is
+   written only by the job-approval edge function. */
+const JOB_APPROVAL_URL = `${SUPABASE_URL}/functions/v1/job-approval`;
+// The APK's WebView origin isn't a URL a customer can open, so links
+// built on a native device point at the live site instead.
+const PUBLIC_SITE_URL = "https://tubular-brigadeiros-5f891f.netlify.app";
+function publicBaseUrl() {
+  return Capacitor.isNativePlatform() ? PUBLIC_SITE_URL : window.location.origin;
+}
+function approvalLink(token) {
+  return `${publicBaseUrl()}/?approve=${token}`;
+}
+function newApprovalToken() {
+  const bytes = new Uint8Array(18);
+  crypto.getRandomValues(bytes);
+  return btoa(String.fromCharCode(...bytes)).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
+}
+const round2 = (n) => Math.round((Number(n) || 0) * 100) / 100;
+function buildApprovalSnapshot(job, session) {
+  const { rows, grandTotal } = buildInvoiceLineItems(job);
+  return {
+    v: 1,
+    plate: job.plate || "", makeModel: job.makeModel || "", customerName: job.customerName || "",
+    jobRef: job.id ? job.id.slice(0, 8).toUpperCase() : "",
+    description: job.description || "", damageNotes: job.damageNotes || "",
+    items: rows.map((r) => ({ desc: r.desc, qty: r.qty, price: round2(r.price), discount: r.discount || 0, amountExcl: round2(r.amountExcl), vat: round2(r.vatAmount), amountIncl: round2(r.amountIncl) })),
+    subtotal: round2(rows.reduce((s, r) => s + r.amountExcl, 0)),
+    vatTotal: round2(rows.reduce((s, r) => s + r.vatAmount, 0)),
+    grandTotal: round2(grandTotal),
+    vatRate: VAT_RATE,
+    sentAt: Date.now(), sentBy: session?.name || null,
+  };
+}
+// Fresh token + snapshot, back to pending, saved straight away. Written
+// with its own narrow PATCH (not saveJob) for two reasons: it must also
+// reset the decision columns, which jobToRow never writes; and it must
+// NOT be queued offline — a queued write would "succeed" locally while
+// the link the customer is about to open doesn't exist on the server yet.
+async function sendJobForApproval(job, session) {
+  const now = Date.now();
+  const next = {
+    ...job,
+    approvalToken: newApprovalToken(),
+    approvalSnapshot: buildApprovalSnapshot(job, session),
+    approvalStatus: "pending", approvalNote: null, approvalDecidedAt: null,
+    approvalSentAt: now, updatedAt: now,
+  };
+  const row = {
+    approval_token: next.approvalToken, approval_snapshot: next.approvalSnapshot,
+    approval_status: "pending", approval_sent_at: new Date(now).toISOString(),
+    approval_decided_at: null, approval_note: null, updated_at: new Date(now).toISOString(),
+  };
+  withActivitySummary(`Sent job card for approval — ${job.plate}`);
+  const { ok } = await sbFetch(`jobs?id=eq.${job.id}`, { method: "PATCH", headers: { Prefer: "return=minimal" }, body: JSON.stringify(row), noQueue: true });
+  if (!ok) return { ok: false, job };
+  if (job._base) {
+    const { approval_decided_at: _d, approval_note: _n, updated_at: _u, ...tracked } = row;
+    next._base = { ...job._base, ...tracked };
+  }
+  return { ok: true, job: next };
+}
+async function jobApprovalCall(payload) {
+  try {
+    const res = await fetch(JOB_APPROVAL_URL, {
+      method: "POST",
+      headers: { apikey: SUPABASE_KEY, Authorization: `Bearer ${SUPABASE_KEY}`, "Content-Type": "application/json" },
+      body: JSON.stringify(payload),
+    });
+    const text = await res.text();
+    const data = text ? JSON.parse(text) : {};
+    if (!res.ok) return { ok: false, notFound: res.status === 404, error: data.error || text.slice(0, 200) };
+    return { ok: true, ...data };
+  } catch {
+    return { ok: false, error: "offline" };
+  }
+}
+
 function generateJobCardPDF(job) {
   const doc = new jsPDF({ unit: "pt", format: "a4" });
   const pageW = doc.internal.pageSize.getWidth();
@@ -1983,14 +2084,15 @@ function generateJobCardPDF(job) {
   // Structured make/model win when present; legacy jobs (no job.make)
   // fall back to the old "split the combined string on the first space"
   // guess, exactly as before.
-  const legacyMake = (job.makeModel || "").split(" ")[0] || "";
-  const legacyModel = (job.makeModel || "").split(" ").slice(1).join(" ") || "";
-  const carRows = [["Make:", job.make || legacyMake], ["Model:", job.model || legacyModel], ["Plate:", job.plate], ["Job Card:", job.id ? job.id.slice(0, 8).toUpperCase() : ""]];
-  if (job.modelYear) carRows.push(["Year:", String(job.modelYear)]);
-  // Colour only if it still fits inside the box without overflowing —
-  // 6 rows is the most this layout can hold before the text runs past
-  // the box's bottom edge.
-  if (job.color && carRows.length < 6) carRows.push(["Colour:", job.color]);
+  // Every vehicle detail captured at intake goes on the invoice (a year or
+  // colour typed into the model is split out — see vehicleForDocs); the
+  // box grows with the row count (billH below), so nothing gets cut off.
+  const v = vehicleForDocs(job);
+  const carRows = [["Make:", v.make], ["Model:", v.model]];
+  if (v.modelYear) carRows.push(["Year:", v.modelYear]);
+  if (v.color) carRows.push(["Colour:", v.color]);
+  if (v.bodyType && BODY_TYPE_LABEL[v.bodyType]) carRows.push(["Body:", BODY_TYPE_LABEL[v.bodyType]]);
+  carRows.push(["Plate:", job.plate], ["Job Card:", job.id ? job.id.slice(0, 8).toUpperCase() : ""]);
   const billH = 90 + Math.max(0, carRows.length - 4) * 14;
   box(margin, pageW - margin * 2, billH);
   doc.line(midX, y, midX, y + billH);
@@ -2691,7 +2793,7 @@ function blankProforma() {
   return {
     id: null, number: null, entity: "ZB", status: "draft", job_id: null, quote_id: null, customer_id: null,
     bill_to: { name: "", phone: "", trn: "", address: "", email: "" },
-    car: { makeModel: "", color: "", plate: "", vin: "", year: "" },
+    car: { makeModel: "", make: "", model: "", color: "", bodyType: "", plate: "", vin: "", year: "" },
     lines: [blankLine()], vat_rate: VAT_RATE, payment_terms: "Cash on delivery", delivery_terms: "", notes: "",
     valid_until: localDateKey(d), supersedes: null,
   };
@@ -2700,12 +2802,13 @@ function blankProforma() {
 // tax invoice would print, the customer's details, and the vehicle.
 function proformaSeedFromJob(job) {
   const { rows } = buildInvoiceLineItems(job);
+  const v = vehicleForDocs(job);
   return {
     ...blankProforma(),
     job_id: job.id, customer_id: job.customerId || null,
     entity: job.commissionEntity === "head_office" ? "ZH" : "ZB",
     bill_to: { name: job.customerName || "", phone: job.customerPhone || "", trn: "", address: "", email: "" },
-    car: { makeModel: job.makeModel || "", color: job.color || "", plate: job.plate || "", vin: "", year: job.modelYear || "" },
+    car: { makeModel: composeMakeModel(v.make, v.model, job.makeModel || ""), make: v.make, model: v.model, color: v.color, bodyType: v.bodyType, plate: job.plate || "", vin: "", year: v.modelYear },
     lines: rows.length ? linesFromInvoiceRows(rows) : [blankLine()],
   };
 }
@@ -3057,9 +3160,15 @@ function generateProformaPDF(p) {
   y += 16;
   doc.setFont("helvetica", "normal"); doc.setFontSize(8.5);
   const noteLines = [];
-  if (car.makeModel) noteLines.push(`MAKE/MODEL: ${car.makeModel}`);
+  // Structured make/model when the proforma has them (raised from a new
+  // job card); older proformas only ever had the combined string.
+  if (car.make) {
+    noteLines.push(`MAKE: ${car.make}`);
+    if (car.model) noteLines.push(`MODEL: ${car.model}`);
+  } else if (car.makeModel) noteLines.push(`MAKE/MODEL: ${car.makeModel}`);
   if (car.year) noteLines.push(`YEAR: ${car.year}`);
   if (car.color) noteLines.push(`COLOR: ${car.color}`);
+  if (car.bodyType && BODY_TYPE_LABEL[car.bodyType]) noteLines.push(`BODY TYPE: ${BODY_TYPE_LABEL[car.bodyType]}`);
   if (car.plate) noteLines.push(`PLATE NO: ${car.plate}`);
   if (car.vin) noteLines.push(`VIN: ${car.vin}`);
   if (p.notes) doc.splitTextToSize(p.notes, right - margin).forEach((l) => noteLines.push(l));
@@ -3112,6 +3221,9 @@ function generateReceiptPDF(p, payment, summary) {
     row("Cheque date", payment.cheque_date ? formatLongDate(`${payment.cheque_date}T12:00:00`) : "");
   }
   row("Against", `Proforma ${p.number}${p.car?.plate ? ` · ${p.car.plate}` : ""}`);
+  const car = p.car || {};
+  const vehicle = [car.make ? composeMakeModel(car.make, car.model, "") : car.makeModel, car.year, car.color, car.bodyType ? BODY_TYPE_LABEL[car.bodyType] : ""].filter(Boolean).join(" · ");
+  if (vehicle) row("Vehicle", vehicle);
   if (summary) {
     row("Proforma total", `AED ${fmtMoney(docTotals(p).totalIncl)}`);
     row("Balance after this", `AED ${fmtMoney(summary.balance)}`);
@@ -3624,7 +3736,7 @@ function Field({ label, children }) {
 }
 
 /* ---------------- Structured vehicle details (make/model/year/colour/body type) ----------------
-   Shared by Quick Intake, New Job Card and Edit Job Card. Make/Model are
+   Shared by New Job Card and Edit Job Card. Make/Model are
    searchable combo boxes seeded from VEHICLE_CATALOG plus whatever's been
    learned from real jobs (see learnVehicle in the data layer above);
    Year/Colour are chip pickers; Body type is 4 big picture buttons. */
@@ -3752,6 +3864,43 @@ function prefillFromLegacyMakeModel(makeModel) {
   return { make: matchedMake, model: remaining.join(" ").trim(), color, modelYear };
 }
 
+// Pulls a year or colour that staff typed into the Model box ("488 Spyder
+// YELLOW 2019") out into their own fields, so documents print
+// Model: 488 Spyder / Year: 2019 / Colour: Yellow. A value already picked
+// in its own field wins; the matching word is still removed from the model.
+// Only trailing words are taken, so a real model name that contains a
+// colour ("Ghost Black Badge") is left alone.
+// Wider than the intake chips (VEHICLE_COLORS) on purpose — these are
+// just the colour words staff actually type into the model box.
+const COLOR_WORDS = VEHICLE_COLORS.filter((c) => c !== "Other").concat(["Yellow", "Orange", "Purple", "Bronze", "Brown", "Maroon", "Pink", "Burgundy", "Champagne", "Gray"]);
+function splitModelExtras(model, knownYear, knownColor) {
+  let modelYear = knownYear ? String(knownYear) : "";
+  let color = knownColor || "";
+  const words = String(model || "").replace(/\//g, " ").split(/\s+/).filter(Boolean);
+  while (words.length) {
+    const clean = words[words.length - 1].replace(/[^\w-]/g, "");
+    if (/^(19|20)\d{2}$/.test(clean) && (!modelYear || modelYear === clean)) { modelYear = clean; words.pop(); continue; }
+    const colorMatch = COLOR_WORDS.find((c) => c.toLowerCase() === clean.toLowerCase());
+    if (colorMatch && (!color || color.toLowerCase() === colorMatch.toLowerCase())) { color = color || colorMatch; words.pop(); continue; }
+    break;
+  }
+  return { model: words.join(" "), modelYear, color };
+}
+// The vehicle as it should print on invoices / proformas / receipts.
+function vehicleForDocs(job) {
+  let make = (job.make || "").trim();
+  let model = job.model || "";
+  let year = job.modelYear || "";
+  let color = job.color || "";
+  if (!make) {
+    const guess = prefillFromLegacyMakeModel(job.makeModel);
+    if (guess.make) { make = guess.make; model = guess.model; year = year || guess.modelYear; color = color || guess.color; }
+    else { const words = String(job.makeModel || "").trim().split(/\s+/); make = words[0] || ""; model = words.slice(1).join(" "); }
+  }
+  const extras = splitModelExtras(model, year, color);
+  return { make, model: extras.model, modelYear: extras.modelYear, color: extras.color, bodyType: job.bodyType || "" };
+}
+
 // Small side-profile silhouettes for the body-type picture buttons —
 // rough on purpose, just enough to read as "tall boxy SUV" vs "low sleek
 // sedan" vs "raked coupe" vs "cab + bed pickup" at a glance.
@@ -3840,8 +3989,8 @@ function VehicleComboBox({ value, onChangeText, options, placeholder, inputRef, 
 const YEAR_RECENT_CHIPS = [2027, 2026, 2025, 2024, 2023];
 const YEAR_OLDER = Array.from({ length: 2022 - 1990 + 1 }, (_, i) => 2022 - i);
 
-// Reusable Make/Model/Year/Colour/Body-type block for Quick Intake, New
-// Job Card and Edit Job Card. Fully controlled — `values` is the current
+// Reusable Make/Model/Year/Colour/Body-type block for New Job Card and
+// Edit Job Card. Fully controlled — `values` is the current
 // {make, model, modelYear, color, bodyType}, and onChange(patch) merges
 // a partial update into the caller's own state.
 function VehicleDetailsFields({ values, onChange, bodyTypeRequired, showBodyTypeMissing }) {
@@ -4845,7 +4994,7 @@ export default function GarageApp() {
         <div aria-hidden="true" style={{ position: "fixed", left: 0, right: 0, bottom: 0, height: 150, zIndex: 45, pointerEvents: "none", background: "linear-gradient(to bottom, rgba(10,10,9,0), rgba(10,10,9,0.82) 55%, rgba(10,10,9,0.96))" }} />
       )}
       {view === "list" && hasPermission(session, team, "newJob") && (
-        <FloatingNewJobButton onClick={() => setView("quickintake")} shiftX={isDesktop ? 116 : 0} />
+        <FloatingNewJobButton onClick={() => setView("new")} shiftX={isDesktop ? 116 : 0} />
       )}
       {view === "list" && isFullDashboardRole(session) && (
         <button
@@ -4864,10 +5013,6 @@ export default function GarageApp() {
           <PauseCircle size={14} /> Park a Vehicle
         </button>
       )}
-      {view === "quickintake" && hasPermission(session, team, "newJob") && (
-        <QuickIntakeForm session={session} onCreated={(job, saved) => { upsertIndex(job); setSyncState(saved ? "ok" : "failed"); if (saved) setLastSyncedAt(Date.now()); openJob(job.id, job); }} onCancel={() => window.history.back()} onFullForm={() => setView("new")} />
-      )}
-      {view === "quickintake" && !hasPermission(session, team, "newJob") && <AccessDenied onBack={() => window.history.back()} />}
       {view === "new" && hasPermission(session, team, "newJob") && (
         <NewJobForm session={session} team={team} onCreated={(job, saved) => { upsertIndex(job); setSyncState(saved ? "ok" : "failed"); if (saved) setLastSyncedAt(Date.now()); openJob(job.id, job); }} onCancel={() => window.history.back()} />
       )}
@@ -6387,115 +6532,9 @@ function ParkVehicleForm({ session, onCreated, onCancel }) {
   );
 }
 
-// Quick Intake — deliberately the opposite of the full Job Card below:
-// plate and a photo, nothing else required. Built because staff kept
-// posting new cars to the WhatsApp group instead of the app, since
-// snapping a photo there was faster than the full form here. This is
-// meant to actually beat that — get the car into the system in under
-// 15 seconds, then classify service type, pricing, damage notes, and
-// the rest later (it lands unclassified, exactly like any job missing
-// a service type — it'll show up in the Dispatch Board's "needs a
-// service type" strip automatically). No signature or terms step here;
-// that's still captured whenever the full details get filled in.
-function QuickIntakeForm({ session, onCreated, onCancel, onFullForm }) {
-  const [plate, setPlate] = useState("");
-  const [customerName, setCustomerName] = useState("");
-  const [photos, setPhotos] = useState([]);
-  const [saving, setSaving] = useState(false);
-  const [saveError, setSaveError] = useState(false);
-  const fileRef = useRef(null);
-  const [make, setMake] = useState("");
-  const [model, setModel] = useState("");
-  const [modelYear, setModelYear] = useState("");
-  const [color, setColor] = useState("");
-  const [bodyType, setBodyType] = useState("");
-  const [saveAttempted, setSaveAttempted] = useState(false);
-  const setVehicle = (patch) => {
-    if ("make" in patch) setMake(patch.make);
-    if ("model" in patch) setModel(patch.model);
-    if ("modelYear" in patch) setModelYear(patch.modelYear);
-    if ("color" in patch) setColor(patch.color);
-    if ("bodyType" in patch) setBodyType(patch.bodyType);
-  };
-
-  const addPhotos = async (files) => {
-    const compressed = await Promise.all(Array.from(files).map((f) => compressImage(f)));
-    setPhotos((p) => [...p, ...compressed]);
-  };
-
-  const submit = async () => {
-    if (!plate.trim()) return;
-    if (!bodyType) { setSaveAttempted(true); return; }
-    setSaving(true);
-    const now = Date.now();
-    const job = {
-      plate: plate.trim().toUpperCase(), makeModel: composeMakeModel(make, model, ""), customerName: customerName.trim() || "—", customerPhone: "",
-      make: make.trim(), model: model.trim(), modelYear: modelYear || null, color: color || null, bodyType: bodyType || null,
-      description: "", damageNotes: "", priority: "Medium", location: BASE_LOCATIONS[0],
-      serviceTypes: [], treatments: {}, treatmentPrices: {}, discountPercent: 0, priceHistory: [],
-      serviceDone: {}, assignedTo: {}, stageIndex: 0,
-      photos: { intake: photos, parts_removal: [], service: {} },
-      startTime: null, stopTime: null, invoiceAmount: "", signature: null, signedAt: null,
-      damagePanels: [], damageDiagramImage: null,
-      history: [{ stage: "intake", label: "Intake", by: session.name, role: session.role, note: "Quick intake — full details to follow", at: now }],
-      createdAt: now, updatedAt: now, createdBy: session.name,
-    };
-    const result = await createJob(job);
-    setSaving(false);
-    if (!result.ok || !result.job.id) { setSaveError(result.reason || true); return; }
-    onCreated(result.job, result.ok);
-  };
-
-  return (
-    <div className="mrcap-view" style={{ padding: "4px 18px 30px" }}>
-      <SectionTitle>Quick Intake</SectionTitle>
-      <div style={{ fontSize: 12.5, color: COLORS.muted, marginTop: -8, marginBottom: 18, lineHeight: 1.45 }}>
-        Get it into the system now — plate and a photo. Everything else (service type, pricing, damage notes) can be filled in later.
-      </div>
-
-      <Field label="Plate"><PlatePicker value={plate} onChange={setPlate} /></Field>
-      <Field label="Whose car (optional)"><input style={inputStyle} value={customerName} onChange={(e) => setCustomerName(e.target.value)} placeholder="Skip if you don't know it yet" /></Field>
-
-      <VehicleDetailsFields values={{ make, model, modelYear, color, bodyType }} onChange={setVehicle} bodyTypeRequired showBodyTypeMissing={saveAttempted && !bodyType} />
-
-      <Field label="Photos">
-        <input ref={fileRef} type="file" accept="image/*" capture="environment" multiple style={{ display: "none" }} onChange={(e) => { if (e.target.files.length) addPhotos(e.target.files); e.target.value = ""; }} />
-        <button onClick={() => fileRef.current.click()} className="mrcap-press" style={{ ...cameraBtnStyle, width: "100%", minHeight: 64, marginTop: 0, color: photos.length ? COLORS.ink : COLORS.muted, border: `1.5px dashed ${photos.length ? "rgba(201,162,39,0.55)" : "#3A3526"}` }}>
-          <Camera size={20} color={photos.length ? COLORS.gold : COLORS.muted} /> {photos.length ? `${photos.length} photo${photos.length === 1 ? "" : "s"} added — add more` : "Take a photo"}
-        </button>
-        {photos.length > 0 && (
-          <div className="mrcap-scroll-x" style={{ display: "flex", gap: 7, overflowX: "auto", marginTop: 10 }}>
-            {photos.map((src, i) => (
-              <img key={i} src={src} alt="" style={{ width: 68, height: 68, objectFit: "cover", borderRadius: 10, border: `1px solid ${COLORS.line}`, flexShrink: 0 }} />
-            ))}
-          </div>
-        )}
-      </Field>
-
-      {onFullForm && (
-        <button onClick={onFullForm} className="mrcap-press" style={{ width: "100%", minHeight: 44, marginTop: 4, background: "none", border: `1px solid ${COLORS.line}`, borderRadius: 12, color: COLORS.muted, fontSize: 13, cursor: "pointer", display: "flex", alignItems: "center", justifyContent: "center", gap: 6 }}>
-          Have all the details now? <span style={{ color: COLORS.gold, fontWeight: 600 }}>Full job card</span>
-        </button>
-      )}
-
-      {saveError && (
-        <div role="alert" style={{ background: "rgba(168,64,47,0.14)", border: "1px solid rgba(168,64,47,0.6)", borderRadius: 14, padding: "10px 14px", marginTop: 14, fontSize: 13, color: COLORS.dangerText }}>
-          {typeof saveError === "string" ? saveError : "Couldn't save to the server."} {lastStorageError && <span style={{ fontFamily: MONO_FONT, display: "block", marginTop: 4, fontSize: 10.5 }}>{lastStorageError}</span>}
-        </div>
-      )}
-
-      <StickyActionBar>
-        <button onClick={onCancel} className="mrcap-press" style={{ ...secondaryBtnStyle, minHeight: 54, borderRadius: 14, padding: "0 18px", background: COLORS.panel }}>Cancel</button>
-        <button onClick={submit} disabled={!plate.trim() || saving} className="mrcap-press" style={{ ...primaryBtnStyle, flex: 1, minHeight: 54, borderRadius: 14, display: "flex", alignItems: "center", justifyContent: "center", gap: 8, opacity: !plate.trim() ? 0.45 : 1 }}>
-          {saving ? "Saving…" : !plate.trim() ? "Pick the plate first" : <>Check in car <ArrowRight size={18} /></>}
-        </button>
-      </StickyActionBar>
-    </div>
-  );
-}
-
 function NewJobForm({ session, team, onCreated, onCancel }) {
   const [, setRefreshTick] = useState(0); // forces a re-render so a just-added pricing module shows immediately
+  const [createdJob, setCreatedJob] = useState(null); // set once saved → shows the send-for-approval step
   const [plate, setPlate] = useState("");
   const [make, setMake] = useState("");
   const [model, setModel] = useState("");
@@ -6711,13 +6750,14 @@ function NewJobForm({ session, team, onCreated, onCancel }) {
     if (!signature && !confirmNoSignature) { setConfirmNoSignature(true); return; }
     setSaving(true);
     const now = Date.now();
+    const v = splitModelExtras(model, modelYear, color);
     const job = {
       // No client-side id here — the database assigns a real UUID on
       // insert (jobs.id defaults to gen_random_uuid()). We read the
       // assigned id back from Supabase's response after saving.
       plate: plate.trim().toUpperCase(),
-      makeModel: composeMakeModel(make, model, ""),
-      make: make.trim(), model: model.trim(), modelYear: modelYear || null, color: color || null, bodyType: bodyType || null,
+      makeModel: composeMakeModel(make, v.model, ""),
+      make: make.trim(), model: v.model, modelYear: Number(v.modelYear) || null, color: v.color || null, bodyType: bodyType || null,
       customerName: customerName.trim(),
       customerPhone: customerPhone.trim(),
       description: description.trim(),
@@ -6752,8 +6792,33 @@ function NewJobForm({ session, team, onCreated, onCancel }) {
     const result = await createJob(job, { reassignVehicle: ownerChoice === "different", customerType });
     setSaving(false);
     if (!result.ok || !result.job.id) { setSaveError(result.reason || true); return; }
-    onCreated(result.job, result.ok);
+    // Saved — go straight to sending it to the customer for approval
+    // instead of opening the job card.
+    setCreatedJob(result.job);
   };
+
+  if (createdJob) {
+    return (
+      <div className="mrcap-view" style={{ padding: "4px 18px 30px" }}>
+        <SectionTitle>Send for Approval</SectionTitle>
+        <div style={{ ...cardStyle, padding: 14, marginBottom: 14, display: "flex", alignItems: "center", gap: 10 }}>
+          <CheckCircle2 size={20} color={COLORS.successText} style={{ flexShrink: 0 }} />
+          <div style={{ minWidth: 0 }}>
+            <div style={{ fontSize: 14, fontWeight: 700, color: COLORS.ink }}>Job card saved</div>
+            <div style={{ fontSize: 12.5, color: COLORS.muted, marginTop: 2 }}>
+              <span style={{ fontFamily: MONO_FONT, color: COLORS.gold }}>{createdJob.plate}</span> · {createdJob.makeModel || "Vehicle"} · {createdJob.customerName}
+            </div>
+          </div>
+        </div>
+        <JobApprovalPanel job={createdJob} session={session} onChanged={setCreatedJob} autoSend />
+        <StickyActionBar>
+          <button onClick={() => onCreated(createdJob, true)} className="mrcap-press" style={{ ...primaryBtnStyle, flex: 1, minHeight: 54, borderRadius: 14, display: "flex", alignItems: "center", justifyContent: "center", gap: 8 }}>
+            {createdJob.approvalStatus === "pending" || createdJob.approvalStatus === "approved" ? "Done" : "Skip for now"} — open job card <ArrowRight size={18} />
+          </button>
+        </StickyActionBar>
+      </div>
+    );
+  }
 
   return (
     <div className="mrcap-view" style={{ padding: "4px 18px 30px" }}>
@@ -7193,10 +7258,11 @@ function EditJobScreen({ job, session, onSaved, onCancel }) {
     diff("Plate", job.plate, plate.trim().toUpperCase());
     diff("Customer name", job.customerName, customerName.trim());
     diff("Customer phone", job.customerPhone, customerPhone.trim());
+    const v = splitModelExtras(model, modelYear, color);
     diff("Make", job.make || "", make.trim());
-    diff("Model", job.model || "", model.trim());
-    diff("Year", job.modelYear || "", modelYear || "");
-    diff("Colour", job.color || "", color || "");
+    diff("Model", job.model || "", v.model);
+    diff("Year", job.modelYear || "", v.modelYear || "");
+    diff("Colour", job.color || "", v.color || "");
     diff("Body type", job.bodyType || "", bodyType || "");
     diff("Description", job.description, description.trim());
     diff("Damage notes", job.damageNotes, damageNotes.trim());
@@ -7256,8 +7322,8 @@ function EditJobScreen({ job, session, onSaved, onCancel }) {
 
     const updated = {
       ...job,
-      plate: plate.trim().toUpperCase(), makeModel: composeMakeModel(make, model, job.makeModel),
-      make: make.trim() || null, model: model.trim() || null, modelYear: modelYear || null, color: color || null, bodyType: bodyType || null,
+      plate: plate.trim().toUpperCase(), makeModel: composeMakeModel(make, v.model, job.makeModel),
+      make: make.trim() || null, model: v.model || null, modelYear: Number(v.modelYear) || null, color: v.color || null, bodyType: bodyType || null,
       customerName: customerName.trim(), customerPhone: customerPhone.trim(),
       description: description.trim(), damageNotes: damageNotes.trim(),
       priority, location, serviceTypes, treatments, treatmentPrices, smartechPieces, discountPercent, parts,
@@ -7657,6 +7723,13 @@ function JobDetail({ id, initialJob, session, team, onChanged, onBack, canArchiv
     const saved = await saveJob(updated);
     setJob(updated);
     notifyChanged(updated, saved);
+  };
+
+  // JobApprovalPanel saves its own (narrow) write before calling this, and
+  // its poll only reports what's already on the server — just adopt it.
+  const onApprovalChanged = (updated) => {
+    setJob(updated);
+    notifyChanged(updated, true);
   };
 
   // Markup calculator — cost + % in, charge price out, saved as a line
@@ -8139,6 +8212,11 @@ function JobDetail({ id, initialJob, session, team, onChanged, onBack, canArchiv
         <StageStepper currentIndex={job.stageIndex} />
       </section>
 
+      {/* ---- Customer approval (job card sent over WhatsApp) ---- */}
+      {!isLast && hasPermission(session, team, "newJob") && !isSmartechPortal(session) && (
+        <JobApprovalPanel job={job} session={session} onChanged={onApprovalChanged} />
+      )}
+
       {/* ---- What happens next (note / parts photos travel with the advance below) ---- */}
       {!isLast && (
         <section style={{ ...cardStyle, padding: 14, marginBottom: 14, border: `1px solid ${stage.key === "service" && !allServicesDone ? "rgba(214,106,86,0.45)" : COLORS.line}` }}>
@@ -8165,8 +8243,8 @@ function JobDetail({ id, initialJob, session, team, onChanged, onBack, canArchiv
           acknowledgment staff can tick regardless of how they told the
           customer (call, in person, WhatsApp from a personal phone,
           etc). Nesting it inside `job.customerPhone &&` used to hide the
-          checkbox entirely for any job with no phone on file (e.g. every
-          Quick Intake job) — leaving no way to ever clear the dashboard's
+          checkbox entirely for any job with no phone on file (e.g. the
+          old Quick Intake jobs) — leaving no way to ever clear the dashboard's
           "Customer Not Yet Informed" flag for that car. */}
       {stage.key === "ready" && (
         <>
@@ -9360,6 +9438,18 @@ const TEMPLATE_DEFS = [
       { token: "plate", sample: "A 12345" },
       { token: "total", sample: "1,200" },
       { token: "quoteLink", sample: "https://…/?quote=…" },
+    ],
+  },
+  {
+    key: "job_approval",
+    label: "Job Card for Approval",
+    description: "Sent right after a new job card is saved (or from the job's detail screen) so the customer can approve or decline it from their phone.",
+    tokens: [
+      { token: "customerName", sample: "Ahmed" },
+      { token: "makeModel", sample: "Toyota Land Cruiser" },
+      { token: "plate", sample: "A 12345" },
+      { token: "total", sample: "1,260" },
+      { token: "approvalLink", sample: "https://…/?approve=…" },
     ],
   },
   {
@@ -11421,7 +11511,24 @@ function ProformaEditor({ seed, session, onCancel, onDone }) {
 
       <div style={billCard}>
         <div style={{ ...smallLabel, marginBottom: 10 }}>Vehicle</div>
-        <Field label="Make / model"><input style={inp} value={p.car.makeModel} onChange={(e) => setCar("makeModel", e.target.value)} /></Field>
+        {/* Older proformas only have the combined string — keep editing it
+            as-is; everything new gets separate Make and Model, with
+            makeModel kept in step for anything that still reads it. */}
+        {!p.car.make && p.car.makeModel ? (
+          <Field label="Make / model"><input style={inp} value={p.car.makeModel} onChange={(e) => setCar("makeModel", e.target.value)} /></Field>
+        ) : (
+          <div style={{ display: "flex", gap: 8 }}>
+            <div style={{ flex: 1 }}><Field label="Make"><input style={inp} value={p.car.make || ""} onChange={(e) => setP((cur) => ({ ...cur, car: { ...cur.car, make: e.target.value, makeModel: composeMakeModel(e.target.value, cur.car.model, "") } }))} /></Field></div>
+            <div style={{ flex: 1 }}><Field label="Model (optional)"><input style={inp} value={p.car.model || ""} onChange={(e) => setP((cur) => ({ ...cur, car: { ...cur.car, model: e.target.value, makeModel: composeMakeModel(cur.car.make, e.target.value, "") } }))} /></Field></div>
+          </div>
+        )}
+        <Field label="Body type (optional)">
+          <div style={{ display: "flex", gap: 6, flexWrap: "wrap" }}>
+            {BODY_TYPES.map((b) => (
+              <button key={b.key} type="button" onClick={() => setCar("bodyType", p.car.bodyType === b.key ? "" : b.key)} className="mrcap-press" aria-pressed={p.car.bodyType === b.key} style={selectChipStyle(p.car.bodyType === b.key)}>{b.label}</button>
+            ))}
+          </div>
+        </Field>
         <div style={{ display: "flex", gap: 8 }}>
           <div style={{ flex: 1 }}><Field label="Year (optional)"><input style={{ ...inp, fontFamily: MONO_FONT }} inputMode="numeric" value={p.car.year || ""} onChange={(e) => setCar("year", e.target.value.replace(/[^0-9]/g, "").slice(0, 4))} placeholder="e.g. 2025" /></Field></div>
           <div style={{ flex: 1 }}><Field label="Colour"><input style={inp} value={p.car.color} onChange={(e) => setCar("color", e.target.value)} /></Field></div>
@@ -11724,6 +11831,280 @@ function slugify(label) {
   return base || `item_${Math.random().toString(36).slice(2, 7)}`;
 }
 
+/* ---------------- Customer approval — staff side ----------------
+   Shown straight after a new job card is saved (autoSend) and on the job
+   card itself. Creates the approval link, hands staff a one-tap WhatsApp
+   send, then polls while pending so the answer shows up on this screen
+   the moment the customer taps Approve/Decline. */
+const APPROVAL_POLL_MS = 8000;
+const APPROVAL_STATUS_UI = {
+  pending: { label: "Waiting for customer", color: COLORS.gold, bg: "rgba(201,162,39,0.12)" },
+  approved: { label: "Approved by customer", color: COLORS.successText, bg: "rgba(74,122,87,0.14)" },
+  declined: { label: "Declined by customer", color: COLORS.dangerText, bg: "rgba(168,64,47,0.14)" },
+};
+
+function JobApprovalPanel({ job, session, onChanged, autoSend = false }) {
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState(null);
+  const [copied, setCopied] = useState(false);
+  // Refs so the poll interval isn't torn down and restarted every time the
+  // parent re-renders with a fresh onChanged/job object.
+  const jobRef = useRef(job);
+  jobRef.current = job;
+  const onChangedRef = useRef(onChanged);
+  onChangedRef.current = onChanged;
+  const autoSent = useRef(false);
+
+  const send = useCallback(async () => {
+    setBusy(true);
+    setError(null);
+    const r = await sendJobForApproval(jobRef.current, session);
+    setBusy(false);
+    if (!r.ok) { setError("Couldn't create the approval link — check the connection and try again."); return; }
+    onChangedRef.current(r.job);
+  }, [session]);
+
+  useEffect(() => {
+    if (autoSend && !autoSent.current && !job.approvalStatus && job.id) {
+      autoSent.current = true;
+      send();
+    }
+  }, [autoSend, job.approvalStatus, job.id, send]);
+
+  // Poll only while waiting on the customer; stops itself once answered.
+  useEffect(() => {
+    if (job.approvalStatus !== "pending" || !job.id) return undefined;
+    let cancelled = false;
+    const tick = async () => {
+      const { ok, data, stale } = await sbFetch(`jobs?id=eq.${job.id}&select=approval_token,approval_status,approval_decided_at,approval_note`);
+      if (cancelled || !ok || stale || !data || !data[0]) return;
+      const row = data[0];
+      const cur = jobRef.current;
+      if (row.approval_token !== cur.approvalToken || row.approval_status === cur.approvalStatus) return;
+      onChangedRef.current({
+        ...cur,
+        approvalStatus: row.approval_status,
+        approvalDecidedAt: row.approval_decided_at ? new Date(row.approval_decided_at).getTime() : null,
+        approvalNote: row.approval_note || null,
+        _base: cur._base ? { ...cur._base, approval_status: row.approval_status } : cur._base,
+      });
+    };
+    const t = setInterval(tick, APPROVAL_POLL_MS);
+    return () => { cancelled = true; clearInterval(t); };
+  }, [job.approvalStatus, job.id]);
+
+  const status = job.approvalStatus;
+  const snap = job.approvalSnapshot;
+  const link = job.approvalToken ? approvalLink(job.approvalToken) : "";
+  const ui = APPROVAL_STATUS_UI[status];
+  const currentTotal = round2(buildInvoiceLineItems(job).grandTotal);
+  const drifted = snap && Math.abs(currentTotal - (snap.grandTotal || 0)) >= 0.01;
+
+  const copy = async () => {
+    try { await navigator.clipboard.writeText(link); setCopied(true); setTimeout(() => setCopied(false), 2000); } catch { /* clipboard blocked — link is still shown below */ }
+  };
+
+  const smallBtn = { display: "inline-flex", alignItems: "center", justifyContent: "center", gap: 6, minHeight: 40, padding: "8px 12px", borderRadius: 10, border: `1px solid ${COLORS.line}`, background: COLORS.panel2, color: COLORS.ink, fontSize: 12.5, fontWeight: 600, cursor: "pointer" };
+
+  return (
+    <section aria-label="Customer approval" style={{ ...cardStyle, padding: 14, marginBottom: 14, border: `1px solid ${ui ? ui.color : COLORS.line}` }}>
+      <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", gap: 8, marginBottom: 10 }}>
+        <span style={eyebrowStyle}>Customer approval</span>
+        {ui && <span style={{ fontSize: 11.5, fontWeight: 700, color: ui.color, background: ui.bg, borderRadius: 999, padding: "4px 10px" }}>{ui.label}</span>}
+      </div>
+
+      {!status && (
+        <>
+          <div style={{ fontSize: 12.5, color: COLORS.muted, marginBottom: 10, lineHeight: 1.45 }}>Send this job card to the customer so they can approve it on their phone.</div>
+          <button onClick={send} disabled={busy} className="mrcap-press" style={{ ...primaryBtnStyle, width: "100%", display: "flex", alignItems: "center", justifyContent: "center", gap: 8, opacity: busy ? 0.6 : 1 }}>
+            <Send size={16} /> {busy ? "Preparing link…" : "Send job card for approval"}
+          </button>
+        </>
+      )}
+
+      {status && snap && (
+        <>
+          <div style={{ display: "flex", justifyContent: "space-between", fontSize: 12.5, color: COLORS.muted, marginBottom: 10 }}>
+            <span>Sent {fmtTime(job.approvalSentAt)}{snap.sentBy ? ` by ${snap.sentBy}` : ""}</span>
+            <span style={{ fontFamily: MONO_FONT, color: COLORS.gold, fontWeight: 700 }}>AED {Math.round(snap.grandTotal || 0).toLocaleString()}</span>
+          </div>
+
+          {status === "approved" && (
+            <div style={{ display: "flex", alignItems: "center", gap: 8, fontSize: 13.5, fontWeight: 700, color: COLORS.successText, background: APPROVAL_STATUS_UI.approved.bg, borderRadius: 10, padding: "10px 12px", marginBottom: 10 }}>
+              <CheckCircle2 size={17} /> {job.customerName || "Customer"} approved · {fmtTime(job.approvalDecidedAt)}
+            </div>
+          )}
+          {status === "declined" && (
+            <div style={{ fontSize: 13, color: COLORS.dangerText, background: APPROVAL_STATUS_UI.declined.bg, borderRadius: 10, padding: "10px 12px", marginBottom: 10 }}>
+              <div style={{ display: "flex", alignItems: "center", gap: 8, fontWeight: 700 }}><XCircle size={17} /> Declined · {fmtTime(job.approvalDecidedAt)}</div>
+              {job.approvalNote && <div style={{ marginTop: 5, color: COLORS.ink, fontSize: 12.5 }}>“{job.approvalNote}”</div>}
+            </div>
+          )}
+
+          {status === "pending" && (
+            <>
+              <WhatsAppSendButton
+                phone={job.customerPhone}
+                templateKey="job_approval"
+                vars={{ customerName: job.customerName || "", makeModel: job.makeModel || "vehicle", plate: job.plate || "", total: Math.round(snap.grandTotal || 0).toLocaleString(), approvalLink: link }}
+                label="Send to Customer on WhatsApp"
+              />
+              {!job.customerPhone && <div style={{ fontSize: 11.5, color: COLORS.muted, marginBottom: 8, fontStyle: "italic" }}>No phone on file — copy the link and send it another way, or add a phone via Edit Job.</div>}
+              <div style={{ display: "flex", alignItems: "center", gap: 7, fontSize: 12, color: COLORS.muted, marginBottom: 10 }}>
+                <span style={{ width: 8, height: 8, borderRadius: 999, background: COLORS.gold, flexShrink: 0, animation: "mrcapPulseRing 1.6s ease-out infinite" }} />
+                This updates by itself when the customer answers.
+              </div>
+            </>
+          )}
+
+          {!snap.grandTotal && !drifted && (
+            <div style={{ fontSize: 12, color: COLORS.muted, background: COLORS.panel2, borderRadius: 10, padding: "8px 10px", marginBottom: 10 }}>
+              No prices on this job card yet — the customer will see “pricing will be confirmed”. Add prices via Edit Job, then Resend.
+            </div>
+          )}
+          {drifted && (
+            <div role="alert" style={{ fontSize: 12, color: COLORS.dangerText, background: "rgba(168,64,47,0.12)", borderRadius: 10, padding: "8px 10px", marginBottom: 10 }}>
+              Prices changed since this was sent (now AED {Math.round(currentTotal).toLocaleString()}). Resend so the customer approves the current total.
+            </div>
+          )}
+
+          <div style={{ display: "flex", gap: 8, flexWrap: "wrap" }}>
+            {status === "pending" && <button onClick={copy} className="mrcap-press" style={smallBtn}><Copy size={14} /> {copied ? "Copied" : "Copy link"}</button>}
+            {(status !== "approved" || drifted) && (
+              <button onClick={send} disabled={busy} className="mrcap-press" style={{ ...smallBtn, opacity: busy ? 0.6 : 1 }}><RotateCcw size={14} /> {busy ? "Preparing…" : "Resend (new link)"}</button>
+            )}
+          </div>
+        </>
+      )}
+
+      {error && <div role="alert" style={{ fontSize: 12.5, color: COLORS.dangerText, marginTop: 10 }}>{error}</div>}
+    </section>
+  );
+}
+
+/* ---------------- Customer approval — public page (?approve=<token>) ----------------
+   What the customer opens from WhatsApp. No login; talks only to the
+   job-approval edge function, which only ever returns the frozen
+   snapshot staff sent. */
+function PublicJobApprovalView({ token }) {
+  const [state, setState] = useState("loading"); // loading | ok | notfound | error
+  const [data, setData] = useState(null);
+  const [busy, setBusy] = useState(false);
+  const [declining, setDeclining] = useState(false);
+  const [reason, setReason] = useState("");
+  const [actionError, setActionError] = useState(null);
+
+  const load = useCallback(async () => {
+    const r = await jobApprovalCall({ action: "view", token });
+    if (r.ok) { setData(r); setState("ok"); } else setState(r.notFound ? "notfound" : "error");
+  }, [token]);
+  useEffect(() => { load(); }, [load]);
+
+  const decide = async (decision) => {
+    setBusy(true);
+    setActionError(null);
+    const r = await jobApprovalCall({ action: "decide", token, decision, note: decision === "declined" ? reason : "" });
+    setBusy(false);
+    if (!r.ok) { setActionError("That didn't go through — please check your connection and try again."); return; }
+    await load();
+  };
+
+  if (state === "loading") return <PublicPageShell><SkeletonRows count={3} height={56} /></PublicPageShell>;
+  if (state !== "ok") {
+    return (
+      <PublicPageShell>
+        <div style={{ textAlign: "center", color: COLORS.muted, padding: 20 }}>
+          {state === "notfound" ? "We couldn't find this job card. The link may have been replaced by a newer one — please check your latest WhatsApp message from us." : "Something went wrong loading this page. Please check your connection and try again."}
+        </div>
+        {state === "error" && <button onClick={() => { setState("loading"); load(); }} className="mrcap-press" style={{ ...secondaryBtnStyle, width: "100%" }}>Try again</button>}
+      </PublicPageShell>
+    );
+  }
+
+  const s = data.snapshot || {};
+  const items = s.items || [];
+  const aed = (n) => `AED ${(Number(n) || 0).toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`;
+  const row = { display: "flex", justifyContent: "space-between", gap: 10, fontSize: 13, color: COLORS.muted, padding: "3px 0" };
+
+  return (
+    <PublicPageShell>
+      <div style={{ background: COLORS.panel, border: `1px solid ${COLORS.line}`, borderRadius: 14, padding: 22 }}>
+        <div style={{ textAlign: "center", marginBottom: 18 }}>
+          <div style={{ fontSize: 11, color: COLORS.muted, textTransform: "uppercase", letterSpacing: 1 }}>Job card{s.jobRef ? ` · ${s.jobRef}` : ""}</div>
+          <div style={{ fontFamily: DISPLAY_FONT, fontWeight: 700, fontSize: 19, color: COLORS.ink, marginTop: 4 }}>{s.makeModel || "Vehicle"}</div>
+          <div style={{ fontFamily: MONO_FONT, fontSize: 13, color: COLORS.gold, marginTop: 2 }}>{s.plate}</div>
+          {s.customerName && <div style={{ fontSize: 12.5, color: COLORS.muted, marginTop: 8 }}>Prepared for {s.customerName}</div>}
+        </div>
+
+        {(s.description || s.damageNotes) && (
+          <div style={{ background: COLORS.panel2, border: `1px solid ${COLORS.line}`, borderRadius: 8, padding: "9px 11px", marginBottom: 12, fontSize: 12.5, color: COLORS.ink, lineHeight: 1.45 }}>
+            {s.description && <div><span style={{ color: COLORS.muted }}>Work requested: </span>{s.description}</div>}
+            {s.damageNotes && <div style={{ marginTop: s.description ? 5 : 0 }}><span style={{ color: COLORS.muted }}>Condition noted: </span>{s.damageNotes}</div>}
+          </div>
+        )}
+
+        {items.length > 0 ? (
+          <div style={{ marginBottom: 12 }}>
+            {items.map((it, i) => (
+              <div key={i} style={{ background: COLORS.panel2, border: `1px solid ${COLORS.line}`, borderRadius: 8, padding: "9px 11px", marginBottom: 6, display: "flex", justifyContent: "space-between", gap: 10 }}>
+                <div>
+                  <div style={{ fontSize: 12.5, fontWeight: 600, color: COLORS.ink }}>{it.desc}</div>
+                  {(it.qty > 1 || it.discount > 0) && <div style={{ fontSize: 11, color: COLORS.muted, marginTop: 2 }}>{it.qty > 1 ? `${it.qty} × ${aed(it.price)}` : ""}{it.qty > 1 && it.discount > 0 ? " · " : ""}{it.discount > 0 ? `${it.discount}% off` : ""}</div>}
+                </div>
+                <div style={{ fontFamily: MONO_FONT, fontSize: 12.5, color: COLORS.gold, whiteSpace: "nowrap" }}>{aed(it.amountExcl)}</div>
+              </div>
+            ))}
+          </div>
+        ) : (
+          <div style={{ fontSize: 12.5, color: COLORS.muted, textAlign: "center", marginBottom: 12 }}>Pricing will be confirmed with you by the team.</div>
+        )}
+
+        {items.length > 0 && <div style={{ borderTop: `1px dashed ${COLORS.line}`, paddingTop: 10 }}>
+          <div style={row}><span>Subtotal</span><span style={{ fontFamily: MONO_FONT }}>{aed(s.subtotal)}</span></div>
+          <div style={row}><span>VAT {Math.round((s.vatRate || 0) * 100)}%</span><span style={{ fontFamily: MONO_FONT }}>{aed(s.vatTotal)}</span></div>
+          <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", padding: "10px 0 4px" }}>
+            <span style={{ fontSize: 14, fontWeight: 700, color: COLORS.ink }}>Total</span>
+            <span style={{ fontFamily: MONO_FONT, fontWeight: 700, fontSize: 19, color: COLORS.gold }}>{aed(s.grandTotal)}</span>
+          </div>
+        </div>}
+
+        {data.status === "approved" && (
+          <div style={{ marginTop: 14, textAlign: "center", padding: "14px 16px", borderRadius: 10, background: "rgba(74,122,87,0.12)", border: `1px solid ${COLORS.green}` }}>
+            <div style={{ fontSize: 15, fontWeight: 700, color: COLORS.successText, display: "flex", alignItems: "center", justifyContent: "center", gap: 7 }}><CheckCircle2 size={18} /> Approved — thank you!</div>
+            <div style={{ fontSize: 11.5, color: COLORS.muted, marginTop: 5 }}>We'll get started and keep you posted on WhatsApp.</div>
+          </div>
+        )}
+        {data.status === "declined" && (
+          <div style={{ marginTop: 14, textAlign: "center", padding: "14px 16px", borderRadius: 10, background: "rgba(168,64,47,0.12)", border: "1px solid rgba(168,64,47,0.6)" }}>
+            <div style={{ fontSize: 14, fontWeight: 700, color: COLORS.dangerText }}>Declined</div>
+            <div style={{ fontSize: 11.5, color: COLORS.muted, marginTop: 5 }}>Thanks for letting us know — our team will be in touch.</div>
+          </div>
+        )}
+
+        {data.status === "pending" && !declining && (
+          <div style={{ marginTop: 16 }}>
+            <button onClick={() => decide("approved")} disabled={busy} className="mrcap-press" style={{ ...primaryBtnStyle, width: "100%", minHeight: 56, fontSize: 16, display: "flex", alignItems: "center", justifyContent: "center", gap: 8, opacity: busy ? 0.6 : 1 }}>
+              <CheckCircle2 size={19} /> {busy ? "Sending…" : "Approve job card"}
+            </button>
+            <button onClick={() => setDeclining(true)} disabled={busy} className="mrcap-press" style={{ ...secondaryBtnStyle, width: "100%", marginTop: 10, color: COLORS.muted }}>Decline</button>
+            <div style={{ fontSize: 11, color: COLORS.muted, textAlign: "center", marginTop: 10 }}>By approving you agree to the work and total shown above.</div>
+          </div>
+        )}
+        {data.status === "pending" && declining && (
+          <div style={{ marginTop: 16 }}>
+            <textarea value={reason} onChange={(e) => setReason(e.target.value)} maxLength={500} placeholder="Reason (optional) — e.g. only want the tint, not the PPF" style={{ ...textareaStyle, marginTop: 0 }} />
+            <div style={{ display: "flex", gap: 8, marginTop: 10 }}>
+              <button onClick={() => setDeclining(false)} disabled={busy} className="mrcap-press" style={{ ...secondaryBtnStyle, flex: 1 }}>Back</button>
+              <button onClick={() => decide("declined")} disabled={busy} className="mrcap-press" style={{ ...primaryBtnStyle, flex: 2, background: COLORS.red, color: "#fff", opacity: busy ? 0.6 : 1 }}>{busy ? "Sending…" : "Confirm decline"}</button>
+            </div>
+          </div>
+        )}
+        {actionError && <div role="alert" style={{ fontSize: 12.5, color: COLORS.dangerText, marginTop: 10, textAlign: "center" }}>{actionError}</div>}
+      </div>
+    </PublicPageShell>
+  );
+}
+
 /* ---------------- Public links — scoped to one job/quote ---------------- */
 // PublicQuoteView is reached via ?quote=<quoteId> in the URL (see
 // PublicLinkRouter below and the router in main.jsx, which checks for
@@ -11898,6 +12279,8 @@ function PublicQuoteView({ quoteId }) {
 // GarageApp itself, behind the staff/Smartech login gate.
 export function PublicLinkRouter() {
   const params = new URLSearchParams(window.location.search);
+  const approveToken = params.get("approve");
+  if (approveToken) return <PublicJobApprovalView token={approveToken} />;
   const quoteId = params.get("quote");
   if (quoteId) return <PublicQuoteView quoteId={quoteId} />;
   return null;
@@ -16480,6 +16863,12 @@ function ppfWhatBookedLabel(job, matcher) {
 // Tint defaults ON when a Window Tinting treatment is booked; foilwork
 // (labelled by whichever of these was actually booked) defaults ON when
 // FoilWork / a sticker install / a PPF removal is booked.
+// "12 panels", "12 panels + tint", or "4 glass areas" for a tint-only job.
+function ppfScopeCountLabel(car) {
+  const n = scopeKeys(car).length;
+  if (!n && car.tintBooked) return `${TINT_KEYS.length} glass areas`;
+  return `${n} panel${n === 1 ? "" : "s"}${car.tintBooked ? " + tint" : ""}`;
+}
 function ppfDefaultExtras(job) {
   const tint = !!ppfWhatBookedLabel(job, /window tint/i);
   const foilLabel = ppfWhatBookedLabel(job, /foilwork|sticker installation|ppf removal/i);
@@ -16700,12 +17089,12 @@ function PPFScopeEditor({ job, session, team, onSaved }) {
       extras: { tint: extras.tint, foilwork: extras.foilwork, doorCups: extras.doorCups },
       spare, note, setBy: session.name, setAt: Date.now(),
     };
-    const label = scopeLabel({ bodyShape: effectiveBodyType, spare, scope });
+    const label = scopeLabel(carDraft);
     const updated = {
       ...job,
       bodyType: effectiveBodyType || job.bodyType,
       ppfScope,
-      history: [...(job.history || []), { stage: "ppf_scope", label: "PPF Room", by: session.name, role: session.role, note: `PPF scope set: ${label} · ${n} panel${n === 1 ? "" : "s"}`, at: Date.now() }],
+      history: [...(job.history || []), { stage: "ppf_scope", label: "PPF Room", by: session.name, role: session.role, note: `PPF scope set: ${label} · ${ppfScopeCountLabel(carDraft)}`, at: Date.now() }],
       updatedAt: Date.now(),
     };
     const saved = await saveJob(updated);
@@ -16715,6 +17104,15 @@ function PPFScopeEditor({ job, session, team, onSaved }) {
   };
 
   const n = scopeKeys({ bodyShape: effectiveBodyType, spare, scope }).length;
+  // Anything at all for the PPF Room to do — panels, tint glass or a
+  // whole-job extra. A tint-only job has zero panels but is still real work.
+  const workCount = zonesFor(carDraft).length;
+  const tintOnly = !!extras.tint && n === 0;
+  const chooseTintOnly = () => {
+    setScope({ preset: "custom", edited: false, z: {} });
+    setExtras((x) => ({ ...x, tint: true, foilwork: false, doorCups: false }));
+    ppfTone2();
+  };
 
   if (collapsed) {
     return (
@@ -16728,7 +17126,7 @@ function PPFScopeEditor({ job, session, team, onSaved }) {
             <ChevronDown size={16} color={COLORS.muted} />
           </div>
           <div style={{ fontSize: 12.5, color: COLORS.muted, marginTop: 6 }}>
-            {job.ppfScope ? `${scopeLabel({ bodyShape: effectiveBodyType, spare, scope })} · ${n} panel${n === 1 ? "" : "s"}` : "Not set yet"}
+            {job.ppfScope ? `${scopeLabel(carDraft)} · ${ppfScopeCountLabel(carDraft)}` : "Not set yet"}
           </div>
         </button>
       </section>
@@ -16754,8 +17152,11 @@ function PPFScopeEditor({ job, session, team, onSaved }) {
       ) : (
         <fieldset disabled={!canEdit} style={{ border: "none", padding: 0, margin: 0 }}>
           <div style={{ display: "flex", flexWrap: "wrap", gap: 6, marginBottom: 10 }}>
+            <button type="button" onClick={chooseTintOnly} className="mrcap-press" style={{ background: tintOnly ? COLORS.gold : COLORS.panel2, border: `1px solid ${tintOnly ? COLORS.gold : COLORS.line}`, color: tintOnly ? COLORS.darkText : COLORS.ink, borderRadius: 999, padding: "8px 14px", fontFamily: DISPLAY_FONT, fontWeight: 700, fontSize: 13, cursor: canEdit ? "pointer" : "default" }}>
+              Tint only
+            </button>
             {PRESET_ORDER.map((p) => {
-              const on = scope.edited ? p === "custom" : scope.preset === p;
+              const on = !tintOnly && (scope.edited ? p === "custom" : scope.preset === p);
               const label = (p === "custom" && scope.edited) ? "Custom (edited)" : PRESETS[p].label;
               return (
                 <button key={p} type="button" onClick={() => applyPreset(p)} className="mrcap-press" style={{ background: on ? COLORS.gold : COLORS.panel2, border: `1px solid ${on ? COLORS.gold : COLORS.line}`, color: on ? COLORS.darkText : COLORS.ink, borderRadius: 999, padding: "8px 14px", fontFamily: DISPLAY_FONT, fontWeight: 700, fontSize: 13, cursor: canEdit ? "pointer" : "default" }}>
@@ -16787,8 +17188,17 @@ function PPFScopeEditor({ job, session, team, onSaved }) {
 
           <div style={{ display: "flex", justifyContent: "space-between", alignItems: "flex-end", gap: 10, marginBottom: 10, flexWrap: "wrap" }}>
             <div>
-              <div style={{ fontFamily: DISPLAY_FONT, fontWeight: 700, fontSize: 26, color: COLORS.ink }}><span style={{ color: COLORS.goldBright }}>{n}</span> panel{n === 1 ? "" : "s"} to do</div>
-              <div style={{ fontFamily: MONO_FONT, fontSize: 12.5, color: COLORS.muted, marginTop: 4 }}>{ppfBreakdown({ bodyShape: effectiveBodyType, spare, scope })}</div>
+              {tintOnly ? (
+                <>
+                  <div style={{ fontFamily: DISPLAY_FONT, fontWeight: 700, fontSize: 26, color: COLORS.ink }}>Tint only</div>
+                  <div style={{ fontFamily: MONO_FONT, fontSize: 12.5, color: COLORS.muted, marginTop: 4 }}>No film panels · {TINT_KEYS.length} glass areas to tint</div>
+                </>
+              ) : (
+                <>
+                  <div style={{ fontFamily: DISPLAY_FONT, fontWeight: 700, fontSize: 26, color: COLORS.ink }}><span style={{ color: COLORS.goldBright }}>{n}</span> panel{n === 1 ? "" : "s"} to do</div>
+                  <div style={{ fontFamily: MONO_FONT, fontSize: 12.5, color: COLORS.muted, marginTop: 4 }}>{ppfBreakdown({ bodyShape: effectiveBodyType, spare, scope })}{extras.tint ? " · + tint" : ""}</div>
+                </>
+              )}
             </div>
           </div>
           <div style={{ fontSize: 11.5, color: COLORS.muted, marginBottom: 10 }}>Tap a panel to add or remove it. Bonnet and front fenders: Off → Full → ½ (front 40%) → Off.</div>
@@ -16808,7 +17218,7 @@ function PPFScopeEditor({ job, session, team, onSaved }) {
           <textarea value={note} onChange={(e) => setNote(e.target.value)} placeholder="Note for the PPF team (optional)" style={{ width: "100%", minHeight: 64, background: COLORS.panel2, border: `1px solid ${COLORS.line}`, borderRadius: 10, color: COLORS.ink, padding: 10, fontFamily: BODY_FONT, fontSize: 13.5, marginBottom: 10, boxSizing: "border-box" }} />
 
           {canEdit && (
-            <button type="button" onClick={send} disabled={saving || n === 0} className="mrcap-press" style={{ ...primaryBtnStyle, width: "100%", opacity: (saving || n === 0) ? 0.6 : 1 }}>
+            <button type="button" onClick={send} disabled={saving || workCount === 0} className="mrcap-press" style={{ ...primaryBtnStyle, width: "100%", opacity: (saving || workCount === 0) ? 0.6 : 1 }}>
               {saving ? "Sending…" : "Send to PPF Room"}
             </button>
           )}
@@ -16859,7 +17269,7 @@ function PPFOfficeView({ job, team }) {
       </div>
 
       <div style={{ fontFamily: MONO_FONT, fontWeight: 700, fontSize: 15, color: COLORS.ink, marginBottom: 4 }}>{t.done} of {t.total}</div>
-      <div style={{ fontSize: 12.5, color: COLORS.muted, marginBottom: 10 }}>{scopeLabel(car)} · {keys.length} panel{keys.length === 1 ? "" : "s"}</div>
+      <div style={{ fontSize: 12.5, color: COLORS.muted, marginBottom: 10 }}>{scopeLabel(car)} · {ppfScopeCountLabel(car)}</div>
       <div style={{ display: "flex", flexWrap: "wrap", gap: 4, marginBottom: 10 }}>
         {keys.map((k) => (
           <span key={k} style={{ fontSize: 11, background: COLORS.panel2, border: `1px solid ${COLORS.line}`, borderRadius: 999, padding: "3px 9px", color: doneSet.has(k) ? COLORS.successText : skippedSet.has(k) ? COLORS.muted : COLORS.ink }}>
