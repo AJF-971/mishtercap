@@ -2070,9 +2070,85 @@ function newApprovalToken() {
   return btoa(String.fromCharCode(...bytes)).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
 }
 const round2 = (n) => Math.round((Number(n) || 0) * 100) / 100;
-function buildApprovalSnapshot(job, session) {
+
+/* Vehicle-inspection picture on the customer's job card. The snapshot is a
+   jsonb column the customer page downloads in full, so the picture only goes
+   in when it is a small JPEG (what PanelDamageMarker exports now). Old jobs
+   hold a ~650 KB PNG: the async send paths shrink those to a JPEG in the
+   browser (prepareDiagramForCard), remembered in diagramJpegCache and stamped
+   into the snapshot together with a fingerprint of the source image
+   (diagramSrcKey), so the sync refresh can keep it while the job's image is
+   unchanged instead of flip-flopping between "has picture" and "none". */
+const DIAGRAM_MAX_CHARS = 200000;
+const diagramJpegCache = new Map(); // diagramSrcKey -> small JPEG data URL
+function diagramSrcKey(src) {
+  return typeof src === "string" && src ? `${src.length}:${src.slice(0, 64)}:${src.slice(-64)}` : null;
+}
+function isUsableDiagram(src) {
+  return typeof src === "string" && /^data:image\/jpe?g;base64,/i.test(src) && src.length <= DIAGRAM_MAX_CHARS;
+}
+// Re-encodes any diagram data URL (legacy PNG, or an oversized JPEG) as a small white-background JPEG.
+function downscaleDiagramToJpeg(src, maxW = 640) {
+  return new Promise((resolve) => {
+    try {
+      const img = new Image();
+      img.onload = () => {
+        try {
+          const nw = img.naturalWidth || 640, nh = img.naturalHeight || 428;
+          const w = Math.min(maxW, nw), h = Math.max(1, Math.round((w * nh) / nw));
+          const c = document.createElement("canvas");
+          c.width = w; c.height = h;
+          const ctx = c.getContext("2d");
+          ctx.fillStyle = "#fff"; ctx.fillRect(0, 0, w, h);
+          ctx.drawImage(img, 0, 0, w, h);
+          for (const q of [0.8, 0.6, 0.45]) {
+            const out = c.toDataURL("image/jpeg", q);
+            if (out.length <= DIAGRAM_MAX_CHARS) { resolve(out); return; }
+          }
+          resolve(null);
+        } catch { resolve(null); }
+      };
+      img.onerror = () => resolve(null);
+      img.src = src;
+    } catch { resolve(null); }
+  });
+}
+// Async step for the send paths: makes sure a small JPEG exists for a job
+// whose stored diagram can't go into the snapshot as it is.
+async function prepareDiagramForCard(job) {
+  const src = job.damageDiagramImage;
+  if (!src || isUsableDiagram(src)) return;
+  const key = diagramSrcKey(src);
+  if (diagramJpegCache.has(key)) return;
+  const snap = job.approvalSnapshot;
+  if (snap && snap.diagram && snap.diagramSrcKey === key) return; // already converted for this exact image
+  const jpeg = await downscaleDiagramToJpeg(src);
+  if (jpeg) diagramJpegCache.set(key, jpeg);
+}
+// { diagram, diagramSrcKey } for a job. `prior` = the snapshot already sent
+// (its converted picture is kept while the job's image is unchanged);
+// `useCache` also accepts a picture converted this session.
+function snapshotDiagram(job, prior, useCache) {
+  const src = job.damageDiagramImage;
+  if (!src) return { diagram: null, diagramSrcKey: null };
+  const key = diagramSrcKey(src);
+  if (isUsableDiagram(src)) return { diagram: src, diagramSrcKey: key };
+  if (prior && prior.diagram && prior.diagramSrcKey === key) return { diagram: prior.diagram, diagramSrcKey: key };
+  return { diagram: (useCache && diagramJpegCache.get(key)) || null, diagramSrcKey: key };
+}
+// Attaches a just-converted picture to an existing snapshot (no revisedAt:
+// the customer is being sent the card right now).
+function withConvertedDiagram(job, snap) {
+  if (!snap) return snap;
+  const d = snapshotDiagram(job, snap, true);
+  if (!d.diagram || (snap.diagram === d.diagram && snap.diagramSrcKey === d.diagramSrcKey)) return snap;
+  return { ...snap, diagram: d.diagram, diagramSrcKey: d.diagramSrcKey };
+}
+
+function buildApprovalSnapshot(job, session, prior, useCache) {
   const { rows, grandTotal } = buildInvoiceLineItems(job);
   const veh = vehicleForDocs(job);
+  const dg = snapshotDiagram(job, prior, useCache);
   return {
     v: 2,
     plate: job.plate || "", makeModel: composeMakeModel(job.make, job.model, job.makeModel) || "", customerName: job.customerName || "",
@@ -2080,6 +2156,8 @@ function buildApprovalSnapshot(job, session) {
     jobRef: job.id ? job.id.slice(0, 8).toUpperCase() : "",
     intakeDate: job.createdAt || null,
     description: job.description || "", damageNotes: job.damageNotes || "",
+    damagePanels: Array.isArray(job.damagePanels) ? job.damagePanels : [],
+    diagram: dg.diagram, diagramSrcKey: dg.diagramSrcKey,
     items: rows.map((r) => ({ desc: r.desc, qty: r.qty, price: round2(r.price), discount: r.discount || 0, amountExcl: round2(r.amountExcl), vat: round2(r.vatAmount), amountIncl: round2(r.amountIncl) })),
     subtotal: round2(rows.reduce((s, r) => s + r.amountExcl, 0)),
     vatTotal: round2(rows.reduce((s, r) => s + r.vatAmount, 0)),
@@ -2106,10 +2184,16 @@ function stableJson(v) {
 // compared on the fields it has, so old cards aren't flagged "revised" just
 // because v2 added vehicle fields.
 const APPROVAL_V1_FIELDS = ["plate", "makeModel", "customerName", "description", "damageNotes", "items", "subtotal", "vatTotal", "grandTotal"];
-const APPROVAL_V2_FIELDS = [...APPROVAL_V1_FIELDS, "make", "model", "modelYear", "color", "bodyType"];
+// damagePanels / diagram arrived later inside v2: a snapshot without them
+// reads as "no panels, no picture" so it compares equal to a job with none.
+const APPROVAL_V2_FIELDS = [...APPROVAL_V1_FIELDS, "make", "model", "modelYear", "color", "bodyType", "damagePanels", "diagram"];
 function approvalContentKey(s, v) {
   const fields = (v || s.v || 1) >= 2 ? APPROVAL_V2_FIELDS : APPROVAL_V1_FIELDS;
-  return stableJson(fields.map((k) => (s[k] === undefined ? null : s[k])));
+  return stableJson(fields.map((k) => {
+    if (k === "damagePanels") return Array.isArray(s.damagePanels) ? s.damagePanels : [];
+    if (k === "diagram") return s.diagram || null;
+    return s[k] === undefined ? null : s[k];
+  }));
 }
 // Live latest: returns the snapshot the customer link should show for this
 // job right now. When nothing customer-visible changed it returns the SAME
@@ -2117,7 +2201,7 @@ function approvalContentKey(s, v) {
 function refreshApprovalSnapshot(job) {
   const old = job.approvalSnapshot;
   if (!job.approvalToken || !old) return old;
-  const fresh = buildApprovalSnapshot(job);
+  const fresh = buildApprovalSnapshot(job, undefined, old);
   if (approvalContentKey(fresh, old.v) === approvalContentKey(old)) return old;
   return { ...fresh, sentAt: old.sentAt, sentBy: old.sentBy || null, revisedAt: Date.now() };
 }
@@ -2126,7 +2210,7 @@ function refreshApprovalSnapshot(job) {
 function jobCardNeedsUpdate(job) {
   const snap = job.approvalSnapshot;
   if (!job.approvalToken || !snap) return { needs: false, at: null };
-  const drift = approvalContentKey(buildApprovalSnapshot(job), snap.v) !== approvalContentKey(snap);
+  const drift = approvalContentKey(buildApprovalSnapshot(job, undefined, snap), snap.v) !== approvalContentKey(snap);
   const revised = (snap.revisedAt || 0) > (job.approvalSentAt || 0);
   return { needs: drift || revised, at: snap.revisedAt || (drift ? Date.now() : null) };
 }
@@ -2135,7 +2219,8 @@ function jobCardNeedsUpdate(job) {
 // Also pushes the newest snapshot in the same write, so what the customer
 // opens is guaranteed to be what staff were looking at when they tapped Send.
 async function markJobCardSent(job) {
-  const snapshot = refreshApprovalSnapshot(job);
+  await prepareDiagramForCard(job); // legacy PNG diagram -> small JPEG for the customer's copy
+  const snapshot = withConvertedDiagram(job, refreshApprovalSnapshot(job));
   const now = Date.now(); // taken after the refresh so a fresh revisedAt is never later than this send
   const row = { approval_sent_at: new Date(now).toISOString(), updated_at: new Date(now).toISOString() };
   if (snapshot !== job.approvalSnapshot) row.approval_snapshot = snapshot;
@@ -2155,11 +2240,12 @@ async function markJobCardSent(job) {
 // NOT be queued offline — a queued write would "succeed" locally while
 // the link the customer is about to open doesn't exist on the server yet.
 async function sendJobForApproval(job, session) {
+  await prepareDiagramForCard(job); // legacy PNG diagram -> small JPEG for the customer's copy
   const now = Date.now();
   const next = {
     ...job,
     approvalToken: newApprovalToken(),
-    approvalSnapshot: buildApprovalSnapshot(job, session),
+    approvalSnapshot: buildApprovalSnapshot(job, session, job.approvalSnapshot, true),
     approvalStatus: "pending", approvalNote: null, approvalDecidedAt: null,
     approvalSentAt: now, updatedAt: now,
   };
@@ -2491,6 +2577,35 @@ function generateCustomerJobCardPDF(snap, options = {}) {
   });
   y += 4;
 
+  // ---- Vehicle inspection: the marked-parts picture + the panel names ----
+  // (the shop's paper job card has the same drawing). Nothing is drawn when
+  // the job has neither a picture nor any marked panel.
+  const markedPanels = Array.isArray(s.damagePanels) ? s.damagePanels.filter(Boolean) : [];
+  const diagFmt = typeof s.diagram === "string" ? (s.diagram.match(/^data:image\/(png|jpe?g);base64,/i) || [])[1] : null;
+  if (diagFmt || markedPanels.length) {
+    const boxW = pageW - margin * 2;
+    const imgW = diagFmt ? 340 : 0, imgH = diagFmt ? Math.round((imgW * 428) / 640) : 0;
+    const textX = margin + 8 + (diagFmt ? imgW + 14 : 0);
+    doc.setFont("helvetica", "normal"); doc.setFontSize(9);
+    const markedLines = markedPanels.length
+      ? doc.splitTextToSize(`Marked: ${markedPanels.join(", ")}`, margin + boxW - 8 - textX)
+      : (diagFmt ? doc.splitTextToSize("No panels ticked.", margin + boxW - 8 - textX) : []);
+    const bodyH = Math.max(imgH, markedLines.length * 11);
+    const boxH = 26 + bodyH + 8;
+    ensure(boxH + 8);
+    doc.setDrawColor(...LINE);
+    doc.rect(margin, y, boxW, boxH);
+    doc.setFont("helvetica", "bold"); doc.setFontSize(9); doc.setTextColor(...DARK);
+    doc.text("VEHICLE INSPECTION — MARKED PARTS", margin + 8, y + 14);
+    if (diagFmt) {
+      try { doc.addImage(s.diagram, /^jpe?g$/i.test(diagFmt) ? "JPEG" : "PNG", margin + 8, y + 22, imgW, imgH); } catch (e) { /* picture optional — the panel names below still print */ }
+    }
+    doc.setFont("helvetica", "normal"); doc.setFontSize(9); doc.setTextColor(...DARK);
+    if (markedLines.length) doc.text(markedLines, textX, y + 32);
+    y += boxH + 8;
+  }
+  y += 4;
+
   // ---- Line items (same columns as the tax invoice) ----
   const items = s.items || [];
   const tableRight = pageW - margin;
@@ -2592,7 +2707,10 @@ function generateCustomerJobCardPDF(snap, options = {}) {
 // Staff copy of the job card (FirstBit entry / printing): same document as the
 // customer's, built from the live job, plus the customer's phone.
 function generateStaffJobCardPDF(job, session) {
-  const snap = { ...buildApprovalSnapshot(job, session), revisedAt: job.approvalSnapshot?.revisedAt || null };
+  const snap = { ...buildApprovalSnapshot(job, session, job.approvalSnapshot, true), revisedAt: job.approvalSnapshot?.revisedAt || null };
+  // The staff copy is built synchronously (Preview/Save callers), so a legacy PNG that
+  // hasn't been shrunk yet goes into the PDF as it is — jsPDF embeds PNG fine.
+  if (!snap.diagram && job.damageDiagramImage) snap.diagram = job.damageDiagramImage;
   return generateCustomerJobCardPDF(snap, { includePhone: true, phone: job.customerPhone });
 }
 
@@ -4713,15 +4831,24 @@ function SignaturePad({ value, onChange }) {
 // strokes drawn while a panel is active are tagged with that panel's
 // name, and a small text label is stamped near the stroke so the
 // picture and the checklist visibly agree, per the shop's requirement.
-// Exports as one flattened PNG (diagram + all marks + labels) stored on
-// the job, same pattern as the signature.
-function PanelDamageMarker({ selectedPanels, onTogglePanel, marks, onMarksChange, onImageChange }) {
+// Exports as one flattened JPEG (diagram + all marks + labels, white
+// background, ~40-80 KB — the old PNG export was ~650 KB) stored on the job,
+// same pattern as the signature. Old jobs still hold PNGs and everything that
+// displays the picture keeps accepting them.
+// baseImage (Edit Job): the job's existing diagram. It is drawn as the
+// background so earlier marks stay and new strokes go on top. Strokes already
+// baked into it can't be removed one by one — "Clear drawing" starts again
+// from the clean diagram instead.
+function PanelDamageMarker({ selectedPanels, onTogglePanel, marks, onMarksChange, onImageChange, baseImage }) {
   const canvasRef = useRef(null);
   const bgImgRef = useRef(null);
+  const baseImgRef = useRef(null);
   const drawingRef = useRef(false);
   const lastPointRef = useRef(null);
   const [activePanel, setActivePanel] = useState(null);
   const [imgLoaded, setImgLoaded] = useState(false);
+  const [baseLoaded, setBaseLoaded] = useState(!baseImage); // nothing to wait for without a base image
+  const [useBase, setUseBase] = useState(!!baseImage);
 
   const CANVAS_W = 640, CANVAS_H = 428; // matches CAR_DIAGRAM_SRC's ~3:2 aspect
 
@@ -4731,13 +4858,23 @@ function PanelDamageMarker({ selectedPanels, onTogglePanel, marks, onMarksChange
     img.onload = () => { bgImgRef.current = img; setImgLoaded(true); };
     img.src = CAR_DIAGRAM_SRC;
   }, []);
+  // The job's existing picture (if any). If it can't be decoded, fall back to the clean diagram.
+  useEffect(() => {
+    if (!baseImage) { baseImgRef.current = null; setBaseLoaded(true); return; }
+    const img = new Image();
+    img.onload = () => { baseImgRef.current = img; setBaseLoaded(true); };
+    img.onerror = () => { baseImgRef.current = null; setUseBase(false); setBaseLoaded(true); };
+    img.src = baseImage;
+  }, [baseImage]);
 
   const redraw = useCallback(() => {
     const canvas = canvasRef.current;
-    if (!canvas || !bgImgRef.current) return;
+    const bg = useBase && baseImgRef.current ? baseImgRef.current : bgImgRef.current;
+    if (!canvas || !bg) return;
     const ctx = canvas.getContext("2d");
-    ctx.clearRect(0, 0, canvas.width, canvas.height);
-    ctx.drawImage(bgImgRef.current, 0, 0, canvas.width, canvas.height);
+    ctx.fillStyle = "#fff"; // solid white so the JPEG export has no black transparent areas
+    ctx.fillRect(0, 0, canvas.width, canvas.height);
+    ctx.drawImage(bg, 0, 0, canvas.width, canvas.height);
     // Replay every stored mark's strokes.
     marks.forEach((mark) => {
       ctx.strokeStyle = COLORS.red;
@@ -4762,10 +4899,11 @@ function PanelDamageMarker({ selectedPanels, onTogglePanel, marks, onMarksChange
         ctx.fillText(mark.panel, p.x + 10, p.y - 2);
       }
     });
-    if (onImageChange) onImageChange(marks.length > 0 ? canvas.toDataURL("image/png") : null);
-  }, [marks, onImageChange]);
+    // No new strokes: keep the job's existing picture untouched (same string, so nothing is re-saved), or none.
+    if (onImageChange) onImageChange(marks.length > 0 ? canvas.toDataURL("image/jpeg", 0.8) : (useBase && baseImage ? baseImage : null));
+  }, [marks, onImageChange, useBase, baseImage]);
 
-  useEffect(() => { if (imgLoaded) redraw(); }, [imgLoaded, redraw]);
+  useEffect(() => { if (imgLoaded && baseLoaded) redraw(); }, [imgLoaded, baseLoaded, redraw]);
 
   const getPos = (e) => {
     const canvas = canvasRef.current;
@@ -4833,19 +4971,23 @@ function PanelDamageMarker({ selectedPanels, onTogglePanel, marks, onMarksChange
             <button
               key={panel}
               onClick={() => {
+                // Ticked but not the one being drawn on: just make it the drawing panel.
+                // Tapping the panel being drawn on unticks it (and drops its new strokes).
+                if (selected && activePanel !== panel) { setActivePanel(panel); return; }
                 onTogglePanel(panel);
                 setActivePanel(selected ? null : panel);
                 if (selected) clearPanelMark(panel);
               }}
               className="mrcap-press"
+              aria-pressed={selected}
               style={{
-                display: "flex", alignItems: "center", gap: 5, padding: "6px 9px", borderRadius: 999,
+                display: "flex", alignItems: "center", gap: 6, padding: "9px 13px", minHeight: 40, borderRadius: 999,
                 border: `1.5px solid ${activePanel === panel ? COLORS.red : selected ? COLORS.gold : COLORS.line}`,
                 background: activePanel === panel ? "rgba(168,64,47,0.18)" : selected ? "rgba(201,162,39,0.12)" : COLORS.panel2,
-                color: selected ? COLORS.ink : COLORS.muted, fontSize: 11, fontWeight: 600, cursor: "pointer",
+                color: selected ? COLORS.ink : COLORS.muted, fontSize: 12.5, fontWeight: 600, cursor: "pointer",
               }}
             >
-              {selected && (marked ? <CheckCircle2 size={11} color={COLORS.gold} /> : <div style={{ width: 8, height: 8, borderRadius: "50%", border: `1.5px solid ${COLORS.red}` }} />)}
+              {selected && (marked ? <CheckCircle2 size={13} color={COLORS.gold} /> : <div style={{ width: 9, height: 9, borderRadius: "50%", border: `1.5px solid ${COLORS.red}` }} />)}
               {panel}
             </button>
           );
@@ -4853,8 +4995,8 @@ function PanelDamageMarker({ selectedPanels, onTogglePanel, marks, onMarksChange
       </div>
 
       {selectedPanels.length > 0 && (
-        <div style={{ fontSize: 10.5, color: activePanel ? COLORS.red : COLORS.muted, marginBottom: 6 }}>
-          {activePanel ? `Drawing on: ${activePanel} — tap it again to switch panels` : "Tap a highlighted panel above to start drawing its location"}
+        <div style={{ fontSize: 11, color: activePanel ? COLORS.red : COLORS.muted, marginBottom: 6 }}>
+          {activePanel ? `Drawing on: ${activePanel} — tap another ticked panel to switch, or tap this one again to untick it` : "Tap a ticked panel above to draw where it is on the car"}
         </div>
       )}
 
@@ -4870,10 +5012,20 @@ function PanelDamageMarker({ selectedPanels, onTogglePanel, marks, onMarksChange
           onPointerLeave={end}
         />
       </div>
-      {marks.length > 0 && (
-        <button onClick={() => { onMarksChange([]); }} className="mrcap-press" style={{ marginTop: 8, fontSize: 11, color: COLORS.muted, background: "none", border: `1px solid ${COLORS.line}`, borderRadius: 6, padding: "5px 10px", cursor: "pointer" }}>
-          Clear all marks
-        </button>
+      <div style={{ display: "flex", flexWrap: "wrap", gap: 8 }}>
+        {marks.length > 0 && (
+          <button onClick={() => { onMarksChange([]); }} className="mrcap-press" style={{ marginTop: 8, fontSize: 12, color: COLORS.muted, background: "none", border: `1px solid ${COLORS.line}`, borderRadius: 8, padding: "9px 12px", minHeight: 40, cursor: "pointer" }}>
+            Clear all marks
+          </button>
+        )}
+        {baseImage && useBase && (
+          <button onClick={() => { setUseBase(false); onMarksChange([]); }} className="mrcap-press" style={{ marginTop: 8, fontSize: 12, color: COLORS.muted, background: "none", border: `1px solid ${COLORS.line}`, borderRadius: 8, padding: "9px 12px", minHeight: 40, cursor: "pointer" }}>
+            Clear drawing
+          </button>
+        )}
+      </div>
+      {baseImage && useBase && (
+        <div style={{ fontSize: 10.5, color: COLORS.muted, marginTop: 6 }}>Earlier marks stay on the picture. Unticking a panel doesn't erase its earlier drawing — use Clear drawing to start again on the clean car.</div>
       )}
     </div>
   );
@@ -6963,7 +7115,7 @@ function NewJobForm({ session, team, onCreated, onCancel }) {
   const [signature, setSignature] = useState(null);
   const [damagePanels, setDamagePanels] = useState([]);
   const [damageMarks, setDamageMarks] = useState([]);
-  const [damageDiagramImage, setDamageDiagramImage] = useState(null); // flattened PNG export, kept in sync by PanelDamageMarker
+  const [damageDiagramImage, setDamageDiagramImage] = useState(null); // flattened JPEG export, kept in sync by PanelDamageMarker
   const toggleDamagePanel = (panel) => setDamagePanels((p) => (p.includes(panel) ? p.filter((x) => x !== panel) : [...p, panel]));
   const [termsAccepted, setTermsAccepted] = useState(false);
   const [confirmNoSignature, setConfirmNoSignature] = useState(false); // warning shown once, if they try to submit without signing
@@ -7608,6 +7760,13 @@ function EditJobScreen({ job, session, onSaved, onCancel }) {
   const [followupDate, setFollowupDate] = useState(job.followupDate || "");
   const [followupNote, setFollowupNote] = useState(job.followupNote || "");
   const [saving, setSaving] = useState(false);
+  // Marked panels (vehicle inspection): staff mark parts as painted / done after intake too.
+  // damageDiagramImage starts as the job's current picture; PanelDamageMarker draws it as the
+  // background (baseImage) and only replaces it once new strokes are added or it is cleared.
+  const [damagePanels, setDamagePanels] = useState(job.damagePanels || []);
+  const [damageMarks, setDamageMarks] = useState([]);
+  const [damageDiagramImage, setDamageDiagramImage] = useState(job.damageDiagramImage || null);
+  const toggleDamagePanel = (panel) => setDamagePanels((p) => (p.includes(panel) ? p.filter((x) => x !== panel) : [...p, panel]));
 
   // Unticking a service must also drop its treatments and their prices —
   // otherwise stale picks/prices linger in state and either reappear if
@@ -7718,6 +7877,10 @@ function EditJobScreen({ job, session, onSaved, onCancel }) {
     (job.parts || []).forEach((p) => {
       if (!afterPartsById[p.id]) changes.push(`Removed ${p.type === "fee" ? "fee" : "part"}: ${p.description || (p.type === "fee" ? "Fee" : "Part")}`);
     });
+    const beforePanels = job.damagePanels || [];
+    damagePanels.filter((p) => !beforePanels.includes(p)).forEach((p) => changes.push(`Marked panel: ${p}`));
+    beforePanels.filter((p) => !damagePanels.includes(p)).forEach((p) => changes.push(`Unmarked panel: ${p}`));
+    if ((damageDiagramImage || null) !== (job.damageDiagramImage || null)) changes.push(damageDiagramImage ? "Vehicle inspection drawing updated" : "Vehicle inspection drawing cleared");
 
     const updated = {
       ...job,
@@ -7726,6 +7889,7 @@ function EditJobScreen({ job, session, onSaved, onCancel }) {
       customerName: customerName.trim(), customerPhone: customerPhone.trim(),
       description: description.trim(), damageNotes: damageNotes.trim(),
       priority, location, serviceTypes, treatments, treatmentPrices, smartechPieces, discountPercent, parts,
+      damagePanels, damageDiagramImage: damageDiagramImage || null,
       // Body Work or "Dent & Paint" added here (not just at intake) should
       // also route the job to Smartech's dashboard — only ever turns this
       // ON, never off, so removing a service later can't silently hide
@@ -7868,6 +8032,9 @@ function EditJobScreen({ job, session, onSaved, onCancel }) {
       <Field label="Damages / scratches / missing items found">
         <textarea style={textareaStyle} value={damageNotes} onChange={(e) => setDamageNotes(e.target.value)} />
       </Field>
+      <Field label="Marked panels (vehicle inspection)">
+        <PanelDamageMarker selectedPanels={damagePanels} onTogglePanel={toggleDamagePanel} marks={damageMarks} onMarksChange={setDamageMarks} onImageChange={setDamageDiagramImage} baseImage={job.damageDiagramImage || null} />
+      </Field>
 
       <div style={{ display: "flex", gap: 10, marginTop: 20 }}>
         <button onClick={onCancel} className="mrcap-press" style={{ ...secondaryBtnStyle, flex: 1 }}>Cancel</button>
@@ -7899,6 +8066,10 @@ function JobDetail({ id, initialJob, session, team, onChanged, onBack, canArchiv
   const [savingStatusNote, setSavingStatusNote] = useState(false);
   const [customStatusNote, setCustomStatusNote] = useState("");
   const [dupeUpdateWarning, setDupeUpdateWarning] = useState("");
+  // A legacy PNG diagram is shrunk to a small JPEG in the background so the
+  // job card PDF (built synchronously) and the customer copy can use it.
+  const diagramSrcForPdf = job?.damageDiagramImage || null;
+  useEffect(() => { if (job && diagramSrcForPdf) prepareDiagramForCard(job); }, [diagramSrcForPdf]); // eslint-disable-line react-hooks/exhaustive-deps
   const addCompletionPhotos = async (files) => {
     setUploadingCompletion(true);
     const compressed = await Promise.all(Array.from(files).map((f) => compressImage(f)));
@@ -12532,6 +12703,7 @@ function PublicJobApprovalView({ token }) {
   const [state, setState] = useState("loading"); // loading | ok | notfound | error
   const [data, setData] = useState(null);
   const [pdfError, setPdfError] = useState(false);
+  const [diagramOpen, setDiagramOpen] = useState(false); // full-size view of the inspection picture
 
   const load = useCallback(async () => {
     const r = await jobApprovalCall({ action: "view", token });
@@ -12560,6 +12732,7 @@ function PublicJobApprovalView({ token }) {
   const vehRows = [["Make", veh.make], ["Model", veh.model], ["Year", veh.modelYear], ["Colour", veh.color], ["Plate", s.plate]].filter((r) => r[1]);
   // Services listed but nothing priced yet: don't show AED 0.00 amounts and a zero total as if they were real.
   const priced = items.length > 0 && Number(s.grandTotal) > 0;
+  const markedPanels = Array.isArray(s.damagePanels) ? s.damagePanels.filter(Boolean) : [];
 
   const downloadPdf = () => {
     setPdfError(false);
@@ -12585,6 +12758,26 @@ function PublicJobApprovalView({ token }) {
           <div style={{ background: COLORS.panel2, border: `1px solid ${COLORS.line}`, borderRadius: 8, padding: "9px 11px", marginBottom: 12, fontSize: 12.5, color: COLORS.ink, lineHeight: 1.45 }}>
             {s.description && <div><span style={{ color: COLORS.muted }}>Work requested: </span>{s.description}</div>}
             {s.damageNotes && <div style={{ marginTop: s.description ? 5 : 0 }}><span style={{ color: COLORS.muted }}>Condition noted: </span>{s.damageNotes}</div>}
+          </div>
+        )}
+
+        {(s.diagram || markedPanels.length > 0) && (
+          <div style={{ background: COLORS.panel2, border: `1px solid ${COLORS.line}`, borderRadius: 8, padding: "10px 11px", marginBottom: 12 }}>
+            <div style={{ fontSize: 13, fontWeight: 700, color: COLORS.ink, marginBottom: 8 }}>Vehicle inspection</div>
+            {s.diagram && (
+              <button onClick={() => setDiagramOpen(true)} aria-label="Open the vehicle inspection picture full size" className="mrcap-press" style={{ display: "block", width: "100%", padding: 0, border: `1px solid ${COLORS.line}`, borderRadius: 8, overflow: "hidden", background: "#fff", cursor: "zoom-in" }}>
+                <img src={s.diagram} alt="Vehicle inspection — marked parts" style={{ width: "100%", height: "auto", display: "block" }} />
+              </button>
+            )}
+            {s.diagram && <div style={{ fontSize: 10.5, color: COLORS.muted, marginTop: 5, textAlign: "center" }}>Tap the picture to enlarge</div>}
+            {markedPanels.length > 0 && (
+              <div style={{ marginTop: s.diagram ? 9 : 0 }}>
+                <div style={{ fontSize: 11, color: COLORS.muted, marginBottom: 6 }}>Marked parts</div>
+                <div style={{ display: "flex", flexWrap: "wrap", gap: 6 }}>
+                  {markedPanels.map((p) => <Pill key={p} tone="red">{p}</Pill>)}
+                </div>
+              </div>
+            )}
           </div>
         )}
 
@@ -12623,6 +12816,12 @@ function PublicJobApprovalView({ token }) {
           This job card is for your information. It is not a tax invoice — your tax invoice is issued on the day of payment. If extra work is agreed, this page updates.
         </div>
       </div>
+      {diagramOpen && s.diagram && (
+        <div role="dialog" aria-label="Vehicle inspection picture" onClick={() => setDiagramOpen(false)} style={{ position: "fixed", inset: 0, zIndex: 1000, background: "rgba(0,0,0,0.92)", display: "flex", flexDirection: "column", alignItems: "center", justifyContent: "center", padding: 14 }}>
+          <img src={s.diagram} alt="Vehicle inspection — marked parts, full size" style={{ maxWidth: "100%", maxHeight: "82vh", width: "auto", height: "auto", background: "#fff", borderRadius: 8 }} />
+          <button onClick={() => setDiagramOpen(false)} className="mrcap-press" style={{ ...secondaryBtnStyle, marginTop: 14, minWidth: 120 }}>Close</button>
+        </div>
+      )}
     </PublicPageShell>
   );
 }
