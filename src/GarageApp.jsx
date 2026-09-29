@@ -649,8 +649,51 @@ const CACHE_PREFIX = "mrcap_cache_";
 function getOfflineQueue() {
   try { return JSON.parse(window.localStorage.getItem(OFFLINE_QUEUE_KEY) || "[]"); } catch { return []; }
 }
+// The read cache used to grow without limit (one entry per distinct query
+// string) until localStorage was full — after which the sign-in, the
+// offline queue and everything else silently failed to save, so a reload
+// logged people out and offline changes were lost. Found live 2026-09-29
+// on a laptop with 1,040 cache entries filling the 10 MB quota. Now the
+// cache is capped, oldest entries go first, and the important keys evict
+// cache to make room instead of failing.
+const CACHE_MAX_ENTRIES = 150;
+const CACHE_MAX_ENTRY_CHARS = 800000;
+let cacheWritesSincePrune = 0;
+function cacheEntriesOldestFirst() {
+  const list = [];
+  try {
+    for (let i = 0; i < window.localStorage.length; i++) {
+      const k = window.localStorage.key(i);
+      if (!k || !k.startsWith(CACHE_PREFIX)) continue;
+      // writeCache always stores {"data":…,"at":<ms>} — read the stamp off
+      // the end instead of parsing every (possibly huge) entry.
+      const m = /"at":(\d+)\}$/.exec(window.localStorage.getItem(k) || "");
+      list.push({ k, at: m ? Number(m[1]) : 0 });
+    }
+  } catch { /* storage unavailable */ }
+  return list.sort((a, b) => a.at - b.at);
+}
+function pruneCache(keep) {
+  const list = cacheEntriesOldestFirst();
+  for (let i = 0; i < list.length - keep; i++) {
+    try { window.localStorage.removeItem(list[i].k); } catch { /* ignore */ }
+  }
+  return list.length;
+}
+// setItem that frees cache space (oldest half first) and retries when the
+// quota is full, so the cache can never crowd out real data.
+function setItemWithRoom(key, value) {
+  for (let attempt = 0; attempt < 5; attempt++) {
+    try { window.localStorage.setItem(key, value); return true; } catch {
+      const n = cacheEntriesOldestFirst().length;
+      if (!n) return false;
+      pruneCache(Math.floor(n / 2));
+    }
+  }
+  return false;
+}
 function setOfflineQueue(q) {
-  try { window.localStorage.setItem(OFFLINE_QUEUE_KEY, JSON.stringify(q)); } catch { /* full/unavailable — not worth blocking over */ }
+  setItemWithRoom(OFFLINE_QUEUE_KEY, JSON.stringify(q));
   try { window.dispatchEvent(new CustomEvent("mrcap-queue-changed", { detail: { length: q.length } })); } catch { /* ignore */ }
 }
 function queueOfflineWrite(envelope) {
@@ -665,7 +708,11 @@ function readCache(path) {
   } catch { return null; }
 }
 function writeCache(path, data) {
-  try { window.localStorage.setItem(CACHE_PREFIX + path, JSON.stringify({ data, at: Date.now() })); } catch { /* localStorage full — not worth blocking over, cache is best-effort */ }
+  let value;
+  try { value = JSON.stringify({ data, at: Date.now() }); } catch { return; }
+  if (value.length > CACHE_MAX_ENTRY_CHARS) return; // too big to be worth a slot — cache is best-effort
+  setItemWithRoom(CACHE_PREFIX + path, value);
+  if (++cacheWritesSincePrune >= 20) { cacheWritesSincePrune = 0; pruneCache(CACHE_MAX_ENTRIES); }
 }
 
 // Replays the queue strictly in order, one at a time — stops the moment
@@ -688,7 +735,7 @@ function getRejectedWrites() {
   try { return JSON.parse(window.localStorage.getItem(REJECTED_KEY) || "[]"); } catch { return []; }
 }
 function setRejectedWrites(list) {
-  try { window.localStorage.setItem(REJECTED_KEY, JSON.stringify(list.slice(-20))); } catch { /* ignore */ }
+  setItemWithRoom(REJECTED_KEY, JSON.stringify(list.slice(-20)));
   try { window.dispatchEvent(new CustomEvent("mrcap-rejected-changed")); } catch { /* ignore */ }
 }
 const WRITE_TABLE_LABELS = { jobs: "Job update", quotes: "Quote update", customers: "Customer update", vehicles: "Vehicle update", announcements: "Announcement", issue_reports: "Issue report", app_settings: "Settings change", team_members: "Team change" };
@@ -756,6 +803,9 @@ async function flushOfflineQueue() {
   }
 }
 if (typeof window !== "undefined") {
+  // Devices that already filled up under the old unbounded cache get
+  // trimmed back to the cap on the first load of this version.
+  pruneCache(CACHE_MAX_ENTRIES);
   window.addEventListener("online", () => flushOfflineQueue());
   // Belt-and-braces on top of the 'online' event: Android WebViews and
   // flaky/captive-portal wifi don't always fire it reliably, so poll
@@ -1693,7 +1743,7 @@ function loadLocalSession() {
 }
 function saveLocalSession(session) {
   try {
-    if (session) window.localStorage.setItem("mrcap_session", JSON.stringify(session));
+    if (session) setItemWithRoom("mrcap_session", JSON.stringify(session));
     else window.localStorage.removeItem("mrcap_session");
   } catch (e) { /* ignore — worst case, they log in again next visit */ }
 }
@@ -18473,7 +18523,7 @@ export function DispatchKiosk() {
     const next = { id: member.id, name: member.name, role: member.role, token: token || null };
     setSession(next);
     setCurrentActor(next);
-    try { window.localStorage.setItem("mrcap_kiosk_session", JSON.stringify(next)); } catch { /* ignore */ }
+    setItemWithRoom("mrcap_kiosk_session", JSON.stringify(next));
     if (shouldShowMorningReminder("mrcap_kiosk")) setShowMorningReminder(true);
     if (getOfflineQueue().length) flushOfflineQueue();
   };
