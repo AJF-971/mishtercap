@@ -22,6 +22,12 @@ export default defineConfig({
       manifest: false, // real manifest.json in /public is already correct — don't generate a second one
       workbox: {
         globPatterns: ["**/*.{js,css,html,ico,png,svg,json,webp}"],
+        // The document-preview PDF renderer (pdf.js, loaded lazily only when a
+        // Preview opens) is ~0.4 MB of JS plus a ~1.4 MB worker — keep both
+        // out of the offline shell so every phone doesn't re-download them on
+        // each deploy. Offline, Preview shows its error state and offers the
+        // plain PDF download instead.
+        globIgnores: ["**/pdf.min-*.js", "**/pdf.worker*"],
         navigateFallback: "/index.html",
         // Never let the shell's service worker intercept live data calls —
         // those are Supabase/gatekeeper fetch()es, already handled by the
