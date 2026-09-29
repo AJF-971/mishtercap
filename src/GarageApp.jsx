@@ -12,7 +12,7 @@ import {
 import { jsPDF } from "jspdf";
 import { Capacitor } from "@capacitor/core";
 import { PushNotifications } from "@capacitor/push-notifications";
-import { Bell, Copy } from "lucide-react";
+import { Bell, Copy, Eye } from "lucide-react";
 import { Receipt, Banknote } from "lucide-react";
 import {
   VAT_RATE_DEFAULT, r2, computeTotals, fmtMoney, fmtPct, amountInWords, proformaNumber, receiptNumber, proformaCounterKey,
@@ -571,12 +571,15 @@ const VERIFY_PIN_URL = `${SUPABASE_URL}/functions/v1/verify-pin`;
 // The ONLY way a PIN is ever checked, from either login screen. The
 // real pin value never reaches the browser in either direction — this
 // just gets back pass/fail plus the safe profile fields to log in with.
-async function verifyPin(memberId, pin) {
+// A correct PIN also returns a signed session pass (result.token) that
+// every later read/write carries — the server works out who's asking from
+// that, not from the name this device sends.
+async function verifyPin(memberId, pin, extra = {}) {
   try {
     const res = await fetch(VERIFY_PIN_URL, {
       method: "POST",
       headers: { apikey: SUPABASE_KEY, Authorization: `Bearer ${SUPABASE_KEY}`, "Content-Type": "application/json" },
-      body: JSON.stringify({ memberId, pin }),
+      body: JSON.stringify({ memberId, pin, ...extra }),
     });
     if (!res.ok) return { ok: false };
     return await res.json();
@@ -584,14 +587,32 @@ async function verifyPin(memberId, pin) {
     return { ok: false };
   }
 }
+// First login for someone with no PIN yet — saves it server-side and
+// signs them in (only works while no PIN is set).
+function setFirstPin(memberId, pin) {
+  return verifyPin(memberId, pin, { setPin: true });
+}
+// Dispatch tablet: tapping a name that doesn't need a PIN there.
+function kioskLogin(memberId) {
+  return verifyPin(memberId, undefined, { kiosk: true });
+}
 
 // Who's currently logged in, for the audit log — set on login/logout,
 // read by sbFetch on every write. Same mutable-global pattern already
 // used for SERVICES/ROLE_DEFS: one place to update, every call site
 // downstream picks it up automatically with no other changes needed.
 let currentActor = null;
+let currentToken = null; // the signed session pass from verify-pin
 function setCurrentActor(session) {
   currentActor = session ? { id: session.id, name: session.name, role: session.role } : null;
+  currentToken = (session && session.token) || null;
+}
+// The server refused this device's pass (expired, or the person was
+// removed) — each app shell listens for this and returns to the PIN screen.
+const AUTH_EXPIRED_EVENT = "mrcap-auth-expired";
+function signalAuthExpired() {
+  if (!currentToken && !currentActor) return; // already signed out — nothing to do
+  try { window.dispatchEvent(new CustomEvent(AUTH_EXPIRED_EVENT)); } catch { /* ignore */ }
 }
 // Optional per-call human-readable summary for the activity log (e.g.
 // "Edited job DXB-41929: added part Kings Shocks") — set right before a
@@ -619,6 +640,9 @@ let lastStorageError = null;
    guard, a validation failure) means the server was reached and said
    no on purpose, so that is never queued — it fails exactly as it
    always has. */
+// Readable with the public key, because the login screens need them
+// before anyone has signed in. Nothing about customers, jobs or money.
+const PUBLIC_READ_TABLES = new Set(["team_members", "service_roles", "service_categories", "service_treatments", "module_workflow_steps", "app_settings"]);
 const OFFLINE_QUEUE_KEY = "mrcap_offline_queue";
 const CACHE_PREFIX = "mrcap_cache_";
 
@@ -697,13 +721,21 @@ async function flushOfflineQueue() {
       const item = q[0];
       let res;
       try {
+        // Replayed with whoever's pass this device holds NOW — the queue
+        // itself never stores a pass (they expire; see queueOfflineWrite).
         res = await fetch(GATEKEEPER_URL, {
           method: "POST",
           headers: { apikey: SUPABASE_KEY, Authorization: `Bearer ${SUPABASE_KEY}`, "Content-Type": "application/json" },
-          body: JSON.stringify(item.envelope),
+          body: JSON.stringify({ ...item.envelope, token: currentToken || undefined }),
         });
       } catch {
         break; // still offline — leave this and everything after it queued
+      }
+      if (res.status === 401) {
+        // Signed out / pass expired: keep everything queued and replay it
+        // after the next PIN login instead of throwing the changes away.
+        signalAuthExpired();
+        break;
       }
       if (!res.ok) {
         const transient = res.status >= 500 || res.status === 408 || res.status === 429;
@@ -756,7 +788,7 @@ async function sbFetch(path, options = {}) {
             Authorization: `Bearer ${SUPABASE_KEY}`,
             "Content-Type": "application/json",
           },
-          body: JSON.stringify(envelope),
+          body: JSON.stringify({ ...envelope, token: currentToken || undefined }),
         });
       } catch {
         // The request never reached the server at all — genuinely offline,
@@ -776,15 +808,27 @@ async function sbFetch(path, options = {}) {
       }
     } else {
       try {
-        res = await fetch(`${SUPABASE_URL}/rest/v1/${path}`, {
-          ...options,
-          headers: {
-            apikey: SUPABASE_KEY,
-            Authorization: `Bearer ${SUPABASE_KEY}`,
-            "Content-Type": "application/json",
-            ...(options.headers || {}),
-          },
-        });
+        // Only the few tables the login screens need before anyone has
+        // signed in (staff names, the service list, settings) are read
+        // straight from the database with the public key. Everything
+        // else — customers, jobs, prices — is read through the gatekeeper
+        // with this device's session pass.
+        const table = path.split("?")[0].split("/")[0];
+        res = PUBLIC_READ_TABLES.has(table)
+          ? await fetch(`${SUPABASE_URL}/rest/v1/${path}`, {
+            ...options,
+            headers: {
+              apikey: SUPABASE_KEY,
+              Authorization: `Bearer ${SUPABASE_KEY}`,
+              "Content-Type": "application/json",
+              ...(options.headers || {}),
+            },
+          })
+          : await fetch(GATEKEEPER_URL, {
+            method: "POST",
+            headers: { apikey: SUPABASE_KEY, Authorization: `Bearer ${SUPABASE_KEY}`, "Content-Type": "application/json" },
+            body: JSON.stringify({ path, method: "GET", headers: options.headers || {}, token: currentToken || undefined }),
+          });
       } catch {
         // No network at all — fall back to whatever this exact query last
         // returned successfully, rather than the screen going blank.
@@ -797,6 +841,7 @@ async function sbFetch(path, options = {}) {
     if (!res.ok) {
       const body = await res.text().catch(() => "");
       lastStorageError = `${method} ${path.split("?")[0]} ${res.status}: ${body.slice(0, 200)}`;
+      if (res.status === 401) signalAuthExpired();
       return { ok: false, data: null };
     }
     lastStorageError = null;
@@ -948,8 +993,9 @@ async function sendPushNotification({ senderId, title, body, targetMemberIds }) 
     const res = await fetch(`${SUPABASE_URL}/functions/v1/send-push-notification`, {
       method: "POST",
       headers: { apikey: SUPABASE_KEY, Authorization: `Bearer ${SUPABASE_KEY}`, "Content-Type": "application/json" },
-      body: JSON.stringify({ senderId, title, body, targetMemberIds: targetMemberIds && targetMemberIds.length ? targetMemberIds : undefined }),
+      body: JSON.stringify({ senderId, title, body, targetMemberIds: targetMemberIds && targetMemberIds.length ? targetMemberIds : undefined, token: currentToken || undefined }),
     });
+    if (res.status === 401) signalAuthExpired();
     const data = await res.json().catch(() => ({}));
     if (!res.ok) return { ok: false, error: data?.error || `Failed (${res.status})` };
     return { ok: true, ...data };
@@ -1052,7 +1098,11 @@ const DEFAULT_WHATSAPP_TEMPLATES = {
   ready_for_collection: "Hi {customerName}, your {makeModel} ({plate}) is ready for collection at Mr.CAP. Thank you!",
   job_started: "Hi {customerName}, we've received your {makeModel} ({plate}) at Mr.CAP. and work is underway.",
   quote_sent: "Hi {customerName}, here's your quote from Mr.CAP. for your {makeModel} ({plate}): AED {total}. View it here: {quoteLink} — reply here or call us to accept.",
-  job_approval: "Hi {customerName}, here's your Mr.CAP. job card for your {makeModel} ({plate}) — total AED {total}. Please review and tap Approve here: {approvalLink}",
+  // Legacy (approval flow retired): kept defined so nothing that still
+  // references the key breaks. The UI now sends job_card_copy / job_card_update.
+  job_approval: "Hi {customerName}, here's your Mr.CAP. job card for your {makeModel} ({plate}) — total AED {total}: {approvalLink}",
+  job_card_copy: "Hi {customerName}, thank you for choosing Mr.CAP. Here is the job card for your {makeModel} ({plate}), received on {intakeDate}: {link} — we'll keep you updated.",
+  job_card_update: "Hi {customerName}, your job card for {makeModel} ({plate}) has been updated: {link}",
   follow_up: "Hi {customerName}, just checking in on your {makeModel} ({plate}) — {reason}. Let us know if you'd like to book it in with Mr.CAP.",
   warranty_reminder: "Hi {customerName}, a friendly reminder that the warranty on your {makeModel} ({plate}) work with Mr.CAP. expires on {expiryDate}. Reach out if you'd like it looked at before then.",
   google_review: "Hi {customerName}, thank you for trusting Mr.CAP. with your {makeModel}! If you had a great experience, we'd really appreciate a quick Google review: {reviewLink}",
@@ -1213,7 +1263,7 @@ function renderTemplate(str, vars) {
 // Shared WhatsApp send button — every new send point (job intake, quote
 // sent, follow-up, warranty reminder) reuses this instead of repeating
 // the wa.me/encodeURIComponent boilerplate at each call site.
-function WhatsAppSendButton({ phone, templateKey, vars, label, small }) {
+function WhatsAppSendButton({ phone, templateKey, vars, label, small, big, onSent }) {
   if (!phone) return null;
   const text = renderTemplate(WHATSAPP_TEMPLATES[templateKey], vars);
   return (
@@ -1223,8 +1273,8 @@ function WhatsAppSendButton({ phone, templateKey, vars, label, small }) {
       className="mrcap-press"
       style={small
         ? { display: "inline-flex", alignItems: "center", gap: 5, padding: "6px 10px", borderRadius: 8, border: "none", background: "#25D366", color: "#0D2A17", fontWeight: 700, fontSize: 11, cursor: "pointer", textDecoration: "none", flexShrink: 0 }
-        : { display: "flex", alignItems: "center", justifyContent: "center", gap: 8, width: "100%", boxSizing: "border-box", padding: "12px", borderRadius: 10, border: "none", background: "#25D366", color: "#0D2A17", fontWeight: 700, fontSize: 13, cursor: "pointer", marginBottom: 12, textDecoration: "none" }}
-      onClick={(e) => e.stopPropagation()}
+        : { display: "flex", alignItems: "center", justifyContent: "center", gap: 8, width: "100%", boxSizing: "border-box", padding: big ? "16px 12px" : "12px", minHeight: big ? 58 : undefined, borderRadius: big ? 12 : 10, border: "none", background: "#25D366", color: "#0D2A17", fontWeight: 700, fontSize: big ? 16 : 13, cursor: "pointer", marginBottom: 12, textDecoration: "none" }}
+      onClick={(e) => { e.stopPropagation(); if (onSent) onSent(); }}
     >
       <Send size={small ? 12 : 15} /> {label}
     </a>
@@ -1943,14 +1993,17 @@ function buildInvoiceLineItems(job) {
   return { rows, grandTotal };
 }
 
-/* ---------------- Customer approval of the job card ----------------
+/* ---------------- Customer job card copy ----------------
    Right after a job card is saved, staff WhatsApp the customer a link
-   (?approve=<token>) showing the job card with Approve / Decline. What the
-   customer sees is a frozen snapshot taken at send time — built from the
-   same buildInvoiceLineItems the printed invoice uses — so an answer
-   always refers to exactly what was sent. Changing prices afterwards
-   means resending (new token, back to pending). The customer's answer is
-   written only by the job-approval edge function. */
+   (?approve=<token> — the param name is historical) to an INFORMATION-ONLY
+   copy of the job card. There is no approve/decline any more; the DB columns
+   and the job-approval edge function are unchanged (approval_status
+   'pending' just means "link sent"). What the customer sees is the
+   approval_snapshot, built from the same buildInvoiceLineItems the printed
+   invoice uses. The link is permanent per job and always shows the LATEST
+   card: saveJob refreshes the snapshot whenever a job with a link is saved
+   (refreshApprovalSnapshot), stamping revisedAt only when something the
+   customer can see actually changed. */
 const JOB_APPROVAL_URL = `${SUPABASE_URL}/functions/v1/job-approval`;
 // The APK's WebView origin isn't a URL a customer can open, so links
 // built on a native device point at the live site instead.
@@ -1969,10 +2022,13 @@ function newApprovalToken() {
 const round2 = (n) => Math.round((Number(n) || 0) * 100) / 100;
 function buildApprovalSnapshot(job, session) {
   const { rows, grandTotal } = buildInvoiceLineItems(job);
+  const veh = vehicleForDocs(job);
   return {
-    v: 1,
-    plate: job.plate || "", makeModel: job.makeModel || "", customerName: job.customerName || "",
+    v: 2,
+    plate: job.plate || "", makeModel: composeMakeModel(job.make, job.model, job.makeModel) || "", customerName: job.customerName || "",
+    make: veh.make || "", model: veh.model || "", modelYear: veh.modelYear ? String(veh.modelYear) : "", color: veh.color || "", bodyType: veh.bodyType || "",
     jobRef: job.id ? job.id.slice(0, 8).toUpperCase() : "",
+    intakeDate: job.createdAt || null,
     description: job.description || "", damageNotes: job.damageNotes || "",
     items: rows.map((r) => ({ desc: r.desc, qty: r.qty, price: round2(r.price), discount: r.discount || 0, amountExcl: round2(r.amountExcl), vat: round2(r.vatAmount), amountIncl: round2(r.amountIncl) })),
     subtotal: round2(rows.reduce((s, r) => s + r.amountExcl, 0)),
@@ -1981,6 +2037,67 @@ function buildApprovalSnapshot(job, session) {
     vatRate: VAT_RATE,
     sentAt: Date.now(), sentBy: session?.name || null,
   };
+}
+// Vehicle fields of a snapshot; a legacy v1 snapshot only has the combined
+// makeModel string, so split it the same way the printed documents do.
+function snapshotVehicle(s) {
+  if (s.make) return { make: s.make, model: s.model || "", modelYear: s.modelYear || "", color: s.color || "", bodyType: s.bodyType || "" };
+  return vehicleForDocs({ makeModel: s.makeModel });
+}
+// Key-order-independent JSON (Postgres jsonb reorders object keys, so a
+// snapshot read back from the DB can't be compared with JSON.stringify).
+function stableJson(v) {
+  if (Array.isArray(v)) return `[${v.map(stableJson).join(",")}]`;
+  if (v && typeof v === "object") return `{${Object.keys(v).sort().map((k) => `${JSON.stringify(k)}:${stableJson(v[k])}`).join(",")}}`;
+  return JSON.stringify(v === undefined ? null : v);
+}
+// What the customer can actually see on the job card page. Deliberately
+// excludes sentAt / sentBy / revisedAt / intakeDate. A legacy v1 snapshot is
+// compared on the fields it has, so old cards aren't flagged "revised" just
+// because v2 added vehicle fields.
+const APPROVAL_V1_FIELDS = ["plate", "makeModel", "customerName", "description", "damageNotes", "items", "subtotal", "vatTotal", "grandTotal"];
+const APPROVAL_V2_FIELDS = [...APPROVAL_V1_FIELDS, "make", "model", "modelYear", "color", "bodyType"];
+function approvalContentKey(s, v) {
+  const fields = (v || s.v || 1) >= 2 ? APPROVAL_V2_FIELDS : APPROVAL_V1_FIELDS;
+  return stableJson(fields.map((k) => (s[k] === undefined ? null : s[k])));
+}
+// Live latest: returns the snapshot the customer link should show for this
+// job right now. When nothing customer-visible changed it returns the SAME
+// object (identity), so saveJob's diff sees no change and writes nothing.
+function refreshApprovalSnapshot(job) {
+  const old = job.approvalSnapshot;
+  if (!job.approvalToken || !old) return old;
+  const fresh = buildApprovalSnapshot(job);
+  if (approvalContentKey(fresh, old.v) === approvalContentKey(old)) return old;
+  return { ...fresh, sentAt: old.sentAt, sentBy: old.sentBy || null, revisedAt: Date.now() };
+}
+// Has the customer-visible job card moved on since the customer was last sent
+// the link? Drives the "send the update" prompt on the staff side.
+function jobCardNeedsUpdate(job) {
+  const snap = job.approvalSnapshot;
+  if (!job.approvalToken || !snap) return { needs: false, at: null };
+  const drift = approvalContentKey(buildApprovalSnapshot(job), snap.v) !== approvalContentKey(snap);
+  const revised = (snap.revisedAt || 0) > (job.approvalSentAt || 0);
+  return { needs: drift || revised, at: snap.revisedAt || (drift ? Date.now() : null) };
+}
+// Records that staff just sent the link on WhatsApp (moves approval_sent_at
+// forward, which is what clears the "send the update" prompt). Same token.
+// Also pushes the newest snapshot in the same write, so what the customer
+// opens is guaranteed to be what staff were looking at when they tapped Send.
+async function markJobCardSent(job) {
+  const snapshot = refreshApprovalSnapshot(job);
+  const now = Date.now(); // taken after the refresh so a fresh revisedAt is never later than this send
+  const row = { approval_sent_at: new Date(now).toISOString(), updated_at: new Date(now).toISOString() };
+  if (snapshot !== job.approvalSnapshot) row.approval_snapshot = snapshot;
+  withActivitySummary(`Sent job card on WhatsApp — ${job.plate}`);
+  const { ok } = await sbFetch(`jobs?id=eq.${job.id}`, { method: "PATCH", headers: { Prefer: "return=minimal" }, body: JSON.stringify(row), noQueue: true });
+  if (!ok) return { ok: false, job };
+  const next = { ...job, approvalSnapshot: snapshot, approvalSentAt: now, updatedAt: now };
+  if (job._base) {
+    const { updated_at: _u, ...tracked } = row;
+    next._base = { ...job._base, ...tracked };
+  }
+  return { ok: true, job: next };
 }
 // Fresh token + snapshot, back to pending, saved straight away. Written
 // with its own narrow PATCH (not saveJob) for two reasons: it must also
@@ -2001,7 +2118,7 @@ async function sendJobForApproval(job, session) {
     approval_status: "pending", approval_sent_at: new Date(now).toISOString(),
     approval_decided_at: null, approval_note: null, updated_at: new Date(now).toISOString(),
   };
-  withActivitySummary(`Sent job card for approval — ${job.plate}`);
+  withActivitySummary(`Created customer job card link — ${job.plate}`);
   const { ok } = await sbFetch(`jobs?id=eq.${job.id}`, { method: "PATCH", headers: { Prefer: "return=minimal" }, body: JSON.stringify(row), noQueue: true });
   if (!ok) return { ok: false, job };
   if (job._base) {
@@ -2026,12 +2143,33 @@ async function jobApprovalCall(payload) {
   }
 }
 
-function generateJobCardPDF(job) {
+// Light diagonal watermark for unissued previews. Drawn first so the page
+// content sits on top of it.
+function drawPreviewWatermark(doc, text = "PREVIEW — NOT ISSUED") {
+  try {
+    const w = doc.internal.pageSize.getWidth(), h = doc.internal.pageSize.getHeight();
+    doc.saveGraphicsState();
+    if (doc.GState) doc.setGState(new doc.GState({ opacity: 0.35 }));
+    doc.setFont("helvetica", "bold"); doc.setFontSize(50); doc.setTextColor(226, 226, 226);
+    doc.text(text, w / 2 - 230, h / 2 + 250, { angle: 45 });
+    doc.restoreGraphicsState();
+  } catch (e) { /* watermark is cosmetic — never block the preview over it */ }
+}
+
+// NOTE: despite the name, this is the TAX INVOICE (the customer's job card
+// copy is generateCustomerJobCardPDF). Kept under this name so existing
+// callers keep working; generateTaxInvoicePDF below is the readable alias.
+// options.preview = draw the "PREVIEW — NOT ISSUED" watermark and print
+// "Invoice no. assigned on issue" when there is no number yet (used by the
+// Preview button so no invoice number is ever consumed).
+function generateJobCardPDF(job, options = {}) {
+  const preview = !!options.preview && !job.invoiceNo;
   const doc = new jsPDF({ unit: "pt", format: "a4" });
   const pageW = doc.internal.pageSize.getWidth();
   const margin = 36;
   let y = 82;
   const DARK = [20, 20, 20], GREY = [110, 110, 110], LINE = [180, 180, 180];
+  if (preview) drawPreviewWatermark(doc);
 
   const box = (x, bw, bh) => { doc.setDrawColor(...LINE); doc.rect(x, y, bw, bh); };
   const label = (text, x, ty) => { doc.setFont("helvetica", "bold"); doc.setFontSize(8); doc.setTextColor(...GREY); doc.text(text, x, ty); };
@@ -2048,11 +2186,17 @@ function generateJobCardPDF(job) {
   doc.text("The Car Appearance & Restyling Experts", margin + 50, y + 30);
   doc.setFont("helvetica", "bold"); doc.setFontSize(13); doc.setTextColor(...DARK);
   doc.text("TAX INVOICE", pageW - margin, y + 22, { align: "right" });
-  if (job.invoiceNo) {
-    doc.setFont("helvetica", "normal"); doc.setFontSize(9); doc.setTextColor(...GREY);
-    doc.text(job.invoiceNo, pageW - margin, y + 34, { align: "right" });
-  }
-  y += 56;
+  doc.setFont("helvetica", "normal"); doc.setFontSize(9); doc.setTextColor(...GREY);
+  let hy = y + 34;
+  if (job.invoiceNo) { doc.text(job.invoiceNo, pageW - margin, hy, { align: "right" }); hy += 12; }
+  else if (preview) { doc.text("Invoice no. assigned on issue", pageW - margin, hy, { align: "right" }); hy += 12; }
+  // Invoice date = when the number was finalized, so a reprint shows the
+  // same date as the original; an unfinalized preview shows today.
+  doc.text(`Date: ${formatLongDate(job.invoiceFinalizedAt ? new Date(job.invoiceFinalizedAt) : new Date())}`, pageW - margin, hy, { align: "right" });
+  hy += 12;
+  // The car's intake date — the invoice itself is dated the day it's issued.
+  if (job.createdAt) { doc.text(`Vehicle received: ${formatLongDate(new Date(job.createdAt))}`, pageW - margin, hy, { align: "right" }); hy += 12; }
+  y += Math.max(56, hy - y - 2);
 
   // ---- Issued By / Bank Details header block ----
   const headerH = 90;
@@ -2156,6 +2300,8 @@ function generateJobCardPDF(job) {
 
   const grandTotal = subtotal + totalVat;
 
+  // Totals + the Released/Received signature lines need ~90pt below the last row; with 16+ lines they used to fall off the bottom of page 1.
+  if (y + 90 > 790) { doc.addPage(); y = 40; }
   y += 10;
   doc.setFont("helvetica", "bold"); doc.setFontSize(8.5); doc.setTextColor(...DARK);
   const wordsLines = doc.splitTextToSize(`TOTAL OF SUPPLY: ${numberToWordsAED(grandTotal)}`, 300);
@@ -2214,6 +2360,190 @@ function generateJobCardPDF(job) {
   });
 
   return doc;
+}
+
+const generateTaxInvoicePDF = generateJobCardPDF;
+
+// The customer's JOB CARD — same letterhead look as the tax invoice, but
+// clearly "not a tax invoice". Built from a snapshot (the customer page) or,
+// on the staff side, from buildApprovalSnapshot(job). options.includePhone +
+// options.phone add the customer's phone (staff copy only; the snapshot itself
+// never carries a phone).
+function generateCustomerJobCardPDF(snap, options = {}) {
+  const s = snap || {};
+  const doc = new jsPDF({ unit: "pt", format: "a4" });
+  const pageW = doc.internal.pageSize.getWidth();
+  const margin = 36;
+  let y = 82;
+  const DARK = [20, 20, 20], GREY = [110, 110, 110], LINE = [180, 180, 180], GOLD = [168, 128, 16];
+  const label = (text, x, ty) => { doc.setFont("helvetica", "bold"); doc.setFontSize(8); doc.setTextColor(...GREY); doc.text(text, x, ty); };
+  const value = (text, x, ty, size = 10) => { doc.setFont("helvetica", "normal"); doc.setFontSize(size); doc.setTextColor(...DARK); doc.text(String(text || ""), x, ty); };
+  const ensure = (h) => { if (y + h > 790) { doc.addPage(); y = 40; } };
+
+  drawLetterheadBanner(doc, pageW, margin);
+  try { doc.addImage(LOGO_SRC, "PNG", margin, y, 31, 42); } catch (e) { /* logo optional — never block the PDF over an image error */ }
+  doc.setFont("helvetica", "bold"); doc.setFontSize(15); doc.setTextColor(...DARK);
+  doc.text("Mr.CAP.", margin + 50, y + 18);
+  doc.setFont("helvetica", "normal"); doc.setFontSize(8); doc.setTextColor(...GREY);
+  doc.text("The Car Appearance & Restyling Experts", margin + 50, y + 30);
+
+  doc.setFont("helvetica", "bold"); doc.setFontSize(20); doc.setTextColor(...DARK);
+  doc.text("JOB CARD", pageW - margin, y + 24, { align: "right" });
+  doc.setFont("helvetica", "normal"); doc.setFontSize(9); doc.setTextColor(...GREY);
+  let hy = y + 38;
+  if (s.jobRef) { doc.text(`Job card no: ${s.jobRef}`, pageW - margin, hy, { align: "right" }); hy += 12; }
+  const received = s.intakeDate || s.sentAt;
+  if (received) { doc.text(`Date received: ${formatLongDate(new Date(received))}`, pageW - margin, hy, { align: "right" }); hy += 12; }
+  if (s.revisedAt) { doc.text(`Revised: ${formatLongDate(new Date(s.revisedAt))}`, pageW - margin, hy, { align: "right" }); hy += 12; }
+  y += Math.max(56, hy - y - 2);
+
+  // ---- Customer / Car Info ----
+  const v = snapshotVehicle(s);
+  const carRows = [["Make:", v.make], ["Model:", v.model]];
+  if (v.modelYear) carRows.push(["Year:", v.modelYear]);
+  if (v.color) carRows.push(["Colour:", v.color]);
+  if (v.bodyType && BODY_TYPE_LABEL[v.bodyType]) carRows.push(["Body:", BODY_TYPE_LABEL[v.bodyType]]);
+  carRows.push(["Plate:", s.plate]);
+  const midX = margin + (pageW - margin * 2) / 2;
+  const blockH = Math.max(70, 34 + carRows.length * 14);
+  doc.setDrawColor(...LINE);
+  doc.rect(margin, y, pageW - margin * 2, blockH);
+  doc.line(midX, y, midX, y + blockH);
+  doc.setFont("helvetica", "bold"); doc.setFontSize(9); doc.setTextColor(...DARK);
+  doc.text("Customer", margin + 8, y + 14);
+  value(s.customerName, margin + 8, y + 30, 10);
+  if (options.includePhone && options.phone) { label("Tel.:", margin + 8, y + 46); value(options.phone, margin + 45, y + 46, 8.5); }
+  doc.setFont("helvetica", "bold"); doc.setFontSize(9); doc.setTextColor(...DARK);
+  doc.text("Car Info", midX + 8, y + 14);
+  carRows.forEach((row, i) => { label(row[0], midX + 8, y + 30 + i * 14); value(row[1], midX + 60, y + 30 + i * 14, 8.5); });
+  y += blockH + 12;
+
+  // ---- Work requested / Condition noted ----
+  const textW = pageW - margin * 2 - 16;
+  const notes = [["Work requested", s.description], ["Condition noted", s.damageNotes]].filter((n) => n[1]);
+  notes.forEach(([title, text]) => {
+    const lines = doc.splitTextToSize(String(text), textW);
+    // A very long note continues on the next page in its own box, instead of running off the bottom.
+    for (let from = 0, first = true; from < lines.length; first = false) {
+      ensure(26 + 2 * 11 + 8);
+      const fit = Math.max(1, Math.min(lines.length - from, Math.floor((790 - y - 26 - 8) / 11)));
+      const chunk = lines.slice(from, from + fit);
+      const h = 26 + chunk.length * 11;
+      doc.setDrawColor(...LINE);
+      doc.rect(margin, y, pageW - margin * 2, h);
+      doc.setFont("helvetica", "bold"); doc.setFontSize(9); doc.setTextColor(...DARK);
+      doc.text(first ? title : `${title} (continued)`, margin + 8, y + 14);
+      doc.setFont("helvetica", "normal"); doc.setFontSize(9); doc.setTextColor(...DARK);
+      doc.text(chunk, margin + 8, y + 27);
+      y += h + 8;
+      from += fit;
+    }
+  });
+  y += 4;
+
+  // ---- Line items (same columns as the tax invoice) ----
+  const items = s.items || [];
+  const tableRight = pageW - margin;
+  const vatPct = String(Math.round((s.vatRate == null ? VAT_RATE : s.vatRate) * 100));
+  let totalDiscount = 0;
+  // Services listed but nothing priced yet: list the work, not a table of 0.00 amounts.
+  const priced = items.length > 0 && Number(s.grandTotal) > 0;
+  if (priced) {
+    ensure(60);
+    const headerRowH = 26;
+    doc.setFillColor(235, 235, 235);
+    doc.rect(margin, y, tableRight - margin, headerRowH, "F");
+    doc.setDrawColor(...LINE);
+    doc.rect(margin, y, tableRight - margin, headerRowH);
+    doc.setFont("helvetica", "bold"); doc.setFontSize(7.5); doc.setTextColor(...DARK);
+    const headers = ["#", "Description", "Qty", "UOM", "Price\n(Excl.VAT)", "Disc.\n%", "Amount\n(Excl.VAT)", "VAT\n%", "Total\n(Incl.VAT)"];
+    const colPositions = [margin + 4, margin + 26, margin + 205, margin + 235, margin + 270, margin + 345, margin + 385, margin + 445, margin + 470];
+    headers.forEach((h, i) => doc.text(h.split("\n"), colPositions[i], y + 10));
+    y += headerRowH;
+    doc.setFont("helvetica", "normal"); doc.setFontSize(8.5);
+    items.forEach((it, i) => {
+      const descLines = doc.splitTextToSize(String(it.desc || ""), 165);
+      const rowH = Math.max(18, descLines.length * 10 + 8);
+      ensure(rowH);
+      doc.setDrawColor(...LINE);
+      doc.rect(margin, y, tableRight - margin, rowH);
+      doc.setFont("helvetica", "normal"); doc.setFontSize(8.5); doc.setTextColor(...DARK);
+      doc.text(String(i + 1), margin + 6, y + 12);
+      doc.text(descLines, margin + 26, y + 12);
+      doc.text(Number(it.qty || 1).toFixed(3), margin + 205, y + 12);
+      doc.text("Pcs", margin + 235, y + 12);
+      doc.text((Number(it.price) || 0).toFixed(2), margin + 270, y + 12);
+      doc.text((Number(it.discount) || 0).toFixed(2), margin + 350, y + 12);
+      doc.text((Number(it.amountExcl) || 0).toFixed(2), margin + 385, y + 12);
+      doc.text(vatPct, margin + 452, y + 12);
+      doc.text((Number(it.amountIncl) || 0).toFixed(2), margin + 470, y + 12);
+      totalDiscount += (Number(it.price) || 0) * (Number(it.qty) || 1) - (Number(it.amountExcl) || 0);
+      y += rowH;
+    });
+    y += 12;
+    ensure(80);
+    const totalsX = pageW - margin - 170;
+    let ty = y;
+    const totalLine = (lbl, val, bold) => {
+      doc.setFont("helvetica", bold ? "bold" : "normal"); doc.setFontSize(9); doc.setTextColor(...DARK);
+      doc.text(lbl, totalsX, ty);
+      doc.text(val, pageW - margin, ty, { align: "right" });
+      ty += 15;
+    };
+    totalLine("Total Discount, AED", Math.max(0, totalDiscount).toFixed(2));
+    totalLine("Sub Total, AED", (Number(s.subtotal) || 0).toFixed(2));
+    totalLine(`Total VAT (${vatPct}%), AED`, (Number(s.vatTotal) || 0).toFixed(2));
+    totalLine("Total, AED", (Number(s.grandTotal) || 0).toFixed(2), true);
+    y = ty + 8;
+  } else {
+    if (items.length) {
+      doc.setFont("helvetica", "bold"); doc.setFontSize(9); doc.setTextColor(...DARK);
+      ensure(24); doc.text("Work", margin, y + 10); y += 18;
+      doc.setFont("helvetica", "normal"); doc.setFontSize(9);
+      items.forEach((it) => {
+        const lines = doc.splitTextToSize(`• ${String(it.desc || "")}`, pageW - margin * 2);
+        ensure(lines.length * 11 + 4);
+        doc.setFont("helvetica", "normal"); doc.setFontSize(9); doc.setTextColor(...DARK);
+        doc.text(lines, margin, y + 8);
+        y += lines.length * 11 + 2;
+      });
+      y += 6;
+    }
+    ensure(30);
+    doc.setFont("helvetica", "italic"); doc.setFontSize(9); doc.setTextColor(...GREY);
+    doc.text("Pricing will be confirmed with you by the Mr.CAP. team.", margin, y + 10);
+    y += 30;
+  }
+
+  // ---- Not-a-tax-invoice note + signature ----
+  ensure(120);
+  y += 6;
+  doc.setDrawColor(...GOLD); doc.setLineWidth(1);
+  doc.rect(margin, y, pageW - margin * 2, 40);
+  doc.setLineWidth(1);
+  doc.setFont("helvetica", "bold"); doc.setFontSize(10); doc.setTextColor(...DARK);
+  doc.text("JOB CARD — NOT A TAX INVOICE.", margin + 10, y + 16);
+  doc.setFont("helvetica", "normal"); doc.setFontSize(9); doc.setTextColor(...DARK);
+  doc.text("A tax invoice is issued on the day of payment.", margin + 10, y + 30);
+  y += 58;
+  doc.setFont("helvetica", "normal"); doc.setFontSize(7.5); doc.setTextColor(...GREY);
+  doc.text("This job card is for your information. If extra work is agreed, it is updated.", margin, y);
+  y += 44;
+  doc.setDrawColor(...LINE);
+  doc.line(margin, y, margin + 200, y);
+  doc.setFont("helvetica", "normal"); doc.setFontSize(9); doc.setTextColor(...DARK);
+  doc.text("Customer signature", margin, y + 14);
+  doc.line(pageW - margin - 120, y, pageW - margin, y);
+  doc.text("Date", pageW - margin - 120, y + 14);
+
+  return doc;
+}
+
+// Staff copy of the job card (FirstBit entry / printing): same document as the
+// customer's, built from the live job, plus the customer's phone.
+function generateStaffJobCardPDF(job, session) {
+  const snap = { ...buildApprovalSnapshot(job, session), revisedAt: job.approvalSnapshot?.revisedAt || null };
+  return generateCustomerJobCardPDF(snap, { includePhone: true, phone: job.customerPhone });
 }
 
 // Same visual language as the tax invoice, but clearly marked as a
@@ -2674,6 +3004,10 @@ const historyKey = (h) => `${h?.at}|${h?.by}|${h?.stage}|${h?.label || ""}|${h?.
 // Jobs with no snapshot (built by hand rather than loaded) fall back to the
 // old whole-row write, exactly as before.
 async function saveJob(job) {
+  // Live latest job card: a job that already has a customer link gets its
+  // snapshot refreshed from the job being saved. Same object back when
+  // nothing customer-visible changed, so the diff below writes nothing extra.
+  if (job.approvalToken && job.approvalSnapshot) job.approvalSnapshot = refreshApprovalSnapshot(job);
   const full = jobToRow(job);
   const base = job._base;
   let body = full;
@@ -2759,9 +3093,10 @@ async function gkCall(envelope) {
     const res = await fetch(GATEKEEPER_URL, {
       method: "POST",
       headers: { apikey: SUPABASE_KEY, Authorization: `Bearer ${SUPABASE_KEY}`, "Content-Type": "application/json" },
-      body: JSON.stringify({ headers: {}, actor: currentActor, ...envelope }),
+      body: JSON.stringify({ headers: {}, actor: currentActor, ...envelope, token: currentToken || undefined }),
     });
     const text = await res.text();
+    if (res.status === 401) signalAuthExpired();
     if (!res.ok) return { ok: false, status: res.status, error: text.slice(0, 200) || `Failed (${res.status})` };
     return { ok: true, data: text ? JSON.parse(text) : null };
   } catch {
@@ -4876,13 +5211,15 @@ export default function GarageApp() {
   }, [ready, session, refreshIndex]);
 
   const onLogin = async (member, viewMode = "phone") => {
-    const s = { id: member.id, name: member.name, role: member.role, viewMode, dashboardMode: member.dashboardMode || "auto" };
+    const s = { id: member.id, name: member.name, role: member.role, viewMode, dashboardMode: member.dashboardMode || "auto", token: member.token || null };
     setSession(s);
     saveLocalSession(s);
     setCurrentActor(s);
     logEvent("login", `${member.name} logged in`, s);
     if (shouldShowMorningReminder("mrcap")) setShowMorningReminder(true);
     registerForPush(s.id);
+    // Anything saved offline while signed out goes up now, under this pass.
+    if (getOfflineQueue().length) flushOfflineQueue();
   };
   const onLogout = () => {
     if (session) logEvent("login", `${session.name} logged out`);
@@ -4890,6 +5227,18 @@ export default function GarageApp() {
     saveLocalSession(null);
     setCurrentActor(null);
   };
+
+  // The server refused this device's pass (expired or revoked) — back to
+  // the PIN screen. Offline-queued changes are kept and sent after login.
+  useEffect(() => {
+    const onExpired = () => {
+      setSession(null);
+      saveLocalSession(null);
+      setCurrentActor(null);
+    };
+    window.addEventListener(AUTH_EXPIRED_EVENT, onExpired);
+    return () => window.removeEventListener(AUTH_EXPIRED_EVENT, onExpired);
+  }, []);
 
   const openJob = (id, job) => { setActiveId(id); setActiveJob(job || null); setView("detail", { activeId: id }); logEvent("view", `Viewed job${job?.plate ? ` ${job.plate}` : ""} (${id.slice(0, 8)})`); };
   const [activeQuoteId, setActiveQuoteId] = useState(null);
@@ -5165,25 +5514,25 @@ function LoginScreen({ team, setTeam, onLogin }) {
     if (pin.length !== 4 || !picked) return;
     (async () => {
       if (mode === "set") {
-        const next = team.map((m) => (m.id === picked.id ? { ...m, pin } : m));
         // Log in only once the PIN is actually saved. This used to show
         // "Access granted" whether or not the save worked, so a new hire whose
         // PIN never reached the server was let in once, then found their PIN
-        // "didn't work" the next morning.
-        const saved = await saveTeam(next);
-        if (!saved) {
-          setError("Couldn't save your PIN — check the connection");
+        // "didn't work" the next morning. Saved by verify-pin (which also
+        // signs them in), and only while they have no PIN yet.
+        const result = await setFirstPin(picked.id, pin);
+        if (!result.ok) {
+          setError(result.alreadySet ? "A PIN is already set — ask an admin to reset it" : "Couldn't save your PIN — check the connection");
           setTimeout(() => setPin(""), 260);
           return;
         }
-        setTeam(next);
+        setTeam(team.map((m) => (m.id === picked.id ? { ...m, hasPin: true } : m)));
         setFlash(true);
-        setTimeout(() => onLogin({ ...picked, hasPin: true }, viewMode), 420);
+        setTimeout(() => onLogin({ ...picked, ...(result.member || {}), hasPin: true, token: result.token }, viewMode), 420);
       } else {
         const result = await verifyPin(picked.id, pin);
         if (result.ok) {
           setFlash(true);
-          setTimeout(() => onLogin(result.member, viewMode), 420);
+          setTimeout(() => onLogin({ ...result.member, token: result.token }, viewMode), 420);
         } else if (result.locked) {
           setLocked(true);
           setError("Locked — see admin");
@@ -6792,7 +7141,7 @@ function NewJobForm({ session, team, onCreated, onCancel }) {
     const result = await createJob(job, { reassignVehicle: ownerChoice === "different", customerType });
     setSaving(false);
     if (!result.ok || !result.job.id) { setSaveError(result.reason || true); return; }
-    // Saved — go straight to sending it to the customer for approval
+    // Saved — go straight to sending the customer their job card copy
     // instead of opening the job card.
     setCreatedJob(result.job);
   };
@@ -6800,7 +7149,7 @@ function NewJobForm({ session, team, onCreated, onCancel }) {
   if (createdJob) {
     return (
       <div className="mrcap-view" style={{ padding: "4px 18px 30px" }}>
-        <SectionTitle>Send for Approval</SectionTitle>
+        <SectionTitle>Job Card for Customer</SectionTitle>
         <div style={{ ...cardStyle, padding: 14, marginBottom: 14, display: "flex", alignItems: "center", gap: 10 }}>
           <CheckCircle2 size={20} color={COLORS.successText} style={{ flexShrink: 0 }} />
           <div style={{ minWidth: 0 }}>
@@ -6813,7 +7162,7 @@ function NewJobForm({ session, team, onCreated, onCancel }) {
         <JobApprovalPanel job={createdJob} session={session} onChanged={setCreatedJob} autoSend />
         <StickyActionBar>
           <button onClick={() => onCreated(createdJob, true)} className="mrcap-press" style={{ ...primaryBtnStyle, flex: 1, minHeight: 54, borderRadius: 14, display: "flex", alignItems: "center", justifyContent: "center", gap: 8 }}>
-            {createdJob.approvalStatus === "pending" || createdJob.approvalStatus === "approved" ? "Done" : "Skip for now"} — open job card <ArrowRight size={18} />
+            {createdJob.approvalToken ? "Done" : "Skip for now"} — open job card <ArrowRight size={18} />
           </button>
         </StickyActionBar>
       </div>
@@ -7514,6 +7863,9 @@ function JobDetail({ id, initialJob, session, team, onChanged, onBack, canArchiv
     notifyChanged(updated, saved);
   };
   const [pickerFor, setPickerFor] = useState(null); // service key currently showing the reassign list
+  const [previewDoc, setPreviewDoc] = useState(null); // { title, filename, make } for DocumentPreviewModal
+  // The internal job-card copy shows prices, so never in the Smartech portal.
+  const showJobCardDocs = !isSmartechPortal(session) && (isFullDashboardRole(session) || hasPermission(session, team, "newJob"));
   const [finalizingInvoice, setFinalizingInvoice] = useState(false);
   const [finalizeError, setFinalizeError] = useState("");
 
@@ -7725,8 +8077,8 @@ function JobDetail({ id, initialJob, session, team, onChanged, onBack, canArchiv
     notifyChanged(updated, saved);
   };
 
-  // JobApprovalPanel saves its own (narrow) write before calling this, and
-  // its poll only reports what's already on the server — just adopt it.
+  // JobApprovalPanel saves its own (narrow) write before calling this —
+  // just adopt what it reports.
   const onApprovalChanged = (updated) => {
     setJob(updated);
     notifyChanged(updated, true);
@@ -7798,7 +8150,7 @@ function JobDetail({ id, initialJob, session, team, onChanged, onBack, canArchiv
     const saved = await saveJob(current);
     // saveJob refreshes _base on the object it was given; carry that onto
     // whatever the latest state is so the next diff starts from it.
-    setJob((j) => (j && j !== current && j.id === current.id ? { ...j, _base: current._base } : j));
+    setJob((j) => (j && j !== current && j.id === current.id ? { ...j, _base: current._base, approvalSnapshot: current.approvalSnapshot } : j));
     notifyChanged(current, saved);
   };
 
@@ -8212,7 +8564,7 @@ function JobDetail({ id, initialJob, session, team, onChanged, onBack, canArchiv
         <StageStepper currentIndex={job.stageIndex} />
       </section>
 
-      {/* ---- Customer approval (job card sent over WhatsApp) ---- */}
+      {/* ---- Customer job card copy (link sent over WhatsApp) ---- */}
       {!isLast && hasPermission(session, team, "newJob") && !isSmartechPortal(session) && (
         <JobApprovalPanel job={job} session={session} onChanged={onApprovalChanged} />
       )}
@@ -8693,10 +9045,26 @@ function JobDetail({ id, initialJob, session, team, onChanged, onBack, canArchiv
         />
       )}
 
+      {previewDoc && <DocumentPreviewModal title={previewDoc.title} filename={previewDoc.filename} makeDoc={previewDoc.make} onClose={() => setPreviewDoc(null)} />}
+
       {/* ---- Documents & job management ---- */}
-      {(isFullDashboardRole(session) || (onCreateProforma && canUseBilling(session, team)) || hasPermission(session, team, "editJob") || hasPermission(session, team, "sendBack") || hasPermission(session, team, "delete")) && (
+      {(isFullDashboardRole(session) || (onCreateProforma && canUseBilling(session, team)) || hasPermission(session, team, "editJob") || hasPermission(session, team, "sendBack") || hasPermission(session, team, "delete") || showJobCardDocs) && (
         <section style={{ marginBottom: 16 }}>
           <div style={{ ...eyebrowStyle, marginBottom: 8 }}>Documents & actions</div>
+
+          {/* Job card (internal copy for FirstBit entry / printing) */}
+          {showJobCardDocs && (
+            <div style={{ display: "flex", gap: 8, marginBottom: 10 }}>
+              <button onClick={() => setPreviewDoc({ title: `Job card — ${job.plate || ""}`, filename: `MrCAP-JobCard-${(job.plate || job.id || "job").toString().replace(/\s+/g, "-")}.pdf`, make: () => generateStaffJobCardPDF(job, session) })}
+                className="mrcap-press" style={{ ...secondaryBtnStyle, flex: 1, display: "flex", alignItems: "center", justifyContent: "center", gap: 7, padding: "13px 8px" }}>
+                <Eye size={16} color={COLORS.gold} /> Preview job card
+              </button>
+              <button onClick={() => { try { generateStaffJobCardPDF(job, session).save(`MrCAP-JobCard-${(job.plate || job.id || "job").toString().replace(/\s+/g, "-")}.pdf`); } catch (e) { setFinalizeError("Couldn't create the job card PDF — please try again."); } }}
+                className="mrcap-press" style={{ ...secondaryBtnStyle, flex: 1, display: "flex", alignItems: "center", justifyContent: "center", gap: 7, padding: "13px 8px" }}>
+                <Download size={16} color={COLORS.gold} /> Job card PDF
+              </button>
+            </div>
+          )}
 
           {isFullDashboardRole(session) && (
             <div style={{ marginBottom: 10 }}>
@@ -8710,6 +9078,14 @@ function JobDetail({ id, initialJob, session, team, onChanged, onBack, canArchiv
                 </div>
               )}
 
+              {/* Preview never consumes an invoice number: unissued jobs get a watermarked draft, issued ones show the real invoice. */}
+              <button
+                onClick={() => setPreviewDoc({ title: job.invoiceNo ? `Tax invoice ${job.invoiceNo}` : "Tax invoice — preview", filename: `MrCAP-Invoice-${job.invoiceNo || "PREVIEW"}.pdf`, make: () => generateJobCardPDF(job, { preview: !job.invoiceNo }) })}
+                className="mrcap-press"
+                style={{ ...secondaryBtnStyle, display: "flex", alignItems: "center", justifyContent: "center", gap: 8, width: "100%", marginBottom: 8 }}
+              >
+                <Eye size={16} color={COLORS.gold} /> Preview invoice
+              </button>
               <button
                 onClick={async () => {
                   setFinalizeError("");
@@ -9441,15 +9817,29 @@ const TEMPLATE_DEFS = [
     ],
   },
   {
-    key: "job_approval",
-    label: "Job Card for Approval",
-    description: "Sent right after a new job card is saved (or from the job's detail screen) so the customer can approve or decline it from their phone.",
+    key: "job_card_copy",
+    label: "Job Card Copy (first send)",
+    description: "Sent right after a new job card is saved (or from the job's detail screen) so the customer has a copy of the job card for their information.",
     tokens: [
       { token: "customerName", sample: "Ahmed" },
       { token: "makeModel", sample: "Toyota Land Cruiser" },
       { token: "plate", sample: "A 12345" },
+      { token: "intakeDate", sample: "September 28, 2026" },
       { token: "total", sample: "1,260" },
-      { token: "approvalLink", sample: "https://…/?approve=…" },
+      { token: "link", sample: "https://…/?approve=…" },
+    ],
+  },
+  {
+    key: "job_card_update",
+    label: "Job Card Updated",
+    description: "Sent from the job's detail screen after work or prices were added, so the customer knows their job card link has changed.",
+    tokens: [
+      { token: "customerName", sample: "Ahmed" },
+      { token: "makeModel", sample: "Toyota Land Cruiser" },
+      { token: "plate", sample: "A 12345" },
+      { token: "intakeDate", sample: "September 28, 2026" },
+      { token: "total", sample: "1,260" },
+      { token: "link", sample: "https://…/?approve=…" },
     ],
   },
   {
@@ -10933,6 +11323,7 @@ function QuoteDetail({ id, session, team, onBack, onConverted }) {
   const [loading, setLoading] = useState(true);
   const [converting, setConverting] = useState(false);
   const [showDeleteConfirm, setShowDeleteConfirm] = useState(false);
+  const [previewing, setPreviewing] = useState(false);
   // Same reasoning as JobDetail: editing a quote is a sub-screen toggle,
   // not a top-level view change, so it needs its own history entry.
   const [editing, setEditingRaw] = useState(false);
@@ -11021,13 +11412,23 @@ function QuoteDetail({ id, session, team, onBack, onConverted }) {
         )}
       </div>
 
-      <button
-        onClick={() => { const doc = generateQuotePDF(quote); doc.save(`MrCAP-Quote-${(quote.plate || quote.customerName).replace(/\s+/g, "-")}.pdf`); }}
-        className="mrcap-press"
-        style={{ display: "flex", alignItems: "center", justifyContent: "center", gap: 8, width: "100%", padding: "12px", borderRadius: 10, border: "none", background: COLORS.gold, color: COLORS.darkText, fontWeight: 700, fontSize: 13, cursor: "pointer", marginBottom: 12 }}
-      >
-        <FileText size={15} /> Generate E-Quote (PDF)
-      </button>
+      <div style={{ display: "flex", gap: 8, marginBottom: 12 }}>
+        <button
+          onClick={() => setPreviewing(true)}
+          className="mrcap-press"
+          style={{ ...secondaryBtnStyle, minHeight: 0, flex: 1, display: "flex", alignItems: "center", justifyContent: "center", gap: 8, padding: "12px", borderRadius: 10, fontSize: 13 }}
+        >
+          <Eye size={15} color={COLORS.gold} /> Preview
+        </button>
+        <button
+          onClick={() => { const doc = generateQuotePDF(quote); doc.save(`MrCAP-Quote-${(quote.plate || quote.customerName || "quote").replace(/\s+/g, "-")}.pdf`); }}
+          className="mrcap-press"
+          style={{ display: "flex", alignItems: "center", justifyContent: "center", gap: 8, flex: 2, padding: "12px", borderRadius: 10, border: "none", background: COLORS.gold, color: COLORS.darkText, fontWeight: 700, fontSize: 13, cursor: "pointer" }}
+        >
+          <FileText size={15} /> Generate E-Quote (PDF)
+        </button>
+      </div>
+      {previewing && <DocumentPreviewModal title={`Quotation — ${quote.plate || quote.customerName || ""}`} filename={`MrCAP-Quote-${(quote.plate || quote.customerName || "quote").replace(/\s+/g, "-")}.pdf`} makeDoc={() => generateQuotePDF(quote)} onClose={() => setPreviewing(false)} />}
 
       {/* Same fix as JobDetail: CustomerNotifyControl isn't gated on
           phone — a quote with no number on file should still let staff
@@ -11636,6 +12037,7 @@ function ProformaDetail({ id, session, team, onBack, onEditDraft, onRevise, onOp
   const [voiding, setVoiding] = useState(false);
   const [voidReason, setVoidReason] = useState("");
   const [confirmDelete, setConfirmDelete] = useState(false);
+  const [previewing, setPreviewing] = useState(false);
 
   const load = useCallback(async () => {
     const r = await loadProformaFull(id);
@@ -11718,9 +12120,15 @@ function ProformaDetail({ id, session, team, onBack, onEditDraft, onRevise, onOp
 
       {error && <div style={{ ...billCard, borderColor: COLORS.red, color: COLORS.dangerText, fontSize: 12.5 }}>{error}</div>}
 
-      <button onClick={pdf} className="mrcap-press" style={{ display: "flex", alignItems: "center", justifyContent: "center", gap: 8, width: "100%", padding: "12px", borderRadius: 10, border: "none", background: COLORS.gold, color: COLORS.darkText, fontWeight: 700, fontSize: 13, cursor: "pointer", marginBottom: 10 }}>
-        <FileText size={15} /> {p.status === "draft" ? "Preview PDF (draft)" : "Download PDF"}
-      </button>
+      <div style={{ display: "flex", gap: 8, marginBottom: 10 }}>
+        <button onClick={() => setPreviewing(true)} className="mrcap-press" style={{ ...secondaryBtnStyle, minHeight: 0, flex: 1, display: "flex", alignItems: "center", justifyContent: "center", gap: 8, padding: "12px", borderRadius: 10, fontSize: 13 }}>
+          <Eye size={15} color={COLORS.gold} /> Preview
+        </button>
+        <button onClick={pdf} className="mrcap-press" style={{ display: "flex", alignItems: "center", justifyContent: "center", gap: 8, flex: 2, padding: "12px", borderRadius: 10, border: "none", background: COLORS.gold, color: COLORS.darkText, fontWeight: 700, fontSize: 13, cursor: "pointer" }}>
+          <FileText size={15} /> {p.status === "draft" ? "Download PDF (draft)" : "Download PDF"}
+        </button>
+      </div>
+      {previewing && <DocumentPreviewModal title={p.number ? `Proforma ${p.number}` : "Proforma (draft)"} filename={`MrCAP-Proforma-${p.number || "DRAFT"}.pdf`} makeDoc={() => generateProformaPDF(p)} onClose={() => setPreviewing(false)} />}
       {p.status === "issued" && p.bill_to?.phone && (
         <a href={`https://wa.me/${toWhatsAppNumber(p.bill_to.phone)}?text=${encodeURIComponent(waText)}`} target="_blank" rel="noopener noreferrer" className="mrcap-press" style={{ display: "flex", alignItems: "center", justifyContent: "center", gap: 8, width: "100%", padding: "12px", borderRadius: 10, background: "#25D366", color: "#0D2A17", fontWeight: 700, fontSize: 13, textDecoration: "none", marginBottom: 10, boxSizing: "border-box" }}>
           <Send size={15} /> Send on WhatsApp
@@ -11831,24 +12239,135 @@ function slugify(label) {
   return base || `item_${Math.random().toString(36).slice(2, 7)}`;
 }
 
-/* ---------------- Customer approval — staff side ----------------
-   Shown straight after a new job card is saved (autoSend) and on the job
-   card itself. Creates the approval link, hands staff a one-tap WhatsApp
-   send, then polls while pending so the answer shows up on this screen
-   the moment the customer taps Approve/Decline. */
-const APPROVAL_POLL_MS = 8000;
-const APPROVAL_STATUS_UI = {
-  pending: { label: "Waiting for customer", color: COLORS.gold, bg: "rgba(201,162,39,0.12)" },
-  approved: { label: "Approved by customer", color: COLORS.successText, bg: "rgba(74,122,87,0.14)" },
-  declined: { label: "Declined by customer", color: COLORS.dangerText, bg: "rgba(168,64,47,0.14)" },
-};
+/* ---------------- Document preview (job card, invoice, quote, proforma) ----------------
+   Staff mostly use Android phones, where Chrome can't show a PDF inside an
+   iframe — so the real jsPDF output is rasterised page by page onto canvases
+   with pdf.js. pdf.js (LEGACY build, for older Android WebViews) is loaded with
+   a dynamic import only when a preview actually opens, so it never touches
+   the main bundle. */
+let pdfJsPromise = null;
+function loadPdfJs() {
+  if (!pdfJsPromise) {
+    pdfJsPromise = Promise.all([
+      import("pdfjs-dist/legacy/build/pdf.min.mjs"),
+      import("pdfjs-dist/legacy/build/pdf.worker.min.mjs?url"),
+    ]).then(([lib, worker]) => {
+      lib.GlobalWorkerOptions.workerSrc = worker.default;
+      return lib;
+    }).catch((e) => { pdfJsPromise = null; throw e; });
+  }
+  return pdfJsPromise;
+}
 
+function DocumentPreviewModal({ title, makeDoc, filename, onClose }) {
+  const [state, setState] = useState("loading"); // loading | ready | error
+  const holderRef = useRef(null);
+  const docRef = useRef(null);
+  const makeDocRef = useRef(makeDoc);
+
+  useEffect(() => {
+    let cancelled = false;
+    let pdf = null;
+    let task = null; // the pdf.js loading task — destroying it also stops a load that hasn't finished
+    const holder = holderRef.current;
+    // A WebView whose worker never answers would leave "Preparing preview…" up forever; after 25s show the Download fallback instead.
+    const stuckTimer = setTimeout(() => { if (!cancelled) setState((s) => (s === "loading" ? "error" : s)); }, 25000);
+    (async () => {
+      try {
+        const jdoc = makeDocRef.current();
+        docRef.current = jdoc;
+        const bytes = new Uint8Array(jdoc.output("arraybuffer"));
+        const pdfjs = await loadPdfJs();
+        if (cancelled) return;
+        task = pdfjs.getDocument({ data: bytes });
+        pdf = await task.promise;
+        // Closed while it was still loading: the cleanup below ran before `pdf` existed, so release it here (else its worker leaks).
+        if (cancelled) { try { pdf.destroy(); } catch (e) { /* already gone */ } return; }
+        const cssW = Math.min(holder.clientWidth || 360, 900);
+        // Capped at 2x: at 3x a tablet-width A4 page is ~40 MB of canvas, several pages deep.
+        const dpr = Math.min(window.devicePixelRatio || 1, 2);
+        for (let n = 1; n <= pdf.numPages; n++) {
+          const page = await pdf.getPage(n);
+          if (cancelled) return;
+          const base = page.getViewport({ scale: 1 });
+          const vp = page.getViewport({ scale: (cssW / base.width) * dpr });
+          const canvas = document.createElement("canvas");
+          canvas.width = Math.floor(vp.width);
+          canvas.height = Math.floor(vp.height);
+          canvas.style.cssText = `display:block;width:${cssW}px;height:${Math.floor(vp.height / dpr)}px;margin:0 auto 14px;background:#fff;border-radius:4px;box-shadow:0 6px 24px rgba(0,0,0,0.55)`;
+          canvas.setAttribute("data-preview-page", String(n));
+          holder.appendChild(canvas);
+          await page.render({ canvasContext: canvas.getContext("2d"), viewport: vp }).promise;
+          if (n === 1) setState("ready");
+        }
+        if (!cancelled) setState("ready");
+      } catch (e) {
+        if (!cancelled) setState("error");
+      }
+    })();
+    return () => {
+      cancelled = true;
+      clearTimeout(stuckTimer);
+      try { if (pdf) pdf.destroy(); else if (task) task.destroy(); } catch (e) { /* already gone */ }
+    };
+  }, []);
+
+  useEffect(() => {
+    const onKey = (e) => { if (e.key === "Escape") onClose(); };
+    const prev = document.body.style.overflow;
+    document.body.style.overflow = "hidden";
+    window.addEventListener("keydown", onKey);
+    return () => { window.removeEventListener("keydown", onKey); document.body.style.overflow = prev; };
+  }, [onClose]);
+
+  const download = () => {
+    try { (docRef.current || makeDocRef.current()).save(filename); } catch (e) { /* nothing more to offer */ }
+  };
+
+  return createPortal(
+    <div role="dialog" aria-modal="true" aria-label={`Preview — ${title}`} data-testid="doc-preview" data-preview-state={state}
+      style={{ position: "fixed", inset: 0, zIndex: 10000, background: "#070707", display: "flex", flexDirection: "column" }}>
+      <div style={{ display: "flex", alignItems: "center", gap: 8, padding: "10px 12px", background: COLORS.panel, borderBottom: `1px solid ${COLORS.line}`, flexShrink: 0 }}>
+        <div style={{ flex: 1, minWidth: 0 }}>
+          <div style={{ ...eyebrowStyle, fontSize: 10 }}>Preview</div>
+          <div style={{ fontSize: 14, fontWeight: 700, color: COLORS.ink, whiteSpace: "nowrap", overflow: "hidden", textOverflow: "ellipsis" }}>{title}</div>
+        </div>
+        <button onClick={download} className="mrcap-press" style={{ ...primaryBtnStyle, minHeight: 42, padding: "8px 12px", fontSize: 13, display: "flex", alignItems: "center", gap: 6, boxShadow: "none" }}>
+          <Download size={15} /> Download PDF
+        </button>
+        <button onClick={onClose} aria-label="Close preview" className="mrcap-press" style={{ ...secondaryBtnStyle, minHeight: 42, padding: "8px 12px", fontSize: 13, display: "flex", alignItems: "center", gap: 6 }}>
+          <X size={15} /> Close
+        </button>
+      </div>
+      <div style={{ flex: 1, overflowY: "auto", WebkitOverflowScrolling: "touch", padding: "14px 10px 30px" }}>
+        {state === "loading" && <div style={{ color: COLORS.muted, textAlign: "center", padding: "30px 10px", fontSize: 13 }}>Preparing preview…</div>}
+        {state === "error" && (
+          <div role="alert" style={{ textAlign: "center", padding: "30px 14px", color: COLORS.ink, fontSize: 13.5, lineHeight: 1.5 }}>
+            Couldn't show the preview on this device.
+            <div style={{ color: COLORS.muted, marginTop: 6 }}>You can still download the PDF and open it in your PDF viewer.</div>
+            <button onClick={download} className="mrcap-press" style={{ ...primaryBtnStyle, marginTop: 14, display: "inline-flex", alignItems: "center", gap: 8 }}><Download size={16} /> Download PDF</button>
+          </div>
+        )}
+        <div ref={holderRef} data-preview-holder style={{ maxWidth: 900, margin: "0 auto" }} />
+      </div>
+    </div>,
+    document.body
+  );
+}
+
+/* ---------------- Customer job card — staff side ----------------
+   Shown straight after a new job card is saved (autoSend) and on the job card
+   itself. Creates the customer's job card link, then hands staff a one-tap
+   WhatsApp send. The link is information-only (no approve/decline) and always
+   shows the LATEST job card; when the work or prices change after the last
+   send, the button turns into "Send updated job card" (same link). */
 function JobApprovalPanel({ job, session, onChanged, autoSend = false }) {
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState(null);
   const [copied, setCopied] = useState(false);
-  // Refs so the poll interval isn't torn down and restarted every time the
-  // parent re-renders with a fresh onChanged/job object.
+  const [confirmNew, setConfirmNew] = useState(false);
+  // Refs so callbacks aren't torn down every time the parent re-renders with
+  // a fresh onChanged/job object.
   const jobRef = useRef(job);
   jobRef.current = job;
   const onChangedRef = useRef(onChanged);
@@ -11860,118 +12379,90 @@ function JobApprovalPanel({ job, session, onChanged, autoSend = false }) {
     setError(null);
     const r = await sendJobForApproval(jobRef.current, session);
     setBusy(false);
-    if (!r.ok) { setError("Couldn't create the approval link — check the connection and try again."); return; }
+    if (!r.ok) { setError("Couldn't create the job card link — check the connection and try again."); return; }
     onChangedRef.current(r.job);
   }, [session]);
 
   useEffect(() => {
-    if (autoSend && !autoSent.current && !job.approvalStatus && job.id) {
+    if (autoSend && !autoSent.current && !job.approvalToken && job.id) {
       autoSent.current = true;
       send();
     }
-  }, [autoSend, job.approvalStatus, job.id, send]);
+  }, [autoSend, job.approvalToken, job.id, send]);
 
-  // Poll only while waiting on the customer; stops itself once answered.
-  useEffect(() => {
-    if (job.approvalStatus !== "pending" || !job.id) return undefined;
-    let cancelled = false;
-    const tick = async () => {
-      const { ok, data, stale } = await sbFetch(`jobs?id=eq.${job.id}&select=approval_token,approval_status,approval_decided_at,approval_note`);
-      if (cancelled || !ok || stale || !data || !data[0]) return;
-      const row = data[0];
-      const cur = jobRef.current;
-      if (row.approval_token !== cur.approvalToken || row.approval_status === cur.approvalStatus) return;
-      onChangedRef.current({
-        ...cur,
-        approvalStatus: row.approval_status,
-        approvalDecidedAt: row.approval_decided_at ? new Date(row.approval_decided_at).getTime() : null,
-        approvalNote: row.approval_note || null,
-        _base: cur._base ? { ...cur._base, approval_status: row.approval_status } : cur._base,
-      });
-    };
-    const t = setInterval(tick, APPROVAL_POLL_MS);
-    return () => { cancelled = true; clearInterval(t); };
-  }, [job.approvalStatus, job.id]);
+  // After the WhatsApp tap: record the send (same link, no new token).
+  const recordSend = useCallback(async () => {
+    const r = await markJobCardSent(jobRef.current);
+    if (!r.ok) { setError("Opened WhatsApp, but couldn't record the send here — check the connection."); return; }
+    setError(null);
+    onChangedRef.current(r.job);
+  }, []);
 
-  const status = job.approvalStatus;
   const snap = job.approvalSnapshot;
+  const sent = !!(job.approvalToken && snap);
   const link = job.approvalToken ? approvalLink(job.approvalToken) : "";
-  const ui = APPROVAL_STATUS_UI[status];
-  const currentTotal = round2(buildInvoiceLineItems(job).grandTotal);
-  const drifted = snap && Math.abs(currentTotal - (snap.grandTotal || 0)) >= 0.01;
+  const { needs, at } = sent ? jobCardNeedsUpdate(job) : { needs: false, at: null };
+  const answered = job.approvalStatus === "approved" || job.approvalStatus === "declined";
 
   const copy = async () => {
-    try { await navigator.clipboard.writeText(link); setCopied(true); setTimeout(() => setCopied(false), 2000); } catch { /* clipboard blocked — link is still shown below */ }
+    try { await navigator.clipboard.writeText(link); setCopied(true); setTimeout(() => setCopied(false), 2000); } catch { /* clipboard blocked — staff can use the WhatsApp button */ }
   };
 
   const smallBtn = { display: "inline-flex", alignItems: "center", justifyContent: "center", gap: 6, minHeight: 40, padding: "8px 12px", borderRadius: 10, border: `1px solid ${COLORS.line}`, background: COLORS.panel2, color: COLORS.ink, fontSize: 12.5, fontWeight: 600, cursor: "pointer" };
 
   return (
-    <section aria-label="Customer approval" style={{ ...cardStyle, padding: 14, marginBottom: 14, border: `1px solid ${ui ? ui.color : COLORS.line}` }}>
+    <section aria-label="Customer job card" style={{ ...cardStyle, padding: 14, marginBottom: 14, border: `1px solid ${needs ? COLORS.gold : COLORS.line}` }}>
       <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", gap: 8, marginBottom: 10 }}>
-        <span style={eyebrowStyle}>Customer approval</span>
-        {ui && <span style={{ fontSize: 11.5, fontWeight: 700, color: ui.color, background: ui.bg, borderRadius: 999, padding: "4px 10px" }}>{ui.label}</span>}
+        <span style={eyebrowStyle}>Job card for customer</span>
+        {sent && <span style={{ fontFamily: MONO_FONT, color: COLORS.gold, fontWeight: 700, fontSize: 12.5 }}>AED {Math.round(snap.grandTotal || 0).toLocaleString()}</span>}
       </div>
 
-      {!status && (
+      {!sent && (
         <>
-          <div style={{ fontSize: 12.5, color: COLORS.muted, marginBottom: 10, lineHeight: 1.45 }}>Send this job card to the customer so they can approve it on their phone.</div>
+          <div style={{ fontSize: 12.5, color: COLORS.muted, marginBottom: 10, lineHeight: 1.45 }}>Give the customer a copy of this job card on their phone — for their information. It stays up to date if work is added.</div>
           <button onClick={send} disabled={busy} className="mrcap-press" style={{ ...primaryBtnStyle, width: "100%", display: "flex", alignItems: "center", justifyContent: "center", gap: 8, opacity: busy ? 0.6 : 1 }}>
-            <Send size={16} /> {busy ? "Preparing link…" : "Send job card for approval"}
+            <Send size={16} /> {busy ? "Preparing link…" : "Send job card to customer"}
           </button>
         </>
       )}
 
-      {status && snap && (
+      {sent && (
         <>
-          <div style={{ display: "flex", justifyContent: "space-between", fontSize: 12.5, color: COLORS.muted, marginBottom: 10 }}>
-            <span>Sent {fmtTime(job.approvalSentAt)}{snap.sentBy ? ` by ${snap.sentBy}` : ""}</span>
-            <span style={{ fontFamily: MONO_FONT, color: COLORS.gold, fontWeight: 700 }}>AED {Math.round(snap.grandTotal || 0).toLocaleString()}</span>
+          <div style={{ fontSize: 12.5, color: COLORS.muted, marginBottom: 10 }}>
+            Sent {fmtTime(job.approvalSentAt)}{snap.sentBy ? ` by ${snap.sentBy}` : ""}
           </div>
 
-          {status === "approved" && (
-            <div style={{ display: "flex", alignItems: "center", gap: 8, fontSize: 13.5, fontWeight: 700, color: COLORS.successText, background: APPROVAL_STATUS_UI.approved.bg, borderRadius: 10, padding: "10px 12px", marginBottom: 10 }}>
-              <CheckCircle2 size={17} /> {job.customerName || "Customer"} approved · {fmtTime(job.approvalDecidedAt)}
-            </div>
-          )}
-          {status === "declined" && (
-            <div style={{ fontSize: 13, color: COLORS.dangerText, background: APPROVAL_STATUS_UI.declined.bg, borderRadius: 10, padding: "10px 12px", marginBottom: 10 }}>
-              <div style={{ display: "flex", alignItems: "center", gap: 8, fontWeight: 700 }}><XCircle size={17} /> Declined · {fmtTime(job.approvalDecidedAt)}</div>
-              {job.approvalNote && <div style={{ marginTop: 5, color: COLORS.ink, fontSize: 12.5 }}>“{job.approvalNote}”</div>}
+          {needs && (
+            <div role="status" style={{ fontSize: 12.5, fontWeight: 600, color: COLORS.goldBright, background: "rgba(201,162,39,0.14)", border: "1px solid rgba(201,162,39,0.5)", borderRadius: 10, padding: "9px 11px", marginBottom: 10, lineHeight: 1.4 }}>
+              Job card changed{at ? ` on ${fmtTime(at)}` : ""} — send the update
             </div>
           )}
 
-          {status === "pending" && (
-            <>
-              <WhatsAppSendButton
-                phone={job.customerPhone}
-                templateKey="job_approval"
-                vars={{ customerName: job.customerName || "", makeModel: job.makeModel || "vehicle", plate: job.plate || "", total: Math.round(snap.grandTotal || 0).toLocaleString(), approvalLink: link }}
-                label="Send to Customer on WhatsApp"
-              />
-              {!job.customerPhone && <div style={{ fontSize: 11.5, color: COLORS.muted, marginBottom: 8, fontStyle: "italic" }}>No phone on file — copy the link and send it another way, or add a phone via Edit Job.</div>}
-              <div style={{ display: "flex", alignItems: "center", gap: 7, fontSize: 12, color: COLORS.muted, marginBottom: 10 }}>
-                <span style={{ width: 8, height: 8, borderRadius: 999, background: COLORS.gold, flexShrink: 0, animation: "mrcapPulseRing 1.6s ease-out infinite" }} />
-                This updates by itself when the customer answers.
-              </div>
-            </>
-          )}
+          <WhatsAppSendButton
+            phone={job.customerPhone}
+            templateKey={needs ? "job_card_update" : "job_card_copy"}
+            vars={{
+              customerName: job.customerName || "", makeModel: job.makeModel || "vehicle", plate: job.plate || "",
+              intakeDate: formatLongDate(new Date(snap.intakeDate || job.createdAt || snap.sentAt || Date.now())),
+              total: Math.round(snap.grandTotal || 0).toLocaleString(), link,
+            }}
+            label={needs ? "Send updated job card" : "Send job card on WhatsApp"}
+            onSent={recordSend}
+            big
+          />
+          {!job.customerPhone && <div style={{ fontSize: 11.5, color: COLORS.muted, marginBottom: 8, fontStyle: "italic" }}>No phone on file — copy the link and send it another way, or add a phone via Edit Job.</div>}
 
-          {!snap.grandTotal && !drifted && (
-            <div style={{ fontSize: 12, color: COLORS.muted, background: COLORS.panel2, borderRadius: 10, padding: "8px 10px", marginBottom: 10 }}>
-              No prices on this job card yet — the customer will see “pricing will be confirmed”. Add prices via Edit Job, then Resend.
-            </div>
-          )}
-          {drifted && (
-            <div role="alert" style={{ fontSize: 12, color: COLORS.dangerText, background: "rgba(168,64,47,0.12)", borderRadius: 10, padding: "8px 10px", marginBottom: 10 }}>
-              Prices changed since this was sent (now AED {Math.round(currentTotal).toLocaleString()}). Resend so the customer approves the current total.
+          {answered && (
+            <div style={{ fontSize: 11.5, color: COLORS.muted, marginBottom: 10 }}>
+              Customer answered: {job.approvalStatus} {fmtTime(job.approvalDecidedAt)}{job.approvalNote ? ` — “${job.approvalNote}”` : ""}
             </div>
           )}
 
           <div style={{ display: "flex", gap: 8, flexWrap: "wrap" }}>
-            {status === "pending" && <button onClick={copy} className="mrcap-press" style={smallBtn}><Copy size={14} /> {copied ? "Copied" : "Copy link"}</button>}
-            {(status !== "approved" || drifted) && (
-              <button onClick={send} disabled={busy} className="mrcap-press" style={{ ...smallBtn, opacity: busy ? 0.6 : 1 }}><RotateCcw size={14} /> {busy ? "Preparing…" : "Resend (new link)"}</button>
+            <button onClick={copy} className="mrcap-press" style={smallBtn}><Copy size={14} /> {copied ? "Copied" : "Copy link"}</button>
+            {isFullDashboardRole(session) && (
+              // Replacing the link kills the one the customer already has, and the layout shifts up right after a WhatsApp send — so a stray second tap must not do it: it takes two taps.
+              <button onClick={() => { if (!confirmNew) { setConfirmNew(true); setTimeout(() => setConfirmNew(false), 4000); return; } setConfirmNew(false); send(); }} disabled={busy} className="mrcap-press" style={{ ...smallBtn, background: "transparent", color: confirmNew ? COLORS.dangerText : COLORS.muted, opacity: busy ? 0.6 : 1 }}>{busy ? "Preparing…" : confirmNew ? "Tap again — the old link stops working" : "Make a new link"}</button>
             )}
           </div>
         </>
@@ -11982,32 +12473,21 @@ function JobApprovalPanel({ job, session, onChanged, autoSend = false }) {
   );
 }
 
-/* ---------------- Customer approval — public page (?approve=<token>) ----------------
+/* ---------------- Customer job card — public page (?approve=<token>) ----------------
    What the customer opens from WhatsApp. No login; talks only to the
-   job-approval edge function, which only ever returns the frozen
-   snapshot staff sent. */
+   job-approval edge function's read-only `view`, which returns the latest
+   snapshot staff's saves have kept up to date. Information only: there is no
+   approve/decline any more and this page never calls `decide`. */
 function PublicJobApprovalView({ token }) {
   const [state, setState] = useState("loading"); // loading | ok | notfound | error
   const [data, setData] = useState(null);
-  const [busy, setBusy] = useState(false);
-  const [declining, setDeclining] = useState(false);
-  const [reason, setReason] = useState("");
-  const [actionError, setActionError] = useState(null);
+  const [pdfError, setPdfError] = useState(false);
 
   const load = useCallback(async () => {
     const r = await jobApprovalCall({ action: "view", token });
     if (r.ok) { setData(r); setState("ok"); } else setState(r.notFound ? "notfound" : "error");
   }, [token]);
   useEffect(() => { load(); }, [load]);
-
-  const decide = async (decision) => {
-    setBusy(true);
-    setActionError(null);
-    const r = await jobApprovalCall({ action: "decide", token, decision, note: decision === "declined" ? reason : "" });
-    setBusy(false);
-    if (!r.ok) { setActionError("That didn't go through — please check your connection and try again."); return; }
-    await load();
-  };
 
   if (state === "loading") return <PublicPageShell><SkeletonRows count={3} height={56} /></PublicPageShell>;
   if (state !== "ok") {
@@ -12023,17 +12503,32 @@ function PublicJobApprovalView({ token }) {
 
   const s = data.snapshot || {};
   const items = s.items || [];
+  const veh = snapshotVehicle(s);
+  const received = s.intakeDate || s.sentAt;
   const aed = (n) => `AED ${(Number(n) || 0).toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`;
   const row = { display: "flex", justifyContent: "space-between", gap: 10, fontSize: 13, color: COLORS.muted, padding: "3px 0" };
+  const vehRows = [["Make", veh.make], ["Model", veh.model], ["Year", veh.modelYear], ["Colour", veh.color], ["Plate", s.plate]].filter((r) => r[1]);
+  // Services listed but nothing priced yet: don't show AED 0.00 amounts and a zero total as if they were real.
+  const priced = items.length > 0 && Number(s.grandTotal) > 0;
+
+  const downloadPdf = () => {
+    setPdfError(false);
+    try { generateCustomerJobCardPDF(s).save(`MrCAP-JobCard-${s.jobRef || "copy"}.pdf`); } catch (e) { setPdfError(true); }
+  };
 
   return (
     <PublicPageShell>
       <div style={{ background: COLORS.panel, border: `1px solid ${COLORS.line}`, borderRadius: 14, padding: 22 }}>
-        <div style={{ textAlign: "center", marginBottom: 18 }}>
-          <div style={{ fontSize: 11, color: COLORS.muted, textTransform: "uppercase", letterSpacing: 1 }}>Job card{s.jobRef ? ` · ${s.jobRef}` : ""}</div>
-          <div style={{ fontFamily: DISPLAY_FONT, fontWeight: 700, fontSize: 19, color: COLORS.ink, marginTop: 4 }}>{s.makeModel || "Vehicle"}</div>
-          <div style={{ fontFamily: MONO_FONT, fontSize: 13, color: COLORS.gold, marginTop: 2 }}>{s.plate}</div>
+        <div style={{ textAlign: "center", marginBottom: 16 }}>
+          <div style={{ fontFamily: DISPLAY_FONT, fontWeight: 700, fontSize: 24, color: COLORS.ink }}>Job Card</div>
+          {s.jobRef && <div style={{ fontFamily: MONO_FONT, fontSize: 12.5, color: COLORS.gold, marginTop: 3 }}>Ref {s.jobRef}</div>}
           {s.customerName && <div style={{ fontSize: 12.5, color: COLORS.muted, marginTop: 8 }}>Prepared for {s.customerName}</div>}
+        </div>
+
+        <div style={{ background: COLORS.panel2, border: `1px solid ${COLORS.line}`, borderRadius: 8, padding: "9px 11px", marginBottom: 12 }}>
+          {received && <div style={{ ...row, color: COLORS.ink }}><span style={{ color: COLORS.muted }}>Date received</span><span>{formatLongDate(new Date(received))}</span></div>}
+          {s.revisedAt && <div style={{ ...row, color: COLORS.ink }}><span style={{ color: COLORS.muted }}>Updated</span><span>{formatLongDate(new Date(s.revisedAt))}</span></div>}
+          {vehRows.map(([k, val]) => <div key={k} style={{ ...row, color: COLORS.ink }}><span style={{ color: COLORS.muted }}>{k}</span><span style={k === "Plate" ? { fontFamily: MONO_FONT, color: COLORS.gold } : undefined}>{val}</span></div>)}
         </div>
 
         {(s.description || s.damageNotes) && (
@@ -12051,55 +12546,32 @@ function PublicJobApprovalView({ token }) {
                   <div style={{ fontSize: 12.5, fontWeight: 600, color: COLORS.ink }}>{it.desc}</div>
                   {(it.qty > 1 || it.discount > 0) && <div style={{ fontSize: 11, color: COLORS.muted, marginTop: 2 }}>{it.qty > 1 ? `${it.qty} × ${aed(it.price)}` : ""}{it.qty > 1 && it.discount > 0 ? " · " : ""}{it.discount > 0 ? `${it.discount}% off` : ""}</div>}
                 </div>
-                <div style={{ fontFamily: MONO_FONT, fontSize: 12.5, color: COLORS.gold, whiteSpace: "nowrap" }}>{aed(it.amountExcl)}</div>
+                {priced && <div style={{ fontFamily: MONO_FONT, fontSize: 12.5, color: COLORS.gold, whiteSpace: "nowrap" }}>{aed(it.amountExcl)}</div>}
               </div>
             ))}
+            {!priced && <div style={{ fontSize: 12.5, color: COLORS.muted, textAlign: "center", marginTop: 8 }}>Pricing will be confirmed with you by the team.</div>}
           </div>
         ) : (
           <div style={{ fontSize: 12.5, color: COLORS.muted, textAlign: "center", marginBottom: 12 }}>Pricing will be confirmed with you by the team.</div>
         )}
 
-        {items.length > 0 && <div style={{ borderTop: `1px dashed ${COLORS.line}`, paddingTop: 10 }}>
+        {priced && <div style={{ borderTop: `1px dashed ${COLORS.line}`, paddingTop: 10 }}>
           <div style={row}><span>Subtotal</span><span style={{ fontFamily: MONO_FONT }}>{aed(s.subtotal)}</span></div>
-          <div style={row}><span>VAT {Math.round((s.vatRate || 0) * 100)}%</span><span style={{ fontFamily: MONO_FONT }}>{aed(s.vatTotal)}</span></div>
+          <div style={row}><span>VAT {Math.round((s.vatRate == null ? VAT_RATE : s.vatRate) * 100)}%</span><span style={{ fontFamily: MONO_FONT }}>{aed(s.vatTotal)}</span></div>
           <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", padding: "10px 0 4px" }}>
             <span style={{ fontSize: 14, fontWeight: 700, color: COLORS.ink }}>Total</span>
             <span style={{ fontFamily: MONO_FONT, fontWeight: 700, fontSize: 19, color: COLORS.gold }}>{aed(s.grandTotal)}</span>
           </div>
         </div>}
 
-        {data.status === "approved" && (
-          <div style={{ marginTop: 14, textAlign: "center", padding: "14px 16px", borderRadius: 10, background: "rgba(74,122,87,0.12)", border: `1px solid ${COLORS.green}` }}>
-            <div style={{ fontSize: 15, fontWeight: 700, color: COLORS.successText, display: "flex", alignItems: "center", justifyContent: "center", gap: 7 }}><CheckCircle2 size={18} /> Approved — thank you!</div>
-            <div style={{ fontSize: 11.5, color: COLORS.muted, marginTop: 5 }}>We'll get started and keep you posted on WhatsApp.</div>
-          </div>
-        )}
-        {data.status === "declined" && (
-          <div style={{ marginTop: 14, textAlign: "center", padding: "14px 16px", borderRadius: 10, background: "rgba(168,64,47,0.12)", border: "1px solid rgba(168,64,47,0.6)" }}>
-            <div style={{ fontSize: 14, fontWeight: 700, color: COLORS.dangerText }}>Declined</div>
-            <div style={{ fontSize: 11.5, color: COLORS.muted, marginTop: 5 }}>Thanks for letting us know — our team will be in touch.</div>
-          </div>
-        )}
+        <button onClick={downloadPdf} className="mrcap-press" style={{ ...secondaryBtnStyle, width: "100%", marginTop: 14, display: "flex", alignItems: "center", justifyContent: "center", gap: 8 }}>
+          <Download size={16} /> Download PDF
+        </button>
+        {pdfError && <div role="alert" style={{ fontSize: 12, color: COLORS.dangerText, marginTop: 8, textAlign: "center" }}>Couldn't create the PDF on this device — please try again.</div>}
 
-        {data.status === "pending" && !declining && (
-          <div style={{ marginTop: 16 }}>
-            <button onClick={() => decide("approved")} disabled={busy} className="mrcap-press" style={{ ...primaryBtnStyle, width: "100%", minHeight: 56, fontSize: 16, display: "flex", alignItems: "center", justifyContent: "center", gap: 8, opacity: busy ? 0.6 : 1 }}>
-              <CheckCircle2 size={19} /> {busy ? "Sending…" : "Approve job card"}
-            </button>
-            <button onClick={() => setDeclining(true)} disabled={busy} className="mrcap-press" style={{ ...secondaryBtnStyle, width: "100%", marginTop: 10, color: COLORS.muted }}>Decline</button>
-            <div style={{ fontSize: 11, color: COLORS.muted, textAlign: "center", marginTop: 10 }}>By approving you agree to the work and total shown above.</div>
-          </div>
-        )}
-        {data.status === "pending" && declining && (
-          <div style={{ marginTop: 16 }}>
-            <textarea value={reason} onChange={(e) => setReason(e.target.value)} maxLength={500} placeholder="Reason (optional) — e.g. only want the tint, not the PPF" style={{ ...textareaStyle, marginTop: 0 }} />
-            <div style={{ display: "flex", gap: 8, marginTop: 10 }}>
-              <button onClick={() => setDeclining(false)} disabled={busy} className="mrcap-press" style={{ ...secondaryBtnStyle, flex: 1 }}>Back</button>
-              <button onClick={() => decide("declined")} disabled={busy} className="mrcap-press" style={{ ...primaryBtnStyle, flex: 2, background: COLORS.red, color: "#fff", opacity: busy ? 0.6 : 1 }}>{busy ? "Sending…" : "Confirm decline"}</button>
-            </div>
-          </div>
-        )}
-        {actionError && <div role="alert" style={{ fontSize: 12.5, color: COLORS.dangerText, marginTop: 10, textAlign: "center" }}>{actionError}</div>}
+        <div style={{ marginTop: 16, padding: "11px 12px", borderRadius: 10, background: COLORS.panel2, border: `1px solid ${COLORS.line}`, fontSize: 11.5, color: COLORS.muted, lineHeight: 1.5, textAlign: "center" }}>
+          This job card is for your information. It is not a tax invoice — your tax invoice is issued on the day of payment. If extra work is agreed, this page updates.
+        </div>
       </div>
     </PublicPageShell>
   );
@@ -12202,9 +12674,15 @@ function PublicQuoteView({ quoteId }) {
 
   const load = useCallback(async () => {
     if (!quoteId) { setStatus("notfound"); return; }
-    const q = await loadQuote(quoteId);
-    if (!q) { setStatus("notfound"); return; }
-    setQuote(q);
+    // Via the job-approval function, which returns only customer-safe
+    // fields — the quotes table itself isn't readable without signing in.
+    const r = await jobApprovalCall({ action: "quote", quoteId });
+    if (!r.ok) { setStatus(r.notFound ? "notfound" : "error"); return; }
+    const q = r.quote;
+    setQuote({
+      plate: q.plate, makeModel: q.make_model, serviceTypes: q.service_types || [], treatments: q.treatments || {},
+      treatmentPrices: q.treatment_prices || {}, discountPercent: q.discount_percent || 0, parts: q.parts || [], status: q.status || "draft",
+    });
     setStatus("ok");
   }, [quoteId]);
 
@@ -12213,8 +12691,8 @@ function PublicQuoteView({ quoteId }) {
   if (status === "loading") {
     return <PublicPageShell><SkeletonRows count={2} height={56} /></PublicPageShell>;
   }
-  if (status === "notfound") {
-    return <PublicPageShell><div style={{ textAlign: "center", color: COLORS.muted, padding: 20 }}>We couldn't find that quotation. The link may be out of date.</div></PublicPageShell>;
+  if (status === "notfound" || status === "error" || !quote) {
+    return <PublicPageShell><div style={{ textAlign: "center", color: COLORS.muted, padding: 20 }}>{status === "error" ? "Something went wrong loading this page. Please check your connection and try again." : "We couldn't find that quotation. The link may be out of date."}</div></PublicPageShell>;
   }
 
   const activeServices = SERVICES.filter((s) => quote.serviceTypes.includes(s.key));
@@ -12294,9 +12772,10 @@ async function storageCall(payload) {
     const res = await fetch(STORAGE_GATEKEEPER_URL, {
       method: "POST",
       headers: { apikey: SUPABASE_KEY, Authorization: `Bearer ${SUPABASE_KEY}`, "Content-Type": "application/json" },
-      body: JSON.stringify(payload),
+      body: JSON.stringify({ ...payload, token: currentToken || undefined }),
     });
     const text = await res.text();
+    if (res.status === 401) signalAuthExpired();
     if (!res.ok) return { ok: false, error: text.slice(0, 200) };
     return { ok: true, ...(text ? JSON.parse(text) : {}) };
   } catch {
@@ -14061,6 +14540,44 @@ async function loadDispatchJobExtras(jobId) {
   return { photos: data[0].photos || {}, damageDiagramImage: data[0].damage_diagram_image || null };
 }
 
+/* ---------------- Off-site cars ----------------
+   A car that's away from the garage (Smartech body shop, Beneloom
+   upholstery, or any other custom location) doesn't belong on the floor
+   board — it comes off the columns, the workload pills, the alerts, the
+   6:45 checklist and the sounds, and sits in a one-line "Off-site" strip
+   instead. On-site = no location at all, or exactly the main garage.
+   The job stays in the fetched `jobs` array, so new-car detection (which
+   diffs job ids) never mistakes a car that comes BACK for a new arrival. */
+function isOffsiteLocation(loc) {
+  const l = String(loc == null ? "" : loc).trim();
+  return !!l && l !== BASE_LOCATIONS[0];
+}
+// "Smartech (Body & Paint)" -> "Smartech"; custom names are kept as typed.
+function dispatchLocationShort(loc) {
+  const l = String(loc == null ? "" : loc).replace(/\s*\(.*\)\s*$/, "").trim();
+  return l || "Off-site";
+}
+// One-tap choices in the job pop-up, in the order they're shown.
+const DISPATCH_LOCATION_CHOICES = [
+  { loc: BASE_LOCATIONS[0], label: "At Mr.CAP" },
+  { loc: BASE_LOCATIONS[2], label: "Sent to Smartech" },
+  { loc: BASE_LOCATIONS[1], label: "At Beneloom" },
+];
+// Whole days since the car was last moved (from its newest "location"
+// history entry; jobs never moved from the board fall back to when they
+// were created). "today" under a day.
+function dispatchAwayLabel(job, now) {
+  let since = 0;
+  const hist = Array.isArray(job.history) ? job.history : [];
+  for (let i = hist.length - 1; i >= 0; i -= 1) {
+    if (hist[i] && hist[i].stage === "location") { since = dispatchMs(hist[i].at) || 0; break; }
+  }
+  if (!since) since = job.createdAt || 0;
+  if (!since) return "";
+  const days = Math.floor((now - since) / 86400000);
+  return days <= 0 ? "today" : `${days}d`;
+}
+
 /* ---------------- Dispatch Board sounds ----------------
    Sharp and loud on purpose — the board runs on a 60" tablet in a noisy
    workshop, and the old soft sine pings were easy to miss. Square and
@@ -14674,11 +15191,11 @@ function DispatchAvatar({ id, name }) {
 // Big UAE-style plate for the TV: emirate strip, category, number. Falls
 // back to the whole string on the plate face for VINs / odd imports.
 const DISPATCH_PLATE_EMIRATE = { DXB: "DUBAI", AUH: "A.D.", SHJ: "SHJ", AJM: "AJM", UAQ: "UAQ", RAK: "RAK", FUJ: "FUJ" };
-function DispatchPlate({ plate, large = false }) {
+function DispatchPlate({ plate, large = false, small = false }) {
   const { code, rest } = parsePlate(plate);
   const m = code ? String(rest || "").match(/^(\S{1,3})\s+(.+)$/) : null;
   return (
-    <span className={`dsp-plate${large ? " dsp-plate-lg" : ""}`} title={plate || ""}>
+    <span className={`dsp-plate${large ? " dsp-plate-lg" : ""}${small ? " dsp-plate-sm" : ""}`} title={plate || ""}>
       {code && <span className="dsp-plate-em" aria-hidden="true">{DISPATCH_PLATE_EMIRATE[code] || code}</span>}
       {m && <span className="dsp-plate-code">{m[1]}</span>}
       <span className="dsp-plate-num">{m ? m[2] : (rest || "—")}</span>
@@ -14727,7 +15244,7 @@ ${FONT_IMPORT}
 .dsp-pills { display: grid; grid-template-columns: repeat(5, minmax(0, 1fr)); gap: ${du(12, 6)}; }
 .dsp-pill { background: ${COLORS.panel}; border: 1px solid ${COLORS.line}; border-radius: ${du(22, 12)}; padding: ${du(14, 8)} ${du(16, 9)}; display: flex; align-items: center; gap: ${du(14, 8)}; min-width: 0; }
 .dsp-pill-nm { font-size: ${du(22, 11.5)}; font-weight: 700; white-space: normal; overflow: hidden; display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical; line-height: 1.15; word-break: break-word; }
-.dsp-pill-ct { font-size: ${du(19, 11)}; color: ${COLORS.goldBright}; margin-top: 2px; line-height: 1.25; }
+.dsp-pill-ct { font-size: ${du(19, 11)}; color: ${COLORS.goldBright}; margin-top: 2px; line-height: 1.25; overflow: hidden; display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical; }
 .dsp-free { font-size: ${du(22, 12.5)}; color: #3FD37A; font-weight: 600; margin-top: ${du(12, 8)}; line-height: 1.4; }
 .dsp-free b { font-weight: 800; letter-spacing: 0.5px; }
 .dsp-free-none { color: ${COLORS.muted}; }
@@ -14735,11 +15252,13 @@ ${FONT_IMPORT}
 @container (max-width: 760px) { .dsp-pills { grid-template-columns: repeat(3, minmax(0, 1fr)); } }
 @container (max-width: 460px) { .dsp-pills { grid-template-columns: repeat(2, minmax(0, 1fr)); } }
 
-.dsp-legend { display: flex; justify-content: space-between; align-items: center; gap: ${du(14, 8)}; flex-wrap: wrap; padding: ${du(18, 12)} ${du(40, 14)} 0; }
-.dsp-legend-keys { display: flex; gap: ${du(22, 10)}; row-gap: 6px; flex-wrap: wrap; font-size: ${du(18, 11.5)}; color: ${COLORS.muted}; }
-.dsp-legend-keys span { display: inline-flex; align-items: center; gap: ${du(8, 5)}; }
+.dsp-legend { display: flex; justify-content: space-between; align-items: center; gap: ${du(10, 8)} ${du(14, 8)}; flex-wrap: wrap; padding: ${du(18, 12)} ${du(40, 14)} 0; }
+/* The colour key is always ONE line (never a tall wrapped block); on a phone it scrolls sideways instead of wrapping. */
+.dsp-legend-keys { display: flex; gap: ${du(20, 12)}; flex-wrap: nowrap; flex: 0 1 auto; min-width: 0; max-width: 100%; overflow-x: auto; scrollbar-width: none; font-size: ${du(18, 11.5)}; color: ${COLORS.muted}; white-space: nowrap; }
+.dsp-legend-keys::-webkit-scrollbar { display: none; }
+.dsp-legend-keys span { display: inline-flex; align-items: center; gap: ${du(8, 5)}; flex-shrink: 0; }
 .dsp-legend-keys i { width: ${du(14, 9)}; height: ${du(14, 9)}; border-radius: 4px; display: inline-block; }
-.dsp-legend-ctl { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }
+.dsp-legend-ctl { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; margin-left: auto; max-width: 100%; }
 .dsp-alerts { display: inline-flex; align-items: center; gap: 6px; height: ${du(40, 30)}; padding: 0 ${du(14, 10)}; border-radius: 999px; background: rgba(255,69,58,0.16); color: #FF8A80; font-size: ${du(18, 12)}; font-weight: 700; white-space: nowrap; }
 .dsp-sort { display: flex; gap: 4px; background: ${COLORS.panel2}; border-radius: ${du(14, 10)}; padding: 3px; }
 .dsp-sort button { height: ${du(40, 30)}; padding: 0 ${du(16, 11)}; border-radius: ${du(11, 8)}; font-size: ${du(17, 12)}; font-weight: 700; color: ${COLORS.muted}; white-space: nowrap; }
@@ -14759,7 +15278,8 @@ ${FONT_IMPORT}
 .dsp-dot { width: ${du(18, 10)}; height: ${du(18, 10)}; border-radius: 999px; flex-shrink: 0; }
 .dsp-col-h h2 { margin: 0; font-family: ${DISPATCH_COND_FONT}; font-size: ${du(30, 14)}; font-weight: 700; letter-spacing: -0.3px; flex: 1; min-width: 0; color: ${COLORS.ink}; line-height: 1.05; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
 .dsp-n { min-width: ${du(52, 28)}; height: ${du(52, 28)}; border-radius: 999px; background: #26231D; font-size: ${du(26, 13)}; font-weight: 700; display: inline-flex; align-items: center; justify-content: center; padding: 0 ${du(14, 8)}; flex-shrink: 0; }
-.dsp-warn { height: ${du(40, 24)}; padding: 0 ${du(14, 8)}; border-radius: 999px; background: rgba(255,69,58,0.16); color: #FF8A80; font-size: ${du(19, 11)}; font-weight: 700; display: inline-flex; align-items: center; white-space: nowrap; flex-shrink: 0; }
+.dsp-warn { height: ${du(40, 24)}; padding: 0 ${du(14, 8)}; border-radius: 999px; background: rgba(255,69,58,0.16); color: #FF8A80; font-size: ${du(19, 11)}; font-weight: 700; display: inline-flex; align-items: center; gap: ${du(6, 4)}; white-space: nowrap; flex-shrink: 0; }
+.dsp-warn svg { width: ${du(20, 12)}; height: ${du(20, 12)}; }
 .dsp-list { flex: 1; min-height: 0; overflow-y: auto; padding: ${du(16, 10)}; display: flex; flex-direction: column; gap: ${du(16, 10)}; scrollbar-width: none; }
 .dsp-list::-webkit-scrollbar { display: none; }
 .dsp-empty { color: ${COLORS.muted}; text-align: center; font-size: ${du(28, 13)}; padding: ${du(80, 30)} 0; }
@@ -14804,6 +15324,46 @@ ${FONT_IMPORT}
 .dsp-plate-lg .dsp-plate-code { font-size: ${du(48, 22)}; padding: 0 ${du(16, 9)} 0 ${du(18, 10)}; }
 .dsp-plate-lg .dsp-plate-num { font-size: ${du(60, 26)}; padding: 0 ${du(22, 12)}; }
 .dsp-plate-lg .dsp-plate-em { font-size: ${du(15, 8)}; padding: 0 ${du(8, 4)}; }
+
+.dsp-plate-sm { height: ${du(46, 26)}; border-radius: ${du(8, 5)}; }
+.dsp-plate-sm .dsp-plate-code { font-size: ${du(22, 12)}; padding: 0 ${du(7, 4)} 0 ${du(8, 5)}; }
+.dsp-plate-sm .dsp-plate-num { font-size: ${du(27, 14)}; padding: 0 ${du(9, 6)}; letter-spacing: ${du(1, 0.5)}; }
+.dsp-plate-sm .dsp-plate-em { font-size: ${du(9, 6)}; padding: 0 ${du(4, 2.5)}; }
+
+/* Compact card: one ~72px row, used when a column holds more than 8 cars so a busy day doesn't flood the screen. */
+.dsp-list-c { gap: ${du(10, 6)}; }
+.dsp-card-c { position: relative; display: grid; grid-template-columns: auto minmax(0, 1fr) auto; grid-template-areas: "plate model timer" "plate state avs"; column-gap: ${du(14, 8)}; row-gap: ${du(4, 2)}; align-items: center; min-height: ${du(74, 48)}; padding: ${du(8, 5)} ${du(14, 8)} ${du(8, 5)} ${du(22, 12)}; border-radius: ${du(20, 12)}; }
+.dsp-card-c::before { content: ""; position: absolute; left: 0; top: 0; bottom: 0; width: ${du(10, 5)}; background: var(--c); }
+.dsp-card-c .dsp-plate { grid-area: plate; }
+.dsp-c-model { grid-area: model; min-width: 0; font-size: ${du(23, 12.5)}; font-weight: 600; line-height: 1.15; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.dsp-c-timer { grid-area: timer; justify-self: end; font-family: ${MONO_FONT}; font-size: ${du(24, 13)}; font-weight: 700; color: var(--c); font-variant-numeric: tabular-nums; white-space: nowrap; }
+.dsp-c-timer.muted { color: ${COLORS.muted}; }
+.dsp-c-state { grid-area: state; min-width: 0; display: flex; align-items: center; gap: ${du(8, 5)}; }
+.dsp-c-pill { flex: 0 1 auto; min-width: 0; max-width: 100%; padding: ${du(2, 1)} ${du(10, 6)}; border-radius: 999px; background: var(--c16); color: var(--c); font-size: ${du(15, 9.5)}; font-weight: 700; letter-spacing: ${du(0.5, 0.2)}; text-transform: uppercase; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.dsp-c-cat { min-width: 0; font-size: ${du(15, 9.5)}; font-weight: 700; color: ${COLORS.muted}; letter-spacing: ${du(0.8, 0.3)}; text-transform: uppercase; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.dsp-card-c .dsp-avs { grid-area: avs; justify-self: end; }
+.dsp-card-c .dsp-avs .dsp-av { width: ${du(32, 20)}; height: ${du(32, 20)}; font-size: ${du(14, 10)}; box-shadow: 0 0 0 2px ${COLORS.panel}; }
+.dsp-card-c .dsp-avs .dsp-av + .dsp-av { margin-left: min(-4px, calc(-7 * var(--u))); }
+.dsp-c-none { grid-area: avs; justify-self: end; font-size: ${du(15, 9.5)}; color: ${COLORS.muted}; font-weight: 600; white-space: nowrap; }
+
+/* Off-site strip: cars at Smartech / Beneloom / elsewhere, one line until tapped. */
+.dsp-off { margin: ${du(18, 12)} ${du(30, 12)} 0; background: ${COLORS.panel}; border: 1px solid ${COLORS.line}; border-radius: ${du(22, 12)}; overflow: hidden; }
+.dsp-off-h { width: 100%; min-height: ${du(68, 46)}; padding: 0 ${du(22, 14)}; display: flex; align-items: center; justify-content: space-between; gap: ${du(14, 8)}; text-align: left; font-size: ${du(21, 12.5)}; font-weight: 700; color: ${COLORS.ink}; }
+.dsp-off-h span { min-width: 0; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.dsp-off-h b { color: ${COLORS.goldBright}; }
+.dsp-off-h em { font-style: normal; font-weight: 500; color: ${COLORS.muted}; }
+.dsp-off-h svg { width: ${du(28, 16)}; height: ${du(28, 16)}; flex-shrink: 0; color: ${COLORS.muted}; }
+.dsp-off-list { display: flex; flex-wrap: wrap; gap: ${du(12, 8)}; padding: 0 ${du(18, 12)} ${du(18, 12)}; max-height: ${du(360, 220)}; overflow-y: auto; scrollbar-width: none; }
+.dsp-off-list::-webkit-scrollbar { display: none; }
+.dsp-off-chip { min-height: ${du(74, 46)}; padding: ${du(8, 5)} ${du(14, 9)}; border-radius: ${du(16, 10)}; background: ${COLORS.panel2}; box-shadow: 0 0 0 1px ${COLORS.line}; display: inline-flex; align-items: center; gap: ${du(12, 8)}; text-align: left; max-width: 100%; }
+.dsp-off-chip .m { display: flex; flex-direction: column; min-width: 0; font-size: ${du(19, 11)}; color: ${COLORS.muted}; line-height: 1.25; }
+.dsp-off-chip .m b { font-size: ${du(20, 11.5)}; color: ${COLORS.goldBright}; font-weight: 700; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+
+/* "Where is the car?" in the pop-up. */
+.dsp-loc { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: ${du(12, 8)}; }
+.dsp-locbtn { min-height: ${du(104, 56)}; padding: ${du(8, 5)} ${du(12, 8)}; border-radius: ${du(26, 14)}; background: ${COLORS.panel2}; box-shadow: 0 0 0 1px ${COLORS.line}; font-size: ${du(29, 13.5)}; font-weight: 700; line-height: 1.15; text-align: center; display: inline-flex; align-items: center; justify-content: center; }
+.dsp-locbtn.on { box-shadow: 0 0 0 4px ${COLORS.goldBright}; background: rgba(201,162,39,0.14); color: ${COLORS.goldBright}; }
+.dsp-locbtn:disabled { opacity: 0.5; cursor: default; }
 
 .dsp-hidden { margin: 0 ${du(30, 12)} ${du(20, 14)}; background: #141414; border: 1px solid ${COLORS.line}; border-radius: ${du(22, 12)}; padding: ${du(18, 12)}; }
 .dsp-hidden-h { font-size: ${du(20, 12.5)}; font-weight: 700; color: ${COLORS.muted}; margin-bottom: 10px; }
@@ -14925,8 +15485,23 @@ function dispatchElapsed(fromMs, now) {
   return formatDispatchElapsed(fromMs, now) || "0m";
 }
 
-function DispatchJobCardImpl({ rowId, jobId, ticketNo, plate, model, carColor, categoryLabel, todo, stateLabel, color, pulse, timerLabel, timerText, timerMuted, redoReason, people, arriving, leaving, onOpen }) {
-  const cls = `dsp-card${pulse ? " dsp-pulse" : ""}${arriving ? " dsp-arrive" : ""}${leaving ? " dsp-leaving" : ""}`;
+function DispatchJobCardImpl({ rowId, jobId, ticketNo, plate, model, carColor, categoryLabel, todo, stateLabel, color, pulse, timerLabel, timerText, timerMuted, redoReason, people, arriving, leaving, compact, hideCat, onOpen }) {
+  const cls = `dsp-card${compact ? " dsp-card-c" : ""}${pulse ? " dsp-pulse" : ""}${arriving ? " dsp-arrive" : ""}${leaving ? " dsp-leaving" : ""}`;
+  if (compact) {
+    // One short row: plate, model, state pill, timer, who's on it. Same
+    // colour bar / pulse / tap target as the full card, just denser.
+    return (
+      <button type="button" className={cls} style={dispatchColorVars(color)} onClick={() => onOpen(rowId, jobId)} aria-label={`${stateLabel}: ${plate || "no plate"}${model ? `, ${model}` : ""}, ${categoryLabel}. Tap to open.`}>
+        <DispatchPlate plate={plate} small />
+        <span className="dsp-c-model">{model || categoryLabel}</span>
+        <span className={`dsp-c-timer${timerMuted ? " muted" : ""}`}>{timerText}</span>
+        <span className="dsp-c-state"><span className="dsp-c-pill">{stateLabel}</span>{model && !hideCat ? <span className="dsp-c-cat">{categoryLabel}</span> : null}</span>
+        {people.length
+          ? <span className="dsp-avs">{people.slice(0, 3).map((p) => <DispatchAvatar key={p.id} id={p.id} name={p.name} />)}</span>
+          : <span className="dsp-c-none">Nobody yet</span>}
+      </button>
+    );
+  }
   return (
     <button type="button" className={cls} style={dispatchColorVars(color)} onClick={() => onOpen(rowId, jobId)} aria-label={`${stateLabel}: ${plate || "no plate"}${model ? `, ${model}` : ""}, ${categoryLabel}. Tap to open.`}>
       <span className="dsp-band">
@@ -14960,7 +15535,7 @@ const DispatchJobCard = memo(DispatchJobCardImpl, (prev, next) => (
   prev.todo === next.todo && prev.stateLabel === next.stateLabel && prev.color === next.color &&
   prev.pulse === next.pulse && prev.timerLabel === next.timerLabel && prev.timerText === next.timerText &&
   prev.timerMuted === next.timerMuted && prev.redoReason === next.redoReason &&
-  prev.arriving === next.arriving && prev.leaving === next.leaving && prev.onOpen === next.onOpen &&
+  prev.arriving === next.arriving && prev.leaving === next.leaving && prev.compact === next.compact && prev.hideCat === next.hideCat && prev.onOpen === next.onOpen &&
   prev.people.map((p) => `${p.id}:${p.name}`).join(",") === next.people.map((p) => `${p.id}:${p.name}`).join(",")
 ));
 
@@ -15204,8 +15779,10 @@ function DispatchEndOfDayChecklist({ views, session, unclassifiedCount, onAction
 // what to do, damage, photos, parts, who's on it, the one big action for
 // its current state, quick updates, move / hide. Everything the old
 // sheet could do is still here.
-function DispatchDetailModal({ row, info, color, ticketNo, now, session, team, assignedIds, staffOptions, moveOptions, canWriteUpdate, canManageVisibility, canFinishDirect, onClose, onStart, onUnstart, onSendToQc, onPassQc, onFailQc, onFinishDirect, onAssign, onMove, onAddUpdate, onToggleHidden, saving }) {
+function DispatchDetailModal({ row, info, color, ticketNo, now, session, team, assignedIds, staffOptions, moveOptions, canWriteUpdate, canManageVisibility, canFinishDirect, onClose, onStart, onUnstart, onSendToQc, onPassQc, onFailQc, onFinishDirect, onAssign, onMove, onAddUpdate, onToggleHidden, onSetLocation, saving }) {
   const { job, categoryLabel, categoryKey } = row;
+  const curLocation = job.location || BASE_LOCATIONS[0];
+  const knownLocation = DISPATCH_LOCATION_CHOICES.some((c) => c.loc === curLocation);
   const isUnclassified = categoryKey === "_none";
   const [updateText, setUpdateText] = useState("");
   const [failPick, setFailPick] = useState(false);
@@ -15234,7 +15811,7 @@ function DispatchDetailModal({ row, info, color, ticketNo, now, session, team, a
         <div className="dsp-m-top">
           <div style={{ minWidth: 0 }}>
             <div className="dsp-m-eye">
-              Ticket #{ticketNo}{!isUnclassified ? ` · ${categoryLabel}` : " · No service type yet"}
+              {ticketNo ? `Ticket #${ticketNo}` : "Off-site"}{!isUnclassified ? ` · ${categoryLabel}` : " · No service type yet"}
               {meta ? <> · <span style={{ color }}>{meta.label}</span></> : null}
             </div>
             <DispatchPlate plate={job.plate} large />
@@ -15255,6 +15832,15 @@ function DispatchDetailModal({ row, info, color, ticketNo, now, session, team, a
             ))}
           </div>
         )}
+
+        <div>
+          <div className="dsp-sec-l">Where is the car?{!knownLocation ? <em>now: {curLocation}</em> : null}</div>
+          <div className="dsp-loc">
+            {DISPATCH_LOCATION_CHOICES.map((c) => (
+              <button key={c.loc} type="button" className={`dsp-locbtn${curLocation === c.loc ? " on" : ""}`} disabled={saving} aria-pressed={curLocation === c.loc} onClick={() => onSetLocation(row, c.loc)}>{c.label}</button>
+            ))}
+          </div>
+        </div>
 
         <div>
           <div className="dsp-sec-l">What to do</div>
@@ -15451,7 +16037,8 @@ function DispatchBoard({ team, session, fill = false }) {
   const [colorDraft, setColorDraft] = useState(null); // non-null while Mr.CAP's colour pop-up is open (live preview)
   const [savingColors, setSavingColors] = useState(false);
   const [arrivingKeys, setArrivingKeys] = useState({}); // rowKey -> true for the 1.2s "just arrived" flash
-  const [leavingKeys, setLeavingKeys] = useState({}); // rowKey -> true for the 1.4s "finished" flash before it drops off
+  const [leavingKeys, setLeavingKeys] = useState({}); // rowKey -> true (or, for a car sent off-site, its short place name) for the 1.4s flash before it drops off
+  const [showOffsite, setShowOffsite] = useState(false); // the one-line "Off-site" strip, collapsed until tapped
   const leaveTimersRef = useRef({});
   useEffect(() => () => { Object.values(leaveTimersRef.current).forEach(clearTimeout); }, []);
   const firstLoadRef = useRef(true);
@@ -15569,6 +16156,12 @@ function DispatchBoard({ team, session, fill = false }) {
     for (const job of data) {
       const known = seenJobIdsRef.current.has(job.id);
       const vehicle = job.makeModel || job.plate || "car";
+      // Off-site cars (Smartech / Beneloom / elsewhere) are still tracked
+      // here — their ids stay in the "seen" set, so a car coming BACK is
+      // never announced as a new arrival — but they make no sounds or
+      // voice while away, and nothing plays when they return either
+      // (their row state is only recorded while they're on the floor).
+      const offsite = isOffsiteLocation(job.location);
       // Assignment call-outs on EVERY device that has the board open —
       // this is what makes a remote assignment announce out loud on the
       // tablet near the person being assigned.
@@ -15576,7 +16169,7 @@ function DispatchBoard({ team, session, fill = false }) {
         const key = rowKey(job.id, categoryKey);
         const after = job.assignedTeam[categoryKey] || [];
         nextAssigned[key] = after;
-        if (first) continue;
+        if (first || offsite) continue;
         const before = prevAssignedRef.current[key] || [];
         for (const id of after.filter((x) => !before.includes(x))) {
           sounds.add("assigned");
@@ -15584,14 +16177,14 @@ function DispatchBoard({ team, session, fill = false }) {
         }
       }
       // Brand-new car on the board.
-      if (!first && !known && !job.dispatchHidden && now - job.createdAt < DISPATCH_NEW_CAR_WINDOW_MS) newCars.push(job);
+      if (!first && !known && !job.dispatchHidden && !offsite && now - job.createdAt < DISPATCH_NEW_CAR_WINDOW_MS) newCars.push(job);
       // Started / sent to QC / QC failed / finished — read straight off
       // the history entries added since the last poll (or since this
       // device's own write, which already played its sound).
       const len = job.history.length;
       nextHistoryLen[job.id] = len;
       const prevLen = historyLenRef.current[job.id];
-      if (!first && known && !job.dispatchHidden && typeof prevLen === "number" && len > prevLen) {
+      if (!first && known && !job.dispatchHidden && !offsite && typeof prevLen === "number" && len > prevLen) {
         for (const h of job.history.slice(prevLen)) {
           if (!h) continue;
           if (h.stage === "service" && h.note === "Started") sounds.add("started");
@@ -15600,7 +16193,7 @@ function DispatchBoard({ team, session, fill = false }) {
           else if (h.stage === "qc" && typeof h.note === "string" && h.note.startsWith("QC failed")) sounds.add("fail");
         }
       }
-      if (job.dispatchHidden) continue;
+      if (job.dispatchHidden || offsite) continue;
       // Needs someone / no update / QC waiting: sound ONCE, at the
       // moment a row moves into that state (by time passing or by data),
       // never again for as long as it stays there.
@@ -15907,6 +16500,58 @@ function DispatchBoard({ team, session, fill = false }) {
     showToast(`Moved ${job.plate} to ${newLabel}`, COLORS.gold, null, 3500);
   };
 
+  // "Where is the car?" — one tap in the pop-up. Same narrow write as the
+  // other board actions (fresh read of location+history, PATCH just those,
+  // history entry appended). A car sent off-site flashes and slides off the
+  // columns first (every open row of that job), then lands in the Off-site
+  // strip; the pop-up closes either way. Undo puts it back.
+  const changeLocation = async (row, newLoc) => {
+    const { job } = row;
+    const curLoc = job.location || BASE_LOCATIONS[0];
+    if (curLoc === newLoc) return true; // already there — nothing to write
+    const short = dispatchLocationShort(newLoc);
+    const note = newLoc === BASE_LOCATIONS[0] ? "Back at Mr.CAP" : `Sent to ${short}`;
+    const timerKey = `loc:${job.id}`;
+    // A previous send-off still animating for this car (e.g. Undo tapped
+    // within 1.4s) is settled first so its delayed update can't land later.
+    clearTimeout(leaveTimersRef.current[timerKey]);
+    delete leaveTimersRef.current[timerKey];
+    const openKeys = (job.serviceTypes.length ? job.serviceTypes : ["_none"]).filter((k) => !job.serviceDone[k]).map((k) => rowKey(job.id, k));
+    setLeavingKeys((prev) => {
+      const next = { ...prev };
+      openKeys.forEach((k) => { delete next[k]; });
+      return next;
+    });
+    const patch = await writeJob(job, "location,history", (cur) => ({
+      location: newLoc,
+      history: [...(cur.history || []), entry("location", "Moved", note)],
+    }), { summary: `Dispatch board: ${session.name} moved ${job.plate} to ${newLoc}`, failText: `Couldn't save where ${job.plate} is` });
+    if (!patch) return false;
+    setSelectedRowKey(null);
+    const undo = () => changeLocation({ ...row, job: { ...job, location: newLoc } }, curLoc);
+    if (isOffsiteLocation(newLoc) && !isOffsiteLocation(job.location)) {
+      applyLocal(job.id, { history: patch.history });
+      setLeavingKeys((prev) => {
+        const next = { ...prev };
+        openKeys.forEach((k) => { next[k] = short; });
+        return next;
+      });
+      leaveTimersRef.current[timerKey] = setTimeout(() => {
+        delete leaveTimersRef.current[timerKey];
+        applyLocal(job.id, { location: newLoc });
+        setLeavingKeys((prev) => {
+          const next = { ...prev };
+          openKeys.forEach((k) => { delete next[k]; });
+          return next;
+        });
+      }, 1400);
+    } else {
+      applyLocal(job.id, { location: newLoc, history: patch.history });
+    }
+    showToast(newLoc === BASE_LOCATIONS[0] ? `${job.plate} is back at Mr.CAP` : `${job.plate} · ${note}`, COLORS.gold, undo, 6000);
+    return true;
+  };
+
   // Free-text updates stay restricted to these three (by id — the name
   // check used "regan", but the live name is "Reagen", so Reagen could
   // never post). The quick-update presets are open to whoever is working
@@ -15985,13 +16630,15 @@ function DispatchBoard({ team, session, fill = false }) {
   // than being dumped into a coloured column.
   const allRows = [];
   const hiddenJobs = []; // manually hidden jobs — shown in their own management panel, not the columns
+  const offsiteRows = []; // rows of cars that are away (Smartech / Beneloom / …) — NOT in the columns, pills, alerts, EOD list; only the Off-site strip and its pop-up
   for (const job of jobs) {
     if (job.dispatchHidden) { hiddenJobs.push(job); continue; }
+    const offsite = isOffsiteLocation(job.location);
     const types = job.serviceTypes.length ? job.serviceTypes : ["_none"];
     for (const key of types) {
       if (job.serviceDone[key]) continue; // cleared — remove it from the board
       const svc = SERVICES.find((s) => s.key === key);
-      allRows.push({ job, categoryKey: key, categoryLabel: svc?.label || key, role: svc?.role || null });
+      (offsite ? offsiteRows : allRows).push({ job, categoryKey: key, categoryLabel: svc?.label || key, role: svc?.role || null });
     }
   }
 
@@ -16012,6 +16659,23 @@ function DispatchBoard({ team, session, fill = false }) {
     if (r.categoryKey === "_none") continue;
     views.push({ key, row: r, info: dispatchRowInfo(r.job, r.categoryKey, r.categoryLabel, nowTick) });
   }
+  // Off-site cars: one chip per job (its first open row is what the chip
+  // opens), grouped by short place name for the collapsed one-line summary.
+  // Their rows are reachable by key so the normal pop-up works for them.
+  const offsiteViews = [];
+  const offsiteChips = [];
+  for (const r of offsiteRows) {
+    const key = rowKey(r.job.id, r.categoryKey);
+    rowsByKey[key] = r;
+    if (r.categoryKey !== "_none") offsiteViews.push({ key, row: r, info: dispatchRowInfo(r.job, r.categoryKey, r.categoryLabel, nowTick) });
+    if (!offsiteChips.some((c) => c.job.id === r.job.id)) offsiteChips.push({ key, job: r.job, place: dispatchLocationShort(r.job.location) });
+  }
+  const offsitePlaces = [];
+  for (const c of offsiteChips) {
+    const hit = offsitePlaces.find((p) => p.place === c.place);
+    if (hit) hit.n += 1; else offsitePlaces.push({ place: c.place, n: 1 });
+  }
+  offsitePlaces.sort((a, b) => b.n - a.n);
   const unclassifiedRows = allRows.filter((r) => r.categoryKey === "_none");
   const detailingViews = views.filter((v) => v.row.role === "detailing");
   const otherViews = views.filter((v) => v.row.role !== "detailing");
@@ -16047,9 +16711,12 @@ function DispatchBoard({ team, session, fill = false }) {
   const totalAlerts = alertCounts.late + alertCounts.stale + alertCounts.qclate + unclassifiedRows.length;
 
   const selectedRow = selectedRowKey ? rowsByKey[selectedRowKey] : null;
-  const selectedView = selectedRow ? views.find((v) => v.key === selectedRowKey) || null : null;
+  const selectedView = selectedRow ? views.find((v) => v.key === selectedRowKey) || offsiteViews.find((v) => v.key === selectedRowKey) || null : null;
 
-  const renderCard = (v, i) => {
+  // A column holding more than 8 cars switches its cards to the compact
+  // one-row variant so a busy day doesn't flood the screen.
+  const DISPATCH_COMPACT_OVER = 8;
+  const renderCard = (v, i, compact, hideCat) => {
     const { info, row } = v;
     const meta = DISPATCH_STATES[info.state];
     const leaving = !!leavingKeys[v.key];
@@ -16072,7 +16739,7 @@ function DispatchBoard({ team, session, fill = false }) {
         carColor={row.job.color || ""}
         categoryLabel={row.categoryLabel}
         todo={dispatchWhatToDo(row.job, row.categoryKey) || ""}
-        stateLabel={leaving ? "Finished" : meta.label}
+        stateLabel={leaving ? (typeof leavingKeys[v.key] === "string" ? `Sent to ${leavingKeys[v.key]}` : "Finished") : meta.label}
         color={colorFor(v)}
         pulse={meta.pulse && !leaving}
         timerLabel={timerLabel}
@@ -16082,24 +16749,29 @@ function DispatchBoard({ team, session, fill = false }) {
         people={info.assigned.map((id) => ({ id, name: nameOf(id) }))}
         arriving={!!arrivingKeys[v.key]}
         leaving={leaving}
+        compact={!!compact}
+        hideCat={!!hideCat}
         onOpen={openRow}
       />
     );
   };
   const renderColumn = (title, dot, list) => {
     const warn = list.filter((v) => DISPATCH_STATES[v.info.state].pulse).length;
+    const compact = list.length > DISPATCH_COMPACT_OVER;
+    // Every card in the column is the same category (the Detailing column) -> the compact row needn't repeat it.
+    const hideCat = compact && list.every((v) => v.row.categoryKey === list[0].row.categoryKey);
     return (
       <section className="dsp-col" aria-label={title}>
         <div className="dsp-col-h">
           <span className="dsp-dot" style={{ background: dot }} />
           <h2>{title}</h2>
-          {warn > 0 && <span className="dsp-warn">{warn} need{warn === 1 ? "s" : ""} a look</span>}
+          {warn > 0 && <span className="dsp-warn" title={`${warn} need${warn === 1 ? "s" : ""} a look`} aria-label={`${warn} need${warn === 1 ? "s" : ""} a look`}><AlertCircle size={14} />{warn}</span>}
           <span className="dsp-n">{list.length}</span>
         </div>
-        <div className="dsp-list">
+        <div className={`dsp-list${compact ? " dsp-list-c" : ""}`} data-compact={compact ? "1" : "0"}>
           {list.length === 0
             ? <div className="dsp-empty">{loading ? "Loading…" : "All clear."}</div>
-            : list.map(renderCard)}
+            : list.map((v, i) => renderCard(v, i, compact, hideCat))}
         </div>
       </section>
     );
@@ -16196,6 +16868,25 @@ function DispatchBoard({ team, session, fill = false }) {
           </div>
         )}
 
+        {offsiteChips.length > 0 && (
+          <div className="dsp-off" data-testid="dsp-offsite">
+            <button type="button" className="dsp-off-h" onClick={() => setShowOffsite((v) => !v)} aria-expanded={showOffsite}>
+              <span><b>{offsiteChips.length} off-site</b>{offsitePlaces.map((p) => <em key={p.place}> · {p.n} {p.place}</em>)}</span>
+              {showOffsite ? <ChevronUp /> : <ChevronDown />}
+            </button>
+            {showOffsite && (
+              <div className="dsp-off-list mrcap-fade">
+                {offsiteChips.map((c) => (
+                  <button key={c.job.id} type="button" className="dsp-off-chip" onClick={() => openRow(c.key, c.job.id)} aria-label={`${c.job.plate || "Car"} at ${c.place}. Tap to open.`}>
+                    <DispatchPlate plate={c.job.plate} small />
+                    <span className="m"><b>{c.place}</b><span>{dispatchAwayLabel(c.job, nowTick)}</span></span>
+                  </button>
+                ))}
+              </div>
+            )}
+          </div>
+        )}
+
         <div className="dsp-cols">
           {renderColumn("Detailing", COLORS.gold, detailingViews)}
           {renderColumn("Body · Dent · PPF", COLORS.blueText, otherViews)}
@@ -16244,6 +16935,7 @@ function DispatchBoard({ team, session, fill = false }) {
           onMove={moveCategory}
           onAddUpdate={(row, text) => addProgressUpdate(row, text)}
           onToggleHidden={toggleDispatchHidden}
+          onSetLocation={changeLocation}
           saving={saving}
         />
       )}
@@ -17540,7 +18232,7 @@ function PPFRoomCarScreen({ jobId, job, onJobChange, onBack, sheet, setSheet, ju
     onJobChange(updated);
     if (playSound) playSound();
     const saved = await saveJob(updated);
-    if (saved) onJobChange((cur) => (cur && cur.id === updated.id ? { ...cur, _base: updated._base } : cur));
+    if (saved) onJobChange((cur) => (cur && cur.id === updated.id ? { ...cur, _base: updated._base, approvalSnapshot: updated.approvalSnapshot } : cur));
   };
 
   const start = () => {
@@ -17777,12 +18469,29 @@ export function DispatchKiosk() {
     return () => clearInterval(t);
   }, [session]);
 
-  const loginAs = (member) => {
-    const next = { id: member.id, name: member.name, role: member.role };
+  const loginAs = (member, token) => {
+    const next = { id: member.id, name: member.name, role: member.role, token: token || null };
     setSession(next);
+    setCurrentActor(next);
     try { window.localStorage.setItem("mrcap_kiosk_session", JSON.stringify(next)); } catch { /* ignore */ }
     if (shouldShowMorningReminder("mrcap_kiosk")) setShowMorningReminder(true);
+    if (getOfflineQueue().length) flushOfflineQueue();
   };
+
+  // Restored tablet session → its pass goes on every request.
+  useEffect(() => { setCurrentActor(session); }, [session]);
+
+  // Pass refused (expired / person removed) — back to the name list.
+  useEffect(() => {
+    const onExpired = () => {
+      setSession(null);
+      setPicked(null);
+      setCurrentActor(null);
+      try { window.localStorage.removeItem("mrcap_kiosk_session"); } catch { /* ignore */ }
+    };
+    window.addEventListener(AUTH_EXPIRED_EVENT, onExpired);
+    return () => window.removeEventListener(AUTH_EXPIRED_EVENT, onExpired);
+  }, []);
 
   const pick = (member) => {
     // QC approvers and admins by id — a name can be renamed (e.g. "Lani"
@@ -17793,14 +18502,21 @@ export function DispatchKiosk() {
     // Gate on the id/role list alone now, not member.pin's presence
     // — that field is never fetched anymore (verify-pin checks it
     // server-side instead), so it would always be falsy here.
-    if (needsPin) {
+    const askPin = () => {
       setPicked(member);
       setPin("");
       setError("");
       setLocked(false);
-    } else {
-      loginAs(member);
-    }
+    };
+    if (needsPin) { askPin(); return; }
+    // No PIN on the tablet for everyone else — same as always — but the
+    // server still hands out the (dispatch-board-only) pass for it.
+    (async () => {
+      const result = await kioskLogin(member.id);
+      if (result.ok) loginAs(result.member || member, result.token);
+      else if (result.needsPin) askPin();
+      else setError("Couldn't sign in — check the connection");
+    })();
   };
 
   const press = (d) => { if (!locked && pin.length < 4) setPin((p) => p + d); };
@@ -17811,7 +18527,7 @@ export function DispatchKiosk() {
     (async () => {
       const result = await verifyPin(picked.id, pin);
       if (result.ok) {
-        loginAs(result.member);
+        loginAs(result.member, result.token);
       } else if (result.locked) {
         setLocked(true);
         setError("Locked — see admin");
