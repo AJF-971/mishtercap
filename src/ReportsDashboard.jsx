@@ -22,7 +22,8 @@
  *   catalog        { STAGES, getServices: () => SERVICES } - pipeline stages and live service catalog
  *
  * Reads (all GET):
- *   jobs?select=<narrow list, never photo/signature columns>&order=created_at.asc,id.asc&limit=1000&offset=N
+ *   jobs?select=<narrow list, never photo/signature columns; includes invoice_finalized_at>&order=created_at.asc,id.asc&limit=1000&offset=N
+ *   jobs?select=id,make,model,...,ppf_scope,ppf_progress&ppf_scope=not.is.null  (PPF film card, only when opened; admin / super-admin)
  *   quotes?select=id,plate,make_model,customer_name,updated_at&status=eq.declined&order=updated_at.desc&limit=25  (same as old ReportsScreen)
  *   deletion_log?select=*&order=deleted_at.desc&limit=25                                                     (same as old ReportsScreen)
  *   gatekeeper: proformas?status=eq.issued&... and proforma_payments?...  (only when canSeeBilling)
@@ -30,20 +31,25 @@
 import React, { useState, useEffect, useLayoutEffect, useRef, useCallback, useMemo } from "react";
 import { jsPDF } from "jspdf";
 import {
-  ChevronLeft, FileText, FileSpreadsheet, ChevronDown, RefreshCw, MessageCircle, AlertTriangle, Hourglass, Info,
+  ChevronLeft, FileText, FileSpreadsheet, ChevronDown, RefreshCw, MessageCircle, AlertTriangle, Hourglass, Info, CalendarDays,
 } from "lucide-react";
 import {
-  PERIODS, periodRange, deriveJob, computeReport, computeDueBack, computeOutstanding, delta, localDateKey,
-  fmtAED, fmtCompact, fmtHours, fmtDays, reportCsv, HOW_NUMBERS_WORK, DUE_BACK_RULES, dueBackMessage, whatsappLink, DAY,
+  PERIODS, periodRange, deriveJob, computeReport, computeDueBack, computeOutstanding, delta, dubaiDateKey,
+  computeWip, computeDayClose, endOfDayMessage, whatsappShareLink, computePpfReport, reportSheets, WIP_REASONS,
+  fmtAED, fmtCompact, fmtHours, fmtDays, HOW_NUMBERS_WORK, DUE_BACK_RULES, dueBackMessage, whatsappLink, DAY,
 } from "./reportsData.js";
 
+// invoice_finalized_at dates the revenue; on_hold*/body_type feed the stuck-cars card.
 const JOB_COLUMNS = [
   "id", "customer_id", "plate", "make_model", "customer_name", "customer_phone",
   "service_types", "treatments", "treatment_prices", "smartech_pieces", "discount_percent",
   "assigned_to", "assigned_team", "service_started", "service_done", "stage_index",
-  "invoice_amount", "history", "created_at", "updated_at",
+  "invoice_amount", "invoice_finalized_at", "history", "created_at", "updated_at",
+  "on_hold", "on_hold_since", "on_hold_note", "body_type",
   "smartech_flag", "smartech_status", "smartech_status_at", "smartech_started_at",
 ].join(",");
+// PPF film report: only the two PPF columns plus what names the car (fetched when the card is opened).
+const PPF_COLUMNS = "id,make,model,make_model,body_type,created_at,ppf_scope,ppf_progress";
 const PAGE = 1000; // PostgREST caps every response at 1000 rows server-side
 
 const DEFAULT_STAGES = [
@@ -51,11 +57,11 @@ const DEFAULT_STAGES = [
   { key: "qc", label: "QC" }, { key: "ready", label: "Ready for Collection" }, { key: "collected", label: "Collected" },
 ];
 
-async function fetchAllJobs(sbFetch) {
+async function fetchAllJobs(sbFetch, query = `select=${JOB_COLUMNS}&order=created_at.asc,id.asc`) {
   let all = [];
   let stale = false, cachedAt = null;
   for (let offset = 0, guard = 0; guard < 100; guard++, offset += PAGE) {
-    const res = await sbFetch(`jobs?select=${JOB_COLUMNS}&order=created_at.asc,id.asc&limit=${PAGE}&offset=${offset}`);
+    const res = await sbFetch(`jobs?${query}&limit=${PAGE}&offset=${offset}`);
     if (!res || !res.ok) return { ok: false };
     if (res.stale) { stale = true; cachedAt = res.cachedAt || cachedAt; }
     const rows = Array.isArray(res.data) ? res.data : [];
@@ -144,6 +150,10 @@ function css(t, kpiCount) {
 .rpt-rowbtn:disabled{cursor:default}
 .rpt-rowbtn small{font-size:12px;color:${t.muted};overflow-wrap:anywhere}
 .rpt-wa{flex:none;min-height:44px;padding:0 14px;border-radius:10px;border:none;background:#25D366;color:#0D0C08;font-size:12.5px;font-weight:700;display:inline-flex;align-items:center;gap:6px;text-decoration:none}
+.rpt-wipstats{display:grid;grid-template-columns:repeat(auto-fit,minmax(112px,1fr));gap:12px;padding:12px;border-radius:12px;background:${t.panel2};border:1px solid ${t.axis}}
+.rpt-dayform{display:flex;flex-wrap:wrap;gap:10px;align-items:flex-end}
+.rpt-dayform label{display:flex;flex-direction:column;gap:4px;font-size:12px;color:${t.muted};flex:1 1 150px;min-width:0}
+.rpt-dayform input{min-height:44px;border-radius:10px;border:1px solid ${t.line};background:${t.panel2};color:${t.ink};padding:0 10px;font-size:14px;color-scheme:dark;width:100%}
 .rpt-rules{margin:0;padding:0;list-style:none;display:flex;flex-wrap:wrap;gap:4px 18px;font-size:12px;color:${t.muted};line-height:1.45}
 .rpt-rules b{color:${t.ink};font-weight:600}
 .rpt-donut{display:flex;gap:18px;align-items:center;flex-wrap:wrap}
@@ -189,6 +199,9 @@ function css(t, kpiCount) {
 
 /* ---------------- small helpers ---------------- */
 
+// Loop, not Math.max(...array): safe however long the list.
+function maxOf(list, floor = 0) { let m = floor; for (let i = 0; i < list.length; i++) if (list[i] > m) m = list[i]; return m; }
+
 function niceCeil(v) {
   if (!(v > 0)) return 1;
   const pow = Math.pow(10, Math.floor(Math.log10(v)));
@@ -226,8 +239,8 @@ function downloadBlob(blob, filename) {
   setTimeout(() => URL.revokeObjectURL(url), 1500);
 }
 
-const shortDate = (ms) => new Date(ms).toLocaleDateString("en-GB", { day: "numeric", month: "short", year: "numeric" });
-const timeOf = (ms) => new Date(ms).toLocaleTimeString("en-GB", { hour: "2-digit", minute: "2-digit" });
+const shortDate = (ms) => new Date(ms).toLocaleDateString("en-GB", { day: "numeric", month: "short", year: "numeric", timeZone: "Asia/Dubai" });
+const timeOf = (ms) => new Date(ms).toLocaleTimeString("en-GB", { hour: "2-digit", minute: "2-digit", timeZone: "Asia/Dubai" });
 
 function Skel({ h = 16, w = "100%", style }) {
   return <div className="rpt-skel" style={{ height: h, width: w, ...style }} aria-hidden="true" />;
@@ -324,7 +337,7 @@ function RevenueChart({ report, t }) {
   const padL = 46, padR = 10, padT = 24, padB = 28;
   const plotW = W - padL - padR, plotH = H - padT - padB;
   const n = Math.max(1, buckets.length);
-  const maxV = Math.max(0, ...buckets.map((b) => b.cur), ...buckets.map((b) => b.prevValue || 0));
+  const maxV = maxOf(buckets.map((b) => Math.max(b.cur, b.prevValue || 0)));
   // Clean ticks: a 1/2/2.5/5 x 10^n step, 2-5 gridlines, top = a whole step.
   const tickStep = niceCeil(maxV / 4);
   const tickCount = Math.max(1, Math.ceil(maxV / tickStep - 1e-9));
@@ -461,7 +474,7 @@ function RevenueChart({ report, t }) {
 function CategoryBars({ report, t }) {
   const [asTable, setAsTable] = useState(false);
   const rows = report.byCategory;
-  const max = Math.max(1, ...rows.map((r) => r.amount));
+  const max = maxOf(rows.map((r) => r.amount), 1);
   return (
     <Card title="Revenue by service" testId="revenue-by-service" actions={rows.length ? <TableToggle on={asTable} onToggle={() => setAsTable((v) => !v)} what="revenue by service" /> : null}>
       {!rows.length ? <div className="rpt-empty">No revenue in this period.</div> : asTable ? (
@@ -493,7 +506,7 @@ function StageBars({ report, t, stages }) {
   const rows = report.stages;
   const pickup = report.pickup;
   const all = [...rows, pickup].filter((r) => r.avgH !== null);
-  const max = Math.max(0.01, ...all.map((r) => r.avgH));
+  const max = maxOf(all.map((r) => r.avgH), 0.01);
   const shortLabel = (r) => (r.key === "parts_removal" ? "Parts off" : r.label);
   const bn = rows.find((r) => r.key === report.bottleneck);
   const hasData = all.length > 0;
@@ -513,7 +526,7 @@ function StageBars({ report, t, stages }) {
   return (
     <Card
       title="Where time goes"
-      sub={hasData ? `Average clock hours per stage · ${report.timedJobs} ${report.timedJobs === 1 ? "car" : "cars"} collected` : "Average clock hours per stage"}
+      sub={hasData ? `Average shop hours per stage · ${report.timedJobs} ${report.timedJobs === 1 ? "car" : "cars"} collected` : "Average shop hours per stage"}
       testId="where-time-goes"
       actions={hasData ? <TableToggle on={asTable} onToggle={() => setAsTable((v) => !v)} what="time per stage" /> : null}
     >
@@ -737,11 +750,125 @@ function DueBackCard({ items, t, onOpenJob, firstRecord }) {
   );
 }
 
+/* ---------------- stuck cars (WIP aging): no money, every Reports user ---------------- */
+
+function WipCard({ wip, t, onOpenJob }) {
+  const [all, setAll] = useState(false);
+  const shown = all ? wip.rows : wip.rows.slice(0, 6);
+  return (
+    <Card
+      title="Stuck cars"
+      sub={wip.total ? `${wip.total} ${wip.total === 1 ? "car needs" : "cars need"} a push right now. Tap one to open it.` : "Cars that are waiting too long, right now."}
+      testId="wip-aging"
+    >
+      <div className="rpt-wipstats">
+        {WIP_REASONS.map((r) => (
+          <div key={r.key} className="rpt-stat" data-wip-count={r.key}><b style={wip.counts[r.key] ? { color: t.goldBright } : undefined}>{wip.counts[r.key]}</b><span>{r.label}</span></div>
+        ))}
+      </div>
+      {!wip.total ? (
+        <div className="rpt-empty">Nothing is stuck. Every open car is moving.</div>
+      ) : (
+        <>
+          <div className="rpt-list" aria-label="Stuck cars">
+            {shown.map((r) => (
+              <div key={r.id} className="rpt-row">
+                <button type="button" className="rpt-rowbtn" data-wip-job={r.id} onClick={() => onOpenJob && onOpenJob(r.id)} disabled={!onOpenJob}
+                  aria-label={`Open ${r.plate || "job"}: ${r.reasons.map((x) => x.label).join(", ")}`}>
+                  <span style={{ overflowWrap: "anywhere" }}>
+                    <span style={{ fontFamily: t.mono }}>{r.plate || "—"}</span>{r.makeModel ? ` · ${r.makeModel}` : ""}
+                    {r.stageLabel ? <span style={{ color: t.muted, fontSize: 12 }}> · {r.stageLabel}</span> : null}
+                  </span>
+                  {r.reasons.map((x) => <small key={x.key + x.detail}><b style={{ color: t.goldBright, fontWeight: 600 }}>{x.label}</b>: {x.detail}</small>)}
+                </button>
+              </div>
+            ))}
+          </div>
+          {wip.rows.length > 6 && (
+            <button type="button" className="rpt-btn" style={{ alignSelf: "flex-start" }} onClick={() => setAll((v) => !v)} aria-expanded={all}>
+              {all ? "Show fewer" : `Show all ${wip.rows.length}`}
+            </button>
+          )}
+        </>
+      )}
+    </Card>
+  );
+}
+
+/* ---------------- daily close-out: counts for everyone with Reports, AED only for the super-admin ---------------- */
+
+function CloseOutCard({ close, dayKey, todayKey, onDay, showMoney, message, t }) {
+  const n = close.invoices;
+  return (
+    <Card title="Daily close-out" sub={close.label} testId="close-out" actions={<CalendarDays size={18} color={t.muted} aria-hidden="true" />}>
+      <div className="rpt-dayform">
+        <label>Day<input type="date" value={dayKey} max={todayKey} onChange={(e) => onDay(e.target.value)} aria-label="Close-out day" /></label>
+        <button type="button" className="rpt-btn" onClick={() => onDay(todayKey)} disabled={dayKey === todayKey}>Today</button>
+      </div>
+      <div className="rpt-wipstats">
+        <div className="rpt-stat" data-close="in"><b>{close.carsIn}</b><span>{close.carsIn === 1 ? "car in" : "cars in"}</span></div>
+        <div className="rpt-stat" data-close="out"><b>{close.carsOut}</b><span>{close.carsOut === 1 ? "car out" : "cars out"}</span></div>
+        <div className="rpt-stat" data-close="shop"><b>{close.wipTotal}</b><span>in the shop {close.isToday ? "now" : "that evening"}</span></div>
+        <div className="rpt-stat" data-close="invoices"><b>{n.count}</b><span>{n.count === 1 ? "invoice finalized" : "invoices finalized"}</span></div>
+      </div>
+      {showMoney && (
+        <div className="rpt-wipstats" data-testid="close-out-money">
+          <div className="rpt-stat" data-close="gross"><b>{fmtAED(n.gross)}</b><span>invoiced, incl. VAT</span></div>
+          <div className="rpt-stat" data-close="net"><b>{fmtAED(n.net)}</b><span>net of VAT</span></div>
+          <div className="rpt-stat" data-close="vat"><b>{fmtAED(n.vat)}</b><span>VAT at 5%</span></div>
+        </div>
+      )}
+      <div className="rpt-sub" data-close="stages">
+        {close.wipTotal ? close.wip.filter((s) => s.count).map((s) => `${s.label} ${s.count}`).join(" · ") : "No cars in the shop."}
+      </div>
+      <a className="rpt-wa" style={{ alignSelf: "flex-start", minHeight: 48 }} href={whatsappShareLink(message)} target="_blank" rel="noopener noreferrer" data-testid="eod-whatsapp">
+        <MessageCircle size={16} aria-hidden="true" />Send end-of-day summary on WhatsApp
+      </a>
+    </Card>
+  );
+}
+
+/* ---------------- PPF film per make/model (admin): loaded when opened ---------------- */
+
+function PpfFilmCard({ state, onOpen, scope, onScope, ppf, t }) {
+  const num = (v, d = 1) => (v === null || v === undefined ? "—" : v.toFixed(d));
+  const line = (r, bold) => (
+    <tr key={r.key} style={bold ? { fontWeight: 700 } : undefined}>
+      <td>{r.label}</td><td>{r.jobs}</td><td>{num(r.plannedAvg)}</td><td>{num(r.actualAvg)}</td>
+      <td>{num(r.filmAvg)}</td><td>{r.filmPct === null ? "—" : `${Math.round(r.filmPct)}%`}</td><td>{num(r.daysAvg)}</td>
+    </tr>
+  );
+  return (
+    <details className="rpt-details" data-testid="ppf-film" onToggle={(e) => { if (e.currentTarget.open) onOpen(); }}>
+      <summary><span>PPF film by make and model</span><ChevronDown size={18} color={t.muted} aria-hidden="true" /></summary>
+      <div style={{ padding: "0 16px 16px", display: "flex", flexDirection: "column", gap: 12 }}>
+        <div className="rpt-sub">Planned panels are what Ahmed scoped; actual panels and film metres are what he recorded when approving the job. Days are shop days from PPF started to finished.</div>
+        <div style={{ display: "flex", gap: 8 }}>
+          <button type="button" className="rpt-btn" aria-pressed={scope === "all"} style={scope === "all" ? { borderColor: t.gold, color: t.goldBright } : undefined} onClick={() => onScope("all")}>All time</button>
+          <button type="button" className="rpt-btn" aria-pressed={scope === "period"} style={scope === "period" ? { borderColor: t.gold, color: t.goldBright } : undefined} onClick={() => onScope("period")}>Selected period</button>
+        </div>
+        {state.status === "loading" || state.status === "idle" ? <Skel h={80} /> : state.status === "error" ? (
+          <div className="rpt-sub">Couldn't load the PPF jobs. <button type="button" className="rpt-toggle" onClick={onOpen}>Retry</button></div>
+        ) : !ppf || !ppf.rows.length ? (
+          <div className="rpt-empty">No PPF jobs with a scope {scope === "period" ? "in this period" : "yet"}.</div>
+        ) : (
+          <div className="rpt-tablewrap">
+            <table className="rpt-table">
+              <thead><tr><th scope="col">Make / model</th><th scope="col">Jobs</th><th scope="col" title="Average panels Ahmed scoped">Planned</th><th scope="col" title="Average panels recorded at approval">Actual</th><th scope="col" title="Average film metres recorded">Film m</th><th scope="col" title="Share of the jobs with film metres recorded">Film logged</th><th scope="col" title="Average shop days, started to finished">Days</th></tr></thead>
+              <tbody>{ppf.rows.map((r) => line(r, false))}{line(ppf.total, true)}</tbody>
+            </table>
+          </div>
+        )}
+      </div>
+    </details>
+  );
+}
+
 /* ---------------- audit (same queries as the old ReportsScreen) ---------------- */
 
 function AuditSection({ audit, t }) {
   const n = audit.quotes.length + audit.deleted.length;
-  const day = (v) => new Date(v).toLocaleDateString([], { month: "short", day: "numeric" });
+  const day = (v) => new Date(v).toLocaleDateString([], { month: "short", day: "numeric", timeZone: "Asia/Dubai" });
   const Row = ({ label, sub }) => (
     <div className="rpt-row" style={{ minHeight: 48 }}>
       <div style={{ padding: "7px 0", minWidth: 0 }}>
@@ -794,7 +921,7 @@ function signedPct(cur, prev) {
   return `${p > 0 ? "+" : ""}${p}%`;
 }
 
-function exportPdf({ report, outstanding, dueBack, showRevenue, session }) {
+function exportPdf({ report, outstanding, dueBack, showRevenue, session, wip }) {
   const doc = new jsPDF({ unit: "pt", format: "a4" });
   const W = doc.internal.pageSize.getWidth(), Hh = doc.internal.pageSize.getHeight();
   const M = 40;
@@ -885,7 +1012,7 @@ function exportPdf({ report, outstanding, dueBack, showRevenue, session }) {
     table([{ label: "Service", w: 0.5 }, { label: "AED", w: 0.25, align: R }, { label: "Share", w: 0.25, align: R }],
       report.byCategory.map((c) => [c.label, aed(c.amount), `${c.pct.toFixed(1)}%`]));
   }
-  section("Where time goes (average clock hours per stage)");
+  section("Where time goes (average shop hours per stage)");
   table([{ label: "Stage", w: 0.46 }, { label: "Average", w: 0.18, align: R }, { label: "Median", w: 0.18, align: R }, { label: "Cars", w: 0.18, align: R }],
     [...report.stages.map((s) => [`${s.label}${report.bottleneck === s.key ? " (bottleneck)" : ""}`, fmtHours(s.avgH), fmtHours(s.medianH), String(s.n)]),
       ["Waiting for pickup (Ready -> Collected)", fmtHours(report.pickup.avgH), fmtHours(report.pickup.medianH), String(report.pickup.n)]]);
@@ -915,6 +1042,11 @@ function exportPdf({ report, outstanding, dueBack, showRevenue, session }) {
   section("Due back");
   table([{ label: "Customer", w: 0.3 }, { label: "Reason", w: 0.26 }, { label: "Car", w: 0.28 }, { label: "Months", w: 0.16, align: R }],
     dueBack.map((d) => [d.name, d.ruleLabel, [d.makeModel, d.plate].filter(Boolean).join(" "), String(d.months)]));
+  if (wip) {
+    section("Stuck cars (right now)");
+    table([{ label: "Plate", w: 0.2 }, { label: "Car", w: 0.25 }, { label: "Problem", w: 0.55 }],
+      wip.rows.map((r) => [r.plate || "-", r.makeModel || "-", r.reasons.map((x) => x.detail).join("; ")]));
+  }
 
   section("How these numbers work");
   doc.setFontSize(8.5);
@@ -930,11 +1062,11 @@ function exportPdf({ report, outstanding, dueBack, showRevenue, session }) {
   for (let p = 1; p <= pages; p++) {
     doc.setPage(p);
     doc.setFont("helvetica", "normal"); doc.setFontSize(7.5); doc.setTextColor(150, 143, 125);
-    doc.text(pdfText(`Mr.CAP. internal report - generated ${new Date().toLocaleString("en-GB")}${session && session.name ? ` by ${session.name}` : ""} - not for customer distribution`), M, Hh - 22);
+    doc.text(pdfText(`Mr.CAP. internal report - generated ${new Date().toLocaleString("en-GB", { timeZone: "Asia/Dubai" })} Dubai time${session && session.name ? ` by ${session.name}` : ""} - not for customer distribution`), M, Hh - 22);
     doc.text(`${p} / ${pages}`, W - M, Hh - 22, { align: "right" });
   }
   const r = report.range;
-  doc.save(`MrCAP-Reports-${localDateKey(new Date(r.start))}-to-${localDateKey(new Date(r.end - 1))}.pdf`);
+  doc.save(`MrCAP-Reports-${dubaiDateKey(r.start)}-to-${dubaiDateKey(r.end - 1)}.pdf`);
 }
 
 /* ---------------- main screen ---------------- */
@@ -949,8 +1081,13 @@ export default function ReportsDashboard({
 
   const [periodKey, setPeriodKey] = useState("month");
   const [nowMs, setNowMs] = useState(() => Date.now());
-  const [custom, setCustom] = useState(() => ({ from: localDateKey(new Date(Date.now() - 29 * DAY)), to: localDateKey(new Date()) }));
+  const [custom, setCustom] = useState(() => ({ from: dubaiDateKey(Date.now() - 29 * DAY), to: dubaiDateKey(Date.now()) }));
   const [draft, setDraft] = useState(custom);
+  const [closeKey, setCloseKey] = useState(() => dubaiDateKey(Date.now()));
+  const [ppfState, setPpfState] = useState({ status: "idle", rows: [] });
+  const [ppfScope, setPpfScope] = useState("all");
+  // PPF film report: admin only (it carries no money, but it is an owner tool).
+  const showPpf = !!(session && session.role === "admin") || canSeeRevenue;
   const [jobsState, setJobsState] = useState({ status: "loading", rows: [], stale: false, cachedAt: null });
   const [billing, setBilling] = useState({ status: canSeeBilling ? "loading" : "off", amount: 0, count: 0 });
   const [audit, setAudit] = useState({ loading: true, quotes: [], deleted: [], quotesError: false, deletedError: false });
@@ -976,6 +1113,14 @@ export default function ReportsDashboard({
     setBilling({ status: "ready", ...o, stale: !!(pf.stale || pay.stale) });
   }, [canSeeBilling, gkGet]);
 
+  const loadPpf = useCallback(async () => {
+    if (!sbFetch) return;
+    setPpfState((s) => ({ ...s, status: "loading" }));
+    const res = await fetchAllJobs(sbFetch, `select=${PPF_COLUMNS}&ppf_scope=not.is.null&order=created_at.asc,id.asc`);
+    setPpfState(res.ok ? { status: "ready", rows: res.data } : { status: "error", rows: [] });
+  }, [sbFetch]);
+  const openPpf = useCallback(() => { if (ppfState.status === "idle" || ppfState.status === "error") loadPpf(); }, [ppfState.status, loadPpf]);
+
   useEffect(() => { loadJobs(); }, [loadJobs]);
   useEffect(() => { loadBilling(); }, [loadBilling]);
   useEffect(() => {
@@ -1000,6 +1145,11 @@ export default function ReportsDashboard({
   const range = useMemo(() => periodRange(periodKey, nowMs, custom), [periodKey, nowMs, custom]);
   const report = useMemo(() => computeReport(derived, range, { team, services, stages, now: nowMs }), [derived, range, team, services, stages, nowMs]);
   const dueBack = useMemo(() => computeDueBack(derived, nowMs), [derived, nowMs]);
+  const wip = useMemo(() => computeWip(derived, { now: nowMs, stages, services }), [derived, nowMs, stages, services]);
+  const close = useMemo(() => computeDayClose(derived, closeKey, { stages, now: nowMs }), [derived, closeKey, stages, nowMs]);
+  const eodMessage = useMemo(() => endOfDayMessage(close, { showMoney: canSeeRevenue, stuck: close.isToday ? wip : null }), [close, canSeeRevenue, wip]);
+  const ppf = useMemo(() => (ppfState.status === "ready" ? computePpfReport(ppfState.rows, { range: ppfScope === "period" ? range : null }) : null), [ppfState, ppfScope, range]);
+  const todayKey = dubaiDateKey(nowMs);
 
   const choosePeriod = (key) => { setPeriodKey(key); setNowMs(Date.now()); };
   const applyCustom = () => {
@@ -1015,14 +1165,32 @@ export default function ReportsDashboard({
   const kpiCount = (canSeeRevenue ? 4 : 2) + (showOutstanding ? 1 : 0);
   const outstandingForExport = showOutstanding && billing.status === "ready" ? { amount: billing.amount, count: billing.count } : null;
 
-  const doCsv = () => {
-    const csv = reportCsv(report, { outstanding: outstandingForExport, dueBack, showRevenue: canSeeRevenue });
-    const r = report.range;
-    downloadBlob(new Blob([csv], { type: "text/csv;charset=utf-8;" }), `MrCAP-Reports-${localDateKey(new Date(r.start))}-to-${localDateKey(new Date(r.end - 1))}.csv`);
+  // A real .xlsx, one sheet per section (exceljs is loaded only when this is tapped).
+  const doXlsx = async () => {
+    setBusy("xlsx");
+    try {
+      const mod = await import("exceljs");
+      const ExcelJS = mod.default || mod;
+      const sheets = reportSheets(report, { outstanding: outstandingForExport, dueBack, wip, close, ppf: showPpf ? ppf : null, showRevenue: canSeeRevenue });
+      const wb = new ExcelJS.Workbook();
+      wb.creator = "Mr.CAP."; wb.created = new Date();
+      for (const s of sheets) {
+        const ws = wb.addWorksheet(s.name.slice(0, 31));
+        ws.columns = s.head.map((h, i) => ({ header: h, width: (s.widths && s.widths[i]) || 18 }));
+        s.rows.forEach((row) => ws.addRow(row));
+        const head = ws.getRow(1);
+        head.font = { bold: true, color: { argb: "FF0D0C08" } };
+        head.fill = { type: "pattern", pattern: "solid", fgColor: { argb: "FFC9A227" } };
+        ws.views = [{ state: "frozen", ySplit: 1 }];
+      }
+      const buf = await wb.xlsx.writeBuffer();
+      const r = report.range;
+      downloadBlob(new Blob([buf], { type: "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet" }), `MrCAP-Reports-${dubaiDateKey(r.start)}-to-${dubaiDateKey(r.end - 1)}.xlsx`);
+    } finally { setBusy(""); }
   };
   const doPdf = async () => {
     setBusy("pdf");
-    try { exportPdf({ report, outstanding: outstandingForExport, dueBack, showRevenue: canSeeRevenue, session }); }
+    try { exportPdf({ report, outstanding: outstandingForExport, dueBack, showRevenue: canSeeRevenue, session, wip }); }
     finally { setBusy(""); }
   };
 
@@ -1062,8 +1230,8 @@ export default function ReportsDashboard({
             <button type="button" className="rpt-btn" onClick={doPdf} disabled={!ready || busy === "pdf"}>
               <FileText size={15} aria-hidden="true" />{busy === "pdf" ? "Preparing…" : "Export PDF"}
             </button>
-            <button type="button" className="rpt-btn" onClick={doCsv} disabled={!ready} aria-label="Excel (download CSV)">
-              <FileSpreadsheet size={15} aria-hidden="true" />Excel
+            <button type="button" className="rpt-btn" onClick={doXlsx} disabled={!ready || busy === "xlsx"} aria-label="Excel (download .xlsx)">
+              <FileSpreadsheet size={15} aria-hidden="true" />{busy === "xlsx" ? "Preparing…" : "Excel"}
             </button>
           </div>
         </div>
@@ -1071,8 +1239,8 @@ export default function ReportsDashboard({
 
       {periodKey === "custom" && (
         <form className="rpt-custom" onSubmit={(e) => { e.preventDefault(); applyCustom(); }} aria-label="Custom date range">
-          <label>From<input type="date" value={draft.from} max={localDateKey(new Date())} onChange={(e) => setDraft((d) => ({ ...d, from: e.target.value }))} required /></label>
-          <label>To<input type="date" value={draft.to} max={localDateKey(new Date())} onChange={(e) => setDraft((d) => ({ ...d, to: e.target.value }))} required /></label>
+          <label>From<input type="date" value={draft.from} max={todayKey} onChange={(e) => setDraft((d) => ({ ...d, from: e.target.value }))} required /></label>
+          <label>To<input type="date" value={draft.to} max={todayKey}onChange={(e) => setDraft((d) => ({ ...d, to: e.target.value }))} required /></label>
           <button type="submit" className="rpt-btn rpt-btn-gold" disabled={!draft.from || !draft.to || (draft.from === custom.from && draft.to === custom.to)}>Apply</button>
         </form>
       )}
@@ -1094,7 +1262,7 @@ export default function ReportsDashboard({
             {canSeeRevenue && <Kpi id="revenue" t={t} loading={loading} label="Revenue" value={fmtAED(k.revenue.cur)} d={noPrev(dRevenue)} vs={fmtAED(k.revenue.prev)} />}
             <Kpi id="jobs" t={t} loading={loading} label="Jobs completed" value={String(k.jobs.cur)} d={noPrev(dJobs)} vs={String(k.jobs.prev)} />
             {canSeeRevenue && <Kpi id="ticket" t={t} loading={loading} label="Average ticket" value={k.avgTicket.cur === null ? "—" : fmtAED(k.avgTicket.cur)} d={noPrev(dTicket)} vs={k.avgTicket.prev === null ? undefined : fmtAED(k.avgTicket.prev)} sub={k.avgTicket.n ? `${k.avgTicket.n} invoiced ${k.avgTicket.n === 1 ? "job" : "jobs"}` : "No invoiced jobs"} />}
-            <Kpi id="turnaround" t={t} loading={loading} label="Avg turnaround" value={fmtDays(k.turnaround.cur)} d={noPrev(dTat)} vs={k.turnaround.prev === null ? undefined : fmtDays(k.turnaround.prev)} sub={k.turnaround.n ? `Intake → collected · ${k.turnaround.n} ${k.turnaround.n === 1 ? "car" : "cars"}` : "Intake → collected"} />
+            <Kpi id="turnaround" t={t} loading={loading} label="Avg turnaround" value={fmtDays(k.turnaround.cur)} d={noPrev(dTat)} vs={k.turnaround.prev === null ? undefined : fmtDays(k.turnaround.prev)} sub={k.turnaround.n ? `Intake → collected, shop days · ${k.turnaround.n} ${k.turnaround.n === 1 ? "car" : "cars"}` : "Intake → collected, shop days"} />
             {showOutstanding && (
               <Kpi
                 id="outstanding" t={t} loading={billing.status === "loading"} label="Outstanding"
@@ -1120,6 +1288,10 @@ export default function ReportsDashboard({
             </>
           ) : (
             <>
+              <div className="rpt-grid2">
+                <WipCard wip={wip} t={t} onOpenJob={onOpenJob} />
+                <CloseOutCard close={close} dayKey={closeKey} todayKey={todayKey} onDay={setCloseKey} showMoney={canSeeRevenue} message={eodMessage} t={t} />
+              </div>
               {canSeeRevenue && (
                 <div className="rpt-grid2">
                   <RevenueChart report={report} t={t} />
@@ -1132,6 +1304,7 @@ export default function ReportsDashboard({
                 <CustomersCard report={report} t={t} showRevenue={canSeeRevenue} onOpenJob={onOpenJob} />
               </div>
               <DueBackCard items={dueBack} t={t} onOpenJob={onOpenJob} firstRecord={report.customers.firstRecord} />
+              {showPpf && <PpfFilmCard state={ppfState} onOpen={openPpf} scope={ppfScope} onScope={setPpfScope} ppf={ppf} t={t} />}
             </>
           )}
         </div>
@@ -1143,7 +1316,7 @@ export default function ReportsDashboard({
         <summary><span>How these numbers work</span><ChevronDown size={18} color={t.muted} aria-hidden="true" /></summary>
         <div style={{ padding: "0 16px 16px" }}>
           <dl>
-            {HOW_NUMBERS_WORK.filter(([term]) => canSeeRevenue || !/Revenue|Average ticket/.test(term)).filter(([term]) => showOutstanding || term !== "Outstanding").map(([term, text]) => (
+            {HOW_NUMBERS_WORK.filter(([term]) => canSeeRevenue || !/Revenue|Average ticket/.test(term)).filter(([term]) => showOutstanding || term !== "Outstanding").filter(([term]) => showPpf || term !== "PPF film").map(([term, text]) => (
               <React.Fragment key={term}><dt>{term}</dt><dd>{text}</dd></React.Fragment>
             ))}
           </dl>
