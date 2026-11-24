@@ -7,7 +7,7 @@ import {
   Users, BarChart3, Phone, Download, Upload, FileText, Send, PauseCircle,
   MessageSquare, TrendingUp, RotateCcw, ExternalLink, Star, AlertCircle,
   Sparkles, Hammer, Armchair, ChevronUp, ChevronDown, GripVertical,
-  XCircle, Trash2, MoreVertical, MessageCircle, ArrowRight, Minus, Palette
+  XCircle, Trash2, MoreVertical, MessageCircle, ArrowRight, Minus, Palette, Menu
 } from "lucide-react";
 import { jsPDF } from "jspdf";
 import { Capacitor } from "@capacitor/core";
@@ -179,6 +179,14 @@ function isSimplifiedRole(session) {
 // (current) and "subcontractor" (the old value this was renamed from) so
 // an older cached client/APK build that still writes "subcontractor"
 // keeps working until every device is confirmed on the new bundle.
+// A person who cannot log in (the server refuses them) but is still on the
+// team: assignable, credited on Marked done, and tappable on the dispatch
+// tablet. Stored as team_members.permissions.nameOnly.
+// These people always log in with a PIN: never switchable to "Name only".
+const ALWAYS_PIN_IDS = ["noel", "reagen", "ahmed", "laani", "suhail", "owner"];
+function isNameOnly(member) {
+  return !!member && !!member.permissions && member.permissions.nameOnly === true;
+}
 function isSmartechPortal(member) {
   return !!member && (member.dashboardMode === "smartech" || member.dashboardMode === "subcontractor");
 }
@@ -422,14 +430,121 @@ const EMIRATES = [
   { code: "UAQ", name: "Umm Al Quwain", categoryType: "letters", categories: ["A", "B", "C", "D", "E", "F", "G"] },
 ];
 
+// Keys and positions never change (history, reports and the database all
+// read them); only the wording does. "parts_removal" is really where a car
+// WAITS for a technician, so a new job lands there (stage 1) and the first
+// Start tap on the Dispatch TV moves it on automatically.
 const STAGES = [
-  { key: "intake",        label: "Intake" },
-  { key: "parts_removal", label: "Parts Removal" },
-  { key: "service",       label: "Service" },
+  { key: "intake",        label: "Checked in" },
+  { key: "parts_removal", label: "Waiting for technician" },
+  { key: "service",       label: "In progress" },
   { key: "qc",             label: "QC" },
   { key: "ready",          label: "Ready for Collection" },
   { key: "collected",      label: "Collected" },
 ];
+// What older history entries carry as their label: stage-move entries are
+// matched on key + label, so both spellings must keep matching.
+const STAGE_LEGACY_LABELS = { intake: "Intake", parts_removal: "Parts Removal", service: "Service", qc: "QC", ready: "Ready for Collection", collected: "Collected" };
+function stageLabelMatches(stage, label) {
+  return !!stage && (label === stage.label || label === STAGE_LEGACY_LABELS[stage.key]);
+}
+// What a customer may see for a stage. Never the shop-floor wording.
+const CUSTOMER_STAGE_LABELS = { intake: "Checked in", parts_removal: "In the queue for work", service: "Work in progress", qc: "Quality check", ready: "Ready for Collection", collected: "Collected" };
+function customerStageLabel(stage) {
+  return (stage && CUSTOMER_STAGE_LABELS[stage.key]) || (stage && stage.label) || "";
+}
+// Stage-move history entries, in the shape advance() has always written:
+// one entry per stage LEFT {stage: <key>, label, by, role, at} with NO note.
+// Moving a job from stage `from` up to stage `to` therefore appends one
+// entry for each stage in between (the entry for stage 0 = "now in stage 1").
+function stageMoveEntries(from, to, by, role, at) {
+  const out = [];
+  for (let i = Math.max(0, from); i < to && i < STAGES.length; i++) out.push({ stage: STAGES[i].key, label: STAGES[i].label, by, role, at });
+  return out;
+}
+// Fields for a brand-new job: it lands in "Waiting for technician" (stage
+// 1). `history` is the intake entry the caller already built; the stage-move
+// entry right after it starts the waiting clock.
+function newJobAtWaiting(history, by, role, at) {
+  return { stageIndex: 1, history: [...history, ...stageMoveEntries(0, 1, by, role, at)] };
+}
+
+// Hours a car should wait before the TV turns its clock amber / red.
+const WAIT_AMBER_HOURS = 2;
+const WAIT_RED_HOURS = 4;
+
+// ---- floor notes -----------------------------------------------------------
+// A note from the floor leads to the team, stored as a history entry
+// { stage: "floor_note", label: "Floor note", note, by, role, at }. Internal
+// only: history is never rendered on anything a customer sees.
+const FLOOR_NOTE_MAX = 140;
+const FLOOR_LEADS = ["noel", "reagen", "ahmed"];
+function isFloorLead(session) { return !!session && (FLOOR_LEADS.includes(session.id) || session.role === "admin"); }
+const FLOOR_NOTE_CHIPS = ["Start this one first", "Customer collects today", "Fresh paint, be careful", "Ask me before starting", "Extra care inside"];
+// The note currently showing for a job: the latest floor_note entry that is
+// newer than the latest move into Ready; an empty note clears it.
+function currentFloorNote(history) {
+  const hist = Array.isArray(history) ? history : [];
+  const qcStage = STAGES.find((s) => s.key === "qc");
+  let readyIdx = -1;
+  for (let i = 0; i < hist.length; i++) {
+    const h = hist[i];
+    if (h && h.stage === "qc" && !h.cat && stageLabelMatches(qcStage, h.label)) readyIdx = i;
+  }
+  for (let i = hist.length - 1; i > readyIdx; i--) {
+    const h = hist[i];
+    if (h && h.stage === "floor_note") {
+      const text = typeof h.note === "string" ? h.note.trim() : "";
+      return text ? { text, by: h.by || "", at: h.at || null } : null;
+    }
+  }
+  return null;
+}
+function floorNoteLine(note) { return note ? `${note.by ? `${note.by}: ` : ""}${note.text}` : ""; }
+
+// ---- automatic stage moves (Dispatch TV and the job card) -----------------
+// Only ever forward, never while on hold, never past Ready, never touching
+// Collected. `job` carries { stageIndex, onHold, serviceTypes, serviceDone,
+// history, priority }. Returns null (no move) or the new { stageIndex,
+// history, priority }.
+function qcPassedSinceStart(history, key) {
+  const label = (SERVICES.find((s) => s.key === key) || {}).label || key;
+  let startIdx = -1;
+  const hist = Array.isArray(history) ? history : [];
+  hist.forEach((h, i) => { if (h && h.stage === "service" && h.note === "Started" && (h.cat ? h.cat === key : h.label === label)) startIdx = i; });
+  return hist.some((h, i) => i > startIdx && h && h.stage === "qc" && h.note === "QC passed" && (h.cat ? h.cat === key : h.label === label));
+}
+function autoStageAfterServiceChange(job, by, role, now, prevDone) {
+  const idx = Number.isFinite(job.stageIndex) ? job.stageIndex : 0;
+  if (job.onHold || idx >= STAGES.length - 1) return null;
+  const types = job.serviceTypes || [];
+  const done = job.serviceDone || {};
+  const hist = Array.isArray(job.history) ? job.history : [];
+  // No service on the card = nothing to count either way. Without this, "not all done" is
+  // read as "something was un-marked" and a car at QC / Ready would be sent back to In progress.
+  if (types.length === 0) return null;
+  const allDone = types.every((k) => done[k]);
+  if (allDone) {
+    const target = types.every((k) => qcPassedSinceStart(hist, k)) ? 4 : 3;
+    if (idx >= target) return null;
+    let nextHist = [...hist, ...stageMoveEntries(idx, target, by, role, now)];
+    let priority = job.priority;
+    // Same rule as advancing to QC by hand: the urgent part is over.
+    if (idx < 3 && priority === "High") {
+      priority = "Medium";
+      nextHist = [...nextHist, { stage: "priority", label: "Priority", by: "System", role: "system", note: "High priority automatically revoked — job reached QC", at: now }];
+    }
+    return { stageIndex: target, history: nextHist, priority };
+  }
+  // Only when THIS change turned a service from done to not done (not a step change, and not a
+  // car at QC / Ready that was simply missing a service already).
+  const unmarked = !!prevDone && types.some((k) => prevDone[k] && !done[k]);
+  if (unmarked && (idx === 3 || idx === 4)) {
+    const fromStage = STAGES[idx], toStage = STAGES[2];
+    return { stageIndex: 2, history: [...hist, { stage: "reversed", label: "Sent back", by, role, note: `${fromStage.label} → ${toStage.label} (a service was un-marked)`, at: now }], priority: job.priority };
+  }
+  return null;
+}
 
 // Quick-pick lines for the customer tracking page — more specific than
 // the 6-stage strip alone (e.g. distinguishing "in polish" from "PPF
@@ -438,7 +553,7 @@ const STAGES = [
 // anything that doesn't fit.
 const CUSTOMER_STATUS_PRESETS = [
   "Vehicle received, inspection underway",
-  "Parts being removed",
+  "In the queue for work",
   "Waiting on parts",
   "In bodywork",
   "In detailing / polish",
@@ -1499,10 +1614,107 @@ async function reorderWorkflowSteps(steps) {
 // Finds an existing customer by phone (or exact name if no phone given),
 // or creates a new one — called on job creation so history links up
 // automatically without asking the intake person to manage IDs.
+/* ---- Several phone numbers per customer + merging duplicates (2026-11-24) ----
+   customers.extra_phones (text[]) and merged_into/merged_at are added by
+   supabase/migrations/2026-11-24_customer_multi_phone.sql. Everything here
+   tolerates the columns being absent (missing extra_phones = none, missing
+   merged_into = not merged), and never hard-deletes a customer. */
+// Canonical stored form of a number: UAE numbers become 05xxxxxxxx, anything
+// else is kept as bare digits. 05x / +9715x / 009715x all give the same string.
+function canonPhone(p) {
+  const k = toWhatsAppNumber(p);
+  if (!k) return "";
+  if (k.startsWith("971") && k.length === 12) return "0" + k.slice(3);
+  return k;
+}
+const phonesSame = (a, b) => { const x = canonPhone(a); return !!x && x === canonPhone(b); };
+const extraPhonesOf = (c) => (c && Array.isArray(c.extra_phones) ? c.extra_phones.filter(Boolean) : []);
+const customerNumbers = (c) => [c && c.phone, ...extraPhonesOf(c)].filter(Boolean);
+const customerHasNumber = (c, p) => customerNumbers(c).some((n) => phonesSame(n, p));
+// Dedupe by canonical form, returning the canonical strings.
+function dedupeNumbers(list, exclude = []) {
+  const seen = new Set(exclude.map(canonPhone).filter(Boolean));
+  const out = [];
+  for (const n of list) { const k = canonPhone(n); if (k && !seen.has(k)) { seen.add(k); out.push(k); } }
+  return out;
+}
+// GET on customers that skips merged records; if the backend has no
+// merged_into column yet (before the migration) it retries without the filter.
+async function customersGet(path) {
+  const r = await sbFetch(`${path}&merged_into=is.null`);
+  const res = r.ok ? r : await sbFetch(path);
+  return res.ok && res.data ? { ok: true, data: res.data.filter((c) => !c.merged_into) } : { ok: false, data: [] };
+}
+async function patchCustomer(id, fields) {
+  const { ok } = await sbFetch(`customers?id=eq.${encodeURIComponent(id)}`, { method: "PATCH", headers: { Prefer: "return=minimal" }, body: JSON.stringify(fields) });
+  return ok;
+}
+// Phone numbers are edited as one list: main number first, then extras.
+async function saveCustomerNumbers(customer, main, extras) {
+  const fields = { phone: main || null, extra_phones: dedupeNumbers(extras, [main]) };
+  const ok = await patchCustomer(customer.id, fields);
+  return ok ? { ...customer, ...fields } : null;
+}
+async function addCustomerNumber(customer, number) {
+  if (!canonPhone(number)) return null;
+  if (!customer.phone) return saveCustomerNumbers(customer, canonPhone(number), extraPhonesOf(customer));
+  return saveCustomerNumbers(customer, customer.phone, [...extraPhonesOf(customer), number]);
+}
+// Merge duplicate customers into `keep`. Order: keeper's numbers first, then
+// every link moved, then each record marked merged (never deleted). Each step is
+// safe to run again, so after a failure the admin can simply press Merge again.
+async function mergeCustomers(keep, others, onStep) {
+  const plan = [{ label: "Saving the extra numbers on " + keep.name, run: async () => {
+    const add = others.flatMap((o) => customerNumbers(o));
+    return patchCustomer(keep.id, { extra_phones: dedupeNumbers([...extraPhonesOf(keep), ...add], [keep.phone]) });
+  } }];
+  for (const o of others) for (const t of ["jobs", "vehicles", "quotes", "proformas"]) {
+    plan.push({ label: `Moving ${t} of ${o.name} to ${keep.name}`, run: async () => {
+      const { ok } = await sbFetch(`${t}?customer_id=eq.${encodeURIComponent(o.id)}`, { method: "PATCH", headers: { Prefer: "return=minimal" }, body: JSON.stringify({ customer_id: keep.id }) });
+      return ok;
+    } });
+  }
+  const stamp = new Date().toISOString();
+  for (const o of others) plan.push({ label: `Marking ${o.name} as merged`, run: () => patchCustomer(o.id, { merged_into: keep.id, merged_at: stamp }) });
+  const done = [];
+  for (let i = 0; i < plan.length; i++) {
+    if (onStep) onStep(i + 1, plan.length, plan[i].label);
+    let ok;
+    try { ok = await plan[i].run(); } catch { ok = false; }
+    if (!ok) return { ok: false, done, failed: plan[i].label, total: plan.length };
+    done.push(plan[i].label);
+  }
+  return { ok: true, done, total: plan.length };
+}
+// Duplicate groups: same normalised name, or one name starting with another (>= 5 chars).
+function nameKey(n) {
+  return String(n || "").toLowerCase().replace(/^\s*(mr|mrs|ms|dr)\b\.?\s*/, "").replace(/[^a-z0-9؀-ۿ]/g, "");
+}
+function findDuplicateGroups(customers) {
+  const items = customers.map((c) => ({ c, key: nameKey(c.name) })).filter((x) => x.key);
+  const parent = items.map((_, i) => i);
+  const find = (i) => (parent[i] === i ? i : (parent[i] = find(parent[i])));
+  for (let i = 0; i < items.length; i++) for (let j = i + 1; j < items.length; j++) {
+    const a = items[i].key, b = items[j].key;
+    const short = a.length <= b.length ? a : b, long = a.length <= b.length ? b : a;
+    if (a === b || (short.length >= 5 && long.startsWith(short))) parent[find(i)] = find(j);
+  }
+  const groups = {};
+  items.forEach((x, i) => { (groups[find(i)] = groups[find(i)] || []).push(x.c); });
+  return Object.values(groups).filter((g) => g.length > 1).sort((a, b) => nameKey(a[0].name).localeCompare(nameKey(b[0].name)));
+}
 async function findOrCreateCustomer(name, phone, customerType) {
   if (phone && phone.trim()) {
-    const { ok, data } = await sbFetch(`customers?phone=eq.${encodeURIComponent(phone.trim())}&select=*&limit=1`);
-    if (ok && data && data.length) return data[0];
+    // Main number as typed, then its canonical form, then any customer's extra numbers.
+    const raw = phone.trim(), canon = canonPhone(raw);
+    const tries = [`customers?phone=eq.${encodeURIComponent(raw)}&select=*&limit=5`];
+    if (canon && canon !== raw) tries.push(`customers?phone=eq.${encodeURIComponent(canon)}&select=*&limit=5`);
+    if (canon) tries.push(`customers?extra_phones=cs.${encodeURIComponent(`{"${canon}"}`)}&select=*&limit=5`);
+    for (const t of tries) {
+      const { ok, data } = await customersGet(t);
+      const hit = ok && data.find((c) => customerHasNumber(c, raw));
+      if (hit) return hit;
+    }
   }
   const { ok: created, data } = await sbFetch("customers", {
     method: "POST",
@@ -1552,17 +1764,32 @@ async function reassignVehicleOwner(vehicleId, customerId) {
 }
 async function searchCustomers(query) {
   const q = encodeURIComponent(`%${query}%`);
-  const { ok, data } = await sbFetch(`customers?or=(name.ilike.${q},phone.ilike.${q})&select=*&order=name.asc&limit=50`);
-  return ok && data ? data : [];
+  // A full-looking number also matches customers' extra numbers (exact, any spelling).
+  const canon = query.replace(/[^0-9]/g, "").length >= 7 ? canonPhone(query) : "";
+  const extra = canon ? `,extra_phones.cs.${encodeURIComponent(`{"${canon}"}`)}` : "";
+  const { ok, data } = await customersGet(`customers?or=(name.ilike.${q},phone.ilike.${q}${extra})&select=*&order=name.asc&limit=50`);
+  return ok ? data : [];
 }
-async function loadCustomerHistory(customerId) {
-  const [vehiclesRes, jobsRes] = await Promise.all([
+async function loadCustomerHistory(customer) {
+  const customerId = customer.id;
+  const nums = dedupeNumbers(customerNumbers(customer));
+  const variants = [...new Set(nums.flatMap((n) => [n, toWhatsAppNumber(n), "+" + toWhatsAppNumber(n)]))];
+  const [vehiclesRes, jobsRes, phoneJobsRes] = await Promise.all([
     sbFetch(`vehicles?customer_id=eq.${customerId}&select=*`),
     sbFetch(`jobs?customer_id=eq.${customerId}&select=*&order=created_at.desc`),
+    variants.length ? sbFetch(`jobs?customer_phone=in.${encodeURIComponent(`(${variants.map((v) => `"${v}"`).join(",")})`)}&select=*&order=created_at.desc&limit=100`) : Promise.resolve({ ok: false }),
   ]);
+  // Jobs linked by customer_id (merged records now point here) plus jobs that only
+  // match by a phone number of this customer (main or extra), no duplicates.
+  const rows = [...(jobsRes.ok && jobsRes.data ? jobsRes.data : [])];
+  const seen = new Set(rows.map((r) => r.id));
+  for (const r of phoneJobsRes.ok && phoneJobsRes.data ? phoneJobsRes.data : []) {
+    if (!seen.has(r.id) && nums.some((n) => phonesSame(n, r.customer_phone))) { seen.add(r.id); rows.push(r); }
+  }
+  rows.sort((a, b) => String(b.created_at).localeCompare(String(a.created_at)));
   return {
     vehicles: vehiclesRes.ok && vehiclesRes.data ? vehiclesRes.data : [],
-    jobs: jobsRes.ok && jobsRes.data ? jobsRes.data.map(rowToJob) : [],
+    jobs: rows.map(rowToJob),
   };
 }
 
@@ -1584,7 +1811,7 @@ function rowToJob(r) {
     ppfProgress: r.ppf_progress || null,
     description: r.description, damageNotes: r.damage_notes, priority: r.priority, location: r.location,
     serviceTypes: r.service_types || [], serviceDone: r.service_done || {}, assignedTo: r.assigned_to || {},
-    assignedTeam: r.assigned_team || {}, serviceStep: r.service_step || {},
+    assignedTeam: r.assigned_team || {}, serviceStep: r.service_step || {}, serviceStarted: r.service_started || {},
     commissionEntity: r.commission_entity || null,
     invoiceFinalizedAt: r.invoice_finalized_at ? new Date(r.invoice_finalized_at).getTime() : null,
     invoiceFinalizedBy: r.invoice_finalized_by || null,
@@ -2851,10 +3078,16 @@ function summaryOf(job) {
     priority: job.priority, location: job.location, stageKey: stage.key, stageLabel: stage.label,
     onHold: !!job.onHold, onHoldNote: job.onHoldNote || null, onHoldSince: job.onHoldSince || null,
     followupDate: job.followupDate || null, followupNote: job.followupNote || null, warrantyExpiry: job.warrantyExpiry || null,
+    // The board lanes read these, so an index row rebuilt from a saved job must carry them too.
+    make: job.make || "", model: job.model || "", bodyType: job.bodyType || "",
+    serviceTypes: job.serviceTypes || [], serviceDone: job.serviceDone || {}, serviceReviewed: job.serviceReviewed || {},
+    serviceStarted: job.serviceStarted || {}, assignedTeam: job.assignedTeam || {},
+    ppfScope: job.ppfScope || null, ppfProgress: job.ppfProgress || null,
+    history: job.history || [], customerNotify: job.customerNotify || {},
     updatedAt: job.updatedAt, createdAt: job.createdAt,
   };
 }
-async function loadIndex() {
+async function loadIndex(sinceIso) {
   // 900, not 500 — Supabase's PostgREST hard-caps any single response at
   // 1000 rows server-side regardless of what's requested (the bug that
   // broke the Admin Dashboard earlier), so 900 is the most headroom
@@ -2862,15 +3095,17 @@ async function loadIndex() {
   // pilot where job volume keeps climbing. Still ordered newest-first,
   // so the jobs that actually matter for the working list are never
   // the ones that would get dropped if this cap is ever hit.
-  const { ok, data } = await sbFetch(`jobs?select=id,plate,make_model,make,model,body_type,customer_name,customer_phone,priority,location,stage_index,service_types,service_done,service_reviewed,ppf_scope,ppf_progress,history,on_hold,on_hold_note,on_hold_since,followup_date,followup_note,warranty_expiry,customer_notify,created_at,updated_at&created_at=gte.${DEFAULT_VIEW_CUTOFF}&order=updated_at.desc&limit=900`);
-  if (!ok || !data) return [];
+  const { ok, data } = await sbFetch(`jobs?select=id,plate,make_model,make,model,body_type,customer_name,customer_phone,priority,location,stage_index,service_types,service_done,service_started,assigned_team,service_reviewed,ppf_scope,ppf_progress,history,on_hold,on_hold_note,on_hold_since,followup_date,followup_note,warranty_expiry,customer_notify,created_at,updated_at&created_at=gte.${DEFAULT_VIEW_CUTOFF}${sinceIso ? `&updated_at=gte.${encodeURIComponent(sinceIso)}` : ""}&order=updated_at.desc&limit=900`);
+  // null (not []) on a failed fetch: the poll now runs every 15 s, and one dropped
+  // request must not blank the whole board.
+  if (!ok || !Array.isArray(data)) return null;
   return data.map((r) => {
     const stage = STAGES[r.stage_index] || STAGES[0];
     learnVehicle(r.make, r.model);
     return {
       id: r.id, plate: r.plate, makeModel: r.make_model, make: r.make || "", model: r.model || "", bodyType: r.body_type || "", customerName: r.customer_name, customerPhone: r.customer_phone,
       priority: r.priority, location: r.location, stageKey: stage.key, stageLabel: stage.label,
-      serviceTypes: r.service_types || [], serviceDone: r.service_done || {}, serviceReviewed: r.service_reviewed || {},
+      serviceTypes: r.service_types || [], serviceDone: r.service_done || {}, serviceStarted: r.service_started || {}, assignedTeam: r.assigned_team || {}, serviceReviewed: r.service_reviewed || {},
       ppfScope: r.ppf_scope || null, ppfProgress: r.ppf_progress || null,
       history: r.history || [],
       onHold: !!r.on_hold, onHoldNote: r.on_hold_note || null, onHoldSince: r.on_hold_since ? new Date(r.on_hold_since).getTime() : null,
@@ -2880,10 +3115,19 @@ async function loadIndex() {
     };
   });
 }
+// The server's current stage / hold / services / history for a job, or null when offline or
+// unreadable (callers then fall back to the card's own copy, as before).
+async function loadFreshServiceState(id) {
+  const { ok, data, stale } = await sbFetch(`jobs?id=eq.${id}&select=stage_index,on_hold,service_done,service_step,history,priority`);
+  if (!ok || stale || !Array.isArray(data) || !data[0]) return null;
+  const r = data[0];
+  return { stageIndex: r.stage_index, onHold: !!r.on_hold, serviceDone: r.service_done || {}, serviceStep: r.service_step || {}, history: r.history || [], priority: r.priority };
+}
 async function loadJob(id) {
-  const { ok, data } = await sbFetch(`jobs?id=eq.${id}&select=*&limit=1`);
+  const { ok, data, stale } = await sbFetch(`jobs?id=eq.${id}&select=*&limit=1`);
   if (!ok || !data || !data.length) return null;
   const job = rowToJob(data[0]);
+  if (stale) job._stale = true; // a cached copy, not the live row: writers must refuse it
   // Re-sign Smartech photo URLs — see refreshSmartechPhotoUrls. Signed
   // URLs always differ from what's in the DB row (a fresh token every
   // time), so job._base (set inside rowToJob, used by saveJob's diff)
@@ -3078,10 +3322,10 @@ async function convertQuoteToJob(quote, session) {
     priority: "Medium", location: BASE_LOCATIONS[0],
     serviceTypes: quote.serviceTypes, treatments: quote.treatments,
     treatmentPrices: quote.treatmentPrices, discountPercent: quote.discountPercent, parts: quote.parts || [],
-    serviceDone, assignedTo: {}, stageIndex: 0,
+    serviceDone, assignedTo: {}, 
     photos: { intake: [], parts_removal: [], service: {} },
     startTime: null, stopTime: null, invoiceAmount: "",
-    history: [{ stage: "intake", label: "Intake", by: session.name, role: session.role, note: `Converted from quote`, at: now }],
+    ...newJobAtWaiting([{ stage: "intake", label: STAGES[0].label, by: session.name, role: session.role, note: `Converted from quote`, at: now }], session.name, session.role, now),
     createdAt: now, updatedAt: now, createdBy: session.name,
   };
   const result = await createJob(job);
@@ -3855,8 +4099,8 @@ function PlateChip({ plate, size = "md", style }) {
   const { code, rest } = parsePlate(plate);
   const s = size === "xl" ? { fs: 30, cfs: 16, pad: "6px 16px", cpad: "8px 11px", r: 10 } : size === "lg" ? { fs: 22, cfs: 13, pad: "5px 14px", cpad: "6px 9px", r: 8 } : size === "sm" ? { fs: 12, cfs: 9.5, pad: "2px 7px", cpad: "3px 5px", r: 5 } : { fs: 13, cfs: 10, pad: "3px 8px", cpad: "4px 6px", r: 6 };
   return (
-    <span style={{ display: "inline-flex", alignItems: "stretch", borderRadius: s.r, overflow: "hidden", border: `1px solid ${COLORS.plateEdge}`, fontFamily: MONO_FONT, fontWeight: 600, fontSize: s.fs, lineHeight: 1.25, flexShrink: 0, maxWidth: "100%", whiteSpace: "nowrap", verticalAlign: "middle", ...style }}>
-      {code && <span style={{ background: COLORS.darkText, color: COLORS.ink, padding: s.cpad, fontSize: s.cfs, display: "flex", alignItems: "center", letterSpacing: 0.5 }}>{code}</span>}
+    <span style={{ display: "inline-flex", alignItems: "stretch", borderRadius: s.r, overflow: "hidden", background: COLORS.plate, fontFamily: MONO_FONT, fontWeight: 600, fontSize: s.fs, lineHeight: 1.25, flexShrink: 0, maxWidth: "100%", whiteSpace: "nowrap", verticalAlign: "middle", ...style }}>
+      {code && <span style={{ background: COLORS.darkText, color: COLORS.plate, padding: s.cpad, fontSize: s.cfs, display: "flex", alignItems: "center", letterSpacing: 0.5, border: `2px solid ${COLORS.plate}`, borderRadius: `${s.r}px 0 0 ${s.r}px` }}>{code}</span>}
       {code ? " " : null}
       <span style={{ background: COLORS.plate, color: COLORS.darkText, padding: s.pad, overflow: "hidden", textOverflow: "ellipsis", letterSpacing: 0.4 }}>{rest || "—"}</span>
     </span>
@@ -3875,11 +4119,30 @@ function stageEnteredAt(job) {
   let at = null;
   for (const h of job.history || []) {
     if (!h || !h.at) continue;
-    const isChange = h.stage === "reversed" || (prev && h.stage === prev.key && h.label === prev.label);
+    const isChange = h.stage === "reversed" || (prev && h.stage === prev.key && stageLabelMatches(prev, h.label));
     if (isChange && (at == null || h.at > at)) at = h.at;
   }
   if (at == null && idx === 0) at = job.createdAt || null;
   return at;
+}
+// When a car started WAITING for a technician: the moment it entered the
+// waiting stage (the stage-move entry for the stage before it, or a
+// send-back), else when the job was created.
+function waitingSinceMs(job) {
+  let at = null;
+  const prev = STAGES[0];
+  for (const h of job.history || []) {
+    if (!h || !h.at) continue;
+    if (h.stage === prev.key && stageLabelMatches(prev, h.label) && (at == null || h.at > at)) at = h.at;
+  }
+  // The office board passes index rows (stageKey, no stageIndex), the TV and job screen pass full jobs.
+  const idxNow = Number.isFinite(job.stageIndex) ? job.stageIndex : STAGES.findIndex((s) => s.key === job.stageKey);
+  if (idxNow === 1) {
+    for (const h of job.history || []) {
+      if (h && h.at && h.stage === "reversed" && (at == null || h.at > at)) at = h.at;
+    }
+  }
+  return at ?? job.createdAt ?? null;
 }
 // Business-hours time in the current stage, using the same open-hours clock
 // and the same age tiers the Dispatch Board already colours cards with
@@ -3904,7 +4167,7 @@ function assigneesFromHistory(history) {
   }
   return [...new Set(Object.values(byLabel))];
 }
-function StageProgress({ index, total = STAGES.length, height = 4 }) {
+function StageProgress({ index, total = STAGES.length, height = 6 }) {
   return (
     <div style={{ display: "flex", gap: 3 }} aria-label={`Stage ${index + 1} of ${total}`}>
       {Array.from({ length: total }).map((_, i) => (
@@ -4113,21 +4376,17 @@ function DesktopShell({ session, team, view, setView, onLogout, canArchive, chil
           </div>
         </div>
         <div style={{ display: "flex", flexDirection: "column", gap: 3, flex: 1 }}>
-          {navItem("list", "Dashboard", LayoutDashboard, () => setView("list"))}
+          {navItem("list", "Board", LayoutDashboard, () => setView("list"))}
           {navItem("customers", "Customers", Users, () => setView("customers"), hasPermission(session, team, "customers"))}
-          {navItem("quotes", "Quotations", FileText, () => setView("quotes"), hasPermission(session, team, "quotations"))}
-          {navItem("billing", "Billing", Receipt, () => setView("billing"), canUseBilling(session, team))}
           {navItem("reports", "Reports", BarChart3, () => setView("reports"), hasPermission(session, team, "reports"))}
-          {navItem("archive", "Archive", Archive, () => setView("archive"), canArchive)}
+          {navItem("billing", "Billing", Receipt, () => setView("billing"), canUseBilling(session, team))}
           {navItem("team", "Team", ShieldCheck, () => setView("team"), hasPermission(session, team, "team"))}
+          {navItem("archive", "Archive", Archive, () => setView("archive"), canArchive)}
           {navItem("import", "Import Data", Upload, () => setView("import"), hasPermission(session, team, "import"))}
           {navItem("dispatch", "Dispatch Board", ListChecks, () => setView("dispatch"))}
           {navItem("admindash", "Admin Dashboard", TrendingUp, () => setView("admindash"), isSuperAdmin(session))}
           {navItem("liveupdates", "Live Updates", MessageSquare, () => setView("liveupdates"), canSeeLiveUpdates(session))}
           {navItem("msgtemplates", "WhatsApp Messages", MessageSquare, () => setView("msgtemplates"), isSuperAdmin(session))}
-          {navItem("announcements", "Post Announcement", Send, () => setView("announcements"), isSuperAdmin(session))}
-          {navItem("issues", "Issue Reports", AlertCircle, () => setView("issues"), isSuperAdmin(session))}
-          {navItem("smartechapprovals", "Smartech Approvals", Receipt, () => setView("smartechapprovals"), canApproveSmartech(session))}
         </div>
         <div style={{ borderTop: `1px solid ${COLORS.line}`, paddingTop: 12, marginTop: 12 }}>
           <div style={{ display: "flex", alignItems: "center", gap: 10, padding: "0 10px 10px" }}>
@@ -4144,7 +4403,8 @@ function DesktopShell({ session, team, view, setView, onLogout, canArchive, chil
         </div>
       </div>
       <div style={{ flex: 1, minWidth: 0 }}>
-        <div style={{ maxWidth: 960, margin: "0 auto", padding: "28px 36px 60px" }}>
+        {/* The board uses the whole width for its stage columns; every other screen keeps the reading width. */}
+        <div style={{ maxWidth: view === "list" ? "none" : 960, margin: "0 auto", padding: view === "list" ? "20px 24px 60px" : "28px 36px 60px" }}>
           {children}
         </div>
       </div>
@@ -5293,6 +5553,69 @@ function PlatePicker({ value, onChange, onModeChange, onVinPhotosChange, seed })
   );
 }
 
+/* ---------------- Phone navigation: bottom bar + More ---------------- */
+// Everything that is not Board / New car / Search lives under More. Each row
+// keeps its own permission check.
+function moreEntries(session, team, canArchive) {
+  const e = [];
+  if (hasPermission(session, team, "reports")) e.push({ key: "reports", label: "Reports", Icon: BarChart3 });
+  if (canUseBilling(session, team)) e.push({ key: "billing", label: "Billing", Icon: Receipt });
+  if (hasPermission(session, team, "team")) e.push({ key: "team", label: "Team", Icon: ShieldCheck });
+  if (hasPermission(session, team, "customers")) e.push({ key: "customers", label: "Customers", Icon: Users });
+  e.push({ key: "dispatch", label: "Dispatch Board", Icon: ListChecks });
+  if (canArchive) e.push({ key: "archive", label: "Archive", Icon: Archive });
+  if (hasPermission(session, team, "import")) e.push({ key: "import", label: "Import Data", Icon: Upload });
+  if (canSeeLiveUpdates(session)) e.push({ key: "liveupdates", label: "Live Updates", Icon: MessageSquare });
+  if (isSuperAdmin(session)) {
+    e.push({ key: "admindash", label: "Admin Dashboard", Icon: LayoutDashboard });
+    e.push({ key: "msgtemplates", label: "WhatsApp Messages", Icon: MessageSquare });
+  }
+  if (isFullDashboardRole(session)) e.push({ key: "park", label: "Park a vehicle", Icon: PauseCircle });
+  e.push({ key: "report", label: "Report an issue", Icon: AlertCircle });
+  return e;
+}
+function BottomNav({ view, canNew, onBoard, onNew, onSearch, onMore }) {
+  useFabLift(true, 84);
+  const item = (label, Icon, onClick, on) => (
+    <button onClick={onClick} aria-label={label} aria-current={on ? "page" : undefined} className="mrcap-press" style={{ display: "flex", flexDirection: "column", alignItems: "center", justifyContent: "center", gap: 3, minHeight: 56, background: "none", border: "none", color: on ? COLORS.goldBright : COLORS.muted, fontSize: 11.5, fontWeight: on ? 700 : 500, fontFamily: BODY_FONT, cursor: "pointer" }}>
+      <Icon size={21} />
+      {label}
+    </button>
+  );
+  return createPortal(
+    <nav aria-label="Main" data-testid="bottom-nav" style={{ position: "fixed", left: 0, right: 0, bottom: 0, zIndex: 60, maxWidth: 480, margin: "0 auto", display: "grid", gridTemplateColumns: canNew ? "1fr auto 1fr 1fr" : "repeat(3, 1fr)", alignItems: "center", background: "rgba(10,10,9,0.97)", borderTop: `1px solid ${COLORS.line}`, padding: "6px 8px max(8px, env(safe-area-inset-bottom))", backdropFilter: "blur(14px)", WebkitBackdropFilter: "blur(14px)" }}>
+      {item("Board", LayoutDashboard, onBoard, view === "list")}
+      {canNew && (
+        <button onClick={onNew} aria-label="New car" className="mrcap-press" style={{ justifySelf: "center", display: "flex", alignItems: "center", justifyContent: "center", gap: 6, height: 50, padding: "0 18px", marginTop: -14, borderRadius: 999, border: `3px solid ${COLORS.paper}`, background: `linear-gradient(135deg, ${COLORS.goldBright}, ${COLORS.gold} 55%, ${COLORS.goldDeep})`, color: COLORS.darkText, fontSize: 14, fontWeight: 700, fontFamily: BODY_FONT, cursor: "pointer", whiteSpace: "nowrap", boxShadow: "0 10px 26px -6px rgba(201,162,39,0.45)" }}>
+          <Plus size={20} strokeWidth={2.6} /> New car
+        </button>
+      )}
+      {item("Search", Search, onSearch, false)}
+      {item("More", Menu, onMore, view === "more")}
+    </nav>,
+    document.body
+  );
+}
+function MoreScreen({ session, team, canArchive, go, onLogout }) {
+  const entries = moreEntries(session, team, canArchive);
+  return (
+    <div className="mrcap-view" data-testid="more-screen" style={{ padding: "6px 18px 130px" }}>
+      <SectionTitle>More</SectionTitle>
+      <div style={{ display: "flex", flexDirection: "column", gap: 8 }}>
+        {entries.map((it) => (
+          <button key={it.key} onClick={() => go(it.key)} data-testid={`more-${it.key}`} className="mrcap-press" style={{ display: "flex", alignItems: "center", gap: 14, minHeight: 56, padding: "0 16px", background: COLORS.panel, border: `1px solid ${COLORS.line}`, borderRadius: 14, color: COLORS.ink, fontSize: 15, fontWeight: 500, fontFamily: BODY_FONT, cursor: "pointer", textAlign: "left" }}>
+            <it.Icon size={19} color={COLORS.gold} /> <span style={{ flex: 1 }}>{it.label}</span>
+            <ChevronLeft size={18} color={COLORS.muted} style={{ transform: "rotate(180deg)" }} />
+          </button>
+        ))}
+      </div>
+      <button onClick={onLogout} className="mrcap-press" style={{ marginTop: 18, display: "flex", alignItems: "center", gap: 14, width: "100%", minHeight: 52, padding: "0 16px", background: "none", border: `1px solid ${COLORS.line}`, borderRadius: 14, color: COLORS.muted, fontSize: 14.5, fontFamily: BODY_FONT, cursor: "pointer" }}>
+        <Lock size={17} /> Log out {session.name}
+      </button>
+    </div>
+  );
+}
+
 /* ================= APP ================= */
 
 export default function GarageApp() {
@@ -5345,11 +5668,50 @@ export default function GarageApp() {
   const [syncState, setSyncState] = useState("idle"); // idle | syncing | ok | failed
   const [lastSyncedAt, setLastSyncedAt] = useState(null);
 
-  const refreshIndex = useCallback(async () => {
-    setSyncState("syncing");
-    const idx = await loadIndex();
-    idx.sort((a, b) => (b.updatedAt || 0) - (a.updatedAt || 0));
-    setIndex(idx);
+  // Set right after a board tap (assign, Pass QC, Collected…): a poll that lands
+  // between the tap and the save finishing must not put the old state back.
+  const holdRefreshUntilRef = useRef(0);
+  const holdRetryRef = useRef(null);
+  // The 15 s poll only asks for jobs changed since the last answer (a few rows) instead of
+  // all ~900 with their history; every 8th poll, on focus and on a manual refresh it asks
+  // for the whole list, which is also what notices deleted jobs. Server time only: the
+  // watermark comes from rows the server sent, never from this device's clock.
+  const indexWatermarkRef = useRef(0);
+  const pollCountRef = useRef(0);
+  const refreshIndex = useCallback(async (opts) => {
+    const wantDelta = !!(opts && opts.delta === true) && indexWatermarkRef.current > 0 && (++pollCountRef.current % 8 !== 0);
+    if (!wantDelta) pollCountRef.current = 0;
+    if (!wantDelta) setSyncState("syncing");
+    const startedAt = Date.now();
+    const idx = await loadIndex(wantDelta ? new Date(indexWatermarkRef.current - 60000).toISOString() : null);
+    // A answer that was asked for before the last tap (or lands inside the hold) is
+    // out of date: drop it, and ask again once the hold is over so other people's
+    // changes still show up without waiting for the next poll.
+    const holdUntil = holdRefreshUntilRef.current;
+    if (Date.now() < holdUntil || startedAt < holdUntil) {
+      setSyncState("ok");
+      if (holdRetryRef.current) clearTimeout(holdRetryRef.current);
+      holdRetryRef.current = setTimeout(() => { holdRetryRef.current = null; refreshIndex(); }, Math.max(300, holdUntil - Date.now() + 300));
+      return;
+    }
+    if (!idx) { if (!wantDelta) setSyncState("failed"); return; }
+    // updated_at comes from whichever device wrote the row: a fast clock must never push the
+    // watermark into the future, or later changes would be skipped. Cap it at this device's now.
+    const wm = Math.min(idx.reduce((m, r) => Math.max(m, r.updatedAt || 0), 0), Date.now());
+    if (wantDelta) {
+      indexWatermarkRef.current = Math.max(indexWatermarkRef.current, wm);
+      if (idx.length) {
+        setIndex((prev) => {
+          const byId = new Map(prev.map((j) => [j.id, j]));
+          for (const r of idx) byId.set(r.id, r);
+          return [...byId.values()].sort((a, b) => (b.updatedAt || 0) - (a.updatedAt || 0));
+        });
+      }
+    } else {
+      indexWatermarkRef.current = wm;
+      idx.sort((a, b) => (b.updatedAt || 0) - (a.updatedAt || 0));
+      setIndex(idx);
+    }
     setSyncState("ok");
     setLastSyncedAt(Date.now());
   }, []);
@@ -5365,6 +5727,13 @@ export default function GarageApp() {
       return next;
     });
   }, []);
+  // Board taps: change a few fields of one row at once; the caller saves in the background and puts the old row back on failure.
+  const patchIndex = useCallback((jobId, fields) => {
+    holdRefreshUntilRef.current = Date.now() + 5000;
+    setIndex((prev) => prev.map((j) => (j.id === jobId ? { ...j, ...fields } : j)));
+  }, []);
+  const [searchTick, setSearchTick] = useState(0);
+  const [reportTick, setReportTick] = useState(0);
   const removeFromIndex = useCallback((jobId) => {
     setIndex((prev) => prev.filter((j) => j.id !== jobId));
   }, []);
@@ -5378,7 +5747,10 @@ export default function GarageApp() {
       if (raw) {
         const s = raw;
         const fresh = t.find((m) => m.id === s.id);
-        if (fresh) {
+        if (fresh && isNameOnly(fresh) && !isPPFRoomKiosk(s)) {
+          // Moved to "Name only" since this phone last logged in: back to the PIN screen.
+          saveLocalSession(null);
+        } else if (fresh) {
           // Merge in whatever an admin may have changed since this device
           // last logged in (role, dashboardMode) — a session restored from
           // localStorage used to keep whatever it was stamped with at
@@ -5417,7 +5789,7 @@ export default function GarageApp() {
   }, [session]);
 
   // Auto-refresh, so nobody has to remember to pull down/reload: a
-  // background poll every 45s, plus an immediate refresh the moment the
+  // background poll every 15s, plus an immediate refresh the moment the
   // tab/app comes back into focus (e.g. someone switches back to it after
   // a few minutes on another app). Only runs once logged in — no point
   // polling the login screen. This only re-fetches the lightweight
@@ -5425,7 +5797,7 @@ export default function GarageApp() {
   // can't clobber in-progress work.
   useEffect(() => {
     if (!ready || !session || isSmartechPortal(session) || isPPFRoomKiosk(session)) return;
-    const interval = setInterval(() => { refreshIndex(); }, 45000);
+    const interval = setInterval(() => { refreshIndex({ delta: true }); }, 15000);
     const onVisible = () => { if (document.visibilityState === "visible") refreshIndex(); };
     const onFocus = () => { refreshIndex(); };
     document.addEventListener("visibilitychange", onVisible);
@@ -5542,21 +5914,24 @@ export default function GarageApp() {
   // is somehow set — shop-floor roles always get the normal mobile Shell.
   const isDesktop = session.viewMode === "pc" && isFullDashboardRole(session);
   const ActiveShell = isDesktop ? DesktopShell : Shell;
+  // Phone board / More: the bottom bar carries the navigation and Live moves up beside the logo.
+  const phoneBar = !isDesktop && !isSimplifiedRole(session) && (view === "list" || view === "more");
 
   return (
     <ActiveShell session={session} team={team} view={view} setView={setView} onLogout={onLogout} canArchive={canArchive}>
-      <ReportIssueButton session={session} view={view} onPark={isFullDashboardRole(session) ? () => setView("park") : null} />
-      <TopBar session={session} team={team} onLogout={onLogout} onNew={() => setView("new")} view={view} onBack={() => window.history.back()} onTeam={() => setView("team")} onArchive={() => setView("archive")} onCustomers={() => setView("customers")} onReports={() => setView("reports")} onQuotes={() => setView("quotes")} canArchive={canArchive} onAdminDash={() => setView("admindash")} onMsgTemplates={() => setView("msgtemplates")} onIssues={() => setView("issues")} onDispatch={() => setView("dispatch")} onLiveUpdates={() => setView("liveupdates")} onAnnouncements={() => setView("announcements")} onBilling={() => setView("billing")} onSmartechApprovals={() => setView("smartechapprovals")} />
+      <ReportIssueButton session={session} view={view} onPark={isFullDashboardRole(session) ? () => setView("park") : null} hidden={phoneBar} openTick={reportTick} />
+      <TopBar desktop={isDesktop} session={session} team={team} onLogout={onLogout} onNew={() => setView("new")} view={view} onBack={() => window.history.back()} onTeam={() => setView("team")} onArchive={() => setView("archive")} onCustomers={() => setView("customers")} onReports={() => setView("reports")} canArchive={canArchive} onDispatch={() => setView("dispatch")} onLiveUpdates={() => setView("liveupdates")} onBilling={() => setView("billing")} />
       {showMorningReminder && <MorningReminderBanner onDismiss={() => { setShowMorningReminder(false); dismissMorningReminder("mrcap"); }} />}
       <AnnouncementBanner session={session} />
       <LiveUpdateBroadcaster onOpenJob={(id) => openJob(id)} />
       {canUseSmartechChat(session) && <SmartechChatBroadcaster session={session} onOpen={() => setView("liveupdates")} />}
-      {canSeeLiveUpdates(session) && view !== "liveupdates" && view !== "smartechchat" && <InternalUpdatesWidget team={team} session={session} index={index} onOpenJob={(id) => openJob(id)} />}
+      {canSeeLiveUpdates(session) && view !== "liveupdates" && view !== "smartechchat" && <InternalUpdatesWidget topRight={phoneBar} team={team} session={session} index={index} onOpenJob={(id) => openJob(id)} />}
       {view === "list" && (
         isSimplifiedRole(session)
           ? <SimplifiedDashboard index={index} session={session} onOpen={openJob} onRefresh={refreshIndex} syncState={syncState} lastSyncedAt={lastSyncedAt} />
-          : <Dashboard index={index} session={session} team={team} onOpen={openJob} onJobDeleted={removeFromIndex} canArchive={canArchive} onRefresh={refreshIndex} syncState={syncState} lastSyncedAt={lastSyncedAt} onJobUpdated={(job, saved) => { upsertIndex(job); setSyncState(saved ? "ok" : "failed"); if (saved) setLastSyncedAt(Date.now()); }} />
+          : <Dashboard desktop={isDesktop} index={index} session={session} team={team} onOpen={openJob} onJobDeleted={removeFromIndex} canArchive={canArchive} onRefresh={refreshIndex} syncState={syncState} lastSyncedAt={lastSyncedAt} onJobUpdated={(job, saved) => { upsertIndex(job); setSyncState(saved ? "ok" : "failed"); if (saved) setLastSyncedAt(Date.now()); }} onPatch={patchIndex} searchTick={searchTick} onNewCar={hasPermission(session, team, "newJob") ? () => setView("new") : undefined} />
       )}
+      {view === "more" && <MoreScreen session={session} team={team} canArchive={canArchive} onLogout={onLogout} go={(key) => (key === "report" ? setReportTick((t) => t + 1) : setView(key))} />}
       {/* Desktop has no fade (below), so without this the last row of the
           dashboard sat permanently under the floating New Job / Park a
           Vehicle buttons (bottom 22px + 56px tall, and 86px + 36px tall).
@@ -5566,13 +5941,16 @@ export default function GarageApp() {
         <div aria-hidden="true" style={{ height: 110 }} />
       )}
       {/* Soft fade under the floating buttons so cards slide away beneath them. */}
-      {view === "list" && !isDesktop && (
+      {view === "list" && !isDesktop && isSimplifiedRole(session) && (
         <div aria-hidden="true" style={{ position: "fixed", left: 0, right: 0, bottom: 0, height: 150, zIndex: 45, pointerEvents: "none", background: "linear-gradient(to bottom, rgba(10,10,9,0), rgba(10,10,9,0.82) 55%, rgba(10,10,9,0.96))" }} />
       )}
       {/* One bottom row on the board: [quick-actions menu]  [+ New car]  [Live].
           Park a vehicle and Report an issue live in the menu. */}
-      {view === "list" && hasPermission(session, team, "newJob") && (
-        <FloatingNewJobButton onClick={() => setView("new")} shiftX={isDesktop ? 116 : 0} label="New car" />
+      {view === "list" && !isDesktop && isSimplifiedRole(session) && hasPermission(session, team, "newJob") && (
+        <FloatingNewJobButton onClick={() => setView("new")} label="New car" />
+      )}
+      {phoneBar && (
+        <BottomNav view={view} canNew={hasPermission(session, team, "newJob")} onBoard={() => { if (view !== "list") setView("list"); else window.scrollTo({ top: 0, behavior: "smooth" }); }} onNew={() => setView("new")} onSearch={() => { if (view !== "list") setView("list"); setSearchTick((t) => t + 1); }} onMore={() => { if (view !== "more") setView("more"); }} />
       )}
       {view === "new" && hasPermission(session, team, "newJob") && (
         <NewJobForm session={session} team={team} onCreated={(job, saved) => { upsertIndex(job); setSyncState(saved ? "ok" : "failed"); if (saved) setLastSyncedAt(Date.now()); openJob(job.id, job); }} onCancel={() => window.history.back()} />
@@ -5606,7 +5984,7 @@ export default function GarageApp() {
       )}
       {view === "archive" && !canArchive && <AccessDenied onBack={() => window.history.back()} />}
       {view === "customers" && hasPermission(session, team, "customers") && (
-        <CustomersScreen onBack={() => window.history.back()} onOpenJob={openJob} />
+        <CustomersScreen onBack={() => window.history.back()} onOpenJob={openJob} canMerge={isSuperAdmin(session) || session.role === "admin"} />
       )}
       {view === "customers" && !hasPermission(session, team, "customers") && <AccessDenied onBack={() => window.history.back()} />}
       {view === "reports" && hasPermission(session, team, "reports") && (
@@ -5869,27 +6247,27 @@ function LoginScreen({ team, setTeam, onLogin }) {
           <span style={{ height: 1, width: 28, background: "linear-gradient(90deg, rgba(201,162,39,0.7), transparent)" }} />
         </div>
         <div style={{ fontFamily: DISPLAY_FONT, fontWeight: 700, fontSize: 30, color: COLORS.ink, lineHeight: 1.1 }}>Who's this?</div>
-        <div style={{ fontSize: 13, color: COLORS.muted, marginTop: 8, letterSpacing: 0.2 }}>Mr.CAP. — Al Hammar, Dubai</div>
+        <div style={{ fontSize: FONT_SIZE.base, color: COLORS.muted, marginTop: 8, letterSpacing: 0.2 }}>Tap your name</div>
       </div>
-      <div style={{ position: "relative", display: "flex", flexDirection: "column", gap: 8 }}>
-        {team.map((m, i) => (
-          <button
-            key={m.id}
-            onClick={() => pick(m)}
-            className="mrcap-press mrcap-fade"
-            style={{ animationDelay: `${i * 40}ms`, display: "flex", alignItems: "center", justifyContent: "space-between", gap: 12, width: "100%", minHeight: 60, boxSizing: "border-box", padding: "10px 14px 10px 10px", borderRadius: 16, border: `1px solid ${COLORS.line}`, background: COLORS.panel, cursor: "pointer" }}
-          >
-            <span aria-hidden="true" style={{ width: 40, height: 40, borderRadius: "50%", flexShrink: 0, display: "flex", alignItems: "center", justifyContent: "center", background: `${(ROLE_DEFS[m.role] || {}).color || COLORS.gold}26`, border: `1px solid ${(ROLE_DEFS[m.role] || {}).color || COLORS.gold}88`, color: COLORS.ink, fontFamily: DISPLAY_FONT, fontWeight: 700, fontSize: 16 }}>{(m.name || "?").charAt(0).toUpperCase()}</span>
-            <span style={{ display: "flex", flexDirection: "column", flex: 1, minWidth: 0, textAlign: "left", gap: 2 }}>
-              <span style={{ fontWeight: 600, fontSize: 15, color: COLORS.ink, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{m.name}</span>
-              <span style={{ fontSize: FONT_SIZE.body, color: (ROLE_DEFS[m.role] || {}).color || COLORS.muted, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{(ROLE_DEFS[m.role] || {}).label || m.role}</span>
-            </span>
-            <span style={{ display: "flex", alignItems: "center", gap: 6, flexShrink: 0, color: COLORS.muted }}>
-              <Lock size={13} />
-              <ChevronLeft size={16} style={{ transform: "rotate(180deg)" }} />
-            </span>
-          </button>
-        ))}
+      {/* Name tiles, three across: the whole team fits in about one screen
+          instead of a long list to scroll. */}
+      <div style={{ position: "relative", display: "grid", gridTemplateColumns: "repeat(3, minmax(0, 1fr))", gap: 10 }}>
+        {team.filter((m) => !isNameOnly(m)).map((m, i) => {
+          const roleColor = (ROLE_DEFS[m.role] || {}).color || COLORS.gold;
+          const oneLine = { maxWidth: "100%", overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" };
+          return (
+            <button
+              key={m.id}
+              onClick={() => pick(m)}
+              className="mrcap-press mrcap-fade"
+              style={{ animationDelay: `${Math.min(i, 12) * 30}ms`, display: "flex", flexDirection: "column", alignItems: "center", justifyContent: "center", gap: 6, minWidth: 0, minHeight: 104, boxSizing: "border-box", padding: "10px 6px", borderRadius: 16, border: `1px solid ${COLORS.line}`, background: COLORS.panel, cursor: "pointer" }}
+            >
+              <span aria-hidden="true" style={{ width: 40, height: 40, borderRadius: "50%", flexShrink: 0, display: "flex", alignItems: "center", justifyContent: "center", background: `${roleColor}26`, border: `1px solid ${roleColor}88`, color: COLORS.ink, fontFamily: DISPLAY_FONT, fontWeight: 700, fontSize: 18 }}>{(m.name || "?").slice(0, 2).toUpperCase()}</span>
+              <span style={{ ...oneLine, fontWeight: 600, fontSize: 14, color: COLORS.ink }}>{m.name}</span>
+              <span style={{ ...oneLine, fontSize: FONT_SIZE.meta, color: roleColor === COLORS.gold ? COLORS.muted : roleColor }}>{(ROLE_DEFS[m.role] || {}).label || m.role}</span>
+            </button>
+          );
+        })}
       </div>
     </div>
   );
@@ -5955,18 +6333,23 @@ function useViewportWidth() {
   return w;
 }
 
-function TopBar({ session, team, onLogout, onNew, view, onBack, onTeam, onArchive, onCustomers, onReports, onQuotes, canArchive, onAdminDash, onMsgTemplates, onIssues, onDispatch, onLiveUpdates, onAnnouncements, onBilling, onSmartechApprovals }) {
+function TopBar({ session, team, onLogout, onNew, view, onBack, onTeam, onArchive, onCustomers, onReports, canArchive, onDispatch, onLiveUpdates, onBilling, desktop = false }) {
   const isSimplified = isSimplifiedRole(session);
   const viewportW = useViewportWidth();
+  // PC mode: the sidebar already carries the logo, every destination, the
+  // signed-in name and Log out — a second copy above the board is clutter.
+  if (desktop && view === "list") return null;
   // Every destination this login can reach, in the order they've always
   // appeared. Only as many as physically fit beside the logo stay as
   // direct taps (4 on a normal phone, 3 on a very narrow one) — measured
   // so the row never wraps into a second line. Whatever doesn't fit
   // folds into "More", lowest-traffic first (Team, then Archive, then
   // Reports), so the daily ones stay one tap away.
-  const navAll = view === "list" ? [
+  // Phone: the bottom bar (Board / New car / Search / More) carries the
+  // navigation, so the header is just the logo. Only the shop-floor roles,
+  // who get no bottom bar, keep a few direct icons here.
+  const navAll = view === "list" && isSimplified ? [
     { key: "customers", title: "Customers", Icon: Users, onClick: onCustomers, allowed: hasPermission(session, team, "customers") },
-    { key: "quotes", title: "Quotations", Icon: FileText, onClick: onQuotes, allowed: hasPermission(session, team, "quotations") },
     { key: "archive", title: "Archive", Icon: Archive, onClick: onArchive, allowed: hasPermission(session, team, "archive") },
     { key: "reports", title: "Reports", Icon: BarChart3, onClick: onReports, allowed: hasPermission(session, team, "reports") },
     { key: "team", title: "Team", Icon: ShieldCheck, onClick: onTeam, allowed: hasPermission(session, team, "team") },
@@ -5974,23 +6357,14 @@ function TopBar({ session, team, onLogout, onNew, view, onBack, onTeam, onArchiv
     { key: "billing", title: "Billing", Icon: Receipt, onClick: onBilling, allowed: canUseBilling(session, team) },
   ].filter((n) => n.allowed) : [];
   const maxDirect = viewportW >= 370 ? 4 : 3;
-  const demoteOrder = ["team", "archive", "billing", "reports", "customers", "quotes"];
+  const demoteOrder = ["team", "archive", "billing", "reports", "customers"];
   const directKeys = new Set(navAll.map((n) => n.key));
   for (const k of demoteOrder) { if (directKeys.size <= maxDirect) break; directKeys.delete(k); }
   const directNav = navAll.filter((n) => directKeys.has(n.key));
   const moreItems = navAll
     .filter((n) => !directKeys.has(n.key))
     .map((n) => ({ label: n.key === "dispatch" ? "Dispatch Board" : n.title, icon: <n.Icon size={15} color={COLORS.ink} />, onClick: n.onClick }));
-  if (view === "list" && canSeeLiveUpdates(session)) moreItems.push({ label: "Live Updates", icon: <MessageSquare size={15} color={COLORS.ink} />, onClick: onLiveUpdates });
-  if (view === "list" && isSuperAdmin(session)) {
-    moreItems.push({ label: "Admin Dashboard", icon: <LayoutDashboard size={15} color={COLORS.ink} />, onClick: onAdminDash });
-    moreItems.push({ label: "WhatsApp Messages", icon: <MessageSquare size={15} color={COLORS.ink} />, onClick: onMsgTemplates });
-    moreItems.push({ label: "Post Announcement", icon: <Send size={15} color={COLORS.ink} />, onClick: onAnnouncements });
-    moreItems.push({ label: "Issue Reports", icon: <AlertCircle size={15} color={COLORS.ink} />, onClick: onIssues });
-  }
-  if (view === "list" && canApproveSmartech(session)) {
-    moreItems.push({ label: "Smartech Approvals", icon: <Receipt size={15} color={COLORS.ink} />, onClick: onSmartechApprovals });
-  }
+  if (view === "list" && isSimplified && canSeeLiveUpdates(session)) moreItems.push({ label: "Live Updates", icon: <MessageSquare size={15} color={COLORS.ink} />, onClick: onLiveUpdates });
   return (
     <>
     <div
@@ -6395,7 +6769,7 @@ function SwipeableJobCard({ job, session, team, onDeleted, children }) {
 // Colours for the on-site stage distribution bar (design comps): steel for
 // the early stages, gold while the work is happening, green when ready.
 const STAGE_BAR_COLORS = { intake: COLORS.blue, parts_removal: "#6B7F8F", service: COLORS.gold, qc: COLORS.goldBright, ready: COLORS.green };
-const STAGE_SHORT_LABELS = { intake: "Intake", parts_removal: "Parts off", service: "Service", qc: "QC", ready: "Ready", collected: "Collected" };
+const STAGE_SHORT_LABELS = { intake: "Checked in", parts_removal: "Waiting", service: "In progress", qc: "QC", ready: "Ready", collected: "Collected" };
 
 // One tick a minute so the "time in stage" labels on the board stay honest
 // without re-rendering on every poll.
@@ -6415,7 +6789,7 @@ function serviceLabelsFor(serviceTypes) {
 // The job card on the board (design comps): plate chip + make/model, the
 // services line, a 6-segment stage bar, and how long it's been in this
 // stage. Only reads fields the board already has.
-function BoardJobCard({ j, now, onOpen, onHoldCard = false, quickRoom = false }) {
+function BoardJobCard({ j, now, onOpen, onHoldCard = false, quickRoom = false, compact = false }) {
   const stageIdx = Math.max(0, STAGES.findIndex((s) => s.key === j.stageKey));
   const time = onHoldCard ? null : stageTimeInfo({ ...j, stageIndex: stageIdx }, now);
   const isReady = j.stageKey === "ready";
@@ -6423,6 +6797,37 @@ function BoardJobCard({ j, now, onOpen, onHoldCard = false, quickRoom = false })
   const services = serviceLabelsFor(j.serviceTypes);
   const assignees = assigneesFromHistory(j.history);
   const border = onHoldCard ? "rgba(201,162,39,0.55)" : isReady ? "rgba(74,122,87,0.6)" : COLORS.line;
+  // PC board column card: the column already says which stage the car is
+  // in, so no stage bar — plate, car, work, then who/where.
+  if (compact) {
+    const oneLine = { overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap", minWidth: 0, width: "100%" };
+    return (
+      <button
+        onClick={() => onOpen(j.id)}
+        className="mrcap-press mrcap-card"
+        style={{ textAlign: "left", background: COLORS.panel, border: `1px solid ${time && time.tone === "hot" ? "rgba(168,64,47,0.6)" : border}`, borderRadius: 14, padding: 12, cursor: "pointer", display: "flex", flexDirection: "column", gap: 7, width: "100%", boxSizing: "border-box", color: COLORS.ink }}
+      >
+        <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", gap: 6, width: "100%" }}>
+          <PlateChip plate={j.plate} size="sm" />
+          {time && time.label && !isReady ? <span title="Time in this stage (shop hours)" style={{ fontSize: FONT_SIZE.meta, fontWeight: 600, color: time.color, fontFamily: MONO_FONT, flexShrink: 0 }}>{time.label}</span> : null}
+        </div>
+        <div style={{ ...oneLine, fontSize: FONT_SIZE.base, fontWeight: 600 }}>{j.makeModel || "Vehicle"}</div>
+        <div style={{ ...oneLine, fontSize: FONT_SIZE.body, color: COLORS.muted }}>{services.join(" · ") || "Service not set yet"}</div>
+        {(j.priority === "High" || smartech) && (
+          <div style={{ display: "flex", gap: 5, flexWrap: "wrap" }}>
+            {j.priority === "High" && <span style={{ fontSize: FONT_SIZE.meta, fontWeight: 700, letterSpacing: 0.6, color: COLORS.dangerText, background: "rgba(168,64,47,0.18)", border: "1px solid rgba(214,106,86,0.45)", padding: "2px 6px", borderRadius: 5 }}>HIGH</span>}
+            {smartech && <span style={{ fontSize: FONT_SIZE.meta, fontWeight: 700, letterSpacing: 0.6, color: COLORS.darkText, background: COLORS.gold, padding: "3px 7px", borderRadius: 5 }}>SMARTECH</span>}
+          </div>
+        )}
+        {onHoldCard && j.onHoldNote && <div style={{ fontSize: FONT_SIZE.body, color: COLORS.ink, fontStyle: "italic", lineHeight: 1.4 }}>"{j.onHoldNote}"</div>}
+        <div style={{ display: "flex", alignItems: "center", width: "100%", minHeight: quickRoom ? TAP : undefined, paddingRight: quickRoom ? 88 : 0, boxSizing: "border-box" }}>
+          <span style={{ ...oneLine, fontSize: FONT_SIZE.meta, color: COLORS.muted }}>
+            {onHoldCard ? `Since ${fmtTime(j.onHoldSince)}` : [assignees.join(", ") || (j.customerName && j.customerName !== "—" ? j.customerName : null), j.location].filter(Boolean).join(" · ")}
+          </span>
+        </div>
+      </button>
+    );
+  }
   return (
     <button
       onClick={() => onOpen(j.id)}
@@ -6514,12 +6919,15 @@ function canQuickAdvanceSummary(j) {
   }
   return true;
 }
-async function quickAdvanceJob(jobId, session) {
+async function quickAdvanceJob(jobId, session, { allowCollect = false } = {}) {
+  // Never write from a cached copy: offline, a queued full-history overwrite could undo other people's changes.
   const job = await loadJob(jobId);
+  if (job && job._stale) return { ok: false, reason: "You're offline — try again when connected. Nothing was changed." };
   if (!job) return { ok: false, reason: "Couldn't load this job — check the connection." };
   const stage = STAGES[job.stageIndex];
   const idx = job.stageIndex;
-  if (!stage || job.onHold || idx > STAGES.findIndex((s) => s.key === "qc")) return { ok: false, reason: "Open the job card to move this one." };
+  if (allowCollect && stage && stage.key !== "ready") return { ok: false, reason: `${job.plate || "This car"} is no longer Ready (it is at ${stage.label}) — nothing was changed.` };
+  if (!stage || job.onHold || (idx > STAGES.findIndex((s) => s.key === "qc") && !(allowCollect && stage.key === "ready"))) return { ok: false, reason: "Open the job card to move this one." };
   if (stage.key === "service") {
     const svcs = SERVICES.filter((s) => (job.serviceTypes || []).includes(s.key));
     if (!svcs.every((s) => job.serviceDone?.[s.key] && (!s.reviewerRole || (job.serviceReviewed || {})[s.key]))) return { ok: false, reason: "Finish every service first." };
@@ -6551,44 +6959,321 @@ async function undoQuickAdvance(res, session) {
   return { updated: reverted, saved };
 }
 
-function Dashboard({ index, session, team, onOpen, onJobDeleted, canArchive, onRefresh, syncState, lastSyncedAt, onJobUpdated }) {
-  // Result of a one-tap "Done": { msg, undo } shown as a toast for a few seconds.
+/* ---------------- Office board: three lanes ----------------
+   Waiting (stage 0-1) | In progress (stage 2-3) | Ready (stage 4).
+   Collected stays out (Archive). Every action here is the same write the
+   Dispatch TV / job card already makes: a fresh read of the row, a narrow
+   PATCH, and the screen updated first and put back with a clear message if
+   the save fails. */
+const BOARD_MAX_ASSIGNEES = 3;
+const LANE_TONES = {
+  red: { border: "rgba(229,138,118,.45)", bg: "rgba(229,138,118,.16)", fg: "#E58A76" },
+  amber: { border: "rgba(224,178,90,.40)", bg: "rgba(224,178,90,.16)", fg: "#E0B25A" },
+  calm: { border: COLORS.line, bg: COLORS.panel2, fg: COLORS.ink },
+  work: { border: COLORS.line, bg: "rgba(143,180,204,.14)", fg: COLORS.blueText },
+  qc: { border: "rgba(201,162,39,.45)", bg: "rgba(232,195,74,.14)", fg: COLORS.goldBright },
+  ok: { border: COLORS.line, bg: "rgba(127,176,140,.14)", fg: COLORS.successText },
+};
+
+function histEntry(session, stage, label, note, catKey) {
+  return { stage, label, ...(catKey ? { cat: catKey } : {}), by: session.name, role: session.role, note, at: Date.now() };
+}
+// The Dispatch Board's assign write (multi-select, capped at 3 per category,
+// toggled on the FRESH value), as a patch builder shared with the office board.
+function assignTeamPatch(cur, categoryKey, memberId) {
+  const fresh = (cur.assigned_team || {})[categoryKey] || [];
+  const removing = fresh.includes(memberId);
+  if (!removing && fresh.length >= BOARD_MAX_ASSIGNEES) return null;
+  const next = removing ? fresh.filter((id) => id !== memberId) : [...fresh, memberId];
+  return { assigned_team: { ...(cur.assigned_team || {}), [categoryKey]: next } };
+}
+// Fold an automatic stage move into a patch, from the row `cur`.
+function withAutoStagePatch(cur, nextDone, nextHistory, base, session) {
+  const auto = autoStageAfterServiceChange({ stageIndex: cur.stage_index, onHold: !!cur.on_hold, serviceTypes: cur.service_types || [], serviceDone: nextDone, history: nextHistory, priority: cur.priority }, session.name, session.role, Date.now(), cur.service_done || {});
+  if (!auto) return { ...base, history: nextHistory };
+  return { ...base, history: auto.history, stage_index: auto.stageIndex, ...(auto.priority !== cur.priority ? { priority: auto.priority } : {}) };
+}
+// Pass = the existing mark-finished write plus a "QC passed" entry saying who
+// checked it, for each category waiting on QC (what the TV's Pass button writes).
+function passQcPatch(cur, cats, session, team) {
+  const hist = [...(cur.history || [])];
+  const nextDone = { ...(cur.service_done || {}) };
+  for (const key of cats) {
+    // Already done AND already passed (someone else tapped Pass a moment ago): nothing to add twice.
+    if (nextDone[key] && qcPassedSinceStart(hist, key)) continue;
+    const label = (SERVICES.find((s) => s.key === key) || {}).label || key;
+    hist.push(histEntry(session, "qc", label, "QC passed", key));
+    if (!nextDone[key]) {
+      hist.push({ ...histEntry(session, "service", label, "Marked done", key), qcBy: session.name, ...(qcDoneCredit(cur, key, team) || {}) });
+      nextDone[key] = true;
+    }
+  }
+  const patch = withAutoStagePatch(cur, nextDone, hist, { service_done: nextDone }, session);
+  // A car at QC with no service on its card has nothing for the automatic rule to count,
+  // so Pass QC would do nothing at all. The tap itself is the decision: move it to Ready.
+  const idx = Number.isFinite(cur.stage_index) ? cur.stage_index : 0;
+  if (patch.stage_index == null && idx === 3 && !cur.on_hold && (cur.service_types || []).length === 0) {
+    return { ...patch, stage_index: 4, history: [...patch.history, ...stageMoveEntries(3, 4, session.name, session.role, Date.now())] };
+  }
+  return patch;
+}
+// Fresh read -> build the patch from THAT -> PATCH (never queued: a replay of
+// stale data is worse than a clear "try again"). Returns {patch} | {noop} | {error}.
+// Writes to the same job from THIS device go one at a time: two quick taps
+// (assign two people, Start then Pass) must each read the row the previous one
+// left behind, or the second would put back what the first just changed.
+const boardWriteTails = new Map();
+async function boardWriteJob(jobId, select, build, opts) {
+  const prev = boardWriteTails.get(jobId) || Promise.resolve();
+  const mine = prev.catch(() => {}).then(() => boardWriteJobNow(jobId, select, build, opts));
+  const tail = mine.catch(() => {});
+  boardWriteTails.set(jobId, tail);
+  tail.then(() => { if (boardWriteTails.get(jobId) === tail) boardWriteTails.delete(jobId); });
+  return mine;
+}
+async function boardWriteJobNow(jobId, select, build, { summary, failText }) {
+  const { ok: fetchOk, data, stale } = await sbFetch(`jobs?id=eq.${jobId}&select=${select}`);
+  if (stale) return { error: "No connection — not saved, try again" };
+  const current = fetchOk && Array.isArray(data) && data[0] ? data[0] : null;
+  if (!current) return { error: `${failText} — couldn't load the latest version of it. Check your connection and try again.` };
+  const patch = build(current);
+  if (!patch) return { noop: true };
+  if (summary) withActivitySummary(summary);
+  const { ok } = await sbFetch(`jobs?id=eq.${jobId}`, {
+    method: "PATCH",
+    headers: { Prefer: "return=minimal" },
+    body: JSON.stringify({ ...patch, updated_at: new Date().toISOString() }),
+    noQueue: true,
+  });
+  if (!ok) return { error: `${failText} — check your connection and try again.` };
+  return { patch };
+}
+// Board index row <-> the snake_case row the patch builders read.
+// Away from the shop for the office board: a known partner place (Beneloom, Smartech or a
+// location someone added). An unknown or old location string stays on-site, so an
+// in-shop car can never drop out of the lanes because of how its location was typed.
+function isAwayFromShop(loc) {
+  const l = String(loc == null ? "" : loc).trim();
+  return !!l && l !== BASE_LOCATIONS[0] && getLocations().includes(l);
+}
+// Which office lane a car is in (null = not on the board: on hold or collected). One
+// rule for the office board AND the Dispatch TV header counts, so they cannot drift.
+function boardLaneOf(stageIdx, onHold, location) {
+  if (onHold || !(stageIdx < 5)) return null;
+  if (stageIdx === 4) return "ready";
+  if (isAwayFromShop(location)) return "away";
+  return stageIdx <= 1 ? "waiting" : "progress";
+}
+function indexRowToCur(j) {
+  return {
+    stage_index: Math.max(0, STAGES.findIndex((s) => s.key === j.stageKey)), on_hold: !!j.onHold, service_types: j.serviceTypes || [],
+    service_done: j.serviceDone || {}, history: j.history || [], priority: j.priority, assigned_team: j.assignedTeam || {}, assigned_to: {},
+    customer_notify: j.customerNotify || {},
+  };
+}
+function indexFieldsFromPatch(patch) {
+  const f = { updatedAt: Date.now() };
+  if (patch.stage_index != null) { const st = STAGES[patch.stage_index] || STAGES[0]; f.stageKey = st.key; f.stageLabel = st.label; }
+  if (patch.history) f.history = patch.history;
+  if (patch.service_done) f.serviceDone = patch.service_done;
+  if (patch.assigned_team) f.assignedTeam = patch.assigned_team;
+  if (patch.customer_notify) f.customerNotify = patch.customer_notify;
+  if (patch.priority !== undefined) f.priority = patch.priority;
+  return f;
+}
+// Which categories of this job are waiting for a QC pass: at QC (stage 3)
+// the ones with no "QC passed" yet; in progress, the ones the floor sent to QC.
+function qcWaitingCats(job, now) {
+  if (!job || job.onHold) return [];
+  const idx = STAGES.findIndex((s) => s.key === job.stageKey);
+  const types = job.serviceTypes || [];
+  if (idx === 3) return types.filter((k) => !qcPassedSinceStart(job.history, k));
+  if (idx !== 2) return [];
+  return types.filter((k) => {
+    if ((job.serviceDone || {})[k]) return false;
+    const label = (SERVICES.find((s) => s.key === k) || {}).label || k;
+    const st = dispatchRowInfo(job, k, label, now).state;
+    return st === "qc" || st === "qclate";
+  });
+}
+// Shop-hours wait, the same clock + tiers the TV uses.
+function waitClock(job, now = Date.now()) {
+  const since = waitingSinceMs(job);
+  const ms = since ? businessMsElapsed(since, now) : 0;
+  const hours = ms / 3600000;
+  const tone = hours >= WAIT_RED_HOURS ? "red" : hours >= WAIT_AMBER_HOURS ? "amber" : "calm";
+  const totalMin = Math.floor(ms / 60000);
+  const label = totalMin < 60 ? `${totalMin} m` : (totalMin % 60 ? `${Math.floor(totalMin / 60)} h ${totalMin % 60} m` : `${Math.floor(totalMin / 60)} h`);
+  return { since, ms, hours, tone, label };
+}
+// Time since the car became Ready (wall clock), the customer-told state, and
+// whether it is time to nudge (not told after 24 h).
+function readyInfo(job, now = Date.now()) {
+  const since = stageEnteredAt({ ...job, stageIndex: 4 }) || job.updatedAt || job.createdAt || now;
+  const ms = Math.max(0, now - since);
+  const hours = Math.floor(ms / 3600000);
+  const label = ms < 3600000 ? "ready just now" : hours >= 24 ? `ready ${Math.floor(hours / 24)} d` : `ready ${hours} h`;
+  const notify = (job.customerNotify || {}).ready_for_collection || {};
+  const told = !!(notify.informedBy || notify.skipped);
+  return { since, ms, label, told, toldBy: notify.informedBy || null, remind: !told && ms >= 24 * 3600000 };
+}
+function readyMessageUrl(job) {
+  if (!job.customerPhone || !toWhatsAppNumber(job.customerPhone)) return null;
+  const text = renderTemplate(WHATSAPP_TEMPLATES.ready_for_collection, { customerName: job.customerName || "", makeModel: job.makeModel || "vehicle", plate: job.plate || "" });
+  return `https://wa.me/${toWhatsAppNumber(job.customerPhone)}?text=${encodeURIComponent(text)}`;
+}
+function namesOnJob(j, team) {
+  const ids = [...new Set(Object.values(j.assignedTeam || {}).flat())];
+  const names = ids.map((id) => (team.find((m) => m.id === id) || {}).name || id);
+  return names.length ? names : assigneesFromHistory(j.history);
+}
+
+// Bottom sheet: pick staff for each service category (writes assigned_team).
+function AssignSheet({ job, team, onToggle, onClose }) {
+  const types = job.serviceTypes || [];
+  return createPortal(
+    <div className="mrcap-fade" onClick={onClose} style={{ position: "fixed", inset: 0, background: "rgba(0,0,0,0.66)", zIndex: 1000, display: "flex", alignItems: "flex-end", justifyContent: "center" }}>
+      <div role="dialog" aria-label="Assign technicians" data-testid="assign-sheet" onClick={(e) => e.stopPropagation()} style={{ width: "100%", maxWidth: 480, maxHeight: "86vh", overflowY: "auto", background: COLORS.panel, borderTop: `1px solid ${COLORS.line}`, borderRadius: "18px 18px 0 0", padding: "18px 18px max(18px, env(safe-area-inset-bottom))", boxSizing: "border-box" }}>
+        <div style={{ display: "flex", alignItems: "center", gap: 10, marginBottom: 4 }}>
+          <PlateChip plate={job.plate} size="sm" />
+          <span style={{ fontSize: 14, fontWeight: 600, color: COLORS.ink, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{job.makeModel || "Vehicle"}</span>
+        </div>
+        <div style={{ fontFamily: DISPLAY_FONT, fontWeight: 700, fontSize: 22, color: COLORS.ink, textTransform: "uppercase", letterSpacing: 0.4, margin: "6px 0 4px" }}>Who's taking it?</div>
+        <div style={{ fontSize: FONT_SIZE.body, color: COLORS.muted, marginBottom: 14, lineHeight: 1.4 }}>Pick up to {BOARD_MAX_ASSIGNEES} per job. It moves to In progress when they tap Start on the TV.</div>
+        {types.length === 0 && <div style={{ fontSize: FONT_SIZE.body, color: COLORS.dangerText, marginBottom: 12 }}>No service on this job yet. Add one with Edit Job first.</div>}
+        {types.map((key) => {
+          const svc = SERVICES.find((s) => s.key === key);
+          const crew = (job.assignedTeam || {})[key] || [];
+          const staff = staffForRole(team, svc ? svc.role : null).filter((m) => !isSmartechPortal(m));
+          return (
+            <div key={key} data-testid={`assign-cat-${key}`} style={{ marginBottom: 16 }}>
+              <div style={{ ...eyebrowStyle, marginBottom: 8 }}>{svc ? svc.label : key}</div>
+              <div style={{ display: "flex", flexWrap: "wrap", gap: 8 }}>
+                {staff.length === 0 && <span style={{ fontSize: 12, color: COLORS.muted }}>No one set up for this yet.</span>}
+                {staff.map((m) => {
+                  const on = crew.includes(m.id);
+                  const full = !on && crew.length >= BOARD_MAX_ASSIGNEES;
+                  return (
+                    <button key={m.id} onClick={() => onToggle(key, m.id)} disabled={full} aria-pressed={on} data-member={m.id} className="mrcap-press" style={{ ...selectChipStyle(on), minHeight: TAP, padding: "0 16px", opacity: full ? 0.4 : 1 }}>{m.name}</button>
+                  );
+                })}
+              </div>
+            </div>
+          );
+        })}
+        <button onClick={onClose} className="mrcap-press" style={{ ...primaryBtnStyle, width: "100%", minHeight: 52, marginTop: 4 }}>Done</button>
+      </div>
+    </div>,
+    document.body
+  );
+}
+
+function ConfirmSheet({ title, body, confirmLabel, onConfirm, onCancel }) {
+  return createPortal(
+    <div className="mrcap-fade" onClick={onCancel} style={{ position: "fixed", inset: 0, background: "rgba(0,0,0,0.66)", zIndex: 1000, display: "flex", alignItems: "flex-end", justifyContent: "center" }}>
+      <div role="dialog" aria-label={title} data-testid="confirm-sheet" onClick={(e) => e.stopPropagation()} style={{ width: "100%", maxWidth: 480, background: COLORS.panel, borderTop: `1px solid ${COLORS.line}`, borderRadius: "18px 18px 0 0", padding: "20px 18px max(18px, env(safe-area-inset-bottom))", boxSizing: "border-box" }}>
+        <div style={{ fontFamily: DISPLAY_FONT, fontWeight: 700, fontSize: 22, color: COLORS.ink, textTransform: "uppercase" }}>{title}</div>
+        <div style={{ fontSize: FONT_SIZE.base, color: COLORS.muted, margin: "6px 0 16px", lineHeight: 1.4 }}>{body}</div>
+        <div style={{ display: "flex", gap: 10 }}>
+          <button onClick={onCancel} className="mrcap-press" style={{ ...secondaryBtnStyle, flex: 1, minHeight: 52 }}>Not yet</button>
+          <button onClick={onConfirm} data-testid="confirm-yes" className="mrcap-press" style={{ ...primaryBtnStyle, flex: 2, minHeight: 52 }}>{confirmLabel}</button>
+        </div>
+      </div>
+    </div>,
+    document.body
+  );
+}
+
+const laneBtnStyle = (tone, small, grow) => ({
+  minHeight: small ? 40 : TAP, padding: small ? "0 12px" : "0 16px", borderRadius: 10, border: tone === "amber" ? "1px solid rgba(224,178,90,.6)" : "none",
+  background: tone === "amber" ? "rgba(224,178,90,.16)" : COLORS.gold, color: tone === "amber" ? "#E0B25A" : COLORS.darkText,
+  fontFamily: DISPLAY_FONT, fontWeight: 700, fontSize: small ? 15 : 17, textTransform: "uppercase", letterSpacing: 0.6, cursor: "pointer", whiteSpace: "nowrap", flexShrink: 0,
+  display: "inline-flex", alignItems: "center", justifyContent: "center", textDecoration: "none", boxSizing: "border-box",
+  ...(grow ? { flex: "1 1 auto", flexShrink: 1 } : {}),
+});
+function LaneChip({ tone, children, testid, title }) {
+  const t = LANE_TONES[tone] || LANE_TONES.calm;
+  return <span title={title} data-testid={testid} data-tone={tone} style={{ fontFamily: MONO_FONT, fontWeight: 600, fontSize: 11.5, padding: "4px 8px", borderRadius: 99, background: t.bg, color: t.fg, whiteSpace: "nowrap", flexShrink: 0 }}>{children}</span>;
+}
+
+// One car on the board. `lane` = waiting | progress | ready.
+function OfficeCard({ j, lane, now, team, busy, onOpen, onAssign, onPassQc, onTell, onCollect, compact }) {
+  const work = serviceLabelsFor(j.serviceTypes).join(" · ") || "Service not set yet";
+  const note = floorNoteLine(currentFloorNote(j.history));
+  let tone; let chip; let action; let sub;
+  // On the PC the Ready lane is narrow and its buttons are long words: put the button on its own line under the
+  // car's text (full width) instead of squeezing it in beside the text.
+  const wrapAction = !!compact && lane === "ready";
+  if (lane === "waiting") {
+    const w = waitClock(j, now);
+    tone = w.tone;
+    chip = <LaneChip tone={w.tone} testid="wait-chip">{w.label}</LaneChip>;
+    const names = namesOnJob(j, team);
+    sub = names.length ? `${names.join(", ")} assigned · waiting for Start on the TV` : null;
+    action = <button onClick={() => onAssign(j)} data-testid="board-assign" className="mrcap-press" style={laneBtnStyle(undefined, compact)}>Assign</button>;
+  } else if (lane === "progress") {
+    const total = (j.serviceTypes || []).length;
+    const done = (j.serviceTypes || []).filter((k) => (j.serviceDone || {})[k]).length;
+    const qcCats = qcWaitingCats(j, now);
+    const inQc = j.stageKey === "qc" || qcCats.length > 0;
+    const names = namesOnJob(j, team);
+    chip = inQc ? <LaneChip tone="qc" testid="qc-chip">IN QC</LaneChip> : <LaneChip tone="work" testid="progress-chip">{total ? `${done} of ${total} done` : "In progress"}</LaneChip>;
+    sub = [names.join(", "), inQc && total ? `${done} of ${total} done` : ""].filter(Boolean).join(" · ") || null;
+    if (inQc) tone = "qc";
+    if (inQc && onPassQc.canPass) {
+      action = <button onClick={() => onPassQc.run(j)} data-testid="board-pass-qc" className="mrcap-press" style={laneBtnStyle(undefined, compact)}>Pass QC</button>;
+    }
+  } else {
+    const r = readyInfo(j, now);
+    tone = r.remind ? "amber" : "ok";
+    chip = <LaneChip tone={r.remind ? "amber" : "ok"} testid="ready-chip">{r.label}</LaneChip>;
+    sub = r.told ? `customer told${r.toldBy ? ` by ${r.toldBy}` : ""}` : "not told yet";
+    const url = readyMessageUrl(j);
+    if (r.told) {
+      action = <button onClick={() => onCollect(j)} data-testid="board-collected" className="mrcap-press" style={laneBtnStyle(undefined, compact, wrapAction)}>Collected</button>;
+    } else if (url) {
+      action = <a href={url} target="_blank" rel="noopener noreferrer" onClick={() => onTell(j)} data-testid="board-tell" className="mrcap-press" style={laneBtnStyle(r.remind ? "amber" : undefined, compact, wrapAction)}>{r.remind ? "Remind" : "Tell customer"}</a>;
+    } else {
+      action = <button onClick={() => onOpen(j.id)} data-testid="board-tell" className="mrcap-press" title="No phone on file — open the job to tick that they were told" style={laneBtnStyle(r.remind ? "amber" : undefined, compact, wrapAction)}>{r.remind ? "Remind" : "Tell customer"}</button>;
+    }
+  }
+  const t = LANE_TONES[tone] || LANE_TONES.calm;
+  const oneLine = { overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap", minWidth: 0 };
+  return (
+    <div data-testid="lane-card" data-job={j.id} data-lane={lane} style={{ display: "flex", flexWrap: "wrap", alignItems: "center", gap: 10, padding: compact ? "10px 10px 10px 12px" : "12px 12px 12px 14px", background: COLORS.panel, border: `1px solid ${t.border}`, borderRadius: 12, opacity: busy ? 0.6 : 1 }}>
+      <button onClick={() => onOpen(j.id)} className="mrcap-press" aria-label={`Open ${j.plate || "job"}`} style={{ flex: "1 1 150px", minWidth: 0, display: "flex", flexDirection: "column", gap: 7, background: "none", border: "none", padding: 0, textAlign: "left", cursor: "pointer", color: COLORS.ink, fontFamily: BODY_FONT }}>
+        <span style={{ display: "flex", alignItems: "center", gap: 8, minWidth: 0 }}>
+          <PlateChip plate={j.plate} size={compact ? "sm" : "md"} />
+          {chip}
+          {isAwayFromShop(j.location) && <span style={{ fontSize: FONT_SIZE.meta, color: COLORS.gold, ...oneLine }}>{dispatchLocationShort(j.location)}</span>}
+        </span>
+        <span style={{ fontSize: compact ? 13 : 14, ...oneLine, width: "100%" }}>{j.makeModel || "Vehicle"} <span style={{ color: COLORS.muted }}>· {work}</span></span>
+        {sub && <span style={{ fontSize: FONT_SIZE.meta, color: COLORS.muted, ...oneLine, width: "100%" }}>{sub}</span>}
+        {note && <span data-testid="lane-note" style={{ fontSize: FONT_SIZE.meta, color: COLORS.gold, ...oneLine, width: "100%" }}>{note}</span>}
+      </button>
+      {wrapAction ? <div data-testid="lane-action-row" style={{ flex: "1 1 100%", display: "flex" }}>{action}</div> : action}
+    </div>
+  );
+}
+
+function Dashboard({ index, session, team, onOpen, onJobDeleted, canArchive, onRefresh, syncState, lastSyncedAt, onJobUpdated, onPatch, searchTick = 0, desktop = false, onNewCar }) {
   const [toast, setToast] = useState(null);
-  const [advancingId, setAdvancingId] = useState(null);
+  const [busyId, setBusyId] = useState(null);
+  const [assignId, setAssignId] = useState(null);
+  const [collectJob, setCollectJob] = useState(null);
   const toastTimer = useRef(null);
+  const searchRef = useRef(null);
   useEffect(() => () => { if (toastTimer.current) clearTimeout(toastTimer.current); }, []);
   const showToast = (t) => { setToast(t); if (toastTimer.current) clearTimeout(toastTimer.current); toastTimer.current = setTimeout(() => setToast(null), 6000); };
-  const quickDone = async (j) => {
-    if (advancingId) return;
-    setAdvancingId(j.id);
-    const res = await quickAdvanceJob(j.id, session);
-    setAdvancingId(null);
-    if (!res.ok) { showToast({ msg: res.reason, error: true }); return; }
-    onJobUpdated && onJobUpdated(res.updated, res.saved);
-    showToast({
-      msg: `${j.plate} → ${res.to.label}${res.saved ? "" : " (will sync when online)"}`,
-      undo: async () => {
-        setToast(null);
-        const u = await undoQuickAdvance(res, session);
-        onJobUpdated && onJobUpdated(u.updated, u.saved);
-      },
-    });
-  };
-  // ONE filter row: a single chip is active at a time — "open" (the
-  // default: every car still here), "today", a stage key ("intake",
-  // "parts_removal", "service", "qc", "ready"), "high", "collected" or "all".
-  // Tapping the active chip again goes back to "open". (This replaces the
-  // old trio of status tabs + stage-count buttons + "Showing X only" bar.)
-  const [chip, setChip] = useState("open");
+  useEffect(() => {
+    if (!searchTick) return;
+    if (searchRef.current) { searchRef.current.focus(); try { searchRef.current.scrollIntoView({ block: "center" }); } catch { /* ignore */ } }
+  }, [searchTick]);
+
+  const [todayOnly, setTodayOnly] = useState(false);
   const [search, setSearch] = useState("");
-  // Where the car is (Quiet Cabin, a partner garage…): the one extra filter,
-  // a compact picker at the end of the chip row. Uses getLocations() (the
-  // app's real BASE_LOCATIONS + CUSTOM_LOCATIONS list) so it never falls out
-  // of sync with whatever locations actually exist.
   const [locationFilter, setLocationFilter] = useState(null);
-  // Alerts (follow-ups, warranties, ready-not-informed, reviews, who's out)
-  // live behind one summary strip; it can be expanded, and dismissed until
-  // the set of alerts changes.
+  const [showOffsite, setShowOffsite] = useState(false);
   const [alertsOpen, setAlertsOpen] = useState(false);
   const [dismissedSig, setDismissedSig] = useState(() => { try { return window.sessionStorage.getItem("mrcap_alerts_dismissed") || ""; } catch { return ""; } });
   const isAdmin = session.role === "admin";
@@ -6605,8 +7290,7 @@ function Dashboard({ index, session, team, onOpen, onJobDeleted, canArchive, onR
   };
 
   // Jobs with at least one service where this person is the reviewer,
-  // that service is marked done by the doer, but not yet reviewed —
-  // Ahmed's "don't let a tint job slip through" queue.
+  // that service is marked done by the doer, but not yet reviewed.
   const reviewQueue = index.filter((j) => {
     if (j.stageKey === "collected") return false;
     return (j.serviceTypes || []).some((key) => {
@@ -6616,93 +7300,52 @@ function Dashboard({ index, session, team, onOpen, onJobDeleted, canArchive, onR
     });
   });
 
-  // Two separate rules stack here:
-  // 1. Only archive-access people (you, Suhail, Ahmed, Laani) ever see
-  //    collected cards on the board at all — everyone else never does.
-  // 2. Even for those people, a collected card only stays on the board
-  //    through the end of its collection day — after that it's Archive-only,
-  //    for everyone, permanently.
-  const visible = index.filter((j) => j.stageKey !== "collected" || (canArchive && isRecentlyCollected(j)));
-
-  const active = visible.filter((j) => j.stageKey !== "collected");
-  const highPriority = active.filter((j) => j.priority === "High");
-
-  // "Brought in today" — cars whose job was created since midnight, so
-  // intake (Lani) can see at a glance which of today's arrivals still need
-  // their job card filled in.
+  const active = index.filter((j) => j.stageKey !== "collected");
   const todayStart = new Date(); todayStart.setHours(0, 0, 0, 0);
   const broughtToday = (j) => (j.createdAt || 0) >= todayStart.getTime();
-
-  // Typing in the search box looks through EVERY car (whatever chip is lit),
-  // so a plate is always found; the chips read as "off" while a search is on.
   const searching = search.trim().length > 0;
-  const chipEff = searching ? "all" : chip;
-  const stageChipKeys = STAGES.filter((s) => s.key !== "collected").map((s) => s.key);
-  const filtered = visible.filter((j) => {
-    if (chipEff === "today" && !broughtToday(j)) return false;
-    if (chipEff === "open" && j.stageKey === "collected") return false;
-    if (chipEff === "collected" && j.stageKey !== "collected") return false;
-    if (chipEff === "high" && (j.priority !== "High" || j.stageKey === "collected")) return false;
-    if (stageChipKeys.includes(chipEff) && j.stageKey !== chipEff) return false;
+  const pool = active.filter((j) => {
+    if (todayOnly && !broughtToday(j)) return false;
     if (locationFilter && j.location !== locationFilter) return false;
     if (searching) {
       const q = search.trim().toLowerCase();
-      return (j.plate || "").toLowerCase().includes(q) || (j.customerName || "").toLowerCase().includes(q) || (j.makeModel || "").toLowerCase().includes(q);
+      return (j.plate || "").toLowerCase().includes(q) || (j.customerName || "").toLowerCase().includes(q) || (j.makeModel || "").toLowerCase().includes(q) || (j.customerPhone || "").toLowerCase().includes(q);
     }
     return true;
   });
+  const filtersActive = todayOnly || !!locationFilter;
 
-  const chipCount = (k) => (k === "open" ? active.length : k === "today" ? visible.filter(broughtToday).length : k === "high" ? highPriority.length : k === "collected" ? visible.filter((j) => j.stageKey === "collected").length : k === "all" ? visible.length : active.filter((j) => j.stageKey === k).length);
-  const chipDefs = [
-    ["open", "Open"], ["today", "In today"],
-    ...STAGES.filter((s) => s.key !== "collected").map((s) => [s.key, STAGE_SHORT_LABELS[s.key] || s.label]),
-    ...(isAdmin ? [["high", "High priority"]] : []),
-    ...(canArchive ? [["collected", "Collected"]] : []),
-    ["all", "All"],
+  // On hold and away-from-the-shop cars stay visible, in their own strips.
+  const onHoldJobs = pool.filter((j) => j.onHold);
+  const live = pool.filter((j) => !j.onHold);
+  const stageIdxOf = (j) => STAGES.findIndex((s) => s.key === j.stageKey);
+  const laneOfJob = (j) => boardLaneOf(stageIdxOf(j), false, j.location);
+  const offsiteJobs = live.filter((j) => laneOfJob(j) === "away");
+  const inLanes = live.filter((j) => laneOfJob(j) !== "away");
+  const waiting = inLanes.filter((j) => laneOfJob(j) === "waiting")
+    .map((j) => ({ j, w: waitClock(j, now) }))
+    .sort((a, b) => b.w.ms - a.w.ms || (a.w.since || 0) - (b.w.since || 0)).map((x) => x.j);
+  const progress = inLanes.filter((j) => laneOfJob(j) === "progress")
+    .sort((a, b) => (qcWaitingCats(b, now).length || stageIdxOf(b) === 3 ? 1 : 0) - (qcWaitingCats(a, now).length || stageIdxOf(a) === 3 ? 1 : 0) || (a.updatedAt || 0) - (b.updatedAt || 0));
+  const ready = inLanes.filter((j) => laneOfJob(j) === "ready")
+    .sort((a, b) => readyInfo(a, now).since - readyInfo(b, now).since);
+  const lanes = [
+    { key: "waiting", title: "Waiting for technician", short: "Waiting", hint: "Longest first. Assign, then the floor taps Start.", color: COLORS.dangerText, jobs: waiting },
+    { key: "progress", title: "In progress", short: "In progress", hint: "Moved by the TV", color: COLORS.blueText, jobs: progress },
+    { key: "ready", title: "Ready", short: "Ready", hint: "Tell the customer, then Collected", color: COLORS.successText, jobs: ready },
   ];
-  const filtersActive = !searching && (chip !== "open" || !!locationFilter);
-  const clearFilters = () => { setChip("open"); setLocationFilter(null); };
-
-  const grouped = STAGES.map((s) => ({ stage: s, jobs: filtered.filter((j) => j.stageKey === s.key && !j.onHold) })).filter((g) => g.jobs.length || chipEff !== "open" || g.stage.key !== "collected");
-  // On Hold is shown as its own section regardless of which pipeline stage
-  // the job is parked at — it's a parking-lot category (a car just sitting
-  // at the shop, sometimes for months), not a step in the normal workflow,
-  // so it's pulled out of the stage groups above and always surfaced here.
-  const onHoldJobs = filtered.filter((j) => j.onHold);
-  const onHoldOnSite = active.filter((j) => j.onHold).length;
-
-  // On-site stage distribution for the summary card (read-only counts).
-  const stageCounts = STAGES.filter((s) => s.key !== "collected").map((s) => ({ stage: s, count: active.filter((j) => j.stageKey === s.key).length }));
   const todayKey = localDateKey(new Date(now));
   const inToday = active.filter((j) => j.createdAt && localDateKey(new Date(j.createdAt)) === todayKey).length;
 
-  // Follow-ups due: pulled from the FULL index, not the tab-filtered
-  // subset, since a follow-up (e.g. "ceramic reapplication in 6 months")
-  // is often set on a job that's already collected — it should still
-  // surface here regardless of which dashboard tab is selected.
   const todayStr = new Date().toISOString().slice(0, 10);
   const followupsDue = index.filter((j) => j.followupDate && j.followupDate <= todayStr);
-
-  // Warranty expiring soon: next 30 days, same full-index reasoning as
-  // follow-ups above — a warranty is almost always on an already-
-  // collected job, so it must not depend on which tab is active.
   const in30DaysStr = new Date(Date.now() + 30 * 24 * 60 * 60 * 1000).toISOString().slice(0, 10);
   const warrantiesExpiringSoon = index
     .filter((j) => j.warrantyExpiry && j.warrantyExpiry >= todayStr && j.warrantyExpiry <= in30DaysStr)
     .sort((a, b) => (a.warrantyExpiry < b.warrantyExpiry ? -1 : 1));
-
-  // Ready for collection, but nobody's ticked "Customer informed" —
-  // the checkbox is only useful as a record if something actually
-  // surfaces the gap, otherwise it's easy for a car to sit ready with
-  // no one having actually told the customer.
-  const readyNotInformed = index.filter((j) => j.stageKey === "ready" && !(j.customerNotify || {}).ready_for_collection?.informedBy);
-
-  // One summary for every alert block. Dismissing hides the strip until the
-  // mix of alerts changes (a new follow-up, a car becoming ready…).
   const canSeeOut = isAdmin || CORE_FOUR.includes(session.id) || CORE_FOUR.includes((session.name || "").toLowerCase());
   const alertParts = [
     followupsDue.length ? { n: followupsDue.length, text: `${followupsDue.length} follow-up${followupsDue.length === 1 ? "" : "s"}` } : null,
-    readyNotInformed.length ? { n: readyNotInformed.length, text: `${readyNotInformed.length} ready, customer not told` } : null,
     reviewQueue.length ? { n: reviewQueue.length, text: `${reviewQueue.length} to review` } : null,
     warrantiesExpiringSoon.length ? { n: warrantiesExpiringSoon.length, text: `${warrantiesExpiringSoon.length} warranty expiring` } : null,
   ].filter(Boolean);
@@ -6712,35 +7355,117 @@ function Dashboard({ index, session, team, onOpen, onJobDeleted, canArchive, onR
   const dismissAlerts = () => { setDismissedSig(alertSig); setAlertsOpen(false); try { window.sessionStorage.setItem("mrcap_alerts_dismissed", alertSig); } catch {} };
   const showStrip = showAlerts || canSeeOut;
 
+  const rowById = (id) => index.find((x) => x.id === id) || null;
+  const failBack = (prev, msg) => { onPatch(prev.id, prev); showToast({ msg, error: true }); };
+
+  // ---- Assign (Dispatch Board's write: assigned_team per category) ----
+  const toggleAssign = async (key, memberId) => {
+    const j = rowById(assignId);
+    if (!j) return;
+    const cur = indexRowToCur(j);
+    const optimistic = assignTeamPatch(cur, key, memberId);
+    if (!optimistic) return; // cap reached
+    const removing = ((j.assignedTeam || {})[key] || []).includes(memberId);
+    const staffName = (team.find((m) => m.id === memberId) || {}).name || memberId;
+    onPatch(j.id, indexFieldsFromPatch(optimistic));
+    const r = await boardWriteJob(j.id, "assigned_team", (c) => assignTeamPatch(c, key, memberId), {
+      summary: `Office board: ${removing ? "removed" : "added"} ${staffName} ${removing ? "from" : "to"} ${key} on ${j.plate}`,
+      failText: `Couldn't save ${removing ? "removing" : "assigning"} ${staffName}`,
+    });
+    if (r.error || r.noop) { failBack(j, r.error || "Not saved — that job already has the most people on it."); return; }
+    onPatch(j.id, indexFieldsFromPatch(r.patch));
+  };
+
+  // ---- Pass QC (same write as the TV's Pass, for every category waiting) ----
+  const canPassQc = isQcApprover(session) || isAdmin;
+  const passQc = async (j) => {
+    if (busyId) return;
+    const cats = qcWaitingCats(j, Date.now());
+    setBusyId(j.id);
+    const optimistic = passQcPatch(indexRowToCur(j), cats, session, team);
+    onPatch(j.id, indexFieldsFromPatch(optimistic));
+    const r = await boardWriteJob(j.id, "service_done,history,assigned_to,assigned_team,stage_index,on_hold,service_types,priority", (c) => passQcPatch(c, cats, session, team), {
+      summary: `Office board: ${session.name} passed QC for ${j.plate}`, failText: `Couldn't save passing QC on ${j.plate}`,
+    });
+    setBusyId(null);
+    if (r.error || r.noop) { failBack(j, r.error || "Not saved."); return; }
+    onPatch(j.id, indexFieldsFromPatch(r.patch));
+    showToast({ msg: `${j.plate} passed QC${r.patch.stage_index === 4 ? " — now Ready" : ""}` });
+  };
+
+  // ---- Tell customer (opens the WhatsApp message; records it) ----
+  const tellCustomer = async (j) => {
+    const prevNotify = j.customerNotify || {};
+    const now2 = Date.now();
+    const nextNotify = { ...prevNotify, ready_for_collection: { ...(prevNotify.ready_for_collection || {}), informedBy: session.name, informedAt: now2 } };
+    onPatch(j.id, { customerNotify: nextNotify, updatedAt: now2 });
+    const r = await boardWriteJob(j.id, "customer_notify", (c) => ({ customer_notify: { ...(c.customer_notify || {}), ready_for_collection: { ...((c.customer_notify || {}).ready_for_collection || {}), informedBy: session.name, informedAt: now2 } } }), {
+      summary: `Office board: told the customer ${j.plate} is ready`, failText: `Couldn't save that the customer was told about ${j.plate}`,
+    });
+    if (r.error) failBack(j, r.error);
+  };
+
+  // ---- Collected (stage 5, through the job card's own saveJob path) ----
+  const collect = async (j) => {
+    setCollectJob(null);
+    if (busyId) return;
+    setBusyId(j.id);
+    const stage = STAGES.find((s) => s.key === "ready");
+    onPatch(j.id, { stageKey: "collected", stageLabel: STAGES[5].label, history: [...(j.history || []), { stage: stage.key, label: stage.label, by: session.name, role: session.role, at: Date.now() }], updatedAt: Date.now() });
+    const res = await quickAdvanceJob(j.id, session, { allowCollect: true });
+    setBusyId(null);
+    if (!res.ok) { failBack(j, res.reason); return; }
+    if (!res.saved) { failBack(j, `Couldn't save ${j.plate} as collected — check the connection and try again.`); return; }
+    onJobUpdated && onJobUpdated(res.updated, res.saved);
+    showToast({ msg: `${j.plate} collected` });
+  };
+
+  const assignJob = assignId ? rowById(assignId) : null;
+  const cardProps = { now, team, onOpen, onAssign: (j) => setAssignId(j.id), onPassQc: { session, canPass: canPassQc, run: passQc }, onTell: tellCustomer, onCollect: (j) => setCollectJob(j) };
+  const renderCard = (lane, j, compact) => (
+    <SwipeableJobCard key={j.id} job={j} session={session} team={team} onDeleted={onJobDeleted}>
+      <OfficeCard j={j} lane={lane} compact={compact} busy={busyId === j.id} {...cardProps} />
+    </SwipeableJobCard>
+  );
+  const dateLine = new Date(now).toLocaleDateString([], { weekday: "short", day: "numeric", month: "short" }).replace(",", "").toUpperCase();
+
   return (
-    <div className="mrcap-view" style={{ padding: "0 18px 120px" }}>
+    <div className="mrcap-view" style={{ padding: desktop ? "0 0 40px" : "0 18px 140px" }}>
       <SyncBar syncState={syncState} lastSyncedAt={lastSyncedAt} onRefresh={onRefresh} />
 
-      {/* Search first, always visible: a plate is one tap + typing away.
-          Typing looks through every car, whatever chip is lit. */}
-      <div style={{ position: "relative", marginBottom: 10 }}>
+      <div style={{ display: "flex", alignItems: "flex-end", gap: 14, padding: "2px 0 10px", flexWrap: "wrap" }}>
+        <div style={{ flex: 1, minWidth: 0 }}>
+          {desktop && <div style={{ fontFamily: MONO_FONT, fontSize: 11, letterSpacing: "0.14em", color: COLORS.gold }}>MR.CAP · {dateLine}</div>}
+          <h1 style={{ margin: "2px 0 0", fontFamily: DISPLAY_FONT, fontWeight: 700, fontSize: desktop ? 34 : 30, lineHeight: 1, textTransform: "uppercase", color: COLORS.ink }}>Today on the floor</h1>
+        </div>
+        {desktop && onNewCar && <button onClick={onNewCar} className="mrcap-press" style={{ ...laneBtnStyle(), height: 44 }}>+ New car</button>}
+      </div>
+
+      {/* Lane counts (phone). On the PC the lane headers carry them. */}
+      {!desktop && (
+        <div data-testid="lane-counts" style={{ display: "grid", gridTemplateColumns: "repeat(3, minmax(0, 1fr))", gap: 8, padding: "2px 0 14px" }}>
+          {lanes.map((l) => (
+            <button key={l.key} onClick={() => { const el = document.getElementById(`lane-${l.key}`); if (el && el.scrollIntoView) el.scrollIntoView({ behavior: "smooth", block: "start" }); }} className="mrcap-press" aria-label={`${l.short}: ${l.jobs.length}`} style={{ display: "flex", flexDirection: "column", alignItems: "flex-start", gap: 2, padding: "10px 12px", borderRadius: 10, textAlign: "left", cursor: "pointer", fontFamily: BODY_FONT, color: COLORS.ink, background: l.key === "waiting" && l.jobs.length ? "rgba(229,138,118,.10)" : COLORS.panel, border: `1px solid ${l.key === "waiting" && l.jobs.length ? "rgba(229,138,118,.35)" : COLORS.line}` }}>
+              <span data-testid={`lane-count-${l.key}`} style={{ fontFamily: DISPLAY_FONT, fontWeight: 700, fontSize: 28, lineHeight: 1, color: l.color }}>{l.jobs.length}</span>
+              <span style={{ fontSize: 12 }}>{l.short}</span>
+            </button>
+          ))}
+        </div>
+      )}
+
+      {/* Search first, always visible. Typing looks through every open car. */}
+      <div style={{ position: "relative", marginBottom: 10, maxWidth: desktop ? 420 : "none" }}>
         <Search size={18} color={COLORS.muted} style={{ position: "absolute", left: 14, top: 15, pointerEvents: "none" }} />
-        <input type="search" aria-label="Search plate, customer or model" value={search} onChange={(e) => setSearch(e.target.value)} placeholder="Search plate, customer, model…" style={{ ...inputStyle, marginTop: 0, paddingLeft: 42, paddingRight: 48, background: COLORS.panel }} />
+        <input ref={searchRef} type="search" aria-label="Search plate, customer or model" value={search} onChange={(e) => setSearch(e.target.value)} placeholder="Search plate, customer, model…" style={{ ...inputStyle, marginTop: 0, paddingLeft: 42, paddingRight: 48, background: COLORS.panel }} />
         {search && (
           <button onClick={() => setSearch("")} className="mrcap-press" aria-label="Clear search" style={{ position: "absolute", right: 2, top: 1, width: TAP, height: TAP, background: "none", border: "none", color: COLORS.muted, cursor: "pointer", display: "flex", alignItems: "center", justifyContent: "center" }}><X size={18} /></button>
         )}
       </div>
 
-      {/* The one filter row. One chip lit at a time; tap the lit chip (or
-          Clear) to go back to every open car. The counts on the chips are the
-          stage numbers the old hero card used to show. */}
-      <div className="mrcap-scroll-x" role="group" aria-label="Filter cars" style={{ display: "flex", gap: 8, overflowX: "auto", margin: "0 -18px 12px", padding: "2px 18px" }}>
-        {filtersActive && (
-          <button onClick={clearFilters} className="mrcap-press" style={{ ...filterChipStyle(false), borderColor: COLORS.gold, color: COLORS.gold }}><X size={14} /> Clear</button>
-        )}
-        {chipDefs.map(([k, label]) => {
-          const on = !searching && chip === k;
-          return (
-            <button key={k} onClick={() => setChip((c) => (c === k ? "open" : k))} className="mrcap-press" aria-pressed={on} style={filterChipStyle(on)}>
-              {label} <span style={{ fontFamily: MONO_FONT, fontSize: FONT_SIZE.meta, opacity: on ? 0.8 : 0.65 }}>{chipCount(k)}</span>
-            </button>
-          );
-        })}
+      <div role="group" aria-label="Filters" style={{ display: "flex", gap: 8, flexWrap: "wrap", marginBottom: 12 }}>
+        <button onClick={() => setTodayOnly((v) => !v)} className="mrcap-press" aria-pressed={todayOnly} data-testid="filter-today" style={filterChipStyle(todayOnly)}>
+          Brought in today <span style={{ fontFamily: MONO_FONT, fontSize: FONT_SIZE.meta, opacity: todayOnly ? 0.8 : 0.65 }}>{active.filter(broughtToday).length}</span>
+        </button>
         {getLocations().length > 1 && (
           <label className="mrcap-press" style={{ ...filterChipStyle(!!locationFilter), position: "relative", paddingRight: 10 }}>
             <Building2 size={14} />
@@ -6750,9 +7475,9 @@ function Dashboard({ index, session, team, onOpen, onJobDeleted, canArchive, onR
             </select>
           </label>
         )}
+        {filtersActive && <button onClick={() => { setTodayOnly(false); setLocationFilter(null); }} className="mrcap-press" style={{ ...filterChipStyle(false), borderColor: COLORS.gold, color: COLORS.gold }}><X size={14} /> Clear</button>}
       </div>
 
-      {/* Alerts: ONE strip. Expand for the detail, dismiss until something new. */}
       {showStrip && (
         <div data-testid="alert-strip" className="mrcap-rise" style={{ background: COLORS.panel, border: `1px solid ${showAlerts ? "rgba(201,162,39,0.5)" : COLORS.line}`, borderRadius: RADIUS.lg, marginBottom: 12, overflow: "hidden" }}>
           <div style={{ display: "flex", alignItems: "center" }}>
@@ -6780,25 +7505,9 @@ function Dashboard({ index, session, team, onOpen, onJobDeleted, canArchive, onR
                         key={j.id} j={j} tone="red" onOpen={onOpen}
                         sub={`${j.followupNote || "Follow-up due"} — ${formatLongDate(j.followupDate)}`}
                         action={j.customerPhone ? (
-                          <WhatsAppSendButton
-                            phone={j.customerPhone}
-                            templateKey="follow_up"
-                            vars={{ customerName: j.customerName || "", makeModel: j.makeModel || "vehicle", plate: j.plate || "", reason: j.followupNote || "a follow-up" }}
-                            label="Message"
-                            small
-                          />
+                          <WhatsAppSendButton phone={j.customerPhone} templateKey="follow_up" vars={{ customerName: j.customerName || "", makeModel: j.makeModel || "vehicle", plate: j.plate || "", reason: j.followupNote || "a follow-up" }} label="Message" small />
                         ) : null}
                       />
-                    ))}
-                  </div>
-                </div>
-              )}
-              {readyNotInformed.length > 0 && (
-                <div style={{ marginTop: 12 }}>
-                  <BoardSectionHead icon={Send} color={COLORS.dangerText} title="Ready — Customer Not Yet Informed" count={readyNotInformed.length} tone="red" />
-                  <div style={{ display: "flex", flexDirection: "column", gap: 8 }}>
-                    {readyNotInformed.map((j) => (
-                      <BoardAlertRow key={j.id} j={j} tone="red" onOpen={onOpen} sub={'Ready for collection — nobody\'s ticked "Customer informed" yet'} action={<ChevronLeft size={18} color={COLORS.muted} style={{ transform: "rotate(180deg)", flexShrink: 0 }} />} />
                     ))}
                   </div>
                 </div>
@@ -6822,13 +7531,7 @@ function Dashboard({ index, session, team, onOpen, onJobDeleted, canArchive, onR
                         key={j.id} j={j} tone="gold" onOpen={onOpen}
                         sub={`Warranty expires ${formatLongDate(j.warrantyExpiry)}`}
                         action={j.customerPhone ? (
-                          <WhatsAppSendButton
-                            phone={j.customerPhone}
-                            templateKey="warranty_reminder"
-                            vars={{ customerName: j.customerName || "", makeModel: j.makeModel || "vehicle", plate: j.plate || "", expiryDate: j.warrantyExpiry }}
-                            label="Message"
-                            small
-                          />
+                          <WhatsAppSendButton phone={j.customerPhone} templateKey="warranty_reminder" vars={{ customerName: j.customerName || "", makeModel: j.makeModel || "vehicle", plate: j.plate || "", expiryDate: j.warrantyExpiry }} label="Message" small />
                         ) : null}
                       />
                     ))}
@@ -6879,89 +7582,73 @@ function Dashboard({ index, session, team, onOpen, onJobDeleted, canArchive, onR
         </div>
       )}
 
-      {/* The one number the boss wants: how many cars are physically in the
-          shop right now (on-hold cars included, they're still here), as a
-          slim line with the stage mix as a thin bar. The per-stage numbers
-          live on the filter chips above. */}
-      <section className="mrcap-rise" aria-label="Cars in the shop" style={{ display: "flex", alignItems: "center", gap: 12, background: COLORS.panel, border: `1px solid ${COLORS.line}`, borderRadius: RADIUS.lg, padding: "10px 14px", marginBottom: 14 }}>
-        <span style={{ fontFamily: MONO_FONT, fontWeight: 600, fontSize: 30, color: COLORS.ink, lineHeight: 1 }}>{active.length}</span>
-        <div style={{ minWidth: 0, flex: 1 }}>
-          <div style={eyebrowStyle}>Cars In The Shop Right Now</div>
-          <div aria-hidden="true" style={{ display: "flex", height: 6, borderRadius: 3, overflow: "hidden", gap: 2, marginTop: 6, background: active.length ? "transparent" : COLORS.line }}>
-            {stageCounts.filter((c) => c.count > 0).map((c) => (
-              <div key={c.stage.key} style={{ flexGrow: c.count, flexBasis: 0, background: STAGE_BAR_COLORS[c.stage.key] || COLORS.gold }} />
-            ))}
-          </div>
-        </div>
-        <div style={{ display: "flex", flexDirection: "column", alignItems: "flex-end", gap: 4, flexShrink: 0 }}>
-          {inToday > 0 && <span style={{ fontSize: FONT_SIZE.meta, fontWeight: 600, color: COLORS.successText }}>{inToday} in today</span>}
-          {onHoldOnSite > 0 && <span style={{ fontSize: FONT_SIZE.meta, fontWeight: 600, color: COLORS.gold }}>{onHoldOnSite} on hold</span>}
-        </div>
-      </section>
-
       {toast && createPortal(
-        <div role="status" aria-live="polite" data-testid="quick-toast" className="mrcap-rise" style={{ position: "fixed", left: 16, right: 16, bottom: "calc(max(88px, env(safe-area-inset-bottom) + 88px))", zIndex: 999, maxWidth: 448, margin: "0 auto", background: "rgba(20,19,17,0.98)", border: `1px solid ${toast.error ? COLORS.red : COLORS.gold}`, borderLeft: `4px solid ${toast.error ? COLORS.red : COLORS.gold}`, borderRadius: RADIUS.md, padding: "8px 8px 8px 14px", display: "flex", alignItems: "center", gap: 10, boxShadow: "0 16px 36px -10px rgba(0,0,0,0.75)" }}>
+        <div role="status" aria-live="polite" data-testid="quick-toast" className="mrcap-rise" style={{ position: "fixed", left: 16, right: 16, bottom: desktop ? 24 : "calc(max(96px, env(safe-area-inset-bottom) + 96px))", zIndex: 999, maxWidth: 448, margin: "0 auto", background: "rgba(20,19,17,0.98)", border: `1px solid ${toast.error ? COLORS.red : COLORS.gold}`, borderLeft: `4px solid ${toast.error ? COLORS.red : COLORS.gold}`, borderRadius: RADIUS.md, padding: "8px 8px 8px 14px", display: "flex", alignItems: "center", gap: 10, boxShadow: "0 16px 36px -10px rgba(0,0,0,0.75)" }}>
           <span style={{ flex: 1, minWidth: 0, fontSize: FONT_SIZE.base, color: toast.error ? COLORS.dangerText : COLORS.ink, lineHeight: 1.35 }}>{toast.msg}</span>
-          {toast.undo && <button onClick={toast.undo} className="mrcap-press" style={{ minHeight: TAP, padding: "0 16px", borderRadius: RADIUS.md, border: `1px solid ${COLORS.gold}`, background: "transparent", color: COLORS.gold, fontWeight: 700, fontSize: FONT_SIZE.base, cursor: "pointer" }}>Undo</button>}
+          <button onClick={() => setToast(null)} className="mrcap-press" aria-label="Dismiss" style={{ width: TAP, height: TAP, background: "none", border: "none", color: COLORS.muted, cursor: "pointer" }}><X size={16} /></button>
         </div>,
         document.body
       )}
 
-      {filtered.length === 0 && (
+      {pool.length === 0 && (
         <EmptyState icon={Car} title="No job cards here yet." sub={searching || filtersActive ? "Try clearing the search or filters." : "New cars you check in will show up here."} />
       )}
 
-      {grouped.map(({ stage, jobs }) => jobs.length > 0 && (
-        <div key={stage.key} style={{ marginBottom: 20 }}>
-          <div style={{ display: "flex", alignItems: "center", gap: 8, marginBottom: 10 }}>
-            <span style={{ width: 8, height: 8, borderRadius: 2, background: STAGE_BAR_COLORS[stage.key] || COLORS.muted }} />
-            <div style={{ fontFamily: DISPLAY_FONT, fontWeight: 700, fontSize: 16, color: COLORS.ink }}>{stage.label}</div>
-            <span style={{ fontFamily: MONO_FONT, fontSize: 12, color: COLORS.muted }}>{jobs.length}</span>
-          </div>
-          <div style={{ display: "flex", flexDirection: "column", gap: 10 }}>
-            {jobs.map((j) => (
-              <SwipeableJobCard key={j.id} job={j} session={session} team={team} onDeleted={onJobDeleted}>
-                <>
-                  {/* Fragment on purpose: the pill is positioned against SwipeableJobCard's own (transformed) wrapper, and the card stays its direct child. */}
-                  <BoardJobCard j={j} now={now} onOpen={onOpen} quickRoom={canQuickAdvanceSummary(j)} />
-                  {canQuickAdvanceSummary(j) && (
-                    <button
-                      onClick={() => quickDone(j)}
-                      disabled={advancingId === j.id}
-                      className="mrcap-press"
-                      data-testid="quick-done"
-                      aria-label={`Mark done — move ${j.plate} to ${STAGES[Math.min(STAGES.findIndex((s) => s.key === j.stageKey) + 1, STAGES.length - 1)].label}`}
-                      title="Mark done → next stage"
-                      style={{ position: "absolute", right: 10, bottom: 8, minHeight: TAP, minWidth: 84, padding: "0 14px", borderRadius: RADIUS.pill, border: `1.5px solid ${COLORS.gold}`, background: "rgba(201,162,39,0.14)", color: COLORS.goldBright, fontSize: FONT_SIZE.body, fontWeight: 700, display: "flex", alignItems: "center", justifyContent: "center", gap: 6, cursor: "pointer", opacity: advancingId === j.id ? 0.5 : 1 }}
-                    >
-                      {advancingId === j.id ? "…" : <>Done <ArrowRight size={16} /></>}
-                    </button>
-                  )}
-                </>
-              </SwipeableJobCard>
-            ))}
-          </div>
-        </div>
-      ))}
+      <div data-testid={desktop ? "pc-board" : "phone-board"} style={desktop ? { display: "grid", gridTemplateColumns: "repeat(3, minmax(0, 1fr))", gap: 16, alignItems: "start" } : { display: "flex", flexDirection: "column", gap: 18 }}>
+        {lanes.map((l) => (
+          <section key={l.key} id={`lane-${l.key}`} data-testid={`lane-${l.key}`} aria-label={l.title} style={{ display: "flex", flexDirection: "column", gap: 8, minWidth: 0, ...(desktop ? { padding: 14, borderRadius: 14, background: "#100F0D", border: `1px solid ${COLORS.line}` } : {}) }}>
+            <div style={{ display: "flex", alignItems: "baseline", justifyContent: "space-between", gap: 8 }}>
+              <h2 style={{ margin: 0, fontFamily: DISPLAY_FONT, fontWeight: 700, fontSize: desktop ? 21 : 19, textTransform: "uppercase", letterSpacing: 0.6, color: COLORS.ink }}>{l.title}</h2>
+              {desktop
+                ? <span data-testid={`lane-count-${l.key}`} style={{ fontFamily: DISPLAY_FONT, fontWeight: 700, fontSize: 24, color: l.color }}>{l.jobs.length}</span>
+                : <span style={{ fontFamily: MONO_FONT, fontSize: 11, color: COLORS.muted, textTransform: "uppercase" }}>{l.key === "waiting" ? "Longest first" : l.key === "progress" ? "Moved by the TV" : "Tell the customer"}</span>}
+            </div>
+            {desktop && <span style={{ fontSize: 12, color: COLORS.muted, padding: "0 2px 4px" }}>{l.hint}</span>}
+            {l.jobs.length === 0 && <div style={{ fontSize: FONT_SIZE.body, color: COLORS.muted, padding: "6px 2px" }}>{l.key === "waiting" ? "No car is waiting." : l.key === "progress" ? "Nothing in progress." : "Nothing ready."}</div>}
+            {l.jobs.map((j) => renderCard(l.key, j, desktop))}
+          </section>
+        ))}
+      </div>
 
-      {/* On Hold now renders last, deliberately below every active stage —
-          these are the "sitting for months" cars, not day-to-day work, so
-          they shouldn't push the actually-moving jobs further down the
-          screen. Still its own clearly-labeled section, never mixed in. */}
+      {/* Cars away from the shop (Smartech, Beneloom…): out of the lanes, in one strip. */}
+      {offsiteJobs.length > 0 && (
+        <div data-testid="offsite-strip" style={{ marginTop: 18, background: COLORS.panel, border: `1px solid ${COLORS.line}`, borderRadius: RADIUS.lg, overflow: "hidden" }}>
+          <button onClick={() => setShowOffsite((v) => !v)} aria-expanded={showOffsite} className="mrcap-press" style={{ width: "100%", minHeight: 48, display: "flex", alignItems: "center", gap: 10, padding: "0 14px", background: "none", border: "none", color: COLORS.ink, cursor: "pointer", fontSize: FONT_SIZE.body, textAlign: "left" }}>
+            <Building2 size={16} color={COLORS.gold} /> <b>Away from the shop</b> <span style={{ color: COLORS.muted }}>· {offsiteJobs.length}</span>
+            <ChevronDown size={18} color={COLORS.muted} style={{ marginLeft: "auto", transform: showOffsite ? "rotate(180deg)" : "none" }} />
+          </button>
+          {showOffsite && (
+            <div style={{ display: "flex", flexDirection: "column", gap: 8, padding: "0 12px 12px" }}>
+              {offsiteJobs.map((j) => (
+                <button key={j.id} onClick={() => onOpen(j.id)} className="mrcap-press" data-testid="offsite-card" style={{ display: "flex", alignItems: "center", gap: 10, textAlign: "left", background: COLORS.panel2, border: `1px solid ${COLORS.line}`, borderRadius: 12, padding: "10px 12px", cursor: "pointer", color: COLORS.ink, fontFamily: BODY_FONT, minHeight: TAP }}>
+                  <PlateChip plate={j.plate} size="sm" />
+                  <span style={{ fontSize: 13, flex: 1, minWidth: 0, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{j.makeModel || "Vehicle"} <span style={{ color: COLORS.muted }}>· {dispatchLocationShort(j.location)} · {dispatchAwayLabel(j, now)}</span></span>
+                </button>
+              ))}
+            </div>
+          )}
+        </div>
+      )}
+
       {onHoldJobs.length > 0 && (
-        <div style={{ marginBottom: 20 }}>
+        <div data-testid="onhold-section" style={{ marginTop: 18 }}>
           <div style={{ display: "flex", alignItems: "center", gap: 8, marginBottom: 10 }}>
             <PauseCircle size={15} color={COLORS.gold} />
             <div style={{ fontFamily: DISPLAY_FONT, fontWeight: 700, fontSize: 16, color: COLORS.gold }}>On Hold</div>
             <span style={{ fontFamily: MONO_FONT, fontSize: 12, color: COLORS.muted }}>{onHoldJobs.length}</span>
           </div>
-          <div style={{ display: "flex", flexDirection: "column", gap: 10 }}>
+          <div style={desktop ? { display: "grid", gridTemplateColumns: "repeat(3, minmax(0, 1fr))", gap: 10 } : { display: "flex", flexDirection: "column", gap: 10 }}>
             {onHoldJobs.map((j) => (
-              <BoardJobCard key={j.id} j={j} now={now} onOpen={onOpen} onHoldCard />
+              <BoardJobCard key={j.id} j={j} now={now} onOpen={onOpen} onHoldCard compact={desktop} />
             ))}
           </div>
         </div>
       )}
+
+      {inToday > 0 && <div style={{ fontSize: FONT_SIZE.meta, color: COLORS.successText, marginTop: 14, textAlign: "center" }}>{inToday} brought in today</div>}
+
+      {assignJob && <AssignSheet job={assignJob} team={team} onToggle={toggleAssign} onClose={() => setAssignId(null)} />}
+      {collectJob && <ConfirmSheet title="Collected?" body={`Mark ${collectJob.plate} (${collectJob.makeModel || "vehicle"}) as collected. It leaves the board and goes to Archive.`} confirmLabel="Yes, collected" onConfirm={() => collect(collectJob)} onCancel={() => setCollectJob(null)} />}
     </div>
   );
 }
@@ -7276,6 +7963,8 @@ function NewJobForm({ session, team, onCreated, onCancel }) {
   // already in the system.
   const [possibleMatches, setPossibleMatches] = useState([]);
   const [matchDismissed, setMatchDismissed] = useState(false);
+  const [pickedCustomer, setPickedCustomer] = useState(null); // existing customer chosen from the matches
+  const [numberMsg, setNumberMsg] = useState("");
   const [plateMatch, setPlateMatch] = useState(null);
   const [plateHistory, setPlateHistory] = useState(null); // most recent past job on this plate, if any
   const [ownerChoice, setOwnerChoice] = useState(null); // 'same' | 'different' | null (undecided)
@@ -7504,7 +8193,7 @@ function NewJobForm({ session, team, onCreated, onCancel }) {
       assignedTeam: Object.fromEntries(
         Object.entries(assignedTo).filter(([, memberId]) => memberId).map(([key, memberId]) => [key, [memberId]])
       ),
-      stageIndex: 0,
+      // stageIndex 1 + the waiting entry come from newJobAtWaiting() below
       photos: { intake: [...photos, ...vinPhotos], parts_removal: [], service: {}, },
       startTime: null, stopTime: null, invoiceAmount: "",
       signature, signedAt: signature ? now : null,
@@ -7516,7 +8205,7 @@ function NewJobForm({ session, team, onCreated, onCancel }) {
       // treatment can be flagged per-piece from Services & Pricing — so
       // always saved, not gated on routesToSmartech.
       smartechPieces,
-      history: [{ stage: "intake", label: "Intake", by: session.name, role: session.role, note: "Job card opened — customer signed", at: now }],
+      ...newJobAtWaiting([{ stage: "intake", label: STAGES[0].label, by: session.name, role: session.role, note: "Job card opened — customer signed", at: now }], session.name, session.role, now),
       createdAt: now, updatedAt: now, createdBy: session.name,
     };
     const result = await createJob(job, { reassignVehicle: ownerChoice === "different", customerType });
@@ -7620,13 +8309,20 @@ function NewJobForm({ session, team, onCreated, onCancel }) {
         </div>
       </Field>
 
+      {pickedCustomer && customerName.trim() === pickedCustomer.name && canonPhone(customerPhone) && !customerHasNumber(pickedCustomer, customerPhone) && (
+        <div data-testid="add-number-offer" style={{ background: "rgba(201,162,39,0.12)", border: `1px solid ${COLORS.gold}`, borderRadius: 10, padding: "11px 12px", marginTop: -8, marginBottom: 14 }}>
+          <div style={{ fontSize: FONT_SIZE.base, color: COLORS.ink, marginBottom: 6 }}>{customerPhone.trim()} isn't saved for {pickedCustomer.name}. Without this, a second customer record is created.</div>
+          <button onClick={async () => { const u = await addCustomerNumber(pickedCustomer, customerPhone); if (u) { setPickedCustomer(u); setNumberMsg(""); } else setNumberMsg("Couldn't save the number. Try again."); }} className="mrcap-press" style={{ minHeight: TAP, fontSize: FONT_SIZE.body, fontWeight: 600, color: COLORS.darkText, background: COLORS.gold, border: "none", borderRadius: RADIUS.md, padding: "0 14px", cursor: "pointer" }}>Add this number to {pickedCustomer.name}</button>
+          {numberMsg && <div role="alert" style={{ marginTop: 6, fontSize: FONT_SIZE.base, color: "#E08A78" }}>{numberMsg}</div>}
+        </div>
+      )}
       {possibleMatches.length > 0 && !matchDismissed && (
         <div className="mrcap-fade" style={{ background: "rgba(201,162,39,0.12)", border: `1px solid ${COLORS.gold}`, borderRadius: 10, padding: "11px 12px", marginTop: -8, marginBottom: 14 }}>
           <div style={{ fontSize: FONT_SIZE.base, color: COLORS.gold, fontWeight: 600, marginBottom: 6 }}>Possible existing customer{possibleMatches.length > 1 ? "s" : ""}</div>
           <div style={{ display: "flex", flexDirection: "column", gap: 6 }}>
             {possibleMatches.map((c) => (
-              <button key={c.id} onClick={() => { setCustomerName(c.name); if (c.phone) setCustomerPhone(c.phone); setCustomerType(c.customer_type === "b2b" ? "b2b" : "retail"); setMatchDismissed(true); }} className="mrcap-press" style={{ display: "flex", justifyContent: "space-between", alignItems: "center", gap: 8, minHeight: 48, padding: "8px 12px", borderRadius: RADIUS.md, border: `1px solid ${COLORS.line}`, background: COLORS.panel2, cursor: "pointer", textAlign: "left" }}>
-                <span style={{ fontSize: FONT_SIZE.body, color: COLORS.ink }}>{c.name}{c.phone ? ` · ${c.phone}` : ""}</span>{c.customer_type === "b2b" && <Pill tone="purple">B2B</Pill>}
+              <button key={c.id} onClick={() => { setCustomerName(c.name); if (c.phone) setCustomerPhone(c.phone); setCustomerType(c.customer_type === "b2b" ? "b2b" : "retail"); setPickedCustomer(c); setNumberMsg(""); setMatchDismissed(true); }} className="mrcap-press" style={{ display: "flex", justifyContent: "space-between", alignItems: "center", gap: 8, minHeight: 48, padding: "8px 12px", borderRadius: RADIUS.md, border: `1px solid ${COLORS.line}`, background: COLORS.panel2, cursor: "pointer", textAlign: "left" }}>
+                <span style={{ fontSize: FONT_SIZE.body, color: COLORS.ink }}>{c.name}{c.phone ? ` · ${c.phone}` : ""}{customerPhone.trim() && !phonesSame(c.phone, customerPhone) && customerHasNumber(c, customerPhone) ? ` (also ${customerPhone.trim()})` : ""}</span>{c.customer_type === "b2b" && <Pill tone="purple">B2B</Pill>}
                 <span style={{ fontSize: FONT_SIZE.body, color: COLORS.gold, fontWeight: 600 }}>Use this</span>
               </button>
             ))}
@@ -7637,13 +8333,6 @@ function NewJobForm({ session, team, onCreated, onCancel }) {
         </div>
       )}
 
-      <Field label="Priority">
-        <div style={{ display: "flex", gap: 8 }}>
-          {PRIORITIES.map((p) => (
-            <button key={p} onClick={() => setPriority(p)} className="mrcap-press" aria-pressed={priority === p} style={{ ...selectChipStyle(priority === p), flex: 1, borderRadius: 12, minHeight: 46, ...(priority === p && p === "High" ? { border: `1.5px solid ${COLORS.dangerText}`, background: "rgba(168,64,47,0.18)", color: COLORS.dangerText } : {}) }}>{p}</button>
-          ))}
-        </div>
-      </Field>
 
       <Field label="Location">
         <LocationPicker location={location} setLocation={setLocation} session={session} />
@@ -8167,13 +8856,6 @@ function EditJobScreen({ job, session, onSaved, onCancel }) {
       <Field label="Customer name"><input style={inputStyle} value={customerName} onChange={(e) => setCustomerName(e.target.value)} /></Field>
       <Field label="Customer phone"><input type="tel" inputMode="tel" style={inputStyle} value={customerPhone} onChange={(e) => setCustomerPhone(e.target.value.replace(/[^0-9+]/g, "").replace(/(?!^)\+/g, ""))} /></Field>
 
-      <Field label="Priority">
-        <div style={{ display: "flex", gap: 8 }}>
-          {PRIORITIES.map((p) => (
-            <button key={p} onClick={() => setPriority(p)} className="mrcap-press" aria-pressed={priority === p} style={{ ...selectChipStyle(priority === p), flex: 1, borderRadius: 12, minHeight: 46, ...(priority === p && p === "High" ? { border: `1.5px solid ${COLORS.dangerText}`, background: "rgba(168,64,47,0.18)", color: COLORS.dangerText } : {}) }}>{p}</button>
-          ))}
-        </div>
-      </Field>
       <Field label="Location">
         <LocationPicker location={location} setLocation={setLocation} session={session} />
       </Field>
@@ -8267,12 +8949,6 @@ function EditJobScreen({ job, session, onSaved, onCancel }) {
 
       <Field label="Warranty expiry (optional — e.g. PPF coverage)">
         <input type="date" style={inputStyle} value={warrantyExpiry} onChange={(e) => setWarrantyExpiry(e.target.value)} />
-      </Field>
-      <Field label="Follow-up reminder (optional)">
-        <input type="date" style={inputStyle} value={followupDate} onChange={(e) => setFollowupDate(e.target.value)} />
-        {followupDate && (
-          <input style={{ ...inputStyle, marginTop: 8 }} value={followupNote} onChange={(e) => setFollowupNote(e.target.value)} placeholder="Why follow up? e.g. Ceramic reapplication due" />
-        )}
       </Field>
       <Field label="Job description / requested work">
         <textarea style={textareaStyle} value={description} onChange={(e) => setDescription(e.target.value)} />
@@ -8393,6 +9069,13 @@ function JobDetail({ id, initialJob, session, team, onChanged, onBack, canArchiv
   // banner with a Retry, same as the job form screens already did.
   const [saveFailed, setSaveFailed] = useState(false);
   const [retrying, setRetrying] = useState(false);
+  // Office-board style actions on the job screen: the screen changes first, the
+  // save runs in the background, and a failed save puts things back with this message.
+  const [actionError, setActionError] = useState("");
+  const [assignOpen, setAssignOpen] = useState(false);
+  const [confirmCollect, setConfirmCollect] = useState(false);
+  const [showManual, setShowManual] = useState(false); // the hand stage-mover (off-site / Smartech jobs, odd cases)
+  const readyBoxRef = useRef(null);
   const updateRef = useRef(null); // "Post update" in the bottom bar scrolls here
   // Debounced Parts & fees save (see updateJobParts): latest job + callback
   // kept in refs so a pending save still goes out if the card closes.
@@ -8480,20 +9163,50 @@ function JobDetail({ id, initialJob, session, team, onChanged, onBack, canArchiv
     return last && last.by === session.name && last.note === "Marked done";
   };
 
+  // Every service done -> the car moves to QC (or straight to Ready when each
+  // one has a "QC passed" from the Dispatch TV); un-marking one sends a car
+  // that had moved on back to In progress. Mutates `updated` in place.
+  const applyAutoStage = (updated, now, prevDone) => {
+    const auto = autoStageAfterServiceChange({ stageIndex: updated.stageIndex, onHold: updated.onHold, serviceTypes: updated.serviceTypes, serviceDone: updated.serviceDone, history: updated.history, priority: updated.priority }, session.name, session.role, now, prevDone);
+    if (!auto) return;
+    updated.stageIndex = auto.stageIndex;
+    updated.history = auto.history;
+    updated.priority = auto.priority;
+  };
+
+  // Note for the team on the Dispatch TV (floor leads only). History only.
+  const saveFloorNote = async (text) => {
+    const now = Date.now();
+    const updated = {
+      ...job,
+      history: [...job.history, { stage: "floor_note", label: "Floor note", by: session.name, role: session.role, note: String(text || "").trim().slice(0, FLOOR_NOTE_MAX), at: now }],
+      updatedAt: now,
+    };
+    const saved = await saveJob(updated);
+    setJob(updated);
+    notifyChanged(updated, saved);
+  };
+
   const toggleServiceDone = async (key) => {
     if (!canToggleService(key)) return;
     const nowDone = !job.serviceDone[key];
     const svc = SERVICES.find((s) => s.key === key);
     const now = Date.now();
+    // Build from the server's CURRENT row (stage, hold, services, history), not the card's
+    // possibly stale copy, so a car that has moved on is never sent backwards by this tap.
+    const fresh = await loadFreshServiceState(job.id);
+    const job0 = fresh ? { ...job, ...fresh } : job;
+    const prevDone = job0.serviceDone || {};
     const updated = {
-      ...job,
-      serviceDone: { ...job.serviceDone, [key]: nowDone },
+      ...job0,
+      serviceDone: { ...prevDone, [key]: nowDone },
       // Real accountability trail: record who cleared (or un-cleared)
       // this specific service and when — this is what "Cleared by me"
       // and any future audit actually reads, not just a status flip.
-      history: [...job.history, { stage: "service", label: svc?.label || key, by: session.name, role: session.role, note: nowDone ? "Marked done" : "Un-marked", at: now }],
+      history: [...job0.history, { stage: "service", label: svc?.label || key, by: session.name, role: session.role, note: nowDone ? "Marked done" : "Un-marked", at: now }],
       updatedAt: now,
     };
+    applyAutoStage(updated, now, prevDone);
     const saved = await saveJob(updated);
     setJob(updated);
     notifyChanged(updated, saved);
@@ -8518,13 +9231,17 @@ function JobDetail({ id, initialJob, session, team, onChanged, onBack, canArchiv
     const stepLabel = (list.find((st) => st.key === stepKey) || {}).label || stepKey;
     const note = !wasDone && isTerminal ? "Marked done" : (wasDone && !isTerminal ? "Un-marked" : `Step: ${stepLabel}`);
     const now = Date.now();
+    const fresh = await loadFreshServiceState(job.id);
+    const job0 = fresh ? { ...job, ...fresh } : job;
+    const prevDone = job0.serviceDone || {};
     const updated = {
-      ...job,
-      serviceStep: { ...(job.serviceStep || {}), [key]: stepKey },
-      serviceDone: { ...job.serviceDone, [key]: isTerminal },
-      history: [...job.history, { stage: "service", label: svc?.label || key, by: session.name, role: session.role, note, at: now }],
+      ...job0,
+      serviceStep: { ...(job0.serviceStep || {}), [key]: stepKey },
+      serviceDone: { ...prevDone, [key]: isTerminal },
+      history: [...job0.history, { stage: "service", label: svc?.label || key, by: session.name, role: session.role, note, at: now }],
       updatedAt: now,
     };
+    applyAutoStage(updated, now, prevDone);
     const saved = await saveJob(updated);
     setJob(updated);
     notifyChanged(updated, saved);
@@ -8759,10 +9476,68 @@ function JobDetail({ id, initialJob, session, team, onChanged, onBack, canArchiv
       updated.history = [...updated.history, { stage: "priority", label: "Priority", by: "System", role: "system", note: "High priority automatically revoked — job reached QC", at: now }];
     }
     updated.updatedAt = now;
-    const saved = await saveJob(updated);
+    // Screen first, save in the background; put it back if the save is refused.
+    const prevJob = job;
+    setActionError("");
     setJob(updated);
-    setNote(""); setPendingPhotos([]); setBusy(false);
-    notifyChanged(updated, saved);
+    setNote(""); setPendingPhotos([]);
+    notifyChanged(updated, true);
+    const saved = await saveJob(updated);
+    setBusy(false);
+    if (!saved) {
+      setJob(prevJob);
+      onChanged(prevJob, false);
+      setNote(note); setPendingPhotos(pendingPhotos);
+      setActionError(`Couldn't save — ${job.plate || "the car"} was put back to ${stage.label}. Check the connection and try again.`);
+    }
+  };
+
+  // ---- Board actions on the job screen (same writes as the office board) ----
+  const applyBoardPatch = (patch, base = job) => {
+    const f = {};
+    if (patch.stage_index != null) f.stageIndex = patch.stage_index;
+    if (patch.history) f.history = patch.history;
+    if (patch.service_done) f.serviceDone = patch.service_done;
+    if (patch.assigned_team) f.assignedTeam = patch.assigned_team;
+    if (patch.priority !== undefined) f.priority = patch.priority;
+    const next = { ...base, ...f, updatedAt: Date.now() };
+    if (base._base) next._base = { ...base._base, ...patch };
+    return next;
+  };
+  const toggleAssignHere = async (key, memberId) => {
+    const prevJob = job;
+    const cur = { assigned_team: job.assignedTeam || {} };
+    const optimistic = assignTeamPatch(cur, key, memberId);
+    if (!optimistic) return;
+    const removing = ((job.assignedTeam || {})[key] || []).includes(memberId);
+    const staffName = (team.find((m) => m.id === memberId) || {}).name || memberId;
+    setActionError("");
+    setJob({ ...job, assignedTeam: optimistic.assigned_team });
+    const r = await boardWriteJob(job.id, "assigned_team", (c) => assignTeamPatch(c, key, memberId), {
+      summary: `Job screen: ${removing ? "removed" : "added"} ${staffName} ${removing ? "from" : "to"} ${key} on ${job.plate}`,
+      failText: `Couldn't save ${removing ? "removing" : "assigning"} ${staffName}`,
+    });
+    if (r.error || r.noop) { setJob(prevJob); setActionError(r.error || "Not saved — that job already has the most people on it."); return; }
+    const done = applyBoardPatch(r.patch, prevJob);
+    setJob((cur2) => ({ ...cur2, assignedTeam: r.patch.assigned_team, _base: done._base }));
+    onChanged(done, true);
+  };
+  const passQcHere = async () => {
+    if (busy) return;
+    const prevJob = job;
+    const cats = qcWaitingCats({ ...job, stageKey: STAGES[job.stageIndex].key }, Date.now());
+    setBusy(true);
+    setActionError("");
+    const optimistic = passQcPatch(indexRowToCur({ ...job, stageKey: STAGES[job.stageIndex].key }), cats, session, team);
+    setJob(applyBoardPatch(optimistic, prevJob));
+    const r = await boardWriteJob(job.id, "service_done,history,assigned_to,assigned_team,stage_index,on_hold,service_types,priority", (c) => passQcPatch(c, cats, session, team), {
+      summary: `Job screen: ${session.name} passed QC for ${job.plate}`, failText: `Couldn't save passing QC on ${job.plate}`,
+    });
+    setBusy(false);
+    if (r.error || r.noop) { setJob(prevJob); setActionError(r.error || "Not saved."); return; }
+    const done = applyBoardPatch(r.patch, prevJob);
+    setJob(done);
+    onChanged(done, true);
   };
 
   // Admin-only: send a job back a stage, from ANY stage including
@@ -8839,6 +9614,27 @@ function JobDetail({ id, initialJob, session, team, onChanged, onBack, canArchiv
     const ok = await deleteJob(job, session);
     setDeleting(false);
     if (ok) onDeleted(job.id);
+  };
+
+  // What the sticky bar offers, by stage (see the bar at the bottom).
+  const approverHere = isQcApprover(session) || session.role === "admin";
+  const asRow = { ...job, stageKey: stage.key };
+  const qcCatsHere = qcWaitingCats(asRow, Date.now());
+  const inQcHere = !job.onHold && (stage.key === "qc" || qcCatsHere.length > 0);
+  const awayHere = (isAwayFromShop(job.location) || !!job.smartechFlag) && stage.key !== "ready";
+  const waitingHere = !job.onHold && job.stageIndex <= 1;
+  const waitHere = waitingHere ? waitClock(job) : null;
+  const readyHere = stage.key === "ready" ? readyInfo(asRow) : null;
+  const namesHere = namesOnJob(job, team);
+  const tellUrl = readyHere ? readyMessageUrl(job) : null;
+  const recordToldHere = async () => {
+    const at = Date.now();
+    const prevNotify = job.customerNotify || {};
+    const updated = { ...job, customerNotify: { ...prevNotify, ready_for_collection: { ...(prevNotify.ready_for_collection || {}), informedBy: session.name, informedAt: at } }, updatedAt: at };
+    setJob(updated);
+    const saved = await saveJob(updated);
+    if (!saved) { setJob(job); setActionError("Couldn't save that the customer was told — check the connection and try again."); return; }
+    notifyChanged(updated, saved);
   };
 
   const introPhotos = [
@@ -9028,7 +9824,7 @@ function JobDetail({ id, initialJob, session, team, onChanged, onBack, canArchiv
           <Building2 size={13} /> {job.location}{job.createdAt ? <> · in since {fmtTime(job.createdAt)}</> : null}
         </div>
         <div style={{ display: "flex", gap: 6, flexWrap: "wrap" }}>
-          <Pill tone={priorityTone(job.priority)}>{job.priority}</Pill>
+          {job.priority === "High" && <Pill tone={priorityTone(job.priority)}>High priority</Pill>}
           {job.onHold && <Pill tone="yellow">On Hold</Pill>}
           {job.smartechFlag && <Pill bg={COLORS.gold} fg={COLORS.darkText}>Smartech</Pill>}
         </div>
@@ -9061,30 +9857,53 @@ function JobDetail({ id, initialJob, session, team, onChanged, onBack, canArchiv
           })()}
         </div>
         <StageStepper currentIndex={job.stageIndex} />
+        {waitHere && (
+          <div data-testid="job-wait-line" data-tone={waitHere.tone} style={{ marginTop: 12, display: "flex", alignItems: "center", gap: 8, flexWrap: "wrap", fontSize: 14, fontWeight: 600, color: waitHere.tone === "red" ? COLORS.dangerText : waitHere.tone === "amber" ? "#E0B25A" : COLORS.ink }}>
+            <Clock size={15} /> Waiting for technician · {waitHere.label}
+            {namesHere.length > 0 && <span style={{ fontWeight: 500, color: COLORS.muted }}>· {namesHere.join(", ")} assigned</span>}
+          </div>
+        )}
+        {readyHere && (
+          <div data-testid="job-ready-line" style={{ marginTop: 12, fontSize: 14, fontWeight: 600, color: readyHere.remind ? "#E0B25A" : COLORS.successText }}>
+            {readyHere.label[0].toUpperCase() + readyHere.label.slice(1)} · {readyHere.told ? `customer told${readyHere.toldBy ? ` by ${readyHere.toldBy}` : ""}` : "customer not told yet"}
+          </div>
+        )}
+        {!isLast && (
+          <button onClick={() => setShowManual((v) => !v)} data-testid="move-by-hand" aria-expanded={showManual} className="mrcap-press" style={{ marginTop: 10, minHeight: 36, padding: 0, background: "none", border: "none", color: COLORS.muted, fontSize: 12.5, textDecoration: "underline", cursor: "pointer" }}>
+            Move stage by hand
+          </button>
+        )}
       </section>
+      {actionError && (
+        <div className="mrcap-fade" role="alert" data-testid="action-error" style={{ background: "rgba(168,64,47,0.14)", border: "1px solid rgba(168,64,47,0.6)", borderRadius: 14, padding: "10px 14px", margin: "0 0 14px", fontSize: 13, color: "#F0C4BA", fontWeight: 600 }}>{actionError}</div>
+      )}
 
       {/* ---- Customer job card copy (link sent over WhatsApp) ---- */}
       {!isLast && hasPermission(session, team, "newJob") && !isSmartechPortal(session) && (
         <JobApprovalPanel job={job} session={session} onChanged={onApprovalChanged} />
       )}
 
-      {/* ---- What happens next (note / parts photos travel with the advance below) ---- */}
-      {!isLast && (
-        <section style={{ ...cardStyle, padding: 14, marginBottom: 14, border: `1px solid ${stage.key === "service" && !allServicesDone ? "rgba(214,106,86,0.45)" : COLORS.line}` }}>
+      {/* ---- Note for the team (shows on the Dispatch TV; never customer-facing) ---- */}
+      {!isLast && (isFloorLead(session) || currentFloorNote(job.history)) && (
+        <section aria-label="Note for the team" data-testid="floor-note-box" style={{ ...cardStyle, padding: 14, marginBottom: 14 }}>
+          <div style={{ ...eyebrowStyle, marginBottom: 8 }}>Note for the team</div>
+          <FloorNoteEditor note={currentFloorNote(job.history)} canEdit={isFloorLead(session)} onSave={saveFloorNote} />
+        </section>
+      )}
+
+      {/* ---- Move stage by hand (note travels with the advance) ---- */}
+      {!isLast && showManual && (
+        <section data-testid="manual-stage" style={{ ...cardStyle, padding: 14, marginBottom: 14, border: `1px solid ${stage.key === "service" && !allServicesDone ? "rgba(214,106,86,0.45)" : COLORS.line}` }}>
           <div style={{ fontSize: 13, color: COLORS.muted, display: "flex", alignItems: "center", gap: 6 }}>
             <Wrench size={14} color={COLORS.gold} /> Next: <b style={{ color: COLORS.ink }}>{nextStage.label}</b>
           </div>
-          {stage.key === "parts_removal" && (
-            <>
-              <div style={{ marginTop: 10 }}><PhotoGrid photos={pendingPhotos} onRemove={(i) => setPendingPhotos((p) => p.filter((_, idx) => idx !== i))} /></div>
-              <input ref={fileRef} type="file" accept="image/*" multiple style={{ display: "none" }} onChange={(e) => e.target.files.length && addPendingPhotos(e.target.files)} />
-              <button onClick={() => fileRef.current.click()} className="mrcap-press" style={{ ...cameraBtnStyle, width: "100%" }}><Camera size={16} /> Add parts-removal photo</button>
-            </>
-          )}
           {stage.key === "service" && !allServicesDone && (
             <div style={{ fontSize: 12.5, color: COLORS.dangerText, marginTop: 8 }}>Check off every service below before advancing.</div>
           )}
           <textarea value={note} onChange={(e) => setNote(e.target.value)} placeholder="Add a note for this step (optional)" style={{ ...textareaStyle, minHeight: 50, marginTop: 10 }} />
+          <button onClick={advance} disabled={busy || (stage.key === "service" && !allServicesDone)} data-testid="manual-advance" className="mrcap-press" style={{ ...primaryBtnStyle, width: "100%", marginTop: 10, opacity: busy || (stage.key === "service" && !allServicesDone) ? 0.45 : 1 }}>
+            {busy ? "Saving…" : stage.key === "service" && !allServicesDone ? "Finish every service first" : `Mark done → ${nextStage.label}`}
+          </button>
         </section>
       )}
 
@@ -9098,7 +9917,7 @@ function JobDetail({ id, initialJob, session, team, onChanged, onBack, canArchiv
           old Quick Intake jobs) — leaving no way to ever clear the dashboard's
           "Customer Not Yet Informed" flag for that car. */}
       {stage.key === "ready" && (
-        <>
+        <div ref={readyBoxRef}>
           <WhatsAppSendButton
             phone={job.customerPhone}
             templateKey="ready_for_collection"
@@ -9122,9 +9941,9 @@ function JobDetail({ id, initialJob, session, team, onChanged, onBack, canArchiv
               <CustomerNotifyControl record={job} templateKey="google_review" session={session} onSave={saveJobRecord} skippable={true} label="Google review sent to customer" />
             </>
           )}
-        </>
+        </div>
       )}
-      {stage.key === "intake" && (
+      {(stage.key === "intake" || stage.key === "parts_removal") && (
         <>
           <WhatsAppSendButton
             phone={job.customerPhone}
@@ -9713,13 +10532,13 @@ function JobDetail({ id, initialJob, session, team, onChanged, onBack, canArchiv
         <div style={{ position: "relative", paddingLeft: 20 }}>
           <div aria-hidden="true" style={{ position: "absolute", left: 5, top: 6, bottom: 6, width: 2, background: COLORS.line, borderRadius: 1 }} />
           {job.history.slice().reverse().map((h, i) => {
-            const isStage = STAGES.some((s) => s.key === h.stage && s.label === h.label);
+            const isStage = STAGES.some((s) => s.key === h.stage && stageLabelMatches(s, h.label));
             const dot = h.stage === "reversed" ? COLORS.red : h.stage === "progress_update" ? COLORS.blue : isStage ? COLORS.gold : h.stage === "service" && h.note === "Marked done" ? COLORS.green : COLORS.muted;
             return (
               <div key={i} style={{ position: "relative", paddingBottom: 14 }}>
                 <span aria-hidden="true" style={{ position: "absolute", left: -20, top: 4, width: 12, height: 12, borderRadius: "50%", background: i === 0 ? dot : COLORS.paper, border: `2px solid ${dot}`, boxSizing: "border-box" }} />
                 <div style={{ fontSize: 13.5, color: COLORS.ink, lineHeight: 1.35 }}><b style={{ fontWeight: 600 }}>{h.label}</b> · {h.by} <span style={{ color: COLORS.muted }}>({ROLE_DEFS[h.role]?.label || h.role})</span></div>
-                {h.note && <div style={{ fontSize: 12.5, color: COLORS.muted, marginTop: 1, lineHeight: 1.4 }}>{h.note}</div>}
+                {(h.note || h.stage === "floor_note") && <div style={{ fontSize: 12.5, color: COLORS.muted, marginTop: 1, lineHeight: 1.4 }}>{h.note || "Cleared"}</div>}
                 <div style={{ fontSize: 11, color: COLORS.muted, marginTop: 2, fontFamily: MONO_FONT }}>{fmtTime(h.at)}</div>
               </div>
             );
@@ -9734,15 +10553,37 @@ function JobDetail({ id, initialJob, session, team, onChanged, onBack, canArchiv
               <MessageSquare size={20} color={COLORS.gold} />
             </button>
           )}
-          <button onClick={advance} disabled={busy || (stage.key === "service" && !allServicesDone)} className="mrcap-press" style={{ ...primaryBtnStyle, flex: 1, minWidth: 0, minHeight: 54, borderRadius: 14, fontSize: 15, display: "flex", alignItems: "center", justifyContent: "center", gap: 8, opacity: busy || (stage.key === "service" && !allServicesDone) ? 0.45 : 1, position: "relative", overflow: "hidden" }}>
-            <span style={{ position: "relative", zIndex: 1, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{busy ? "Saving…" : stage.key === "service" && !allServicesDone ? "Finish every service first" : `Mark done → ${nextStage.label}`}</span>
-            {!busy && !(stage.key === "service" && !allServicesDone) && <ArrowRight size={18} style={{ position: "relative", zIndex: 1, flexShrink: 0 }} />}
-            {!busy && !(stage.key === "service" && !allServicesDone) && <span className="mrcap-sweep" style={{ position: "absolute", inset: 0 }} />}
-          </button>
+          {(() => {
+            const bigBtn = { ...primaryBtnStyle, flex: 1, minWidth: 0, minHeight: 54, borderRadius: 14, fontSize: 15, display: "flex", alignItems: "center", justifyContent: "center", gap: 8, textDecoration: "none", boxSizing: "border-box" };
+            const hint = (text) => <div data-testid="job-action-hint" style={{ flex: 1, minWidth: 0, fontSize: 13, color: COLORS.muted, lineHeight: 1.35, padding: "0 4px" }}>{text}</div>;
+            if (job.onHold) return hint("On hold. Take it off hold (Documents & actions) to carry on.");
+            if (awayHere) {
+              const blocked = busy || (stage.key === "service" && !allServicesDone);
+              return (
+                <button onClick={advance} disabled={blocked} data-testid="job-primary" className="mrcap-press" style={{ ...bigBtn, opacity: blocked ? 0.45 : 1 }}>
+                  <span style={{ overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{busy ? "Saving…" : stage.key === "service" && !allServicesDone ? "Finish every service first" : `Away from the shop · Mark done → ${nextStage.label}`}</span>
+                </button>
+              );
+            }
+            if (waitingHere) return <button onClick={() => setAssignOpen(true)} data-testid="job-primary" className="mrcap-press" style={bigBtn}>{namesHere.length ? "Assign · change" : "Assign technician"}</button>;
+            if (inQcHere) return approverHere
+              ? <button onClick={passQcHere} disabled={busy} data-testid="job-primary" className="mrcap-press" style={{ ...bigBtn, opacity: busy ? 0.6 : 1 }}>{busy ? "Saving…" : "Pass QC"}</button>
+              : hint("In QC. Waiting for Noel, Reagen or Ahmed to pass it.");
+            if (readyHere) {
+              if (readyHere.told) return <button onClick={() => setConfirmCollect(true)} disabled={busy} data-testid="job-primary" className="mrcap-press" style={{ ...bigBtn, opacity: busy ? 0.6 : 1 }}>Collected</button>;
+              const label = readyHere.remind ? "Remind" : "Tell customer";
+              return tellUrl
+                ? <a href={tellUrl} target="_blank" rel="noopener noreferrer" onClick={recordToldHere} data-testid="job-primary" className="mrcap-press" style={bigBtn}>{label}</a>
+                : <button onClick={() => { if (readyBoxRef.current) readyBoxRef.current.scrollIntoView({ behavior: "smooth", block: "center" }); }} data-testid="job-primary" className="mrcap-press" style={bigBtn}>{label}</button>;
+            }
+            return hint("Moves by itself when the floor taps on the TV.");
+          })()}
         </StickyActionBar>
       ) : (
         <div style={{ background: "rgba(74,122,87,0.14)", border: "1px solid rgba(74,122,87,0.6)", borderRadius: 16, padding: 16, textAlign: "center", color: COLORS.successText, fontWeight: 700, fontSize: 14, display: "flex", alignItems: "center", justifyContent: "center", gap: 8 }}><CheckCircle2 size={18} /> Vehicle collected — job card closed</div>
       )}
+      {assignOpen && <AssignSheet job={job} team={team} onToggle={toggleAssignHere} onClose={() => setAssignOpen(false)} />}
+      {confirmCollect && <ConfirmSheet title="Collected?" body={`Mark ${job.plate} (${job.makeModel || "vehicle"}) as collected. The job card closes and moves to Archive.`} confirmLabel="Yes, collected" onConfirm={() => { setConfirmCollect(false); advance(); }} onCancel={() => setConfirmCollect(false)} />}
     </div>
   );
 }
@@ -9765,38 +10606,63 @@ function AccessDenied({ onBack }) {
 function InfoBlock({ title, children }) {
   return <div style={{ marginBottom: 12 }}><div style={labelStyle}>{title}</div><div style={{ fontSize: 13.5, color: COLORS.ink, marginTop: 4, lineHeight: 1.4 }}>{children}</div></div>;
 }
-// Horizontal 6-stage stepper for the job screen (design comps): done
-// stages get a gold check, the current one a bright-gold ring.
+// 6-stage rail for the job screen (redesign): one thick segment per
+// stage — gold when done, bright gold for the current one — each with its
+// short name underneath, and the current stage spelled out big below.
 function StageStepper({ currentIndex }) {
+  const last = STAGES.length - 1;
+  const idx = Math.max(0, Math.min(currentIndex, last));
   return (
-    <div style={{ position: "relative", display: "grid", gridTemplateColumns: `repeat(${STAGES.length}, minmax(0, 1fr))`, gap: 4 }}>
-      <div aria-hidden="true" style={{ position: "absolute", top: 12, left: `${50 / STAGES.length}%`, right: `${50 / STAGES.length}%`, height: 2, background: COLORS.line }} />
-      <div aria-hidden="true" style={{ position: "absolute", top: 12, left: `${50 / STAGES.length}%`, width: `${(Math.min(currentIndex, STAGES.length - 1) / STAGES.length) * 100}%`, height: 2, background: COLORS.gold, transition: "width 0.4s ease" }} />
-      {STAGES.map((s, i) => {
-        const done = i < currentIndex || (i === currentIndex && i === STAGES.length - 1);
-        const current = i === currentIndex && !done;
-        return (
-          <div key={s.key} title={s.label} style={{ position: "relative", display: "flex", flexDirection: "column", alignItems: "center", gap: 6, minWidth: 0 }}>
-            <span style={{ width: 26, height: 26, borderRadius: 13, boxSizing: "border-box", display: "flex", alignItems: "center", justifyContent: "center", fontSize: 11, fontWeight: 700, fontFamily: MONO_FONT,
-              background: done ? COLORS.gold : current ? "#2A2414" : COLORS.panel,
-              border: done ? "none" : current ? `2px solid ${COLORS.goldBright}` : `1px solid ${COLORS.line}`,
-              color: done ? COLORS.darkText : current ? COLORS.goldBright : COLORS.muted,
-              boxShadow: current ? "0 0 0 4px rgba(232,195,74,0.12)" : "none" }}>
-              {done ? <Check size={14} strokeWidth={3} /> : i + 1}
-            </span>
-            <span style={{ fontSize: 10, color: current ? COLORS.goldBright : COLORS.muted, fontWeight: current ? 600 : 400, textAlign: "center", lineHeight: 1.2, maxWidth: "100%", overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{STAGE_SHORT_LABELS[s.key] || s.label}</span>
-          </div>
-        );
-      })}
+    <div>
+      <div style={{ display: "grid", gridTemplateColumns: `repeat(${STAGES.length}, minmax(0, 1fr))`, gap: 3 }}>
+        {STAGES.map((s, i) => {
+          const done = i < idx || (i === idx && i === last);
+          const current = i === idx && !done;
+          return (
+            <div key={s.key} title={s.label} style={{ display: "flex", flexDirection: "column", gap: 6, minWidth: 0 }}>
+              <span style={{ height: 8, borderRadius: 4, background: done ? COLORS.gold : current ? COLORS.goldBright : COLORS.line, transition: "background 0.4s ease" }} />
+              <span style={{ fontSize: 10, color: current ? COLORS.goldBright : COLORS.muted, fontWeight: current ? 600 : 400, textAlign: "center", lineHeight: 1.2, maxWidth: "100%", overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{STAGE_SHORT_LABELS[s.key] || s.label}</span>
+            </div>
+          );
+        })}
+      </div>
+      <div style={{ fontFamily: DISPLAY_FONT, fontWeight: 600, fontSize: 24, lineHeight: 1.1, letterSpacing: 0.5, textTransform: "uppercase", color: idx === last ? COLORS.successText : COLORS.gold, marginTop: 10 }}>{STAGES[idx].label}</div>
     </div>
   );
 }
+// "Note for the team": quick chips + a short text box. Floor leads write it,
+// everyone internal sees it. Used on the job card here and (in TV styling) in
+// the Dispatch pop-up.
+function FloorNoteEditor({ note, canEdit, onSave, saving = false }) {
+  const [text, setText] = useState(note ? note.text : "");
+  const dirtyRef = useRef(false);
+  useEffect(() => { if (!dirtyRef.current) setText(note ? note.text : ""); }, [note]);
+  const set = (v) => { dirtyRef.current = true; setText(v.slice(0, FLOOR_NOTE_MAX)); };
+  return (
+    <div>
+      {note && <div data-testid="floor-note-current" style={{ fontSize: 15, fontWeight: 700, color: COLORS.goldBright, lineHeight: 1.35, marginBottom: canEdit ? 10 : 0 }}>{floorNoteLine(note)}</div>}
+      {canEdit && (
+        <>
+          <div style={{ display: "flex", flexWrap: "wrap", gap: 6, marginBottom: 8 }}>
+            {FLOOR_NOTE_CHIPS.map((c) => <button key={c} type="button" onClick={() => set(c)} className="mrcap-press" style={{ ...secondaryBtnStyle, padding: "7px 11px", minHeight: 0, fontSize: 12.5 }}>{c}</button>)}
+          </div>
+          <textarea value={text} onChange={(e) => set(e.target.value)} maxLength={FLOOR_NOTE_MAX} placeholder="A short note the team will see on the TV" aria-label="Note for the team" style={{ ...textareaStyle, minHeight: 50 }} />
+          <div style={{ display: "flex", gap: 8, marginTop: 8 }}>
+            <button type="button" disabled={saving || !text.trim()} onClick={() => { dirtyRef.current = false; onSave(text); }} className="mrcap-press" style={{ ...primaryBtnStyle, flex: 1, minHeight: 44, opacity: text.trim() ? 1 : 0.45 }}>Show on the TV</button>
+            <button type="button" disabled={saving || !note} onClick={() => { dirtyRef.current = false; setText(""); onSave(""); }} className="mrcap-press" style={{ ...secondaryBtnStyle, minHeight: 44, padding: "0 16px", opacity: note ? 1 : 0.45 }}>Clear</button>
+          </div>
+        </>
+      )}
+    </div>
+  );
+}
+
 function StageStrip({ currentIndex }) {
   return (
     <div style={{ display: "flex", alignItems: "center" }}>
       {STAGES.map((s, i) => (
         <React.Fragment key={s.key}>
-          <div title={s.label} style={{ width: 9, height: 9, borderRadius: "50%", background: i <= currentIndex ? COLORS.gold : "rgba(255,255,255,0.25)", flexShrink: 0 }} />
+          <div title={customerStageLabel(s)} style={{ width: 9, height: 9, borderRadius: "50%", background: i <= currentIndex ? COLORS.gold : "rgba(255,255,255,0.25)", flexShrink: 0 }} />
           {i < STAGES.length - 1 && <div style={{ flex: 1, height: 2, background: i < currentIndex ? COLORS.gold : "rgba(255,255,255,0.25)" }} />}
         </React.Fragment>
       ))}
@@ -9855,7 +10721,202 @@ function ArchiveScreen({ index, onOpen, onBack }) {
 
 /* ---------------- Customers (CRM) ---------------- */
 
-function CustomersScreen({ onBack, onOpenJob }) {
+// Progress + result of a merge run, shared by the duplicates screen and the manual merge.
+function MergeStatus({ run }) {
+  if (!run) return null;
+  const bad = run.result && !run.result.ok;
+  return (
+    <div data-testid="merge-status" style={{ marginTop: 10, padding: "10px 12px", borderRadius: 10, fontSize: 13, color: COLORS.ink, background: bad ? "rgba(168,64,47,0.15)" : "rgba(201,162,39,0.12)", border: `1px solid ${bad ? COLORS.red : COLORS.gold}` }}>
+      {!run.result && <div>Step {run.step} of {run.total}: {run.label}…</div>}
+      {run.result && run.result.ok && <div>Merged. {run.result.total} steps done. Nothing was deleted.</div>}
+      {bad && (
+        <div>
+          <div style={{ fontWeight: 700 }}>Merge stopped at: {run.result.failed}</div>
+          <div style={{ marginTop: 4 }}>Done so far: {run.result.done.length ? run.result.done.join("; ") : "nothing yet"}.</div>
+          <div style={{ marginTop: 4 }}>Nothing has been deleted and every step is safe to repeat. Press Merge again to carry on.</div>
+        </div>
+      )}
+    </div>
+  );
+}
+
+function CustomerNumbers({ customer, onChange }) {
+  const [adding, setAdding] = useState("");
+  const [msg, setMsg] = useState("");
+  const [busy, setBusy] = useState(false);
+  const extras = extraPhonesOf(customer);
+  const run = async (fn) => {
+    setBusy(true); setMsg("");
+    const updated = await fn();
+    setBusy(false);
+    if (updated) onChange(updated); else setMsg("Couldn't save. Check the connection and try again.");
+    return !!updated;
+  };
+  const add = async () => {
+    const n = adding.trim();
+    if (!canonPhone(n)) { setMsg("Enter a phone number."); return; }
+    if (customerHasNumber(customer, n)) { setMsg("That number is already on this customer."); return; }
+    if (await run(() => addCustomerNumber(customer, n))) setAdding("");
+  };
+  const makeMain = (n) => run(() => saveCustomerNumbers(customer, n, [...extras.filter((e) => !phonesSame(e, n)), customer.phone].filter(Boolean)));
+  const remove = (n) => run(() => saveCustomerNumbers(customer, customer.phone, extras.filter((e) => !phonesSame(e, n))));
+  const rowStyle = { display: "flex", alignItems: "center", gap: 8, minHeight: 44 };
+  return (
+    <div data-testid="customer-numbers" style={{ ...cardStyle, marginBottom: 18 }}>
+      <div style={labelStyle}>Phone numbers</div>
+      {customer.phone && (
+        <div style={rowStyle}><span style={{ fontFamily: MONO_FONT, fontSize: 14, color: COLORS.ink, flex: 1 }}>{customer.phone}</span><Pill tone="yellow">Main</Pill></div>
+      )}
+      {extras.map((n) => (
+        <div key={n} style={rowStyle}>
+          <span style={{ fontFamily: MONO_FONT, fontSize: 14, color: COLORS.ink, flex: 1 }}>{n}</span>
+          <button disabled={busy} onClick={() => makeMain(n)} className="mrcap-press" style={{ ...secondaryBtnStyle, minHeight: 40, padding: "6px 10px", fontSize: 12.5 }}>Make main</button>
+          <button disabled={busy} onClick={() => remove(n)} aria-label={`Remove ${n}`} className="mrcap-press" style={{ ...secondaryBtnStyle, minHeight: 40, width: 40, padding: 0, display: "flex", alignItems: "center", justifyContent: "center" }}><X size={16} /></button>
+        </div>
+      ))}
+      {!customer.phone && extras.length === 0 && <div style={{ fontSize: 12.5, color: COLORS.muted, marginTop: 6 }}>No number on file.</div>}
+      <div style={{ display: "flex", gap: 8, marginTop: 8 }}>
+        <input type="tel" inputMode="tel" value={adding} onChange={(e) => { setAdding(e.target.value.replace(/[^0-9+]/g, "").replace(/(?!^)\+/g, "")); setMsg(""); }} placeholder="Another number" aria-label="Another number" style={{ ...inputStyle, marginTop: 0, flex: 1 }} />
+        <button disabled={busy} onClick={add} className="mrcap-press" style={{ ...secondaryBtnStyle, minHeight: 46, padding: "0 14px", display: "flex", alignItems: "center", gap: 6 }}><Plus size={16} />Add number</button>
+      </div>
+      {msg && <div role="alert" style={{ marginTop: 6, fontSize: 12.5, color: "#E08A78" }}>{msg}</div>}
+    </div>
+  );
+}
+
+// Manual merge from a customer's page: search another customer, confirm, merge it into this one.
+function MergeIntoThis({ customer, onMerged }) {
+  const [open, setOpen] = useState(false);
+  const [q, setQ] = useState("");
+  const [found, setFound] = useState([]);
+  const [picked, setPicked] = useState(null);
+  const [run, setRun] = useState(null);
+  const [busy, setBusy] = useState(false);
+  useEffect(() => {
+    if (!open || q.trim().length < 2) { setFound([]); return; }
+    const t = setTimeout(async () => setFound((await searchCustomers(q.trim())).filter((c) => c.id !== customer.id)), 300);
+    return () => clearTimeout(t);
+  }, [q, open, customer.id]);
+  const go = async () => {
+    setBusy(true);
+    setRun({ step: 0, total: 0, label: "Starting" });
+    const result = await mergeCustomers(customer, [picked], (step, total, label) => setRun({ step, total, label }));
+    setRun({ result });
+    setBusy(false);
+    if (result.ok) { setPicked(null); setQ(""); setFound([]); onMerged(); }
+  };
+  if (!open) return <button onClick={() => setOpen(true)} className="mrcap-press" style={{ ...secondaryBtnStyle, marginTop: 18, width: "100%" }}>Merge another customer into this one</button>;
+  return (
+    <div data-testid="manual-merge" style={{ ...cardStyle, marginTop: 18 }}>
+      <div style={labelStyle}>Merge another customer into {customer.name}</div>
+      {!picked && (
+        <>
+          <input value={q} onChange={(e) => setQ(e.target.value)} placeholder="Search by name or phone…" aria-label="Customer to merge" style={inputStyle} />
+          <div style={{ display: "flex", flexDirection: "column", gap: 6, marginTop: 8 }}>
+            {found.map((c) => (
+              <button key={c.id} onClick={() => setPicked(c)} className="mrcap-press" style={{ ...secondaryBtnStyle, textAlign: "left", fontSize: 13.5 }}>{c.name}{customerNumbers(c).length ? ` · ${customerNumbers(c).join(", ")}` : ""}</button>
+            ))}
+          </div>
+        </>
+      )}
+      {picked && (
+        <div style={{ marginTop: 8, fontSize: 13.5, color: COLORS.ink }}>
+          Move all cars, jobs, quotes and proformas of <b>{picked.name}</b> to <b>{customer.name}</b>, add its numbers here, and hide {picked.name}. Nothing is deleted.
+          <div style={{ display: "flex", gap: 8, marginTop: 10 }}>
+            <button disabled={busy} onClick={go} className="mrcap-press" style={{ ...primaryBtnStyle, flex: 1 }}>Merge</button>
+            <button disabled={busy} onClick={() => { setPicked(null); setRun(null); }} className="mrcap-press" style={{ ...secondaryBtnStyle }}>Cancel</button>
+          </div>
+        </div>
+      )}
+      <MergeStatus run={run} />
+    </div>
+  );
+}
+
+// Admin-only: groups of customers that look like the same business, with one-tap merge.
+function DuplicatesPanel({ onBack }) {
+  const [state, setState] = useState({ loading: true, groups: [], counts: {}, error: false });
+  const [sel, setSel] = useState({}); // customerId -> ticked
+  const [keepBy, setKeepBy] = useState({}); // group index key -> keeper id
+  const [confirming, setConfirming] = useState(null);
+  const [runs, setRuns] = useState({});
+  const [busy, setBusy] = useState(false);
+  const load = useCallback(async () => {
+    setState((s) => ({ ...s, loading: true }));
+    const [cs, js, vs] = await Promise.all([
+      sbFetchAll("customers?select=*&order=name.asc"),
+      sbFetchAll("jobs?select=customer_id"),
+      sbFetchAll("vehicles?select=customer_id"),
+    ]);
+    if (!cs.ok) { setState({ loading: false, groups: [], counts: {}, error: true }); return; }
+    const counts = {};
+    for (const j of js.data || []) if (j.customer_id) (counts[j.customer_id] = counts[j.customer_id] || { jobs: 0, cars: 0 }).jobs++;
+    for (const v of vs.data || []) if (v.customer_id) (counts[v.customer_id] = counts[v.customer_id] || { jobs: 0, cars: 0 }).cars++;
+    setState({ loading: false, groups: findDuplicateGroups(cs.data.filter((c) => !c.merged_into)), counts, error: false });
+  }, []);
+  useEffect(() => { load(); }, [load]);
+  const merge = async (gid, group) => {
+    const keep = group.find((c) => c.id === keepBy[gid]);
+    const others = group.filter((c) => c.id !== keepBy[gid] && sel[c.id]);
+    setConfirming(null); setBusy(true);
+    setRuns((r) => ({ ...r, [gid]: { step: 0, total: 0, label: "Starting" } }));
+    const result = await mergeCustomers(keep, others, (step, total, label) => setRuns((r) => ({ ...r, [gid]: { step, total, label } })));
+    setRuns((r) => ({ ...r, [gid]: { result } }));
+    setBusy(false);
+    if (result.ok) load();
+  };
+  return (
+    <div className="mrcap-view" style={{ padding: "0 18px 30px" }} data-testid="duplicates-screen">
+      <button onClick={onBack} style={{ ...iconBtnStyle, width: 44, height: 44, marginBottom: 14 }} className="mrcap-press" aria-label="Back to customers"><ChevronLeft size={20} color={COLORS.ink} /></button>
+      <SectionTitle>Possible duplicates</SectionTitle>
+      <div style={{ fontSize: 12.5, color: COLORS.muted, marginBottom: 12 }}>Tick the records that are the same customer, choose the one to keep, then merge. Nothing is deleted.</div>
+      {state.loading && <SkeletonRows count={3} height={80} />}
+      {state.error && <div style={{ color: "#E08A78", fontSize: 13 }}>Couldn't load customers.</div>}
+      {!state.loading && !state.error && state.groups.length === 0 && <EmptyState icon={Users} title="No duplicates found." sub="Every customer name looks different." />}
+      {!state.loading && state.groups.map((group) => {
+        const gid = group.map((c) => c.id).sort()[0];
+        const keepId = keepBy[gid];
+        const others = group.filter((c) => c.id !== keepId && sel[c.id]);
+        const keep = group.find((c) => c.id === keepId);
+        return (
+          <div key={gid} data-testid="dup-group" style={{ ...cardStyle, marginBottom: 12 }}>
+            {group.map((c) => {
+              const n = state.counts[c.id] || { jobs: 0, cars: 0 };
+              return (
+                <div key={c.id} data-testid="dup-row" style={{ display: "flex", alignItems: "flex-start", gap: 10, padding: "8px 0", borderBottom: `1px solid ${COLORS.line}` }}>
+                  <input type="checkbox" aria-label={`Same customer: ${c.name}`} checked={!!sel[c.id]} onChange={(e) => setSel((s) => ({ ...s, [c.id]: e.target.checked }))} style={{ width: 22, height: 22, marginTop: 2 }} />
+                  <div style={{ flex: 1, minWidth: 0 }}>
+                    <div style={{ fontWeight: 600, color: COLORS.ink, fontSize: 14.5 }}>{c.name}</div>
+                    <div style={{ fontFamily: MONO_FONT, fontSize: 12.5, color: COLORS.muted }}>{customerNumbers(c).join(" · ") || "no number"}</div>
+                    <div style={{ fontSize: 12, color: COLORS.muted }}>{n.jobs} job{n.jobs === 1 ? "" : "s"} · {n.cars} car{n.cars === 1 ? "" : "s"}</div>
+                  </div>
+                  <label style={{ display: "flex", alignItems: "center", gap: 6, fontSize: 12.5, color: COLORS.ink, minHeight: 44 }}>
+                    <input type="radio" name={`keep-${gid}`} aria-label={`Keep ${c.name}`} checked={keepId === c.id} onChange={() => { setKeepBy((k) => ({ ...k, [gid]: c.id })); setSel((s) => ({ ...s, [c.id]: true })); }} />Keep
+                  </label>
+                </div>
+              );
+            })}
+            {confirming === gid ? (
+              <div style={{ marginTop: 10, fontSize: 13.5, color: COLORS.ink }}>
+                Merge {others.map((o) => o.name).join(", ")} into <b>{keep && keep.name}</b>? Their cars, jobs, quotes and proformas move across and their numbers are added. Nothing is deleted.
+                <div style={{ display: "flex", gap: 8, marginTop: 8 }}>
+                  <button disabled={busy} onClick={() => merge(gid, group)} className="mrcap-press" style={{ ...primaryBtnStyle, flex: 1 }}>Confirm merge</button>
+                  <button disabled={busy} onClick={() => setConfirming(null)} className="mrcap-press" style={secondaryBtnStyle}>Cancel</button>
+                </div>
+              </div>
+            ) : (
+              <button disabled={busy || !keep || others.length === 0} onClick={() => setConfirming(gid)} className="mrcap-press" style={{ ...primaryBtnStyle, width: "100%", marginTop: 10, opacity: !keep || others.length === 0 ? 0.5 : 1 }}>Merge ticked into the kept one</button>
+            )}
+            <MergeStatus run={runs[gid]} />
+          </div>
+        );
+      })}
+    </div>
+  );
+}
+
+function CustomersScreen({ onBack, onOpenJob, canMerge = false }) {
+  const [showDupes, setShowDupes] = useState(false);
   const [search, setSearch] = useState("");
   const [results, setResults] = useState([]);
   const [searching, setSearching] = useState(false);
@@ -9877,10 +10938,12 @@ function CustomersScreen({ onBack, onOpenJob }) {
   const openCustomer = async (customer) => {
     setSelected(customer);
     setLoadingHistory(true);
-    const h = await loadCustomerHistory(customer.id);
+    const h = await loadCustomerHistory(customer);
     setHistory(h);
     setLoadingHistory(false);
   };
+
+  if (showDupes && canMerge && !selected) return <DuplicatesPanel onBack={() => setShowDupes(false)} />;
 
   if (selected) {
     return (
@@ -9900,6 +10963,8 @@ function CustomersScreen({ onBack, onOpenJob }) {
             <a href={`https://wa.me/${toWhatsAppNumber(selected.phone)}`} target="_blank" rel="noopener noreferrer" aria-label="WhatsApp customer" title="WhatsApp customer" className="mrcap-press" style={{ width: 44, height: 44, borderRadius: 12, background: "#25D366", color: COLORS.darkText, display: "flex", alignItems: "center", justifyContent: "center", flexShrink: 0 }}><MessageCircle size={19} /></a>
           )}
         </div>
+
+        <CustomerNumbers customer={selected} onChange={(c) => { setSelected(c); openCustomer(c); }} />
 
         {loadingHistory && <SkeletonRows count={3} height={72} />}
 
@@ -9941,6 +11006,13 @@ function CustomersScreen({ onBack, onOpenJob }) {
             </div>
           </>
         )}
+
+        {canMerge && (
+          <MergeIntoThis customer={selected} onMerged={async () => {
+            const { ok, data } = await sbFetch(`customers?id=eq.${encodeURIComponent(selected.id)}&select=*&limit=1`);
+            openCustomer(ok && data && data[0] ? data[0] : selected);
+          }} />
+        )}
       </div>
     );
   }
@@ -9948,6 +11020,9 @@ function CustomersScreen({ onBack, onOpenJob }) {
   return (
     <div className="mrcap-view" style={{ padding: "0 18px 30px" }}>
       <SectionTitle>Customers</SectionTitle>
+      {canMerge && (
+        <button onClick={() => setShowDupes(true)} className="mrcap-press" style={{ ...secondaryBtnStyle, width: "100%", marginBottom: 12 }}>Possible duplicates</button>
+      )}
       <div style={{ position: "relative", marginBottom: 14 }}>
         <Search size={16} color={COLORS.muted} style={{ position: "absolute", left: 14, top: 15, pointerEvents: "none" }} />
         <input value={search} onChange={(e) => setSearch(e.target.value)} placeholder="Search by name or phone…" style={{ ...inputStyle, marginTop: 0, paddingLeft: 40, background: COLORS.panel }} autoFocus />
@@ -10296,7 +11371,7 @@ const TEMPLATE_DEFS = [
   {
     key: "job_started",
     label: "Job Started / Intake Confirmation",
-    description: "Sent from a job's detail screen while it's at the Intake stage, to confirm the vehicle's been received.",
+    description: "Sent from a job's detail screen while the car is checked in or waiting for a technician, to confirm the vehicle's been received.",
     tokens: [
       { token: "customerName", sample: "Ahmed" },
       { token: "makeModel", sample: "Toyota Land Cruiser" },
@@ -11135,8 +12210,9 @@ function exportAdminStatsPDF({ rangeLabel, totalRevenue, revenueInRange, activeJ
 // dynamic layouts) for a 3-month pilot feature that mainly needs to be
 // reliable. Context (which screen, who, device) plus a note is enough
 // for someone reviewing these to reproduce most issues.
-function ReportIssueButton({ session, view, onPark }) {
+function ReportIssueButton({ session, view, onPark, hidden = false, openTick = 0 }) {
   const [open, setOpen] = useState(false);
+  useEffect(() => { if (openTick) setOpen(true); }, [openTick]);
   // On the board the circle becomes a small "quick actions" menu (Park a
   // vehicle, Report an issue) so the bottom of the screen is one tidy row.
   const onBoard = view === "list";
@@ -11178,7 +12254,7 @@ function ReportIssueButton({ session, view, onPark }) {
   const leftPx = session && session.viewMode === "pc" && isFullDashboardRole(session) ? 248 : 16;
   return createPortal(
     <>
-      {onBoard ? (
+      {hidden ? null : onBoard ? (
         <div data-quick-menu style={{ position: "fixed", left: leftPx, bottom: "calc(max(18px, env(safe-area-inset-bottom)) + var(--mrcap-fab-lift, 0px))", zIndex: 998 }}>
           {menuOpen && (
             <div role="menu" className="mrcap-rise" style={{ position: "absolute", left: 0, bottom: 58, minWidth: 210, background: COLORS.panel, border: `1px solid ${COLORS.line}`, borderRadius: RADIUS.lg, boxShadow: "0 18px 40px -10px rgba(0,0,0,0.75)", overflow: "hidden" }}>
@@ -12942,7 +14018,6 @@ function JobApprovalPanel({ job, session, onChanged, autoSend = false }) {
   const sent = !!(job.approvalToken && snap);
   const link = job.approvalToken ? approvalLink(job.approvalToken) : "";
   const { needs, at } = sent ? jobCardNeedsUpdate(job) : { needs: false, at: null };
-  const answered = job.approvalStatus === "approved" || job.approvalStatus === "declined";
 
   const copy = async () => {
     try { await navigator.clipboard.writeText(link); setCopied(true); setTimeout(() => setCopied(false), 2000); } catch { /* clipboard blocked — staff can use the WhatsApp button */ }
@@ -12969,7 +14044,7 @@ function JobApprovalPanel({ job, session, onChanged, autoSend = false }) {
       {sent && (
         <>
           <div style={{ fontSize: 12.5, color: COLORS.muted, marginBottom: 10 }}>
-            Sent {fmtTime(job.approvalSentAt)}{snap.sentBy ? ` by ${snap.sentBy}` : ""}
+            Job card sent {fmtTime(job.approvalSentAt)}{snap.sentBy ? ` by ${snap.sentBy}` : ""}
           </div>
 
           {needs && (
@@ -12991,12 +14066,6 @@ function JobApprovalPanel({ job, session, onChanged, autoSend = false }) {
             big
           />
           {!job.customerPhone && <div style={{ fontSize: 11.5, color: COLORS.muted, marginBottom: 8, fontStyle: "italic" }}>No phone on file — copy the link and send it another way, or add a phone via Edit Job.</div>}
-
-          {answered && (
-            <div style={{ fontSize: 11.5, color: COLORS.muted, marginBottom: 10 }}>
-              Customer answered: {job.approvalStatus} {fmtTime(job.approvalDecidedAt)}{job.approvalNote ? ` — “${job.approvalNote}”` : ""}
-            </div>
-          )}
 
           <div style={{ display: "flex", gap: 8, flexWrap: "wrap" }}>
             <button onClick={copy} className="mrcap-press" style={smallBtn}><Copy size={14} /> {copied ? "Copied" : "Copy link"}</button>
@@ -13070,10 +14139,10 @@ function PublicJobTracker({ jobId }) {
           border: `1px solid ${isReady ? COLORS.gold : isCollected ? COLORS.green : COLORS.line}`,
         }}>
           <div style={{ fontSize: 14, fontWeight: 700, color: isReady ? COLORS.gold : isCollected ? COLORS.successText : COLORS.ink }}>
-            {isReady ? "Ready for collection!" : isCollected ? "Collected — thank you!" : (job.customer_status_note || `Currently: ${stage.label}`)}
+            {isReady ? "Ready for collection!" : isCollected ? "Collected — thank you!" : (job.customer_status_note || `Currently: ${customerStageLabel(stage)}`)}
           </div>
           {!isReady && !isCollected && job.customer_status_note && (
-            <div style={{ fontSize: 11, color: COLORS.muted, marginTop: 4 }}>{stage.label} stage</div>
+            <div style={{ fontSize: 11, color: COLORS.muted, marginTop: 4 }}>{customerStageLabel(stage)} stage</div>
           )}
           {!isCollected && (
             <div style={{ fontSize: 11.5, color: COLORS.muted, marginTop: 5 }}>
@@ -14463,6 +15532,13 @@ function TeamScreen({ team, setTeam, session, onBack, onImport, onServices, canS
     }
     setTeam(team.filter((m) => m.id !== id));
   };
+  // Who can't log in: still assignable and still shown for no-PIN taps on the
+  // dispatch tablet. Admins (and the person using this screen) always keep a login.
+  const setNameOnly = async (id, on) => {
+    if (on && (ALWAYS_PIN_IDS.includes(id) || (team.find((m) => m.id === id) || {}).role === "admin")) return;
+    const next = team.map((m) => (m.id === id ? { ...m, permissions: { ...(m.permissions || {}), nameOnly: on } } : m));
+    await persistTeam(next, on ? "moving them to Name only" : "giving them a PIN login");
+  };
   const startEdit = (m) => { setEditingId(m.id); setEditName(m.name); };
   const saveEdit = async (id) => {
     if (!editName.trim()) return;
@@ -14499,9 +15575,19 @@ function TeamScreen({ team, setTeam, session, onBack, onImport, onServices, canS
         <Upload size={15} /> Import Historical Data
       </button>
 
-      <div style={{ display: "flex", flexDirection: "column", gap: 10, marginBottom: 20 }}>
-        {team.map((m) => {
+      {[
+        { key: "pin", title: "Logs in with a PIN", note: null, list: team.filter((m) => !isNameOnly(m)) },
+        { key: "nameonly", title: "Name only", note: "These people can't log in. They still show up when you assign work and on the dispatch tablet.", list: team.filter((m) => isNameOnly(m)) },
+      ].map((group) => (
+      <div key={group.key} data-testid={`team-group-${group.key}`} style={{ display: "flex", flexDirection: "column", gap: 10, marginBottom: 20 }}>
+        <div>
+          <div style={{ ...eyebrowStyle, color: COLORS.gold }}>{group.title} · {group.list.length}</div>
+          {group.note && <div style={{ fontSize: 12, color: COLORS.muted, marginTop: 4, lineHeight: 1.4 }}>{group.note}</div>}
+        </div>
+        {group.list.length === 0 && <div style={{ fontSize: 12.5, color: COLORS.muted, fontStyle: "italic" }}>Nobody here.</div>}
+        {group.list.map((m) => {
           const isAdmin = m.role === "admin";
+          const nameOnly = isNameOnly(m);
           return (
             <div key={m.id} style={{ borderRadius: 12, border: `1px solid ${COLORS.line}`, background: COLORS.panel, overflow: "hidden" }}>
               <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", padding: "11px 12px", borderBottom: `1px solid ${COLORS.line}` }}>
@@ -14529,7 +15615,10 @@ function TeamScreen({ team, setTeam, session, onBack, onImport, onServices, canS
                       {m.locked && (
                         <button onClick={() => unlockMember(m.id)} disabled={busyMemberId === m.id} className="mrcap-press" style={{ fontSize: 11, color: COLORS.green, background: "none", border: `1px solid ${COLORS.green}`, borderRadius: 7, padding: "5px 7px", cursor: busyMemberId === m.id ? "default" : "pointer", opacity: busyMemberId === m.id ? 0.6 : 1, fontWeight: 600 }}>{busyMemberId === m.id ? "…" : "Unlock"}</button>
                       )}
-                      <button onClick={() => setConfirmResetId(m.id)} disabled={busyMemberId === m.id} className="mrcap-press" style={{ fontSize: 11, color: COLORS.muted, background: "none", border: `1px solid ${COLORS.line}`, borderRadius: 7, padding: "5px 7px", cursor: busyMemberId === m.id ? "default" : "pointer", opacity: busyMemberId === m.id ? 0.6 : 1 }}>Reset PIN</button>
+                      {session.role === "admin" && !isAdmin && m.id !== session.id && !ALWAYS_PIN_IDS.includes(m.id) && (
+                        <button onClick={() => setNameOnly(m.id, !nameOnly)} className="mrcap-press" data-testid={`nameonly-toggle-${m.id}`} style={{ fontSize: 11, color: COLORS.gold, background: "none", border: `1px solid ${COLORS.gold}`, borderRadius: 7, padding: "5px 7px", cursor: "pointer" }}>{nameOnly ? "Give a PIN login" : "Make name only"}</button>
+                      )}
+                      {!nameOnly && <button onClick={() => setConfirmResetId(m.id)} disabled={busyMemberId === m.id} className="mrcap-press" style={{ fontSize: 11, color: COLORS.muted, background: "none", border: `1px solid ${COLORS.line}`, borderRadius: 7, padding: "5px 7px", cursor: busyMemberId === m.id ? "default" : "pointer", opacity: busyMemberId === m.id ? 0.6 : 1 }}>Reset PIN</button>}
                       {m.id !== session.id && (
                         <button onClick={() => setConfirmRemoveId(m.id)} disabled={busyMemberId === m.id} className="mrcap-press" style={{ fontSize: 11, color: COLORS.red, background: "none", border: `1px solid ${COLORS.line}`, borderRadius: 7, padding: "5px 7px", cursor: "pointer" }}>Remove</button>
                       )}
@@ -14612,6 +15701,7 @@ function TeamScreen({ team, setTeam, session, onBack, onImport, onServices, canS
           );
         })}
       </div>
+      ))}
 
       <div style={{ background: COLORS.panel, border: `1px solid ${COLORS.line}`, borderRadius: 13, padding: 15 }}>
         <div style={{ fontFamily: DISPLAY_FONT, fontWeight: 600, fontSize: 15, marginBottom: 10, display: "flex", alignItems: "center", gap: 6 }}><UserPlus size={16} color={COLORS.gold} /> Add team member</div>
@@ -14833,7 +15923,7 @@ async function loadDispatchJobs() {
   // dropped request doesn't blank the board and then "re-announce"
   // every car as new when the next poll succeeds.
   const { ok, data, stale } = await sbFetch(
-    "jobs?select=id,plate,make_model,color,customer_name,description,damage_notes,priority,location,stage_index,service_types,assigned_to,assigned_team,service_done,service_started,treatments,parts,history,dispatch_hidden,created_at,updated_at&or=(stage_index.neq.5,stage_index.is.null)&order=created_at.asc&limit=900"
+    "jobs?select=id,plate,make_model,color,customer_name,description,damage_notes,priority,location,stage_index,service_types,assigned_to,assigned_team,service_done,service_started,treatments,parts,history,dispatch_hidden,on_hold,created_at,updated_at&or=(stage_index.neq.5,stage_index.is.null)&order=created_at.asc&limit=900"
   );
   if (!ok || !Array.isArray(data)) return null;
   const jobs = data
@@ -14845,7 +15935,7 @@ async function loadDispatchJobs() {
       priority: r.priority, location: r.location,
       stageIndex: r.stage_index, serviceTypes: r.service_types || [], assignedTo: r.assigned_to || {}, assignedTeam: r.assigned_team || {},
       serviceDone: r.service_done || {}, serviceStarted: r.service_started || {}, treatments: r.treatments || {},
-      parts: r.parts || [], history: Array.isArray(r.history) ? r.history : [], dispatchHidden: !!r.dispatch_hidden,
+      parts: r.parts || [], history: Array.isArray(r.history) ? r.history : [], dispatchHidden: !!r.dispatch_hidden, onHold: !!r.on_hold,
       createdAt: new Date(r.created_at).getTime(), updatedAt: new Date(r.updated_at).getTime(),
     }));
   // `stale` means this came from the offline-cache fallback in sbFetch,
@@ -15059,7 +16149,7 @@ async function loadRecentUpdates(sinceMs) {
 // the existing LiveUpdatesBoard in a slide-over panel so it's reachable
 // from wherever someone happens to be in the app, without navigating
 // away from what they're doing.
-function InternalUpdatesWidget({ team, onOpenJob, session, index }) {
+function InternalUpdatesWidget({ team, onOpenJob, session, index, topRight = false }) {
   const [open, setOpen] = useState(false);
   const [unread, setUnread] = useState(0);
   // Persisted per-device so the badge survives a page reload instead of
@@ -15113,8 +16203,8 @@ function InternalUpdatesWidget({ team, onOpenJob, session, index }) {
         className="mrcap-press"
         title="Internal Updates"
         style={{
-          position: "fixed", right: 16, bottom: "calc(max(18px, calc(env(safe-area-inset-bottom) + 18px)) + var(--mrcap-fab-lift, 0px))", zIndex: 55,
-          width: 50, height: 50, borderRadius: "50%",
+          position: "fixed", right: topRight ? 14 : 16, ...(topRight ? { top: "calc(env(safe-area-inset-top) + 8px)", zIndex: 65 } : { bottom: "calc(max(18px, calc(env(safe-area-inset-bottom) + 18px)) + var(--mrcap-fab-lift, 0px))", zIndex: 55 }),
+          width: topRight ? 44 : 50, height: topRight ? 44 : 50, borderRadius: "50%",
           border: `1.5px solid ${COLORS.gold}`, background: "rgba(20,19,17,0.94)", color: COLORS.gold,
           display: "flex", alignItems: "center", justifyContent: "center",
           boxShadow: "0 8px 22px -6px rgba(0,0,0,0.6)", cursor: "pointer", transition: "bottom 0.25s ease",
@@ -15567,6 +16657,32 @@ ${FONT_IMPORT}
 .dsp-pill { background: ${COLORS.panel}; border: 1px solid ${COLORS.line}; border-radius: ${du(22, 12)}; padding: ${du(14, 8)} ${du(16, 9)}; display: flex; align-items: center; gap: ${du(14, 8)}; min-width: 0; }
 .dsp-pill-nm { font-size: ${du(22, 11.5)}; font-weight: 700; white-space: normal; overflow: hidden; display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical; line-height: 1.15; word-break: break-word; }
 .dsp-pill-ct { font-size: ${du(19, 11)}; color: ${COLORS.goldBright}; margin-top: 2px; line-height: 1.25; overflow: hidden; display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical; }
+.dsp-pill-free { border-color: rgba(63,211,122,0.55); background: rgba(63,211,122,0.10); }
+.dsp-pill-free .dsp-pill-ct { color: #3FD37A; font-weight: 700; }
+.dsp-counts { font-size: ${du(26, 13)}; font-weight: 700; color: ${COLORS.ink}; margin-top: ${du(12, 8)}; display: flex; gap: ${du(14, 8)}; flex-wrap: wrap; font-variant-numeric: tabular-nums; }
+.dsp-counts span { white-space: nowrap; }
+.dsp-counts b { color: ${COLORS.goldBright}; }
+.dsp-fnote { font-size: ${du(30, 15)}; font-weight: 800; line-height: 1.25; color: ${COLORS.goldBright}; background: rgba(232,195,74,0.14); border-left: ${du(8, 4)} solid ${COLORS.goldBright}; border-radius: ${du(10, 6)}; padding: ${du(10, 6)} ${du(14, 8)}; overflow-wrap: anywhere; }
+.dsp-c-note { grid-column: 1 / -1; font-size: ${du(22, 12)}; font-weight: 800; color: ${COLORS.goldBright}; line-height: 1.2; overflow-wrap: anywhere; }
+.dsp-wait { margin: ${du(22, 12)} ${du(30, 12)} 0; background: #0F0E0C; border: 1px solid ${COLORS.line}; border-radius: ${du(30, 16)}; overflow: hidden; flex-shrink: 0; }
+.dsp-wait-list { padding: ${du(14, 8)}; display: flex; flex-direction: column; gap: ${du(12, 8)}; }
+.dsp-wempty { color: ${COLORS.muted}; font-size: ${du(24, 13)}; padding: ${du(20, 10)} ${du(10, 8)}; text-align: center; }
+.dsp-wrow { width: 100%; text-align: left; display: grid; grid-template-columns: auto minmax(0, 1fr) auto; align-items: center; gap: ${du(8, 6)} ${du(22, 12)}; background: ${COLORS.panel}; border-radius: ${du(22, 12)}; box-shadow: 0 0 0 2px ${COLORS.line}; padding: ${du(16, 10)} ${du(20, 11)}; color: ${COLORS.ink}; }
+.dsp-wrow:active { transform: scale(0.99); }
+.dsp-wrow[data-tone="amber"] { box-shadow: 0 0 0 2px #FF9F0A; }
+.dsp-wrow[data-tone="red"] { box-shadow: 0 0 0 3px #FF453A; }
+.dsp-wmain { min-width: 0; display: flex; flex-direction: column; gap: ${du(6, 4)}; }
+.dsp-wmodel { font-size: ${du(28, 14)}; font-weight: 700; line-height: 1.2; overflow-wrap: anywhere; }
+.dsp-wwork { font-size: ${du(21, 12)}; color: #CFC8B4; line-height: 1.3; overflow-wrap: anywhere; }
+.dsp-wwho { font-size: ${du(19, 11)}; color: ${COLORS.muted}; font-weight: 600; }
+.dsp-wclock { font-family: ${MONO_FONT}; font-variant-numeric: tabular-nums; font-size: ${du(44, 20)}; font-weight: 800; line-height: 1; padding: ${du(12, 8)} ${du(22, 12)}; border-radius: 999px; background: #26231D; color: ${COLORS.ink}; white-space: nowrap; }
+.dsp-wclock small { display: block; font-family: ${BODY_FONT}; font-size: ${du(14, 9)}; letter-spacing: 1.5px; font-weight: 700; color: ${COLORS.muted}; text-align: center; margin-bottom: 3px; }
+.dsp-wrow[data-tone="amber"] .dsp-wclock { background: #FF9F0A; color: #1a1100; }
+.dsp-wrow[data-tone="amber"] .dsp-wclock small { color: #4a3000; }
+.dsp-wrow[data-tone="red"] .dsp-wclock { background: #FF453A; color: #fff; }
+.dsp-wrow[data-tone="red"] .dsp-wclock small { color: #ffd6d2; }
+.dsp-wrow .dsp-fnote { grid-column: 1 / -1; }
+@container (max-width: 640px) { .dsp-wrow { grid-template-columns: minmax(0, 1fr) auto; } .dsp-wrow > :first-child { grid-column: 1 / -1; } }
 .dsp-free { font-size: ${du(22, 12.5)}; color: #3FD37A; font-weight: 600; margin-top: ${du(12, 8)}; line-height: 1.4; }
 .dsp-free b { font-weight: 800; letter-spacing: 0.5px; }
 .dsp-free-none { color: ${COLORS.muted}; }
@@ -15807,7 +16923,7 @@ function dispatchElapsed(fromMs, now) {
   return formatDispatchElapsed(fromMs, now) || "0m";
 }
 
-function DispatchJobCardImpl({ rowId, jobId, ticketNo, plate, model, carColor, categoryLabel, todo, stateLabel, color, pulse, timerLabel, timerText, timerMuted, redoReason, people, arriving, leaving, compact, hideCat, onOpen }) {
+function DispatchJobCardImpl({ rowId, jobId, ticketNo, plate, model, carColor, categoryLabel, todo, stateLabel, color, pulse, timerLabel, timerText, timerMuted, redoReason, floorNote, people, arriving, leaving, compact, hideCat, onOpen }) {
   const cls = `dsp-card${compact ? " dsp-card-c" : ""}${pulse ? " dsp-pulse" : ""}${arriving ? " dsp-arrive" : ""}${leaving ? " dsp-leaving" : ""}`;
   if (compact) {
     // One short row: plate, model, state pill, timer, who's on it. Same
@@ -15821,6 +16937,7 @@ function DispatchJobCardImpl({ rowId, jobId, ticketNo, plate, model, carColor, c
         {people.length
           ? <span className="dsp-avs">{people.slice(0, 3).map((p) => <DispatchAvatar key={p.id} id={p.id} name={p.name} />)}</span>
           : <span className="dsp-c-none">Nobody yet</span>}
+        {floorNote ? <span className="dsp-c-note">{floorNote}</span> : null}
       </button>
     );
   }
@@ -15836,6 +16953,7 @@ function DispatchJobCardImpl({ rowId, jobId, ticketNo, plate, model, carColor, c
         <span className="dsp-cat">{categoryLabel}</span>
         {todo ? <span className="dsp-todo">{todo}</span> : null}
         {redoReason ? <span className="dsp-redo">Sent back: {redoReason}</span> : null}
+        {floorNote ? <span className="dsp-fnote">{floorNote}</span> : null}
         <span className="dsp-foot">
           {people.length
             ? <span className="dsp-avs">{people.slice(0, 3).map((p) => <DispatchAvatar key={p.id} id={p.id} name={p.name} />)}</span>
@@ -15856,7 +16974,7 @@ const DispatchJobCard = memo(DispatchJobCardImpl, (prev, next) => (
   prev.plate === next.plate && prev.model === next.model && prev.carColor === next.carColor && prev.categoryLabel === next.categoryLabel &&
   prev.todo === next.todo && prev.stateLabel === next.stateLabel && prev.color === next.color &&
   prev.pulse === next.pulse && prev.timerLabel === next.timerLabel && prev.timerText === next.timerText &&
-  prev.timerMuted === next.timerMuted && prev.redoReason === next.redoReason &&
+  prev.timerMuted === next.timerMuted && prev.redoReason === next.redoReason && prev.floorNote === next.floorNote &&
   prev.arriving === next.arriving && prev.leaving === next.leaving && prev.compact === next.compact && prev.hideCat === next.hideCat && prev.onOpen === next.onOpen &&
   prev.people.map((p) => `${p.id}:${p.name}`).join(",") === next.people.map((p) => `${p.id}:${p.name}`).join(",")
 ));
@@ -16101,8 +17219,11 @@ function DispatchEndOfDayChecklist({ views, session, unclassifiedCount, onAction
 // what to do, damage, photos, parts, who's on it, the one big action for
 // its current state, quick updates, move / hide. Everything the old
 // sheet could do is still here.
-function DispatchDetailModal({ row, info, color, ticketNo, now, session, team, assignedIds, staffOptions, moveOptions, canWriteUpdate, canManageVisibility, canFinishDirect, onClose, onStart, onUnstart, onSendToQc, onPassQc, onFailQc, onFinishDirect, onAssign, onMove, onAddUpdate, onToggleHidden, onSetLocation, saving }) {
+function DispatchDetailModal({ row, info, color, ticketNo, now, session, team, assignedIds, staffOptions, moveOptions, canWriteUpdate, canManageVisibility, canFinishDirect, onClose, onStart, onUnstart, onSendToQc, onPassQc, onFailQc, onFinishDirect, onAssign, onMove, onAddUpdate, onToggleHidden, onSetLocation, onSaveNote, saving }) {
   const { job, categoryLabel, categoryKey } = row;
+  const floorNote = currentFloorNote(job.history);
+  const canNote = isFloorLead(session);
+  const [noteText, setNoteText] = useState(floorNote ? floorNote.text : "");
   const curLocation = job.location || BASE_LOCATIONS[0];
   const knownLocation = DISPATCH_LOCATION_CHOICES.some((c) => c.loc === curLocation);
   const isUnclassified = categoryKey === "_none";
@@ -16146,6 +17267,24 @@ function DispatchDetailModal({ row, info, color, ticketNo, now, session, team, a
           </div>
           <button type="button" className="dsp-x" onClick={onClose} aria-label="Close"><X color={COLORS.ink} strokeWidth={2.6} /></button>
         </div>
+
+        {floorNote ? <div className="dsp-fnote" data-testid="dsp-modal-note">{floorNoteLine(floorNote)}</div> : null}
+
+        {canNote && (
+          <div>
+            <div className="dsp-sec-l">Note for the team <em>shows in gold on the TV</em></div>
+            <div className="dsp-chips">
+              {FLOOR_NOTE_CHIPS.map((c) => (
+                <button key={c} type="button" className="dsp-chip dsp-chip-sm" disabled={saving} onClick={() => setNoteText(c)}>{c}</button>
+              ))}
+            </div>
+            <textarea className="dsp-textarea" value={noteText} maxLength={FLOOR_NOTE_MAX} onChange={(e) => setNoteText(e.target.value.slice(0, FLOOR_NOTE_MAX))} placeholder="Or type a short note for the team…" aria-label="Note for the team" rows={2} />
+            <div className="dsp-acts">
+              <button type="button" className="dsp-big dsp-big-gold" disabled={saving || !noteText.trim()} onClick={() => onSaveNote(job, noteText)}>Show on the TV</button>
+              <button type="button" className="dsp-big dsp-big-ghost" disabled={saving || !floorNote} onClick={() => { setNoteText(""); onSaveNote(job, ""); }}>Clear</button>
+            </div>
+          </div>
+        )}
 
         {!isUnclassified && (
           <div className="dsp-flow">
@@ -16602,39 +17741,26 @@ function DispatchBoard({ team, session, fill = false }) {
   const writeJob = async (job, select, build, { summary, failText }) => {
     markLocalWrite();
     setSaving(true);
-    const { ok: fetchOk, data, stale } = await sbFetch(`jobs?id=eq.${job.id}&select=${select}`);
-    if (stale) {
-      setSaving(false);
-      showError("No connection — not saved, try again");
-      return null;
-    }
-    const current = fetchOk && Array.isArray(data) && data[0] ? data[0] : null;
-    if (!current) {
-      setSaving(false);
-      showError(`${failText} — couldn't load the latest version of it. Check your connection and try again.`);
-      return null;
-    }
-    const patch = build(current);
-    if (!patch) { setSaving(false); return null; }
-    if (summary) withActivitySummary(summary);
-    const { ok } = await sbFetch(`jobs?id=eq.${job.id}`, {
-      method: "PATCH",
-      headers: { Prefer: "return=minimal" },
-      body: JSON.stringify({ ...patch, updated_at: new Date().toISOString() }),
-      noQueue: true,
-    });
+    const res = await boardWriteJob(job.id, select, build, { summary, failText });
     markLocalWrite(); // hold the poll off a little past the save itself, not just past the tap
     setSaving(false);
-    if (!ok) {
-      showError(`${failText} — check your connection and try again.`);
-      return null;
-    }
+    if (res.error) { showError(res.error); return null; }
+    if (res.noop) return null;
+    const patch = res.patch;
     // This device plays its own sound straight away; tell the poll those
     // entries are already accounted for so it doesn't play them again.
     if (Array.isArray(patch.history)) historyLenRef.current[job.id] = patch.history.length;
     return patch;
   };
   const applyLocal = (jobId, fields) => setJobs((prev) => prev.map((j) => (j.id === jobId ? { ...j, ...fields } : j)));
+  // The stage fields a board write may have changed (automatic stage moves),
+  // in the board's own (camelCase) shape.
+  const stageLocal = (p) => ({ ...(p.stage_index != null ? { stageIndex: p.stage_index } : {}), ...(p.priority !== undefined ? { priority: p.priority } : {}) });
+  // Fold an automatic stage move (see autoStageAfterServiceChange) into a
+  // patch the caller is already building, from the FRESH row `cur`.
+  const withAutoStage = (cur, nextDone, nextHistory, base) => {
+    return withAutoStagePatch(cur, nextDone, nextHistory, base, session);
+  };
 
   // Multi-select, capped at 3 per (job, category) — separate field from
   // the single-assignee `assigned_to` JobDetail still uses, so that
@@ -16659,11 +17785,7 @@ function DispatchBoard({ team, session, fill = false }) {
     // two people tapping assign around the same time must not clobber
     // each other.
     const patch = await writeJob(job, "assigned_team", (cur) => {
-      const freshCurrent = (cur.assigned_team || {})[categoryKey] || [];
-      const removing = freshCurrent.includes(memberId);
-      if (!removing && freshCurrent.length >= DISPATCH_MAX_ASSIGNEES) return null; // cap reached on the fresh value — no-op
-      const nextList = removing ? freshCurrent.filter((id) => id !== memberId) : [...freshCurrent, memberId];
-      return { assigned_team: { ...(cur.assigned_team || {}), [categoryKey]: nextList } };
+      return assignTeamPatch(cur, categoryKey, memberId); // null = cap reached on the fresh value — no-op
     }, {
       summary: isRemoving
         ? `Dispatch board: removed ${staffName} from ${categoryKey} on ${job.plate}`
@@ -16687,15 +17809,22 @@ function DispatchBoard({ team, session, fill = false }) {
   // "Started" history entry is also what opens a fresh QC cycle.
   const toggleStarted = async (row, nowStarted) => {
     const { job, categoryKey, categoryLabel } = row;
-    const patch = await writeJob(job, "service_started,history", (cur) => ({
-      service_started: { ...(cur.service_started || {}), [categoryKey]: nowStarted ? new Date().toISOString() : false },
-      history: [...(cur.history || []), entry("service", categoryLabel, nowStarted ? "Started" : "Un-started", categoryKey)],
-    }), {
+    const patch = await writeJob(job, "service_started,history,stage_index,on_hold", (cur) => {
+      // Already in the state asked for (a stray second Start): change nothing, so the QC cycle isn't reset.
+      if (nowStarted === !!(cur.service_started || {})[categoryKey]) return null;
+      const hist = [...(cur.history || []), entry("service", categoryLabel, nowStarted ? "Started" : "Un-started", categoryKey)];
+      const base = { service_started: { ...(cur.service_started || {}), [categoryKey]: nowStarted ? new Date().toISOString() : false }, history: hist };
+      // First Start on a car that is still checked in / waiting: it is now
+      // in progress. Forward only, never on hold, never touches later stages.
+      const idx = Number.isFinite(cur.stage_index) ? cur.stage_index : 0;
+      if (!nowStarted || cur.on_hold || idx > 1) return base;
+      return { ...base, stage_index: 2, history: [...hist, ...stageMoveEntries(idx, 2, session.name, session.role, Date.now())] };
+    }, {
       summary: `Dispatch board: ${nowStarted ? "started" : "un-started"} ${categoryLabel} on ${job.plate}`,
       failText: `Couldn't save ${nowStarted ? "starting" : "un-starting"} ${categoryLabel} on ${job.plate}`,
     });
     if (!patch) return false;
-    applyLocal(job.id, { serviceStarted: patch.service_started, history: patch.history });
+    applyLocal(job.id, { serviceStarted: patch.service_started, history: patch.history, ...stageLocal(patch) });
     if (nowStarted) playDispatchSound("started");
     return true;
   };
@@ -16734,7 +17863,7 @@ function DispatchBoard({ team, session, fill = false }) {
     const { job, categoryKey } = row;
     const key = rowKey(job.id, categoryKey);
     setSelectedRowKey((k) => (k === key ? null : k));
-    applyLocal(job.id, { history: patch.history });
+    applyLocal(job.id, { history: patch.history, ...stageLocal(patch) });
     setLeavingKeys((prev) => ({ ...prev, [key]: true }));
     playDispatchSound("done");
     clearTimeout(leaveTimersRef.current[key]);
@@ -16752,16 +17881,12 @@ function DispatchBoard({ team, session, fill = false }) {
   const passQc = async (row) => {
     if (!isQcApprover(session)) return false;
     const { job, categoryKey, categoryLabel } = row;
-    const patch = await writeJob(job, "service_done,history,assigned_to,assigned_team", (cur) => {
+    const patch = await writeJob(job, "service_done,history,assigned_to,assigned_team,stage_index,on_hold,service_types,priority", (cur) => {
       // "Marked done" is credited to whoever DID the work (lead first, then the
       // rest of the team on that service); the QC approver stays on the
       // separate "QC passed" entry and as qcBy. Only if nobody is assigned does
       // the approver stand in, as before.
-      const done = { ...entry("service", categoryLabel, "Marked done", categoryKey), qcBy: session.name, ...(qcDoneCredit(cur, categoryKey, team) || {}) };
-      return {
-        service_done: { ...(cur.service_done || {}), [categoryKey]: true },
-        history: [...(cur.history || []), entry("qc", categoryLabel, "QC passed", categoryKey), done],
-      };
+      return passQcPatch(cur, [categoryKey], session, team);
     }, { summary: `Dispatch board: ${session.name} passed QC on ${categoryLabel} for ${job.plate}`, failText: `Couldn't save passing QC on ${job.plate}` });
     if (!patch) return false;
     finishLocally(row, patch, `Finished ${job.plate} · passed by ${session.name}`, true);
@@ -16775,10 +17900,11 @@ function DispatchBoard({ team, session, fill = false }) {
   const finishDirect = async (row) => {
     if (!canFinishDirect) return false;
     const { job, categoryKey, categoryLabel } = row;
-    const patch = await writeJob(job, "service_done,history", (cur) => ({
-      service_done: { ...(cur.service_done || {}), [categoryKey]: true },
-      history: [...(cur.history || []), entry("service", categoryLabel, "Marked done", categoryKey)],
-    }), { summary: `Dispatch board: marked ${categoryLabel} done on ${job.plate}`, failText: `Couldn't save marking ${categoryLabel} done on ${job.plate}` });
+    const patch = await writeJob(job, "service_done,history,stage_index,on_hold,service_types,priority", (cur) => {
+      if ((cur.service_done || {})[categoryKey]) return null; // already done: nothing to write
+      const nextDone = { ...(cur.service_done || {}), [categoryKey]: true };
+      return withAutoStage(cur, nextDone, [...(cur.history || []), entry("service", categoryLabel, "Marked done", categoryKey)], { service_done: nextDone });
+    }, { summary: `Dispatch board: marked ${categoryLabel} done on ${job.plate}`, failText: `Couldn't save marking ${categoryLabel} done on ${job.plate}` });
     if (!patch) return false;
     finishLocally(row, patch, `Finished ${job.plate}`, false);
     return true;
@@ -16790,12 +17916,12 @@ function DispatchBoard({ team, session, fill = false }) {
     clearTimeout(leaveTimersRef.current[key]);
     delete leaveTimersRef.current[key];
     setLeavingKeys((prev) => { const next = { ...prev }; delete next[key]; return next; });
-    const patch = await writeJob(job, "service_done,history", (cur) => ({
-      service_done: { ...(cur.service_done || {}), [categoryKey]: false },
-      history: [...(cur.history || []), entry("service", categoryLabel, "Un-marked", categoryKey), ...(backToQc ? [entry("qc", categoryLabel, "Sent to QC", categoryKey)] : [])],
-    }), { summary: `Dispatch board: un-marked ${categoryLabel} done on ${job.plate}`, failText: `Couldn't undo finishing ${job.plate}` });
+    const patch = await writeJob(job, "service_done,history,stage_index,on_hold,service_types,priority", (cur) => {
+      const nextDone = { ...(cur.service_done || {}), [categoryKey]: false };
+      return withAutoStage(cur, nextDone, [...(cur.history || []), entry("service", categoryLabel, "Un-marked", categoryKey), ...(backToQc ? [entry("qc", categoryLabel, "Sent to QC", categoryKey)] : [])], { service_done: nextDone });
+    }, { summary: `Dispatch board: un-marked ${categoryLabel} done on ${job.plate}`, failText: `Couldn't undo finishing ${job.plate}` });
     if (!patch) return;
-    applyLocal(job.id, { serviceDone: patch.service_done, history: patch.history });
+    applyLocal(job.id, { serviceDone: patch.service_done, history: patch.history, ...stageLocal(patch) });
     setToast(null);
   };
 
@@ -16913,6 +18039,20 @@ function DispatchBoard({ team, session, fill = false }) {
     return "ok";
   };
 
+  // "Note for the team": floor leads only (UI check). History only, so it is
+  // the same narrow write as every other board action. An empty text clears.
+  const saveFloorNote = async (job, text) => {
+    if (!isFloorLead(session)) return false;
+    const t = String(text || "").trim().slice(0, FLOOR_NOTE_MAX);
+    const patch = await writeJob(job, "history", (cur) => ({
+      history: [...(cur.history || []), { stage: "floor_note", label: "Floor note", by: session.name, role: session.role, note: t, at: Date.now() }],
+    }), { summary: `Dispatch board: ${session.name} ${t ? "left a note on" : "cleared the note on"} ${job.plate}`, failText: `Couldn't save the note on ${job.plate}` });
+    if (!patch) return false;
+    applyLocal(job.id, { history: patch.history });
+    showToast(t ? "Note is on the TV" : "Note cleared", COLORS.gold, null, 3000);
+    return true;
+  };
+
   // Fully manual by request — no automatic location-based hiding.
   // Named-list gated (canManageDispatchVisibility), not a permission
   // flag. Hides the *whole job* from the board, not just one category.
@@ -17006,8 +18146,22 @@ function DispatchBoard({ team, session, fill = false }) {
   }
   offsitePlaces.sort((a, b) => b.n - a.n);
   const unclassifiedRows = allRows.filter((r) => r.categoryKey === "_none");
-  const detailingViews = views.filter((v) => v.row.role === "detailing");
-  const otherViews = views.filter((v) => v.row.role !== "detailing");
+  // A car that is checked in / waiting and not started is NOT in a column:
+  // it sits in the full-width "Waiting for technician" list above them
+  // (one row per car, longest wait first) until someone taps Start.
+  const isWaitingView = (v) => (v.row.job.stageIndex ?? 0) <= 1 && !v.info.startedAt;
+  const waitingViews = views.filter(isWaitingView);
+  const waitList = [];
+  for (const v of waitingViews) {
+    const hit = waitList.find((w) => w.job.id === v.row.job.id);
+    if (hit) { hit.cats.push(v.row.categoryLabel); continue; }
+    waitList.push({ job: v.row.job, view: v, cats: [v.row.categoryLabel], since: waitingSinceMs(v.row.job) });
+  }
+  for (const w of waitList) w.waitMs = w.since ? businessMsElapsed(w.since, nowTick) : 0;
+  waitList.sort((a, b) => b.waitMs - a.waitMs || (a.since || 0) - (b.since || 0));
+  const columnViews = views.filter((v) => !isWaitingView(v));
+  const detailingViews = columnViews.filter((v) => v.row.role === "detailing");
+  const otherViews = columnViews.filter((v) => v.row.role !== "detailing");
   const nameOf = (id) => team.find((m) => m.id === id)?.name || id;
   const colorFor = (v) => {
     if (leavingKeys[v.key]) return themeColors.done;
@@ -17029,9 +18183,18 @@ function DispatchBoard({ team, session, fill = false }) {
   const busy = Object.entries(workload)
     .map(([id, e]) => ({ id, name: nameOf(id), ...e }))
     .sort((a, b) => b.cars - a.cars || a.name.localeCompare(b.name));
-  const freeNames = team
+  // Technicians with no active row at all: shown green ("free") so the leads
+  // see at a glance who can take the next car.
+  const freeTeam = team
     .filter((m) => !["admin", "intake", "accountant"].includes(m.role) && !isSmartechPortal(m) && !workload[m.id])
-    .map((m) => m.name);
+    .sort((a, b) => a.name.localeCompare(b.name));
+  // Header counts = the office board's lanes, one number per CAR (not per service row):
+  // waiting = stage 0-1, working = stage 2-3, ready = stage 4; on hold, collected and
+  // away-from-the-shop cars are left out of waiting / working, exactly as the lanes do.
+  const laneCounts = { waiting: 0, progress: 0, ready: 0 };
+  for (const j of jobs) { const l = boardLaneOf(Number.isFinite(j.stageIndex) ? j.stageIndex : 0, j.onHold, j.location); if (l && l in laneCounts) laneCounts[l] += 1; }
+  const workingCount = laneCounts.progress;
+  const readyCount = laneCounts.ready;
 
   // One glanceable alerts number: needs someone + no update + QC waiting
   // + no service type — the same states the cards pulse for.
@@ -17075,6 +18238,7 @@ function DispatchBoard({ team, session, fill = false }) {
         timerText={timerText}
         timerMuted={timerMuted}
         redoReason={info.redoReason || ""}
+        floorNote={floorNoteLine(currentFloorNote(row.job.history))}
         people={info.assigned.map((id) => ({ id, name: nameOf(id) }))}
         arriving={!!arrivingKeys[v.key]}
         leaving={leaving}
@@ -17109,7 +18273,9 @@ function DispatchBoard({ team, session, fill = false }) {
   const selectedTicketNo = selectedRow
     ? (selectedRow.categoryKey === "_none"
       ? unclassifiedRows.findIndex((r) => rowKey(r.job.id, r.categoryKey) === selectedRowKey)
-      : (selectedRow.role === "detailing" ? detailingViews : otherViews).findIndex((v) => v.key === selectedRowKey)) + 1
+      : (waitingViews.some((v) => v.key === selectedRowKey)
+        ? waitList.findIndex((w) => w.job.id === selectedRow.job.id)
+        : (selectedRow.role === "detailing" ? detailingViews : otherViews).findIndex((v) => v.key === selectedRowKey))) + 1
     : null;
 
   return (
@@ -17120,6 +18286,7 @@ function DispatchBoard({ team, session, fill = false }) {
           <div>
             <div className="dsp-eyebrow">MR.CAP.</div>
             <h1 className="dsp-title">Dispatch</h1>
+            <div className="dsp-counts" data-testid="dsp-counts"><span><b>{laneCounts.waiting}</b> waiting</span><span>·</span><span><b>{workingCount}</b> working</span><span>·</span><span><b>{readyCount}</b> ready</span></div>
           </div>
           <DispatchClock>
             {isSuperAdmin(session) && (
@@ -17133,7 +18300,7 @@ function DispatchBoard({ team, session, fill = false }) {
 
         <div className="dsp-floor">
           <div className="dsp-floor-lab"><span>On the floor</span><span>cars each</span></div>
-          {busy.length > 0 ? (
+          {busy.length > 0 || freeTeam.length > 0 ? (
             <div className="dsp-pills">
               {busy.map((p) => (
                 <div key={p.id} className="dsp-pill">
@@ -17144,11 +18311,19 @@ function DispatchBoard({ team, session, fill = false }) {
                   </div>
                 </div>
               ))}
+              {freeTeam.map((m) => (
+                <div key={m.id} className="dsp-pill dsp-pill-free" data-free="1">
+                  <DispatchAvatar id={m.id} name={m.name} />
+                  <div style={{ minWidth: 0 }}>
+                    <div className="dsp-pill-nm">{m.name}</div>
+                    <div className="dsp-pill-ct">free</div>
+                  </div>
+                </div>
+              ))}
             </div>
           ) : (
             <div className="dsp-free dsp-free-none">{loading ? "Loading…" : "Nobody has a car assigned right now."}</div>
           )}
-          {freeNames.length > 0 && <div className="dsp-free"><b>Free:</b> {freeNames.join(", ")}</div>}
         </div>
 
         <div className="dsp-legend">
@@ -17216,6 +18391,37 @@ function DispatchBoard({ team, session, fill = false }) {
           </div>
         )}
 
+        <section className="dsp-wait" aria-label="Waiting for technician" data-testid="dsp-waiting">
+          <div className="dsp-col-h">
+            <span className="dsp-dot" style={{ background: COLORS.goldBright }} />
+            <h2>Waiting for technician</h2>
+            <span className="dsp-n">{waitList.length}</span>
+          </div>
+          <div className="dsp-wait-list">
+            {waitList.length === 0
+              ? <div className="dsp-wempty">{loading ? "Loading…" : "No car is waiting."}</div>
+              : waitList.map((w) => {
+                const hours = w.waitMs / 3600000;
+                const tone = hours >= WAIT_RED_HOURS ? "red" : hours >= WAIT_AMBER_HOURS ? "amber" : "ok";
+                const nm = w.view.info.assigned.map(nameOf);
+                const note = floorNoteLine(currentFloorNote(w.job.history));
+                const todo = dispatchWhatToDo(w.job, w.view.row.categoryKey);
+                return (
+                  <button key={w.job.id} type="button" className={`dsp-wrow${arrivingKeys[w.view.key] ? " dsp-arrive" : ""}`} data-tone={tone} data-job={w.job.id} onClick={() => openRow(w.view.key, w.job.id)} aria-label={`Waiting ${dispatchElapsed(w.since, nowTick)}: ${w.job.plate || "no plate"}${w.job.makeModel ? `, ${w.job.makeModel}` : ""}, ${w.cats.join(", ")}. Tap to open.`}>
+                    <DispatchPlate plate={w.job.plate} />
+                    <span className="dsp-wmain">
+                      <span className="dsp-wmodel">{w.job.makeModel || w.cats[0]}{w.job.color ? ` · ${w.job.color}` : ""}</span>
+                      <span className="dsp-wwork">{w.cats.join(" + ")}{todo ? ` — ${todo}` : ""}</span>
+                      {nm.length ? <span className="dsp-wwho">{nm.join(", ")} assigned · tap to start</span> : <span className="dsp-wwho">Nobody yet · tap to assign</span>}
+                    </span>
+                    <span className="dsp-wclock" data-testid="dsp-wait-clock"><small>WAITING</small>{dispatchElapsed(w.since, nowTick)}</span>
+                    {note ? <span className="dsp-fnote">{note}</span> : null}
+                  </button>
+                );
+              })}
+          </div>
+        </section>
+
         <div className="dsp-cols">
           {renderColumn("Detailing", COLORS.gold, detailingViews)}
           {renderColumn("Body · Dent · PPF", COLORS.blueText, otherViews)}
@@ -17265,6 +18471,7 @@ function DispatchBoard({ team, session, fill = false }) {
           onAddUpdate={(row, text) => addProgressUpdate(row, text)}
           onToggleHidden={toggleDispatchHidden}
           onSetLocation={changeLocation}
+          onSaveNote={saveFloorNote}
           saving={saving}
         />
       )}
@@ -18605,7 +19812,7 @@ function ppfSummary(ops) {
 // changed. Used by the tablet worker and by Ahmed's review / send-back.
 async function ppfWriteOps(jobId, ops) {
   const needHist = ops.some((o) => o.t === "start" || o.t === "finish" || o.t === "reopen");
-  const cols = `ppf_progress,service_done,service_reviewed,ppf_scope,body_type${needHist ? ",history" : ""}`;
+  const cols = `ppf_progress,service_done,service_reviewed,ppf_scope,body_type${needHist ? ",history,stage_index,on_hold,service_types,priority" : ""}`;
   const jid = encodeURIComponent(jobId);
   const rd = await Promise.race([gkCall({ path: `jobs?id=eq.${jid}&select=${cols}&limit=1`, method: "GET" }), ppfTimeout(15000)]);
   if (!rd.ok) return ppfClassify(rd);
@@ -18617,12 +19824,28 @@ async function ppfWriteOps(jobId, ops) {
   if (res.changed.sd) body.service_done = res.service_done;
   if (res.changed.sr) body.service_reviewed = res.service_reviewed;
   if (res.changed.history) body.history = res.history;
+  // The PPF Room moves the car on its own, like the Dispatch TV does: first Start of PPF takes a car that is
+  // still checked in / waiting to In progress; PPF finished (or sent back) goes through the same automatic
+  // stage rule as every other service. Forward only, never on hold, never past Ready.
+  let stageHist = res.history;
+  if (needHist && Number.isFinite(row.stage_index) && !row.on_hold) {
+    const cur = { stage_index: row.stage_index, on_hold: false, service_types: row.service_types || [], priority: row.priority };
+    const startedNow = ops.some((o) => o.t === "start") && !(row.ppf_progress && row.ppf_progress.startedAt);
+    const sess = { name: "PPF Room", role: "ppf" };
+    if (res.changed.sd) {
+      const p = withAutoStagePatch(cur, res.service_done, res.history, {}, sess);
+      if (p.stage_index != null) { body.stage_index = p.stage_index; body.history = p.history; stageHist = p.history; if (p.priority !== undefined && p.priority !== cur.priority) body.priority = p.priority; }
+    } else if (startedNow && cur.stage_index <= 1) {
+      stageHist = [...res.history, ...stageMoveEntries(cur.stage_index, 2, sess.name, sess.role, Date.now())];
+      body.stage_index = 2; body.history = stageHist;
+    }
+  }
   if (Object.keys(body).length) {
     body.updated_at = new Date().toISOString();
     const wr = await Promise.race([gkCall({ path: `jobs?id=eq.${jid}`, method: "PATCH", headers: { Prefer: "return=minimal" }, body, summary: ppfSummary(ops) }), ppfTimeout(15000)]);
     if (!wr.ok) return ppfClassify(wr);
   }
-  return { ok: true, merged: { ppf_progress: res.ppf_progress, service_done: res.service_done, service_reviewed: res.service_reviewed, ppf_scope: row.ppf_scope, body_type: row.body_type, ...(needHist ? { history: res.history } : {}) } };
+  return { ok: true, merged: { ppf_progress: res.ppf_progress, service_done: res.service_done, service_reviewed: res.service_reviewed, ppf_scope: row.ppf_scope, body_type: row.body_type, ...(needHist ? { history: stageHist } : {}) } };
 }
 const ppfWriteNow = ppfWriteOps;
 

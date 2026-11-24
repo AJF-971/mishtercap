@@ -1,5 +1,6 @@
 /* ---------------------------------------------------------------
-   Mr.CAP — design tokens (black + gold, IBM Plex Sans).
+   Mr.CAP — design tokens (black + gold, Barlow Condensed headings,
+   IBM Plex Sans body).
 
    One small module so the staff app, the customer pages and the
    reports can share the same colours, radii, type sizes and spacing.
@@ -33,8 +34,8 @@ export const COLORS = {
   plateEdge: "#D8D2C0",
 };
 
-export const FONT_IMPORT = `@import url('https://fonts.googleapis.com/css2?family=Playfair+Display:wght@500;600;700&family=IBM+Plex+Sans:wght@400;500;600;700&family=IBM+Plex+Sans+Condensed:wght@600;700&family=IBM+Plex+Mono:wght@400;500;600;700&display=swap');`;
-export const DISPLAY_FONT = "'Playfair Display', serif";
+export const FONT_IMPORT = `@import url('https://fonts.googleapis.com/css2?family=Barlow+Condensed:wght@500;600;700&family=IBM+Plex+Sans:wght@400;500;600;700&family=IBM+Plex+Sans+Condensed:wght@600;700&family=IBM+Plex+Mono:wght@400;500;600;700&display=swap');`;
+export const DISPLAY_FONT = "'Barlow Condensed', 'Arial Narrow', sans-serif";
 export const MONO_FONT = "'IBM Plex Mono', ui-monospace, monospace";
 export const BODY_FONT = "'IBM Plex Sans', -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif";
 

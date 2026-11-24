@@ -53,7 +53,7 @@ const PPF_COLUMNS = "id,make,model,make_model,body_type,created_at,ppf_scope,ppf
 const PAGE = 1000; // PostgREST caps every response at 1000 rows server-side
 
 const DEFAULT_STAGES = [
-  { key: "intake", label: "Intake" }, { key: "parts_removal", label: "Parts Removal" }, { key: "service", label: "Service" },
+  { key: "intake", label: "Checked in" }, { key: "parts_removal", label: "Waiting for technician" }, { key: "service", label: "In progress" },
   { key: "qc", label: "QC" }, { key: "ready", label: "Ready for Collection" }, { key: "collected", label: "Collected" },
 ];
 
@@ -80,7 +80,7 @@ function theme(ui) {
     // chart series (validated on #141311: dataviz validate_palette, dark mode)
     cur: "#B08A18", curHover: "#C9A227", prev: "#3D8BD9", single: C.gold || "#C9A227", stage: "#6E6552",
     good: "#7FB08C", bad: "#E58A76", axis: "#3A3526",
-    display: (ui && ui.DISPLAY_FONT) || "'Playfair Display', serif",
+    display: (ui && ui.DISPLAY_FONT) || "'Barlow Condensed', 'Arial Narrow', sans-serif",
     mono: (ui && ui.MONO_FONT) || "'IBM Plex Mono', monospace",
   };
 }
@@ -507,7 +507,7 @@ function StageBars({ report, t, stages }) {
   const pickup = report.pickup;
   const all = [...rows, pickup].filter((r) => r.avgH !== null);
   const max = maxOf(all.map((r) => r.avgH), 0.01);
-  const shortLabel = (r) => (r.key === "parts_removal" ? "Parts off" : r.label);
+  const shortLabel = (r) => (r.key === "parts_removal" ? "Waiting" : r.label);
   const bn = rows.find((r) => r.key === report.bottleneck);
   const hasData = all.length > 0;
   const completed = report.kpi.jobs.cur;

@@ -239,8 +239,10 @@ export function buildBuckets(range) {
 
 /* ------------------------------------------------------------- per job facts */
 
+// Wording before the 2026-11 floor-flow rename: old history entries carry it.
+const LEGACY_STAGE_LABELS = { intake: "Intake", parts_removal: "Parts Removal", service: "Service", qc: "QC", ready: "Ready for Collection", collected: "Collected" };
 const DEFAULT_STAGES = [
-  { key: "intake", label: "Intake" }, { key: "parts_removal", label: "Parts Removal" }, { key: "service", label: "Service" },
+  { key: "intake", label: "Checked in" }, { key: "parts_removal", label: "Waiting for technician" }, { key: "service", label: "In progress" },
   { key: "qc", label: "QC" }, { key: "ready", label: "Ready for Collection" }, { key: "collected", label: "Collected" },
 ];
 
@@ -323,7 +325,7 @@ export function deriveJob(row, { stages = DEFAULT_STAGES, services = [] } = {}) 
   const finalizedAt = toMs(row.invoice_finalized_at);
   const left = {};
   stages.forEach((s, i) => {
-    left[s.key] = i < stageIndex ? lastAt(hist, (e) => e.stage === s.key && e.label === s.label) : null;
+    left[s.key] = i < stageIndex ? lastAt(hist, (e) => e.stage === s.key && (e.label === s.label || e.label === LEGACY_STAGE_LABELS[s.key])) : null;
   });
 
   let collectedAt = null, timed = false;

@@ -105,6 +105,22 @@ function usePublicMeta(title) {
   }, [title]);
 }
 
+// The number plate as a plate: emirate code in a black block, the rest on
+// the white face — same look as the staff app's plate chip. The text stays
+// exactly the stored plate.
+function PublicPlate({ plate }) {
+  const m = /^([A-Za-z]{2,4})\s+(.+)$/.exec(String(plate || "").trim());
+  const code = m ? m[1].toUpperCase() : "";
+  const rest = m ? m[2] : String(plate || "");
+  return (
+    <span style={{ display: "inline-flex", alignItems: "stretch", borderRadius: 7, overflow: "hidden", background: COLORS.plate, fontFamily: MONO_FONT, fontWeight: 600, fontSize: 16, lineHeight: 1.25, whiteSpace: "nowrap" }}>
+      {code && <span style={{ background: COLORS.darkText, color: COLORS.plate, padding: "5px 7px", fontSize: 12, display: "flex", alignItems: "center", border: `2px solid ${COLORS.plate}`, borderRadius: "7px 0 0 7px" }}>{code}</span>}
+      {code ? " " : null}
+      <span style={{ color: COLORS.darkText, padding: "4px 10px" }}>{rest || "—"}</span>
+    </span>
+  );
+}
+
 export function PublicPageShell({ children, context }) {
   return (
     <div style={{ minHeight: "100vh", background: COLORS.paper, fontFamily: BODY_FONT, color: COLORS.ink, display: "flex", flexDirection: "column", alignItems: "center", padding: "28px 16px 120px", boxSizing: "border-box" }}>
@@ -188,7 +204,7 @@ function PublicJobApprovalView({ token }) {
     <PublicPageShell context={`job card${s.jobRef ? ` ${s.jobRef}` : ""}${s.plate ? ` (${s.plate})` : ""}`}>
       <div style={{ background: COLORS.panel, border: `1px solid ${COLORS.line}`, borderRadius: RADIUS.lg, padding: 20 }}>
         <div style={{ textAlign: "center", marginBottom: 14 }}>
-          <div style={{ fontFamily: DISPLAY_FONT, fontWeight: 700, fontSize: 26, color: COLORS.ink }}>Job Card</div>
+          <div style={{ fontFamily: DISPLAY_FONT, fontWeight: 700, fontSize: 34, lineHeight: 1.05, letterSpacing: 0.5, textTransform: "uppercase", color: COLORS.ink }}>Job Card</div>
           {s.jobRef && <div style={{ fontFamily: MONO_FONT, fontSize: 15, color: COLORS.gold, marginTop: 3 }}>Ref {s.jobRef}</div>}
           {s.customerName && <div style={{ fontSize: FONT_SIZE.customerBody, color: COLORS.muted, marginTop: 8 }}>Prepared for {s.customerName}</div>}
         </div>
@@ -204,7 +220,7 @@ function PublicJobApprovalView({ token }) {
         <div style={panelBox}>
           {received && <div style={{ ...row, color: COLORS.ink }}><span style={{ color: COLORS.muted }}>Date received</span><span>{formatLongDate(new Date(received))}</span></div>}
           {s.revisedAt && <div style={{ ...row, color: COLORS.ink }}><span style={{ color: COLORS.muted }}>Updated</span><span>{formatLongDate(new Date(s.revisedAt))}</span></div>}
-          {vehRows.map(([k, val]) => <div key={k} style={{ ...row, color: COLORS.ink }}><span style={{ color: COLORS.muted }}>{k}</span><span style={k === "Plate" ? { fontFamily: MONO_FONT, color: COLORS.gold } : undefined}>{val}</span></div>)}
+          {vehRows.map(([k, val]) => <div key={k} style={{ ...row, color: COLORS.ink, alignItems: "center" }}><span style={{ color: COLORS.muted }}>{k}</span>{k === "Plate" ? <PublicPlate plate={val} /> : <span>{val}</span>}</div>)}
         </div>
 
         {(s.description || s.damageNotes) && (
@@ -256,7 +272,7 @@ function PublicJobApprovalView({ token }) {
           <div style={row}><span>VAT {Math.round((s.vatRate == null ? VAT_RATE_DEFAULT : s.vatRate) * 100)}%</span><span style={{ fontFamily: MONO_FONT }}>{aed(s.vatTotal)}</span></div>
           <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", padding: "10px 0 4px" }}>
             <span style={{ fontSize: 17, fontWeight: 700, color: COLORS.ink }}>Total</span>
-            <span style={{ fontFamily: MONO_FONT, fontWeight: 700, fontSize: 21, color: COLORS.gold }}>{aed(s.grandTotal)}</span>
+            <span style={{ fontFamily: DISPLAY_FONT, fontWeight: 700, fontSize: 30, lineHeight: 1, color: COLORS.gold }}>{aed(s.grandTotal)}</span>
           </div>
         </div>}
 
